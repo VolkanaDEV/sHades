@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.db
+*.db-shm
+*.db-wal
+
+# sHades runtime storage
+.sHades/
+.sHades_client/
+*.log
+guild_info.json
+identity
+
+# Reticulum / LXMF runtime
+rns/
+lxmf/
+
+# NomadNet runtime
+.nomadnetwork/
+
+# OS
+.DS_Store
