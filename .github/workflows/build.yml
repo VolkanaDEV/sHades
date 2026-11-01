@@ -35,13 +35,7 @@ jobs:
           python -m py_compile kivy_client.py setup_sHades.py sHades.py
           python -m flake8 kivy_client.py setup_sHades.py sHades.py
       - name: Import smoke test (headless)
-        run: |
-          KIVY_GL_BACKEND=mock python -c "
-            import kivy_client
-            app = kivy_client.sHadesClientApp()
-            app.build()
-            print('client builds OK')
-          "
+        run: KIVY_GL_BACKEND=mock python -c "import kivy_client; app = kivy_client.sHadesClientApp(); app.build(); print('client builds OK')"
 
   build-linux:
     name: build Linux (PyInstaller onefile)
