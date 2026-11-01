@@ -18,7 +18,6 @@ import json
 import time
 import hashlib
 import threading
-from io import BytesIO
 from collections import OrderedDict
 
 # ---------------------------------------------------------------------------
@@ -31,7 +30,6 @@ try:
     from kivy.uix.image import Image
     from kivy.uix.screenmanager import ScreenManager, Screen
     from kivy.core.window import Window
-    from kivy.core.image import Image as CoreImage
     from kivy.clock import Clock
     from kivy.properties import (
         StringProperty, ObjectProperty, BooleanProperty,
@@ -204,24 +202,26 @@ class GuildAPI:
 # ---------------------------------------------------------------------------
 class ImageCache:
     def __init__(self):
-        self._textures = {}
+        self._paths = {}   # key -> cached file path
         self._loading = set()
 
     def get(self, key):
-        return self._textures.get(key)
+        return self._paths.get(key)
 
     def set_bytes(self, key, data, ext="png"):
         try:
-            tex = CoreImage(BytesIO(data), ext=ext).texture
-            self._textures[key] = tex
-            return tex
+            fpath = os.path.join(cache_dir(), key + "." + ext)
+            with open(fpath, "wb") as f:
+                f.write(data)
+            self._paths[key] = fpath
+            return fpath
         except Exception as e:
             print("image cache error:", e)
             return None
 
     def fetch_and_cache(self, api, path, key, ext="png"):
-        if key in self._textures or key in self._loading:
-            return self._textures.get(key)
+        if key in self._paths or key in self._loading:
+            return self._paths.get(key)
         self._loading.add(key)
 
         def work():
@@ -344,7 +344,6 @@ KV = r"""
             height: self.texture_size[1]
             halign: 'left'
             valign: 'top'
-            on_texture_size: self.setter('height')(self, self.texture_size)
 
     Widget:
         size_hint_x: None
@@ -816,6 +815,7 @@ class sHadesClientApp(App):
             return
         author = m.get("author_hash", "")
         uname = m.get("username") or ("user-" + author[:6])
+        self._record_member(author, uname)
         content = m.get("content") or ""
         ts = time.strftime("%H:%M", time.localtime(m.get("ts", 0)))
         is_own = (author == self.my_hash)
@@ -823,9 +823,9 @@ class sHadesClientApp(App):
         # avatar
         avatar_source = ""
         key = "av:" + author
-        tex = IMAGE_CACHE.get(key)
-        if tex:
-            avatar_source = key
+        path = IMAGE_CACHE.get(key)
+        if path:
+            avatar_source = path
         else:
             # fetch avatar
             def _do_av(a=author, k=key):
@@ -866,9 +866,14 @@ class sHadesClientApp(App):
 
     def _refresh_avatar(self, key):
         # re-render rows that use this avatar
+        path = IMAGE_CACHE.get(key)
+        if not path:
+            return
+        author = key[3:]  # strip "av:" prefix
         for row in self._msg_widgets.values():
-            if row.avatar_source == key:
-                row.avatar_source = key
+            if row.author_hash == author:
+                row.avatar_source = ""   # force Kivy to re-bind source
+                row.avatar_source = path
 
     def _apply_update(self, u):
         # edit / delete delta

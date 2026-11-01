@@ -209,9 +209,6 @@ def render_content(content):
         out.append(rendered)
     return "\n".join(out)
 
-def fmt_time(ts):
-    return time.strftime("%H:%M", time.localtime(ts))
-
 def get_username(author_hash):
     with db_lock:
         row = db.execute("SELECT username FROM users WHERE dest_hash=?", (author_hash,)).fetchone()
