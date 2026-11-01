@@ -659,7 +659,8 @@ class sHadesClientApp(App):
 
     # -- lifecycle -------------------------------------------------------
     def build(self):
-        Window.clearcolor = (0.14, 0.16, 0.19, 1)
+        if Window:
+            Window.clearcolor = (0.14, 0.16, 0.19, 1)
         sm = ScreenManager()
         sm.add_widget(ConnectScreen(name="connect"))
         sm.add_widget(MainScreen(name="main"))
