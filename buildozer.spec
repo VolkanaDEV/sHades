@@ -15,6 +15,7 @@ android.api = 33
 android.minapi = 24
 android.ndk = 25b
 android.sdk = 23
+android.accept_sdk_license = True
 android.entrypoint = kivy_client.py
 android.manifest_template = AndroidManifest.tmpl
 android.extra_android_arguments = -
