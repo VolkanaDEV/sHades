@@ -15,7 +15,11 @@ Two deployment modes:
 
 Run:  /usr/bin/python3 setup_sHades.py
 """
-import os, sys, json, time, shutil, subprocess, tempfile, re
+import os
+import json
+import time
+import subprocess
+import re
 
 RETI_DIR = os.path.dirname(os.path.abspath(__file__))
 SHades_PY = os.path.join(RETI_DIR, "sHades.py")
@@ -127,7 +131,8 @@ def fresh_hub():
         info = None
         for _ in range(300):
             if os.path.isfile(info_path):
-                info = json.load(open(info_path)); break
+                info = json.load(open(info_path))
+                break
             if proc.poll() is not None:
                 print(open(os.path.join(storage, "sHades.log")).read())
                 print("  server exited early; check the log above")
@@ -183,7 +188,7 @@ def join_hub():
     print(f"  client delivery hash: {client_hash}")
     print("\nTo post to the hub from an LXMF client, message:")
     print(f"  {delivery_hash}   with a leading '#channel' token, e.g. '#general hello'")
-    print(f"To browse the hub in NomadNet, add node:")
+    print("To browse the hub in NomadNet, add node:")
     print(f"  {node_hash}")
     print("\nIf you run the sHades server on this machine too, point it at a *different* "
           "storage dir and set share_instance=yes in both RNS configs to share the instance.")

@@ -16,7 +16,6 @@ import sys
 import re
 import json
 import time
-import shutil
 import hashlib
 import threading
 from io import BytesIO
@@ -26,40 +25,27 @@ from collections import OrderedDict
 # Kivy (guarded so the module can be imported for linting without Kivy present)
 # ---------------------------------------------------------------------------
 try:
-    import kivy
     from kivy.app import App
     from kivy.uix.boxlayout import BoxLayout
-    from kivy.uix.scrollview import ScrollView
     from kivy.uix.label import Label
-    from kivy.uix.textinput import TextInput
-    from kivy.uix.button import Button
     from kivy.uix.image import Image
-    from kivy.uix.widget import Widget
-    from kivy.uix.floatlayout import FloatLayout
-    from kivy.uix.relativelayout import RelativeLayout
-    from kivy.uix.gridlayout import GridLayout
-    from kivy.uix.popup import Popup
-    from kivy.uix.modalview import ModalView
     from kivy.uix.screenmanager import ScreenManager, Screen
     from kivy.core.window import Window
     from kivy.core.image import Image as CoreImage
-    from kivy.clock import Clock, mainthread
+    from kivy.clock import Clock
     from kivy.properties import (
-        StringProperty, ObjectProperty, ListProperty, NumericProperty,
-        BooleanProperty, DictProperty,
+        StringProperty, ObjectProperty, BooleanProperty,
     )
     from kivy.lang import Builder
     from kivy.uix.behaviors import ButtonBehavior
     from kivy.animation import Animation
     from kivy.metrics import dp, sp
-    from kivy.cache import Cache
     KIVY = True
 except Exception as _e:  # pragma: no cover - Kivy missing at import time
     KIVY = False
     _KIVY_IMPORT_ERROR = _e
 
 import RNS
-import LXMF
 from RNS.vendor import umsgpack as msgpack
 
 # ---------------------------------------------------------------------------
@@ -125,16 +111,17 @@ def md_to_kivy(text):
         elif g == "i":
             out.append("[i]" + _escape(m.group("i")) + "[/i]")
         elif g == "code":
-            out.append("[color=#BFBFBF][font=RobotoMono]" + _escape(m.group("code")) + "[/font][/color]")
+            out.append("[color=#BFBFBF]" + _escape(m.group("code")) + "[/color]")
         pos = m.end()
     out.append(_escape(text[pos:]))
     return "".join(out)
 
 
 def _escape(s):
-    return (s.replace("&", "&amp;")
-              .replace("[", "&bl;")
-              .replace("]", "&br;"))
+    s = s.replace("&", "&amp;")
+    s = s.replace("[", "&bl;")
+    s = s.replace("]", "&br;")
+    return s
 
 
 def find_urls(text):
@@ -717,7 +704,9 @@ class sHadesClientApp(App):
         node_hash = (node_hash or "").strip().lower()
         delivery_hash = (delivery_hash or "").strip().lower()
         username = (username or "user").strip() or "user"
-        if not re.fullmatch(r"[0-9a-f]{32}", node_hash) or not re.fullmatch(r"[0-9a-f]{32}", delivery_hash):
+        ok_node = bool(re.fullmatch(r"[0-9a-f]{32}", node_hash))
+        ok_delivery = bool(re.fullmatch(r"[0-9a-f]{32}", delivery_hash))
+        if not ok_node or not ok_delivery:
             self._set_status("Invalid hashes (need 32 hex each)")
             return
         self.node_hash = node_hash
@@ -767,12 +756,12 @@ class sHadesClientApp(App):
 
             Clock.schedule_once(lambda dt: self._switch_main(), 0)
             Clock.schedule_once(lambda dt: self._start_poll(), 0)
-        except Exception as e:
-            Clock.schedule_once(lambda dt: self._set_status("connect failed: %s" % e), 0)
+        except Exception:
+            Clock.schedule_once(
+                lambda dt: self._set_status("connect failed"), 0)
 
     def _switch_main(self):
         self.root.current = "main"
-        main = self.root.get_screen("main")
         # load channels (placeholder: general + anything discovered)
         self._refresh_channels_ui()
 
@@ -868,11 +857,9 @@ class sHadesClientApp(App):
                 emb.add_widget(AsyncImage(source=url, allow_stretch=True, keep_ratio=False))
                 grid.add_widget(emb)
             elif ext in (".mp3", ".ogg", ".wav", ".flac"):
-                from kivy.uix.label import Label
                 grid.add_widget(Label(text="[audio] " + url, size_hint_y=None, height=dp(20),
                                       color=(0.7, 0.73, 0.77, 1), font_size=sp(12)))
             elif ext in (".mp4", ".webm"):
-                from kivy.uix.label import Label
                 grid.add_widget(Label(text="[video] " + url, size_hint_y=None, height=dp(20),
                                       color=(0.7, 0.73, 0.77, 1), font_size=sp(12)))
 
@@ -914,8 +901,6 @@ class sHadesClientApp(App):
 
     # -- channels / members ---------------------------------------------
     def _ensure_general_channel(self):
-        main = self.root.get_screen("main")
-        grid = main.ids.channel_grid
         # only add once
         if not hasattr(self, "_channels_added"):
             self._channels_added = True
@@ -967,6 +952,7 @@ class sHadesClientApp(App):
             return
         cid = getattr(main, "_current_channel", "general")
         inp.text = ""
+
         def work():
             res = self.guild_api.post(cid, text)
             if res.get("ok"):

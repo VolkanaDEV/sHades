@@ -1,0 +1,5 @@
+[flake8]
+max-line-length = 100
+extend-ignore = E201, E202, E221, E222, E223, E224, E225, E226, E227, E241, E242, E251, E302, E303, E704
+per-file-ignores =
+    sHades.py: E501, E305, E741, F811, E128, F841, F401
