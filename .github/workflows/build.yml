@@ -56,7 +56,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements.txt "pyinstaller>=6.0,<7.0"
       - name: Build onefile binary
         run: |
           pyinstaller --onefile --name sHades-client kivy_client.py \
@@ -66,7 +66,6 @@ jobs:
             --hidden-import=RNS.vendor.umsgpack \
             --collect-all=RNS \
             --collect-all=LXMF \
-            --collect-all=kivy \
             --distpath dist/linux
       - name: Publish artifact
         uses: actions/upload-artifact@v4
@@ -90,7 +89,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements.txt "pyinstaller>=6.0,<7.0"
       - name: Build onefile binary
         run: |
           pyinstaller --onefile --name sHades-client.exe kivy_client.py \
@@ -100,7 +99,6 @@ jobs:
             --hidden-import=RNS.vendor.umsgpack \
             --collect-all=RNS \
             --collect-all=LXMF \
-            --collect-all=kivy \
             --distpath dist/windows
       - name: Publish artifact
         uses: actions/upload-artifact@v4
