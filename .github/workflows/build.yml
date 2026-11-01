@@ -1,0 +1,141 @@
+name: Build sHades Kivy client
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.10"
+
+jobs:
+  lint-and-test:
+    name: lint + import test (Linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install kivy[base]==2.3.1 pygments
+          pip install rns lxmf
+      - name: Lint
+        run: |
+          python -m py_compile kivy_client.py setup_sHades.py sHades.py
+          python -m flake8 kivy_client.py setup_sHades.py sHades.py || true
+      - name: Import smoke test (headless)
+        run: |
+          KIVY_GL_BACKEND=mock python -c "
+            import kivy_client
+            app = kivy_client.sHadesClientApp()
+            app.build()
+            print('client builds OK')
+          "
+
+  build-linux:
+    name: build Linux (PyInstaller onefile)
+    needs: lint-and-test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install kivy[base]==2.3.1 pyinstaller rns lxmf
+      - name: Build onefile binary
+        run: |
+          pyinstaller --onefile --name sHades-client kivy_client.py \
+            --hidden-import=RNS \
+            --hidden-import=LXMF \
+            --hidden-import=RNS.vendor \
+            --hidden-import=RNS.vendor.umsgpack \
+            --collect-all=RNS \
+            --collect-all=LXMF \
+            --distpath dist/linux
+      - name: Publish artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sHades-client-linux
+          path: dist/linux/sHades-client
+          retention-days: 7
+
+  build-windows:
+    name: build Windows (PyInstaller onefile)
+    needs: lint-and-test
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install kivy[base]==2.3.1 pyinstaller rns lxmf
+      - name: Build onefile binary
+        run: |
+          pyinstaller --onefile --name sHades-client.exe kivy_client.py \
+            --hidden-import=RNS \
+            --hidden-import=LXMF \
+            --hidden-import=RNS.vendor \
+            --hidden-import=RNS.vendor.umsgpack \
+            --collect-all=RNS \
+            --collect-all=LXMF \
+            --distpath dist/windows
+      - name: Publish artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sHades-client-windows
+          path: dist/windows/sHades-client.exe
+          retention-days: 7
+
+  build-android:
+    name: build Android debug APK (buildozer)
+    needs: lint-and-test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+      - name: Install system deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y -qq \
+            git zip unzip openjdk-17-jdk python3-pip autoconf libtool \
+            pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 \
+            libffi-dev libssl-dev openjdk-17-jdk cmake ninja-build
+      - name: Install buildozer + deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install buildozer==1.5.0 kivy[base]==2.3.1 cython rns lxmf
+      - name: Build debug APK
+        run: |
+          buildozer android debug
+      - name: Publish APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sHades-client-android
+          path: bin/*.apk
+          retention-days: 7
