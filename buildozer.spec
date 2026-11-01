@@ -1,4 +1,4 @@
-[buildozer]
+[app]
 
 # sHades Android build spec
 title = sHades
@@ -6,6 +6,7 @@ package.name = shades
 package.domain = io.eldeucebag
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
+version = 0.1
 requirements = python3,kivy,rns,lxmf
 orientation = portrait
 fullscreen = 0
@@ -21,6 +22,8 @@ android.copy_assets = sHades.py
 android.services = sHades.py
 p4a.branch = master
 p4a.local_endpoint = -
+
+[buildozer]
 
 log.level = 2
 warn_on_root = 1
