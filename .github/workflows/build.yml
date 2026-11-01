@@ -36,8 +36,8 @@ jobs:
           sudo apt-get install -y -qq libmtdev1 xvfb
       - name: Lint
         run: |
-          python -m py_compile kivy_client.py setup_sHades.py sHades.py
-          python -m flake8 kivy_client.py setup_sHades.py sHades.py
+          python -m py_compile main.py kivy_client.py setup_sHades.py sHades.py
+          python -m flake8 main.py kivy_client.py setup_sHades.py sHades.py
       - name: Import smoke test (headless)
         run: xvfb-run -a env KIVY_GL_BACKEND=mock python -c "import kivy_client; app = kivy_client.sHadesClientApp(); app.build(); print('client builds OK')"
 
@@ -53,12 +53,17 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: "pip"
           cache-dependency-path: requirements.txt
+      - name: Install system deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y -qq libmtdev1 xvfb
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt "pyinstaller>=6.0,<7.0"
       - name: Build onefile binary
         run: |
+          xvfb-run -a env KIVY_GL_BACKEND=mock \
           pyinstaller --onefile --name sHades-client kivy_client.py \
             --hidden-import=RNS \
             --hidden-import=LXMF \
@@ -91,15 +96,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt "pyinstaller>=6.0,<7.0"
       - name: Build onefile binary
-        run: |
-          pyinstaller --onefile --name sHades-client.exe kivy_client.py \
-            --hidden-import=RNS \
-            --hidden-import=LXMF \
-            --hidden-import=RNS.vendor \
-            --hidden-import=RNS.vendor.umsgpack \
-            --collect-all=RNS \
-            --collect-all=LXMF \
-            --distpath dist/windows
+        run: pyinstaller --onefile --name sHades-client.exe kivy_client.py --hidden-import=RNS --hidden-import=LXMF --hidden-import=RNS.vendor --hidden-import=RNS.vendor.umsgpack --collect-all=RNS --collect-all=LXMF --distpath dist/windows
       - name: Publish artifact
         uses: actions/upload-artifact@v4
         with:
