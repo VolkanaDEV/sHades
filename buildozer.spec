@@ -7,7 +7,7 @@ package.domain = io.eldeucebag
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 version = 0.1
-requirements = python3,kivy,rns,lxmf
+requirements = python3==3.11,kivy,rns,lxmf
 orientation = portrait
 fullscreen = 0
 android.permissions = INTERNET,ACCESS_NETWORK_STATE,READ_EXTERNAL_STATE,WRITE_EXTERNAL_STORAGE
