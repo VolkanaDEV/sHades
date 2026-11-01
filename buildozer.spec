@@ -21,7 +21,7 @@ android.manifest_template = AndroidManifest.tmpl
 android.extra_android_arguments = -
 android.copy_assets = sHades.py
 android.services = sHades.py
-p4a.branch = master
+p4a.branch = develop
 p4a.local_endpoint = -
 
 [buildozer]
