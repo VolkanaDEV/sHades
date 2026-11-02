@@ -682,6 +682,7 @@ class sHadesClientApp(App):
         self._members = {}               # member_hash -> username
         self._msg_widgets = {}           # msg_id -> MessageRow
         self._popup = None
+        self._poll_error_shown = False
 
     # -- lifecycle -------------------------------------------------------
     def build(self):
@@ -946,6 +947,7 @@ class sHadesClientApp(App):
                 cid = getattr(main, "_current_channel", "general")
                 st = self.guild_api.state(cid)
                 if st.get("ok"):
+                    self._poll_error_shown = False
                     seq = st.get("seq", 0)
                     last_ts = st.get("last_ts", 0.0)
                     if seq != self._seq or last_ts != self._last_ts:
@@ -953,6 +955,12 @@ class sHadesClientApp(App):
                         self._last_ts = last_ts
                         self._fetch_messages(cid)
                         self._refresh_members_ui(cid)
+                else:
+                    err = st.get("error", "unknown")
+                    if not getattr(self, "_poll_error_shown", False):
+                        self._poll_error_shown = True
+                        Clock.schedule_once(
+                            lambda dt: self._set_status("poll failed: %s" % err), 0)
                 # also (re)discover channels: just ensure 'general' exists
                 Clock.schedule_once(lambda dt: self._ensure_general_channel(), 0)
             except Exception as e:
@@ -960,26 +968,32 @@ class sHadesClientApp(App):
             self._poll_stop.wait(3.0)
 
     def _fetch_messages(self, channel, since_id=None, since_ts=None):
-        res = self.guild_api.messages(channel, since_id=since_id, since_ts=since_ts, limit=100)
-        if not res.get("ok"):
-            return
-        msgs = res.get("messages", []) or []
-        updates = res.get("updates", []) or []
+        # Network call must not block the main thread — run it in background,
+        # schedule UI updates via Clock.schedule_once.
+        def work():
+            res = self.guild_api.messages(channel, since_id=since_id, since_ts=since_ts, limit=100)
+            if not res.get("ok"):
+                err = res.get("error", "unknown")
+                Clock.schedule_once(
+                    lambda dt: self._set_status("fetch failed: %s" % err), 0)
+                return
+            msgs = res.get("messages", []) or []
+            updates = res.get("updates", []) or []
 
-        def apply(dt):
-            # All widget access must happen on the main thread.
-            try:
-                main = self.root.get_screen("main")
-                grid = main.ids.message_grid
-                for m in msgs:
-                    self._render_message(grid, m)
-                Clock.schedule_once(lambda dt: self._scroll_to_bottom(), 0.1)
-            except Exception as e:
-                print("render messages error:", e)
-        Clock.schedule_once(apply, 0)
+            def apply(dt):
+                try:
+                    main = self.root.get_screen("main")
+                    grid = main.ids.message_grid
+                    for m in msgs:
+                        self._render_message(grid, m)
+                    Clock.schedule_once(lambda dt: self._scroll_to_bottom(), 0.1)
+                except Exception as e:
+                    print("render messages error:", e)
+            Clock.schedule_once(apply, 0)
 
-        for u in updates:
-            self._apply_update(u)
+            for u in updates:
+                self._apply_update(u)
+        threading.Thread(target=work, daemon=True).start()
 
     def _render_message(self, grid, m):
         msg_id = m.get("msg_id")
@@ -1149,7 +1163,9 @@ class sHadesClientApp(App):
                 Clock.schedule_once(lambda dt: self._render_message(
                     main.ids.message_grid, m), 0)
             else:
-                print("post failed:", res)
+                err = res.get("error", "unknown")
+                Clock.schedule_once(
+                    lambda dt: self._set_status("send failed: %s" % err), 0)
         threading.Thread(target=work, daemon=True).start()
 
     # -- ui helpers ------------------------------------------------------
