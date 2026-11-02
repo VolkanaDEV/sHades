@@ -923,6 +923,7 @@ class sHadesClientApp(App):
         images = [
             f for f in os.listdir(media_dir)
             if f.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+            and f != "1793645765.png"   # client icon/logo — not a banner
         ]
         if not images:
             return
