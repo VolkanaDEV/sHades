@@ -21,6 +21,9 @@ import threading
 import random
 from collections import OrderedDict
 import mimetypes
+from PIL import Image as PILImage
+from PIL import ImageDraw as PILImageDraw
+from PIL import ImageChops as PILImageChops
 
 # ---------------------------------------------------------------------------
 # Kivy (guarded so the module can be imported for linting without Kivy present)
@@ -304,6 +307,7 @@ if KIVY:
             super().__init__(**kwargs)
             self._drag_mode = None   # 'move' or 'resize'
             self._last_pos = None
+            self._img = None
             self.bind(
                 circle_x=self._update_crop,
                 circle_y=self._update_crop,
@@ -318,6 +322,30 @@ if KIVY:
             self.crop_cx = self.x + self.circle_x * self.width
             self.crop_cy = self.y + self.circle_y * self.height
             self.crop_r = self.circle_radius * min(self.width, self.height)
+            self._size_image()
+
+        def on_source(self, instance, value):
+            """Re-size image when a new source loads."""
+            from kivy.clock import Clock
+            Clock.schedule_once(lambda dt: self._size_image(), 0)
+
+        def _size_image(self):
+            """Size the child image at natural size, centered, never stretched."""
+            img = self.ids.get("pfp_img")
+            if not img or not img.texture:
+                return
+            tw, th = img.texture_size
+            if tw <= 0 or th <= 0:
+                return
+            # Cap to fit within editor while preserving aspect ratio
+            max_w = self.width * 0.95
+            max_h = self.height * 0.95
+            scale = min(max_w / tw, max_h / th, 1.0)
+            img.size = (tw * scale, th * scale)
+            img.pos = (
+                self.center_x - img.size[0] / 2,
+                self.center_y - img.size[1] / 2,
+            )
 
         def _circle_hit(self, touch):
             dx = touch.x - self.crop_cx
@@ -1909,7 +1937,6 @@ class sHadesClientApp(App):
         from widget coords to image-relative coords for cropping.
         """
         try:
-            from PIL import Image as PILImage
             pil = PILImage.open(path).convert("RGBA")
         except Exception:
             # PIL not available — use original directly
@@ -1970,6 +1997,14 @@ class sHadesClientApp(App):
                 crop = pil.crop((left, top, left + size, top + size))
 
             crop = crop.resize((256, 256), PILImage.LANCZOS)
+            # Apply circular mask — corners become transparent
+            mask = PILImage.new("L", (256, 256), 0)
+            mask_draw = PILImageDraw.Draw(mask)
+            mask_draw.ellipse([0, 0, 255, 255], fill=255)
+            crop = crop.convert("RGBA")
+            r, g, b, a = crop.split()
+            a = PILImageChops.multiply(a, mask)
+            crop = PILImage.merge("RGBA", (r, g, b, a))
             crop.save(small_path, "PNG")
         else:
             import shutil
@@ -1986,12 +2021,13 @@ class sHadesClientApp(App):
 
         if res and res.get("ok"):
             self._set_status("Avatar updated")
-            # Profile screen shows original (full-size)
-            self.profile_screen.target_avatar = orig_path
+            # Profile screen shows circular 256x256 pfp
+            self.profile_screen.target_avatar = small_path
             self.my_avatar_orig = orig_path
+            self.my_avatar_small = small_path
             if hasattr(self, "profile_screen"):
-                self.profile_screen.ids.profile_pfp.source = orig_path
-            # Chat/members use 256x256 version
+                self.profile_screen.ids.profile_pfp.source = small_path
+            # Chat/members use 256x256 circular version
             self.my_avatar_small = small_path
         else:
             self._set_status("avatar upload failed")
