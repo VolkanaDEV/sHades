@@ -998,4 +998,25 @@ if __name__ == "__main__":
         print("Kivy is required to run the client: pip install kivy[base]", file=sys.stderr)
         print(_KIVY_IMPORT_ERROR)
         sys.exit(1)
-    sHadesClientApp().run()
+
+    # Graceful GL backend fallback: Wayland without a GPU, headless runners,
+    # and VMs often fail with "No matching FB config found" from SDL2/OpenGL.
+    # Try software GL first, then the mock backend as last resort.
+    _attempt = int(os.environ.get("_SHades_GL_ATTEMPT", "1"))
+    try:
+        sHadesClientApp().run()
+    except Exception as _e:
+        _msg = str(_e)
+        if _attempt < 3 and (
+            "FB config" in _msg
+            or "No matching" in _msg
+            or "couldn't connect to X server" in _msg
+        ):
+            os.environ["_SHades_GL_ATTEMPT"] = str(_attempt + 1)
+            if _attempt == 1:
+                os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
+            else:
+                os.environ["KIVY_GL_BACKEND"] = "mock"
+            os.execv(sys.executable, [sys.executable] + sys.argv[1:])
+        print(f"sHades client failed to start: {_e}", file=sys.stderr)
+        sys.exit(1)
