@@ -430,7 +430,7 @@ KV = r"""
             height: dp(340)
             TextInput:
                 id: hub_address
-                hint_text: 'Hub address (ip:port, e.g. 192.168.1.50:29221)'
+                hint_text: 'RNS community hub (ip:port, e.g. rns.reticulum.world:6666)'
                 multiline: False
                 size_hint_y: None
                 height: dp(44)

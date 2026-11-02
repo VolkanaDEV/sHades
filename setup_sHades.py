@@ -123,14 +123,14 @@ def fresh_hub():
 
     if yes_no("\nLaunch the sHades guild server now?", True):
         delay = prompt("Announce delay (seconds)", "2") or "2"
-        listen = prompt("Listen address:port for direct client connections "
-                        "(blank = LAN discovery only)", "0.0.0.0:29221")
+        rns_hub = prompt("RNS community hub ip:port to connect to "
+                         "(blank = LAN discovery only)", "rns.reticulum.world:6666")
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
         server_args = ["/usr/bin/python3", SHades_PY, "--storage", storage,
                        "--name", name, "--announce-delay", delay]
-        if listen:
-            server_args.extend(["--listen", listen])
+        if rns_hub:
+            server_args.extend(["--rns-hub", rns_hub])
         proc = subprocess.Popen(
             server_args,
             cwd=RETI_DIR, env=env,
@@ -149,7 +149,7 @@ def fresh_hub():
                 return
             time.sleep(0.25)
         if info:
-            print("\n=== sHades community hub is live ===")
+            print("\n=== sHades guild hub is live ===")
             print(f"  name         : {info['name']}")
             print(f"  node_hash    : {info['node_hash']}   (NomadNet: add as node to browse)")
             print(f"  delivery_hash: {info['delivery_hash']}  (LXMF: #channel first token)")
@@ -213,13 +213,14 @@ def join_hub():
         json.dump(cfg, f, indent=2)
 
     print(f"\nClient config written: {CLIENT_CONFIG}")
-    print(f"  hub address : {hub_host}:{hub_port}")
-    print(f"  hub node_hash: {node_hash}")
+    print(f"  RNS community hub : {hub_host}:{hub_port}")
     print(f"  client delivery hash: {client_hash}")
-    print("\nThe RNS config (~/.sHades_client/rns/config) now routes to the hub directly.")
-    print("Run the sHades client and enter the same hub address to connect.")
-    print("\nShare this node_hash with others so they can join your hub:")
-    print(f"  {node_hash}")
+    if node_hash:
+        print(f"  guild node_hash   : {node_hash}")
+    print("\nThe RNS config (~/.sHades_client/rns/config) now routes to the community hub.")
+    print("Run the sHades client and enter the same community hub address to connect.")
+    print("\nIf you know the guild's node_hash, enter it in the client to connect directly.")
+    print("Otherwise the client will auto-discover it from the guild's mesh announce.")
     print("\nIf you run the sHades server on this machine too, point it at a *different* "
           "storage dir and set share_instance=yes in both RNS configs to share the instance.")
 
