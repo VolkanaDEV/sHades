@@ -1983,22 +1983,26 @@ class sHadesClientApp(App):
             img_x, img_y = image_pos if image_pos else (0, 0)
             img_w, img_h = image_size if image_size else (pil.width, pil.height)
 
-            # Circle center relative to image (0-1)
-            rel_cx = (circle_x * editor_w - img_x) / img_w if img_w > 0 else 0.5
-            rel_cy = (circle_y * editor_h - img_y) / img_h if img_h > 0 else 0.5
+            # The image is uniformly scaled (keep_ratio=True):
+            # screen_pixels = natural_pixels * scale
+            scale = img_w / pil.width if pil.width > 0 else 1.0
 
-            # Circle radius relative to image dimensions
-            img_min_dim = min(img_w, img_h)
-            rel_r = (circle_radius * min(editor_w, editor_h) / img_min_dim
-                     if img_min_dim > 0 else 0.25)
+            # Circle center in screen pixels, relative to image top-left
+            cx_img_screen = circle_x * editor_w - img_x
+            cy_img_screen = circle_y * editor_h - img_y
+
+            # Convert screen pixels -> natural image pixels (divide by scale)
+            cx_px = cx_img_screen / scale if scale > 0 else cx_img_screen
+            cy_px = cy_img_screen / scale if scale > 0 else cy_img_screen
+
+            # Circle radius in screen pixels -> natural pixels
+            r_screen = circle_radius * min(editor_w, editor_h)
+            r_px = r_screen / scale if scale > 0 else r_screen
 
             # Crop from original image (PIL uses top-left origin)
-            cx_px = rel_cx * pil.width
-            cy_px = rel_cy * pil.height
-            r_px = rel_r * img_min_dim
-
             left = int(cx_px - r_px)
             right = int(cx_px + r_px)
+            # Kivy uses bottom-left origin; PIL uses top-left origin
             top = int(pil.height - (cy_px + r_px))
             bottom = int(pil.height - (cy_px - r_px))
 
