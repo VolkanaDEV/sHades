@@ -899,26 +899,40 @@ class sHadesClientApp(App):
             # we just connected through; we capture the hash from the announce.
             if not self.node_hash:
                 self.node_hash = self._discover_node_hash(reticulum)
-                if self.node_hash:
-                    print(f"Discovered guild node_hash via announce: {self.node_hash}")
-                else:
+                if not self.node_hash:
                     raise RuntimeError(
                         "Could not discover guild node_hash from hub announces. "
-                        "Ask the hub admin for its node_hash and try again."
-                    )
+                        "Ask the hub admin for its node_hash and try again.")
+                print(f"Discovered guild node_hash via announce: {self.node_hash}")
 
-            # link to guild node
+            # Validate that RNS knows this identity (from hearing its announce)
             nh = bytes.fromhex(self.node_hash)
             nid = RNS.Identity.recall(nh)
-            nd = RNS.Destination(nid, RNS.Destination.OUT,
-                                 RNS.Destination.SINGLE, "nomadnetwork", "node")
-            link = RNS.Link(nd)
-            for _ in range(200):
+            if nid is None:
+                raise RuntimeError(
+                    "RNS does not know identity for node_hash %s — "
+                    "the guild's announce was not heard yet. Try again." % self.node_hash)
+            print(f"RNS recalled identity for node_hash {self.node_hash}")
+
+            # link to guild node — retry up to 3 times
+            link = None
+            for attempt in range(3):
+                nd = RNS.Destination(nid, RNS.Destination.OUT,
+                                     RNS.Destination.SINGLE, "nomadnetwork", "node")
+                link = RNS.Link(nd)
+                for _ in range(200):
+                    if link.status == RNS.Link.ACTIVE:
+                        break
+                    time.sleep(0.1)
                 if link.status == RNS.Link.ACTIVE:
                     break
-                time.sleep(0.1)
+                print(f"Link attempt {attempt + 1} not ACTIVE, retrying...")
+                time.sleep(1.0)
+
             if link.status != RNS.Link.ACTIVE:
-                raise RuntimeError("link never active")
+                raise RuntimeError(
+                    "Could not establish RNS link to guild node — "
+                    "link never went ACTIVE after 3 attempts.")
             link.identify(self.client_identity)
             self.link = link
 
