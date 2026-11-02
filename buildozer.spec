@@ -10,10 +10,12 @@ version = 0.1
 requirements = python3,kivy,rns,lxmf
 orientation = portrait
 fullscreen = 0
-android.permissions = INTERNET,ACCESS_NETWORK_STATE
+android.permissions = INTERNET,ACCESS_NETWORK_STATE,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
 android.api = 33
 android.minapi = 24
 android.accept_sdk_license = True
+android.entrypoint = main
+android.manifest_template = AndroidManifest.tmpl
 p4a.branch = develop
 
 [buildozer]

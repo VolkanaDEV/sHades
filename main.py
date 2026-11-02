@@ -1,9 +1,18 @@
-"""Android entry point: python-for-android requires main.py in the app dir.
+#!/usr/bin/env python3
+"""Android entry point for sHades client.
 
-Runs at module level on purpose -- p4a executes main.py via runpy, where
-__name__ is not "__main__".
+p4a executes this module via runpy where __name__ is not "__main__".
+The app must be started from the Android activity's onCreate callback.
 """
 
 from kivy_client import sHadesClientApp
 
-sHadesClientApp().run()
+
+def main():
+    """Entry point called from Android activity."""
+    app = sHadesClientApp()
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
