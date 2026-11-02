@@ -501,6 +501,7 @@ KV = r"""
             height: dp(200)
             allow_stretch: False
             keep_ratio: True
+            pos_hint: {'x': 0}
         Label:
             text: 'sHades'
             font_size: sp(40)
@@ -703,6 +704,7 @@ KV = r"""
             height: dp(200)
             allow_stretch: False
             keep_ratio: True
+            pos_hint: {'x': 0}
         BoxLayout:
             orientation: 'horizontal'
 
