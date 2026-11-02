@@ -605,8 +605,6 @@ KV = r"""
 # Screens
 # ---------------------------------------------------------------------------
 if KIVY:
-    Builder.load_string(KV)
-
     class ConnectScreen(Screen):
         pass
 
@@ -627,6 +625,8 @@ if KIVY:
             self.right_open = not self.right_open
             anim = Animation(width=(dp(200) if self.right_open else dp(0)), d=0.2)
             anim.start(self.ids.right_sidebar)
+
+    Builder.load_string(KV)
 
 
 # ---------------------------------------------------------------------------
@@ -674,6 +674,14 @@ class sHadesClientApp(App):
             self.username = sess.get("username", "user")
             self._open_main()
             Clock.schedule_once(lambda dt: self._connect_guild(), 0.5)
+
+    def _open_main(self):
+        """Switch to the main chat screen."""
+        try:
+            self.root.current = "main"
+            self._refresh_channels_ui()
+        except Exception:
+            pass
 
     # -- session ---------------------------------------------------------
     def _session_path(self):
