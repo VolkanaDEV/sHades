@@ -498,9 +498,9 @@ KV = r"""
             id: banner_config
             source: app.banner_config_path or ''
             size_hint_y: None
-            height: dp(120)
-            allow_stretch: True
-            keep_ratio: False
+            height: dp(200)
+            allow_stretch: False
+            keep_ratio: True
         Label:
             text: 'sHades'
             font_size: sp(40)
@@ -700,9 +700,9 @@ KV = r"""
             id: banner_channel
             source: app.banner_channel_path or ''
             size_hint_y: None
-            height: dp(100)
-            allow_stretch: True
-            keep_ratio: False
+            height: dp(200)
+            allow_stretch: False
+            keep_ratio: True
         BoxLayout:
             orientation: 'horizontal'
 
