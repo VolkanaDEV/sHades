@@ -6,15 +6,16 @@ stdout/stderr are redirected to Android logcat (tag: python/stderr).
 """
 
 import sys
-import traceback
 import time
-
-from kivy_client import sHadesClientApp
+import traceback
 
 
 def main():
-    """Entry point called from Android activity."""
+    """Entry point called from Android activity. All Python execution
+    is wrapped so any import/runtime crash prints a traceback to logcat."""
     try:
+        # Deferred import so import errors are caught below
+        from kivy_client import sHadesClientApp
         app = sHadesClientApp()
         app.run()
     except Exception:
