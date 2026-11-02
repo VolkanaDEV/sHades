@@ -54,14 +54,6 @@ def yes_no(text, default=True):
         print("  please answer y or n")
 
 
-def hash_prompt(text):
-    while True:
-        h = prompt(text).strip().lower()
-        if HUB_HASH_RE.match(h):
-            return h
-        print("  not a valid 32-hex destination hash, try again")
-
-
 def address_prompt(text, default=None):
     while True:
         a = prompt(text, default).strip()
@@ -176,12 +168,15 @@ def join_hub():
     print("Defaults to the public RNS community hub: rns.reticulum.world:6666")
     hub_host, hub_port = address_prompt("Hub address (ip:port)", "rns.reticulum.world:6666")
 
-    print("\nYou need the hub's destination hashes from its guild_info.json.")
-    print("Ask the hub admin, or check the hub's startup output.")
-    node_hash = hash_prompt("Hub node_hash (32 hex, REQUIRED)")
+    print("\nOptional: guild node_hash (32 hex). Leave blank to auto-discover")
+    print("from the hub's RNS announce after connecting.")
+    node_hash = prompt("Hub node_hash (32 hex, optional)", "").strip().lower() or None
     delivery_hash = prompt("Hub delivery_hash (32 hex, optional)", "").strip().lower() or None
     prop_hash = prompt("Hub propagation_hash (32 hex, optional)", "").strip().lower() or None
 
+    if node_hash and not HUB_HASH_RE.match(node_hash):
+        print("  invalid node_hash, clearing")
+        node_hash = None
     if delivery_hash and not HUB_HASH_RE.match(delivery_hash):
         print("  invalid delivery_hash, clearing")
         delivery_hash = None

@@ -447,7 +447,7 @@ KV = r"""
                 foreground_color: 1, 1, 1, 1
                 cursor_color: 1, 1, 1, 1
             Label:
-                text: 'Guild hashes (ask the hub admin if you don\'t have them)'
+                text: 'Guild hashes (leave blank to auto-discover from hub announce)'
                 color: 0.7, 0.73, 0.77, 1
                 font_size: sp(12)
                 size_hint_y: None
@@ -457,7 +457,7 @@ KV = r"""
                 text_size: self.width, None
             TextInput:
                 id: node_hash
-                hint_text: 'Guild node_hash (32 hex)'
+                hint_text: 'Guild node_hash (32 hex, optional)'
                 multiline: False
                 size_hint_y: None
                 height: dp(40)
@@ -466,7 +466,7 @@ KV = r"""
                 cursor_color: 1, 1, 1, 1
             TextInput:
                 id: delivery_hash
-                hint_text: 'Guild delivery_hash (32 hex)'
+                hint_text: 'Guild delivery_hash (32 hex, optional)'
                 multiline: False
                 size_hint_y: None
                 height: dp(40)
@@ -823,13 +823,46 @@ class sHadesClientApp(App):
         except Exception:
             return True
 
+    def _discover_node_hash(self, reticulum):
+        """Listen for RNS announces from the hub's nomadnetwork.node destination.
+
+        When a hub announces, its announce packet carries the destination hash
+        and public key. Our announce handler captures the hash; RNS populates
+        known_destinations from the announce body, so Identity.recall() then
+        returns the peer identity.
+        Returns the node_hash as hex string, or None on timeout.
+        """
+        discovered = {}
+
+        class _NodeAnnounceHandler:
+            aspect_filter = "nomadnetwork.node"
+
+            def received_announce(self, destination_hash, announced_identity, app_data):
+                if isinstance(destination_hash, bytes):
+                    discovered["hash"] = destination_hash.hex()
+                else:
+                    discovered["hash"] = str(destination_hash)
+
+        handler = _NodeAnnounceHandler()
+        RNS.Transport.register_announce_handler(handler)
+
+        try:
+            # Hub announces on boot and every 5 minutes; we should hear it
+            # within a few seconds of connecting via TCPClientInterface.
+            for _ in range(300):  # up to 30 seconds
+                if "hash" in discovered:
+                    return discovered["hash"]
+                time.sleep(0.1)
+        finally:
+            # Handler stays registered; harmless for subsequent announces.
+            pass
+
+        return None
+
     def _connect_after_rns(self):
         """Background thread: identity, destinations, link to guild node."""
         try:
             reticulum = self.reticulum
-
-            if not self.node_hash:
-                raise RuntimeError("node_hash required to connect to guild")
 
             # identity
             storage = os.path.join(_app_data_dir(), "rns")
@@ -849,6 +882,19 @@ class sHadesClientApp(App):
                 self.client_identity, RNS.Destination.OUT,
                 RNS.Destination.SINGLE, "lxmf", "delivery")
             self.my_hash = hexstr(self.client_dest.hash)
+
+            # Discover guild node_hash via RNS announce if not provided.
+            # The hub announces nomadnetwork.node over the TCPClientInterface
+            # we just connected through; we capture the hash from the announce.
+            if not self.node_hash:
+                self.node_hash = self._discover_node_hash(reticulum)
+                if self.node_hash:
+                    print(f"Discovered guild node_hash via announce: {self.node_hash}")
+                else:
+                    raise RuntimeError(
+                        "Could not discover guild node_hash from hub announces. "
+                        "Ask the hub admin for its node_hash and try again."
+                    )
 
             # link to guild node
             nh = bytes.fromhex(self.node_hash)
