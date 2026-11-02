@@ -193,6 +193,17 @@ class GuildAPI:
     def delete(self, msg_id):
         return self._request("/api/delete", {"msg": msg_id})
 
+    def register_node(self, node_hash, address, port, identity_hash):
+        return self._request("/api/register_node", {
+            "node_hash": node_hash,
+            "address": address,
+            "port": port,
+            "identity_hash": identity_hash,
+        })
+
+    def lookup_node(self, node_hash):
+        return self._request("/api/lookup_node", {"node_hash": node_hash})
+
     def register(self, username, profile_node=""):
         return self._request("/api/register",
                              {"username": username, "profile_node": profile_node})
@@ -409,6 +420,7 @@ KV = r"""
         font_size: sp(13)
         halign: 'left'
         valign: 'middle'
+        on_press: app.open_profile(root.author_hash, root.username)
         on_press: app.open_profile(root.author_hash, root.username)
 
 
@@ -726,6 +738,13 @@ KV = r"""
                     halign: 'left'
                     valign: 'middle'
                     text_size: self.width, None
+            Button:
+                text: 'members \u25bc' if root.right_open else 'members \u25b6'
+                size_hint_y: None
+                height: dp(34)
+                background_color: 0.24, 0.26, 0.3, 1
+                color: 1, 1, 1, 0.9
+                on_press: root.toggle_right()
             ScrollView:
                 do_scroll_x: False
                 GridLayout:
@@ -735,13 +754,6 @@ KV = r"""
                     height: self.minimum_height
                     spacing: dp(2)
                     padding: [dp(6), dp(6)]
-            Button:
-                text: 'members \u25bc' if root.right_open else 'members \u25b6'
-                size_hint_y: None
-                height: dp(34)
-                background_color: 0.24, 0.26, 0.3, 1
-                color: 1, 1, 1, 0.9
-                on_press: root.toggle_right()
 """
 
 
@@ -817,6 +829,7 @@ class sHadesClientApp(App):
         sm = ScreenManager()
         sm.add_widget(ConnectScreen(name="connect"))
         sm.add_widget(MainScreen(name="main"))
+        sm.add_widget(ProfileScreen(name="profile"))
         return sm
 
     def on_start(self):
