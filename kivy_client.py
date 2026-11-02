@@ -1429,18 +1429,22 @@ class sHadesClientApp(App):
 
         # avatar
         avatar_source = ""
-        key = "av:" + author
-        path = IMAGE_CACHE.get(key)
-        if path:
-            avatar_source = path
+        if is_own and getattr(self, "my_avatar_small", None):
+            # Use our own saved circular pfp immediately
+            avatar_source = self.my_avatar_small
         else:
-            # fetch avatar
-            def _do_av(a=author, k=key):
-                res = self.guild_api.avatar_get(a)
-                if res.get("ok") and res.get("avatar"):
-                    IMAGE_CACHE.set_bytes(k, res["avatar"], "png")
-                    Clock.schedule_once(lambda dt: self._refresh_avatar(k), 0)
-            threading.Thread(target=_do_av, daemon=True).start()
+            key = "av:" + author
+            path = IMAGE_CACHE.get(key)
+            if path:
+                avatar_source = path
+            else:
+                # fetch avatar
+                def _do_av(a=author, k=key):
+                    res = self.guild_api.avatar_get(a)
+                    if res.get("ok") and res.get("avatar"):
+                        IMAGE_CACHE.set_bytes(k, res["avatar"], "png")
+                        Clock.schedule_once(lambda dt: self._refresh_avatar(k), 0)
+                threading.Thread(target=_do_av, daemon=True).start()
 
         row = MessageRow(
             author_hash=author,
@@ -1742,7 +1746,10 @@ class sHadesClientApp(App):
             return
         self.profile_screen.target_hash = self.my_hash or ""
         self.profile_screen.target_username = self.username or "user"
-        self.profile_screen.target_avatar = ""
+        # Show saved circular pfp if we have one, otherwise blank
+        self.profile_screen.target_avatar = getattr(
+            self, "my_avatar_small", ""
+        ) or ""
         try:
             self.root.current = "profile"
         except Exception:
@@ -1909,18 +1916,22 @@ class sHadesClientApp(App):
         )
 
         def do_save(*_):
-            popup.dismiss()
-            img = editor.ids.pfp_img
-            self._save_pfp_crop(
-                path,
-                circle_x=editor.circle_x,
-                circle_y=editor.circle_y,
-                circle_radius=editor.circle_radius,
-                editor_w=editor.width,
-                editor_h=editor.height,
-                image_pos=img.pos,
-                image_size=img.size,
-            )
+            # Defer to next frame so FloatLayout completes and
+            # editor.width/height + img.pos/size reflect actual rendered state
+            def _do_save(dt):
+                popup.dismiss()
+                img = editor.ids.pfp_img
+                self._save_pfp_crop(
+                    path,
+                    circle_x=editor.circle_x,
+                    circle_y=editor.circle_y,
+                    circle_radius=editor.circle_radius,
+                    editor_w=editor.width,
+                    editor_h=editor.height,
+                    image_pos=img.pos,
+                    image_size=img.size,
+                )
+            Clock.schedule_once(_do_save, 0)
 
         def do_cancel(*_):
             popup.dismiss()
@@ -2024,14 +2035,13 @@ class sHadesClientApp(App):
 
         if res and res.get("ok"):
             self._set_status("Avatar updated")
-            # Profile screen shows circular 256x256 pfp
-            self.profile_screen.target_avatar = small_path
+            # Always store paths (profile_screen may not exist yet)
             self.my_avatar_orig = orig_path
             self.my_avatar_small = small_path
+            # Apply to profile screen if it exists
             if hasattr(self, "profile_screen"):
+                self.profile_screen.target_avatar = small_path
                 self.profile_screen.ids.profile_pfp.source = small_path
-            # Chat/members use 256x256 circular version
-            self.my_avatar_small = small_path
         else:
             self._set_status("avatar upload failed")
 
