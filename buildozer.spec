@@ -6,6 +6,7 @@ package.name = shades
 package.domain = io.eldeucebag
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
+source.exclude_dirs = .git, .github, tests, __pycache__, build, dist, .buildozer
 version = 0.1
 requirements = python3,kivy,rns,lxmf
 orientation = portrait
