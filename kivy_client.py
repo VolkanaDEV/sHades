@@ -365,17 +365,17 @@ KV = r"""
         source: root.source
         allow_stretch: True
         keep_ratio: False
-    canvas.after:
-        Color:
-            rgba: 0, 0, 0, 0.6
-        Ellipse:
-            pos: self.center_x - dp(64), self.center_y - dp(64)
-            size: dp(128), dp(128)
-        Color:
-            rgba: 1, 1, 1, 1
-        Line:
-            circle: self.center_x, self.center_y, 64
-            width: 2
+        canvas.after:
+            Color:
+                rgba: 0, 0, 0, 0.6
+            Ellipse:
+                pos: self.center_x - dp(64), self.center_y - dp(64)
+                size: dp(128), dp(128)
+            Color:
+                rgba: 1, 1, 1, 1
+            Line:
+                circle: self.center_x, self.center_y, 64
+                width: 2
 
 <MessageRow>:
     orientation: 'horizontal'
@@ -496,7 +496,7 @@ KV = r"""
                 size: self.size
         Image:
             id: banner_config
-            source: root.app.banner_config_path or ''
+            source: app.banner_config_path or ''
             size_hint_y: None
             height: dp(120)
             allow_stretch: True
@@ -615,17 +615,17 @@ KV = r"""
                     allow_stretch: True
                     keep_ratio: True
                     pos_hint: {'center_x': 0.5}
-                canvas.after:
-                    Color:
-                        rgba: 0, 0, 0, 0.5
-                    Ellipse:
-                        pos: self.center_x - dp(75), self.center_y - dp(75)
-                        size: dp(150), dp(150)
-                    Color:
-                        rgba: 1, 1, 1, 1
-                    Line:
-                        circle: self.center_x, self.center_y, 75
-                        width: 2
+                    canvas.after:
+                        Color:
+                            rgba: 0, 0, 0, 0.5
+                        Ellipse:
+                            pos: self.center_x - dp(75), self.center_y - dp(75)
+                            size: dp(150), dp(150)
+                        Color:
+                            rgba: 1, 1, 1, 1
+                        Line:
+                            circle: self.center_x, self.center_y, 75
+                            width: 2
                 Label:
                     text: root.target_username
                     font_size: sp(20)
@@ -698,7 +698,7 @@ KV = r"""
                 size: self.size
         Image:
             id: banner_channel
-            source: root.app.banner_channel_path or ''
+            source: app.banner_channel_path or ''
             size_hint_y: None
             height: dp(100)
             allow_stretch: True
