@@ -696,15 +696,6 @@ KV = r"""
             Rectangle:
                 pos: self.pos
                 size: self.size
-        Image:
-            id: banner_channel
-            source: app.banner_channel_path or ''
-            size_hint_y: None
-            height: dp(200)
-            size_hint_x: None
-            width: dp(400)
-            allow_stretch: False
-            keep_ratio: True
         BoxLayout:
             orientation: 'horizontal'
             size_hint_y: 1
@@ -721,6 +712,16 @@ KV = r"""
                     Rectangle:
                         pos: self.pos
                         size: self.size
+                Image:
+                    id: banner_channel
+                    source: app.banner_channel_path or ''
+                    size_hint_y: None
+                    height: dp(160)
+                    size_hint_x: None
+                    width: dp(200)
+                    allow_stretch: False
+                    keep_ratio: True
+                    pos_hint: {'center_x': 0.5}
                 Button:
                     text: 'channels \u25bc' if root.left_open else 'channels \u25b6'
                     size_hint_y: None
