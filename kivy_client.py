@@ -781,7 +781,11 @@ class sHadesClientApp(App):
         self._save_session()
         # RNS.Reticulum() installs signal handlers and must run on the main
         # thread. Schedule it there, then do blocking link work in a bg thread.
-        Clock.schedule_once(lambda dt: self._init_reticulum(), 0)
+        # If RNS is already initialized (retry), skip initialization.
+        if self.reticulum is not None:
+            Clock.schedule_once(lambda dt: self._connect_after_rns(), 0)
+        else:
+            Clock.schedule_once(lambda dt: self._init_reticulum(), 0)
 
     def _init_reticulum(self):
         """Main thread only: create RNS instance (signal handlers), then
