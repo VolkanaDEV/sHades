@@ -2,7 +2,7 @@
 """Android entry point for sHades client.
 
 p4a executes this module via PyRun_SimpleFile with __name__ == "__main__".
-stdout/stderr are redirected to Android logcat (tag: python/stderr).
+stdout/stderr are redirected to Android logcat (tags: python / stderr).
 """
 
 import sys
