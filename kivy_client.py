@@ -325,8 +325,10 @@ if KIVY:
             self._size_image()
 
         def on_source(self, instance, value):
-            """Re-size image when a new source loads."""
-            from kivy.clock import Clock
+            """Re-size image when source changes or texture loads."""
+            img = self.ids.get("pfp_img")
+            if img:
+                img.bind(texture_size=lambda *args: self._size_image())
             Clock.schedule_once(lambda dt: self._size_image(), 0)
 
         def _size_image(self):
@@ -336,6 +338,8 @@ if KIVY:
                 return
             tw, th = img.texture_size
             if tw <= 0 or th <= 0:
+                return
+            if self.width <= 0 or self.height <= 0:
                 return
             # Cap to fit within editor while preserving aspect ratio
             max_w = self.width * 0.95
@@ -458,7 +462,6 @@ KV = r"""
         allow_stretch: False
         keep_ratio: True
         size_hint: None, None
-        pos_hint: {'center_x': 0.5, 'center_y': 0.5}
 
 <MessageRow>:
     orientation: 'horizontal'
@@ -693,7 +696,7 @@ KV = r"""
                 size_hint: None, None
                 size: dp(150), dp(150)
                 source: root.target_avatar or ''
-                allow_stretch: True
+                allow_stretch: False
                 keep_ratio: True
                 canvas.after:
                     Color:
