@@ -823,36 +823,13 @@ class sHadesClientApp(App):
         except Exception:
             return True
 
-    def _retrieve_guild_info(self):
-        """Connect to the hub's discovery port and retrieve guild_info.json.
-        Returns the parsed info dict, or None on failure."""
-        if not self.hub_address:
-            return None
-        try:
-            import socket
-            disco_port = getattr(self, "hub_port", 29221) + 1
-            ds = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            ds.settimeout(5)
-            ds.connect((self.hub_host, disco_port))
-            data = b""
-            while True:
-                chunk = ds.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-                if b"\n" in data:
-                    break
-            ds.close()
-            if data:
-                return json.loads(data.decode().strip())
-        except Exception as e:
-            print("discovery retrieval error:", repr(e))
-        return None
-
     def _connect_after_rns(self):
         """Background thread: identity, destinations, link to guild node."""
         try:
             reticulum = self.reticulum
+
+            if not self.node_hash:
+                raise RuntimeError("node_hash required to connect to guild")
 
             # identity
             storage = os.path.join(_app_data_dir(), "rns")
@@ -873,41 +850,26 @@ class sHadesClientApp(App):
                 RNS.Destination.SINGLE, "lxmf", "delivery")
             self.my_hash = hexstr(self.client_dest.hash)
 
-            # If we don't have a node_hash yet, try to retrieve it from
-            # the hub's discovery port (hub_port + 1 by default).
-            if not self.node_hash:
-                guild_info = self._retrieve_guild_info()
-                if guild_info:
-                    self.node_hash = guild_info.get("node_hash")
-                    self.delivery_hash = guild_info.get("delivery_hash")
-                    print("Auto-retrieved guild info from hub discovery port")
-                    if self.node_hash:
-                        print(f"  node_hash: {self.node_hash}")
+            # link to guild node
+            nh = bytes.fromhex(self.node_hash)
+            nid = RNS.Identity.recall(nh)
+            nd = RNS.Destination(nid, RNS.Destination.OUT,
+                                 RNS.Destination.SINGLE, "nomadnetwork", "node")
+            link = RNS.Link(nd)
+            for _ in range(200):
+                if link.status == RNS.Link.ACTIVE:
+                    break
+                time.sleep(0.1)
+            if link.status != RNS.Link.ACTIVE:
+                raise RuntimeError("link never active")
+            link.identify(self.client_identity)
+            self.link = link
 
-            # link to guild node — only if we have a node_hash
-            if self.node_hash:
-                nh = bytes.fromhex(self.node_hash)
-                nid = RNS.Identity.recall(nh)
-                nd = RNS.Destination(nid, RNS.Destination.OUT,
-                                     RNS.Destination.SINGLE, "nomadnetwork", "node")
-                link = RNS.Link(nd)
-                for _ in range(200):
-                    if link.status == RNS.Link.ACTIVE:
-                        break
-                    time.sleep(0.1)
-                if link.status != RNS.Link.ACTIVE:
-                    raise RuntimeError("link never active")
-                link.identify(self.client_identity)
-                self.link = link
+            self.guild_api = GuildAPI(reticulum, link)
+            self._save_session()
 
-                self.guild_api = GuildAPI(reticulum, link)
-                self._save_session()
-
-                Clock.schedule_once(lambda dt: self._switch_main(), 0)
-                Clock.schedule_once(lambda dt: self._start_poll(), 0)
-            else:
-                # Connected to hub by address only — no guild node link yet.
-                self._set_status("Connected to hub (no node_hash — limited access)")
+            Clock.schedule_once(lambda dt: self._switch_main(), 0)
+            Clock.schedule_once(lambda dt: self._start_poll(), 0)
         except Exception as e:
             print("connect guild error:", repr(e))
             err_msg = "connect failed: %s" % e
