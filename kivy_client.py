@@ -699,6 +699,9 @@ class sHadesClientApp(App):
             self.node_hash = sess.get("node_hash")
             self.delivery_hash = sess.get("delivery_hash")
             self.username = sess.get("username", "user")
+            self.hub_address = sess.get("hub_address")
+            self.hub_host = sess.get("hub_host")
+            self.hub_port = sess.get("hub_port")
             self._open_main()
             Clock.schedule_once(lambda dt: self._init_reticulum(), 0.5)
 
@@ -723,6 +726,9 @@ class sHadesClientApp(App):
                     "node_hash": self.node_hash,
                     "delivery_hash": self.delivery_hash,
                     "username": self.username,
+                    "hub_address": self.hub_address,
+                    "hub_host": self.hub_host,
+                    "hub_port": self.hub_port,
                 }, f)
         except Exception:
             pass
@@ -771,6 +777,7 @@ class sHadesClientApp(App):
         self.node_hash = node_hash or None
         self.delivery_hash = delivery_hash or None
         self._set_status("Connecting...")
+        self._save_session()
         # RNS.Reticulum() installs signal handlers and must run on the main
         # thread. Schedule it there, then do blocking link work in a bg thread.
         Clock.schedule_once(lambda dt: self._init_reticulum(), 0)
