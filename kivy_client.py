@@ -1007,6 +1007,10 @@ class sHadesClientApp(App):
         self.banner_channel_path = None
         self._select_random_banners()
 
+        # Avatar pfp paths (set by _save_pfp_crop)
+        self.my_avatar_orig = None
+        self.my_avatar_small = None
+
     def _select_random_banners(self):
         """Pick random banner images from media/ folder on startup.
         One for the connect screen, one for the channel header."""
@@ -1916,21 +1920,25 @@ class sHadesClientApp(App):
         )
 
         def do_save(*_):
-            # Defer to next frame so FloatLayout completes and
-            # editor.width/height + img.pos/size reflect actual rendered state
+            # Capture all values BEFORE dismissing popup — once dismissed,
+            # the FloatLayout tears down and editor.width/height/img.pos/
+            # img.size may become (0, 0) or stale, producing wrong crops.
+            img = editor.ids.pfp_img
+            save_kwargs = dict(
+                path=path,
+                circle_x=editor.circle_x,
+                circle_y=editor.circle_y,
+                circle_radius=editor.circle_radius,
+                editor_w=editor.width,
+                editor_h=editor.height,
+                image_pos=tuple(img.pos),
+                image_size=tuple(img.size),
+            )
+            popup.dismiss()
+
             def _do_save(dt):
-                popup.dismiss()
-                img = editor.ids.pfp_img
-                self._save_pfp_crop(
-                    path,
-                    circle_x=editor.circle_x,
-                    circle_y=editor.circle_y,
-                    circle_radius=editor.circle_radius,
-                    editor_w=editor.width,
-                    editor_h=editor.height,
-                    image_pos=img.pos,
-                    image_size=img.size,
-                )
+                self._save_pfp_crop(**save_kwargs)
+
             Clock.schedule_once(_do_save, 0)
 
         def do_cancel(*_):
@@ -2035,15 +2043,29 @@ class sHadesClientApp(App):
 
         if res and res.get("ok"):
             self._set_status("Avatar updated")
-            # Always store paths (profile_screen may not exist yet)
-            self.my_avatar_orig = orig_path
-            self.my_avatar_small = small_path
-            # Apply to profile screen if it exists
-            if hasattr(self, "profile_screen"):
-                self.profile_screen.target_avatar = small_path
-                self.profile_screen.ids.profile_pfp.source = small_path
         else:
             self._set_status("avatar upload failed")
+
+        # Always store paths locally regardless of guild API result —
+        # the files are saved to disk even if guild upload fails.
+        self.my_avatar_orig = orig_path
+        self.my_avatar_small = small_path
+
+        # Apply to profile screen if it exists
+        if hasattr(self, "profile_screen"):
+            self.profile_screen.target_avatar = small_path
+            self.profile_screen.ids.profile_pfp.source = small_path
+
+        # Refresh existing chat message rows for local user with new pfp
+        msg_widgets = getattr(self, "_msg_widgets", {})
+        for row in msg_widgets.values():
+            if getattr(row, "is_own", False):
+                row.avatar_source = small_path
+
+        # Force re-render of own avatar in IMAGE_CACHE so new messages pick it up
+        if self.my_hash:
+            key = "av:" + self.my_hash
+            IMAGE_CACHE.set_bytes(key, open(small_path, "rb").read(), "png")
 
     def attach_file(self, path):
         """Attach a file to the current message input as an upload."""
