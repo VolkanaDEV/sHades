@@ -354,8 +354,7 @@ KV = r"""
                 bold: True
                 font_size: sp(13)
                 text_size: self.width, None
-                size_hint_x: None
-                width: dp(140)
+                size_hint_x: 1
                 halign: 'left'
                 valign: 'middle'
                 shorten: True
@@ -420,7 +419,8 @@ KV = r"""
         font_size: sp(13)
         halign: 'left'
         valign: 'middle'
-        on_press: app.open_profile(root.author_hash, root.username)
+        text_size: self.width, None
+        size_hint_x: 1
         on_press: app.open_profile(root.author_hash, root.username)
 
 
