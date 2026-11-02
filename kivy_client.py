@@ -405,6 +405,308 @@ KV = r"""
         spacing: dp(2)
         BoxLayout:
             orientation: 'horizontal'
+            size_hint_y: None
+            height: dp(18)
+            ClickableLabel:
+                text: root.username
+                target_hash: root.author_hash
+                color: (1, 1, 1, 1) if root.is_own else (0.9, 0.9, 0.9, 1)
+                bold: True
+                font_size: sp(13)
+                text_size: self.width, None
+                size_hint_x: 1
+                halign: 'left'
+                valign: 'middle'
+                shorten: True
+                on_press: app.open_profile(root.author_hash, root.username)
+            Label:
+                text: root.ts
+                color: (0.6, 0.63, 0.67, 1)
+                font_size: sp(11)
+                text_size: self.width, None
+                size_hint_x: None
+                width: dp(50)
+                halign: 'right'
+                valign: 'middle'
+        Label:
+            id: content_lbl
+            text: root.content_markup
+            markup: True
+            color: (1, 1, 1, 1)
+            font_size: sp(14)
+            text_size: self.width, None
+            size_hint_y: None
+            height: self.texture_size[1]
+            halign: 'left'
+            valign: 'top'
+
+    Widget:
+        size_hint_x: None
+        width: dp(4)
+
+<ChannelButton>:
+    orientation: 'vertical'
+    size_hint_y: None
+    height: dp(44)
+    padding: [dp(10), 0]
+    spacing: dp(4)
+    Label:
+        text: root.channel_name
+        color: (1, 1, 1, 0.85)
+        font_size: sp(13)
+        halign: 'left'
+        valign: 'middle'
+        text_size: self.width, None
+
+<MemberRow>:
+    orientation: 'horizontal'
+    size_hint_y: None
+    height: dp(36)
+    padding: [dp(8), 0]
+    spacing: dp(8)
+    PfpImage:
+        id: pfpx
+        size_hint: None, None
+        size: dp(26), dp(26)
+        source: root.avatar_source or ""
+        allow_stretch: True
+        keep_ratio: True
+    ClickableLabel:
+        text: root.username
+        target_hash: root.author_hash
+        color: (1, 1, 1, 0.9)
+        font_size: sp(13)
+        halign: 'left'
+        valign: 'middle'
+        text_size: self.width, None
+        size_hint_x: 1
+        on_press: app.open_profile(root.author_hash, root.username)
+
+<ConnectScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: dp(40)
+        spacing: dp(20)
+        canvas.before:
+            Color:
+                rgba: 0.14, 0.16, 0.19, 1
+            Rectangle:
+                pos: self.pos
+                size: self.size
+        Image:
+            id: banner_config
+            source: app.banner_config_path or ''
+            size_hint_y: None
+            height: dp(200)
+            size_hint_x: None
+            width: dp(400)
+            allow_stretch: False
+            keep_ratio: True
+        Label:
+            text: 'sHades'
+            font_size: sp(40)
+            bold: True
+            color: 1, 1, 1, 1
+            size_hint_y: None
+            height: dp(60)
+        Label:
+            text: 'Connect to a guild'
+            color: 0.7, 0.73, 0.77, 1
+            font_size: sp(16)
+            size_hint_y: None
+            height: dp(30)
+        BoxLayout:
+            orientation: 'vertical'
+            spacing: dp(10)
+            size_hint_y: None
+            height: dp(340)
+            TextInput:
+                id: hub_address
+                hint_text: 'Hub address (ip:port, e.g. 192.168.1.50:29221)'
+                multiline: False
+                size_hint_y: None
+                height: dp(44)
+                background_color: 0.22, 0.24, 0.28, 1
+                foreground_color: 1, 1, 1, 1
+                cursor_color: 1, 1, 1, 1
+            TextInput:
+                id: username
+                hint_text: 'Your username'
+                multiline: False
+                size_hint_y: None
+                height: dp(44)
+                background_color: 0.18, 0.2, 0.23, 1
+                foreground_color: 1, 1, 1, 1
+                cursor_color: 1, 1, 1, 1
+            Label:
+                text: 'Guild hashes (leave blank to auto-discover from hub announce)'
+                color: 0.7, 0.73, 0.77, 1
+                font_size: sp(12)
+                size_hint_y: None
+                height: dp(20)
+                halign: 'left'
+                valign: 'middle'
+                text_size: self.width, None
+            TextInput:
+                id: node_hash
+                hint_text: 'Guild node_hash (32 hex, optional)'
+                multiline: False
+                size_hint_y: None
+                height: dp(40)
+                background_color: 0.18, 0.2, 0.23, 1
+                foreground_color: 1, 1, 1, 1
+                cursor_color: 1, 1, 1, 1
+            TextInput:
+                id: delivery_hash
+                hint_text: 'Guild delivery_hash (32 hex, optional)'
+                multiline: False
+                size_hint_y: None
+                height: dp(40)
+                background_color: 0.18, 0.2, 0.23, 1
+                foreground_color: 1, 1, 1, 1
+                cursor_color: 1, 1, 1, 1
+        Button:
+            text: 'Connect'
+            size_hint_y: None
+            height: dp(50)
+            background_color: 0.36, 0.41, 0.59, 1
+            color: 1, 1, 1, 1
+            on_press:app.connect_to_guild(hub_address.text,username.text,node_hash.text,delivery_hash.text)
+        Label:
+            id: status
+            text: ''
+            color: 1, 0.4, 0.4, 1
+            font_size: sp(13)
+            size_hint_y: None
+            height: dp(30)
+
+<ProfileScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: dp(20)
+        spacing: dp(15)
+        canvas.before:
+            Color:
+                rgba: 0.14, 0.16, 0.19, 1
+            Rectangle:
+                pos: self.pos
+                size: self.size
+        Label:
+            text: 'Profile'
+            font_size: sp(32)
+            bold: True
+            color: 1, 1, 1, 1
+            size_hint_y: None
+            height: dp(50)
+        BoxLayout:
+            orientation: 'horizontal'
+            size_hint_y: None
+            height: dp(200)
+            spacing: dp(10)
+            Widget:
+                size_hint_x: 1
+            PfpImage:
+                id: profile_pfp
+                size_hint: None, None
+                size: dp(150), dp(150)
+                source: root.target_avatar or ''
+                allow_stretch: True
+                keep_ratio: True
+                canvas.after:
+                    Color:
+                        rgba: 0, 0, 0, 0.5
+                    Ellipse:
+                        pos: self.center_x - dp(75), self.center_y - dp(75)
+                        size: dp(150), dp(150)
+                    Color:
+                        rgba: 1, 1, 1, 1
+                    Line:
+                        circle: self.center_x, self.center_y, 75
+                        width: 2
+            Widget:
+                size_hint_x: 1
+        Label:
+            text: root.target_username
+            font_size: sp(20)
+            bold: True
+            color: 1, 1, 1, 1
+            size_hint_y: None
+            height: dp(30)
+            halign: 'center'
+            text_size: self.width, None
+        TextInput:
+            id: profile_username_input
+            text: root.target_username
+            multiline: False
+            size_hint_y: None
+            height: dp(40)
+            background_color: 0.22, 0.24, 0.28, 1
+            foreground_color: 1, 1, 1, 1
+            cursor_color: 1, 1, 1, 1
+        Label:
+            text: 'Node hash: ' + root.target_hash
+            font_size: sp(11)
+            color: 0.7, 0.73, 0.77, 1
+            size_hint_y: None
+            height: dp(20)
+            halign: 'center'
+            text_size: self.width, None
+            shorten: True
+        Label:
+            text: 'Delivery: ' + root.target_username
+            font_size: sp(11)
+            color: 0.7, 0.73, 0.77, 1
+            size_hint_y: None
+            height: dp(20)
+            halign: 'center'
+            text_size: self.width, None
+            shorten: True
+        BoxLayout:
+            size_hint_y: None
+            height: dp(50)
+            spacing: dp(10)
+            Button:
+                text: 'Change Avatar'
+                size_hint_x: None
+                width: dp(140)
+                background_color: 0.36, 0.41, 0.59, 1
+                color: 1, 1, 1, 1
+                on_press: app.open_file_chooser(avatar=True)
+            Button:
+                text: 'Save Username'
+                size_hint_x: None
+                width: dp(140)
+                background_color: 0.36, 0.41, 0.59, 1
+                color: 1, 1, 1, 1
+                on_press: app.save_profile()
+            Button:
+                text: 'Back'
+                size_hint_x: None
+                width: dp(100)
+                background_color: 0.5, 0.53, 0.59, 1
+                color: 1, 1, 1, 1
+                on_press: app.root.current = 'main'
+
+<MainScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        canvas.before:
+            Color:
+                rgba: 0.14, 0.16, 0.19, 1
+            Rectangle:
+                pos: self.pos
+                size: self.size
+        Image:
+            id: banner_channel
+            source: app.banner_channel_path or ''
+            size_hint_y: None
+            height: dp(200)
+            size_hint_x: None
+            width: dp(400)
+            allow_stretch: False
+            keep_ratio: True
+        BoxLayout:
+            orientation: 'horizontal'
             size_hint_y: 1
 
             # ---------------- left: channels (collapsable) ----------------
@@ -549,7 +851,6 @@ KV = r"""
                         height: self.minimum_height
                         spacing: dp(2)
                         padding: [dp(6), dp(6)]
-
 """
 
 
