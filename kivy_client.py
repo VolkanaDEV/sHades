@@ -364,7 +364,7 @@ KV = r"""
         id: pfp_img
         source: root.source
         allow_stretch: True
-        keep_ratio: False
+        keep_ratio: True
         canvas.after:
             Color:
                 rgba: 0, 0, 0, 0.6
@@ -404,6 +404,7 @@ KV = r"""
         size_hint_x: 1
         spacing: dp(2)
         BoxLayout:
+            orientation: 'horizontal'
             size_hint_y: None
             height: dp(18)
             ClickableLabel:
@@ -423,7 +424,8 @@ KV = r"""
                 color: (0.6, 0.63, 0.67, 1)
                 font_size: sp(11)
                 text_size: self.width, None
-                size_hint_x: 1
+                size_hint_x: None
+                width: dp(50)
                 halign: 'right'
                 valign: 'middle'
         Label:
@@ -442,7 +444,6 @@ KV = r"""
         size_hint_x: None
         width: dp(4)
 
-
 <ChannelButton>:
     orientation: 'vertical'
     size_hint_y: None
@@ -456,7 +457,6 @@ KV = r"""
         halign: 'left'
         valign: 'middle'
         text_size: self.width, None
-
 
 <MemberRow>:
     orientation: 'horizontal'
@@ -482,7 +482,6 @@ KV = r"""
         size_hint_x: 1
         on_press: app.open_profile(root.author_hash, root.username)
 
-
 <ConnectScreen>:
     BoxLayout:
         orientation: 'vertical'
@@ -494,16 +493,15 @@ KV = r"""
             Rectangle:
                 pos: self.pos
                 size: self.size
-        BoxLayout:
+        Image:
+            id: banner_config
+            source: app.banner_config_path or ''
             size_hint_y: None
             height: dp(200)
-            Image:
-                id: banner_config
-                source: app.banner_config_path or ''
-                size_hint_x: None
-                width: dp(400)
-                allow_stretch: False
-                keep_ratio: True
+            size_hint_x: None
+            width: dp(400)
+            allow_stretch: False
+            keep_ratio: True
         Label:
             text: 'sHades'
             font_size: sp(40)
@@ -582,7 +580,6 @@ KV = r"""
             size_hint_y: None
             height: dp(30)
 
-
 <ProfileScreen>:
     BoxLayout:
         orientation: 'vertical'
@@ -602,68 +599,68 @@ KV = r"""
             size_hint_y: None
             height: dp(50)
         BoxLayout:
-            orientation: 'vertical'
+            orientation: 'horizontal'
             size_hint_y: None
-            height: dp(260)
+            height: dp(200)
             spacing: dp(10)
-            BoxLayout:
-                orientation: 'vertical'
-                size_hint_y: None
-                height: dp(200)
-                PfpImage:
-                    id: profile_pfp
-                    size_hint: None, None
-                    size: dp(150), dp(150)
-                    source: root.target_avatar or ''
-                    allow_stretch: True
-                    keep_ratio: True
-                    pos_hint: {'center_x': 0.5}
-                    canvas.after:
-                        Color:
-                            rgba: 0, 0, 0, 0.5
-                        Ellipse:
-                            pos: self.center_x - dp(75), self.center_y - dp(75)
-                            size: dp(150), dp(150)
-                        Color:
-                            rgba: 1, 1, 1, 1
-                        Line:
-                            circle: self.center_x, self.center_y, 75
-                            width: 2
-                Label:
-                    text: root.target_username
-                    font_size: sp(20)
-                    bold: True
-                    color: 1, 1, 1, 1
-                    size_hint_y: None
-                    height: dp(30)
-                    halign: 'center'
-            TextInput:
-                id: profile_username_input
-                text: root.target_username
-                multiline: False
-                size_hint_y: None
-                height: dp(40)
-                background_color: 0.22, 0.24, 0.28, 1
-                foreground_color: 1, 1, 1, 1
-                cursor_color: 1, 1, 1, 1
-            Label:
-                text: 'Node hash: ' + root.target_hash
-                font_size: sp(11)
-                color: 0.7, 0.73, 0.77, 1
-                size_hint_y: None
-                height: dp(20)
-                halign: 'center'
-                text_size: self.width, None
-                shorten: True
-            Label:
-                text: 'Delivery: ' + root.target_username
-                font_size: sp(11)
-                color: 0.7, 0.73, 0.77, 1
-                size_hint_y: None
-                height: dp(20)
-                halign: 'center'
-                text_size: self.width, None
-                shorten: True
+            Widget:
+                size_hint_x: 1
+            PfpImage:
+                id: profile_pfp
+                size_hint: None, None
+                size: dp(150), dp(150)
+                source: root.target_avatar or ''
+                allow_stretch: True
+                keep_ratio: True
+                canvas.after:
+                    Color:
+                        rgba: 0, 0, 0, 0.5
+                    Ellipse:
+                        pos: self.center_x - dp(75), self.center_y - dp(75)
+                        size: dp(150), dp(150)
+                    Color:
+                        rgba: 1, 1, 1, 1
+                    Line:
+                        circle: self.center_x, self.center_y, 75
+                        width: 2
+            Widget:
+                size_hint_x: 1
+        Label:
+            text: root.target_username
+            font_size: sp(20)
+            bold: True
+            color: 1, 1, 1, 1
+            size_hint_y: None
+            height: dp(30)
+            halign: 'center'
+            text_size: self.width, None
+        TextInput:
+            id: profile_username_input
+            text: root.target_username
+            multiline: False
+            size_hint_y: None
+            height: dp(40)
+            background_color: 0.22, 0.24, 0.28, 1
+            foreground_color: 1, 1, 1, 1
+            cursor_color: 1, 1, 1, 1
+        Label:
+            text: 'Node hash: ' + root.target_hash
+            font_size: sp(11)
+            color: 0.7, 0.73, 0.77, 1
+            size_hint_y: None
+            height: dp(20)
+            halign: 'center'
+            text_size: self.width, None
+            shorten: True
+        Label:
+            text: 'Delivery: ' + root.target_username
+            font_size: sp(11)
+            color: 0.7, 0.73, 0.77, 1
+            size_hint_y: None
+            height: dp(20)
+            halign: 'center'
+            text_size: self.width, None
+            shorten: True
         BoxLayout:
             size_hint_y: None
             height: dp(50)
@@ -699,16 +696,15 @@ KV = r"""
             Rectangle:
                 pos: self.pos
                 size: self.size
-        BoxLayout:
+        Image:
+            id: banner_channel
+            source: app.banner_channel_path or ''
             size_hint_y: None
             height: dp(200)
-            Image:
-                id: banner_channel
-                source: app.banner_channel_path or ''
-                size_hint_x: None
-                width: dp(400)
-                allow_stretch: False
-                keep_ratio: True
+            size_hint_x: None
+            width: dp(400)
+            allow_stretch: False
+            keep_ratio: True
         BoxLayout:
             orientation: 'horizontal'
 
@@ -717,12 +713,20 @@ KV = r"""
             id: left_sidebar
             size_hint_x: None
             width: dp(220) if root.left_open else dp(0)
+            orientation: 'vertical'
             canvas.before:
                 Color:
                     rgba: 0.18, 0.2, 0.23, 1
                 Rectangle:
                     pos: self.pos
                     size: self.size
+            Button:
+                text: 'channels \u25bc' if root.left_open else 'channels \u25b6'
+                size_hint_y: None
+                height: dp(34)
+                background_color: 0.24, 0.26, 0.3, 1
+                color: 1, 1, 1, 0.9
+                on_press: root.toggle_left()
             ScrollView:
                 do_scroll_x: False
                 GridLayout:
@@ -732,13 +736,6 @@ KV = r"""
                     height: self.minimum_height
                     spacing: dp(2)
                     padding: [dp(6), dp(6)]
-            Button:
-                text: 'channels \u25bc' if root.left_open else 'channels \u25b6'
-                size_hint_y: None
-                height: dp(34)
-                background_color: 0.24, 0.26, 0.3, 1
-                color: 1, 1, 1, 0.9
-                on_press: root.toggle_left()
 
         # ---------------- center: chat ----------------
         BoxLayout:
@@ -815,6 +812,7 @@ KV = r"""
             id: right_sidebar
             size_hint_x: None
             width: dp(200) if root.right_open else dp(0)
+            orientation: 'vertical'
             canvas.before:
                 Color:
                     rgba: 0.18, 0.2, 0.23, 1
@@ -851,6 +849,7 @@ KV = r"""
                     spacing: dp(2)
                     padding: [dp(6), dp(6)]
 """
+
 
 
 # ---------------------------------------------------------------------------
