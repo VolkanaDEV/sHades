@@ -682,7 +682,7 @@ class sHadesClientApp(App):
             self.delivery_hash = sess.get("delivery_hash")
             self.username = sess.get("username", "user")
             self._open_main()
-            Clock.schedule_once(lambda dt: self._connect_guild(), 0.5)
+            Clock.schedule_once(lambda dt: self._init_reticulum(), 0.5)
 
     def _open_main(self):
         """Switch to the main chat screen."""
@@ -730,16 +730,31 @@ class sHadesClientApp(App):
         self.delivery_hash = delivery_hash
         self.username = username
         self._set_status("Connecting...")
-        threading.Thread(target=self._connect_guild, daemon=True).start()
+        # RNS.Reticulum() installs signal handlers and must run on the main
+        # thread. Schedule it there, then do blocking link work in a bg thread.
+        Clock.schedule_once(lambda dt: self._init_reticulum(), 0)
 
-    def _connect_guild(self):
+    def _init_reticulum(self):
+        """Main thread only: create RNS instance (signal handlers), then
+        spawn a background thread for the blocking link establishment."""
         try:
             storage = os.path.join(_app_data_dir(), "rns")
             os.makedirs(storage, exist_ok=True)
             reticulum = RNS.Reticulum(configdir=storage)
             self.reticulum = reticulum
+        except Exception as e:
+            print("init reticulum error:", repr(e))
+            self._set_status("connect failed: %s" % e)
+            return
+        threading.Thread(target=self._connect_after_rns, daemon=True).start()
+
+    def _connect_after_rns(self):
+        """Background thread: identity, destinations, link to guild node."""
+        try:
+            reticulum = self.reticulum
 
             # identity
+            storage = os.path.join(_app_data_dir(), "rns")
             ipath = os.path.join(storage, "identity")
             if os.path.exists(ipath):
                 self.client_identity = RNS.Identity.from_file(ipath)
