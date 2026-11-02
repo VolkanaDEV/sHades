@@ -293,13 +293,6 @@ if KIVY:
 
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
-            self.orientation = 'vertical'
-            self.img = Image(
-                source=self.source,
-                allow_stretch=True,
-                keep_ratio=False,
-            )
-            self.add_widget(self.img)
 
         def on_touch_down(self, touch):
             if self.collide_point(*touch.pos):
@@ -309,8 +302,10 @@ if KIVY:
 
         def on_touch_move(self, touch):
             if touch.grab_current is self:
-                self.img.center_x += touch.dx * 0.5
-                self.img.center_y += touch.dy * 0.5
+                img = self.ids.get("pfp_img")
+                if img:
+                    img.center_x += touch.dx * 0.5
+                    img.center_y += touch.dy * 0.5
                 return True
             return super().on_touch_move(touch)
 
@@ -364,24 +359,23 @@ KV = r"""
 #:import dp kivy.metrics.dp
 
 <PFPEditorWidget>:
-    BoxLayout:
-        orientation: 'vertical'
-        Image:
-            id: pfp_img
-            source: root.source
-            allow_stretch: True
-            keep_ratio: False
-        canvas.after:
-            Color:
-                rgba: 0, 0, 0, 0.6
-            Ellipse:
-                pos: self.center_x - dp(64), self.center_y - dp(64)
-                size: dp(128), dp(128)
-            Color:
-                rgba: 1, 1, 1, 1
-            Line:
-                circle: self.center_x, self.center_y, 64
-                width: 2
+    orientation: 'vertical'
+    Image:
+        id: pfp_img
+        source: root.source
+        allow_stretch: True
+        keep_ratio: False
+    canvas.after:
+        Color:
+            rgba: 0, 0, 0, 0.6
+        Ellipse:
+            pos: self.center_x - dp(64), self.center_y - dp(64)
+            size: dp(128), dp(128)
+        Color:
+            rgba: 1, 1, 1, 1
+        Line:
+            circle: self.center_x, self.center_y, 64
+            width: 2
 
 <MessageRow>:
     orientation: 'horizontal'
