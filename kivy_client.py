@@ -427,7 +427,7 @@ KV = r"""
             orientation: 'vertical'
             spacing: dp(10)
             size_hint_y: None
-            height: dp(220)
+            height: dp(340)
             TextInput:
                 id: node_hash
                 hint_text: 'Guild node_hash (32 hex)'
@@ -440,6 +440,15 @@ KV = r"""
             TextInput:
                 id: delivery_hash
                 hint_text: 'Guild delivery_hash (32 hex)'
+                multiline: False
+                size_hint_y: None
+                height: dp(44)
+                background_color: 0.22, 0.24, 0.28, 1
+                foreground_color: 1, 1, 1, 1
+                cursor_color: 1, 1, 1, 1
+            TextInput:
+                id: hub_ip
+                hint_text: 'Hub IP (optional, blank = LAN discovery)'
                 multiline: False
                 size_hint_y: None
                 height: dp(44)
@@ -461,7 +470,7 @@ KV = r"""
             height: dp(50)
             background_color: 0.36, 0.41, 0.59, 1
             color: 1, 1, 1, 1
-            on_press: app.connect_to_guild(node_hash.text, delivery_hash.text, username.text)
+            on_press:app.connect_to_guild(node_hash.text,delivery_hash.text,hub_ip.text,username.text)
         Label:
             id: status
             text: ''
@@ -717,10 +726,11 @@ class sHadesClientApp(App):
             return None
 
     # -- connect ---------------------------------------------------------
-    def connect_to_guild(self, node_hash, delivery_hash, username):
+    def connect_to_guild(self, node_hash, delivery_hash, hub_ip, username):
         node_hash = (node_hash or "").strip().lower()
         delivery_hash = (delivery_hash or "").strip().lower()
         username = (username or "user").strip() or "user"
+        hub_ip = (hub_ip or "").strip() or None
         ok_node = bool(re.fullmatch(r"[0-9a-f]{32}", node_hash))
         ok_delivery = bool(re.fullmatch(r"[0-9a-f]{32}", delivery_hash))
         if not ok_node or not ok_delivery:
@@ -729,6 +739,7 @@ class sHadesClientApp(App):
         self.node_hash = node_hash
         self.delivery_hash = delivery_hash
         self.username = username
+        self.hub_ip = hub_ip
         self._set_status("Connecting...")
         # RNS.Reticulum() installs signal handlers and must run on the main
         # thread. Schedule it there, then do blocking link work in a bg thread.
@@ -740,6 +751,29 @@ class sHadesClientApp(App):
         try:
             storage = os.path.join(_app_data_dir(), "rns")
             os.makedirs(storage, exist_ok=True)
+
+            # Write an RNS config that routes to the guild. If a hub IP was
+            # provided, use a TCPClientInterface to reach it directly;
+            # otherwise use AutoInterface for LAN multicast discovery.
+            cfgfile = os.path.join(storage, "config")
+            if not os.path.exists(cfgfile) or self._config_needs_update(cfgfile):
+                with open(cfgfile, "w") as f:
+                    f.write("[reticulum]\n"
+                            "  enable_transport = no\n"
+                            "  share_instance = no\n\n"
+                            "[interfaces]\n")
+                    if self.hub_ip:
+                        hub_port = getattr(self, "hub_port", 29221)
+                        f.write("  [[TCPClientInterface]]\n"
+                                "    type = TCPClientInterface\n"
+                                "    enabled = yes\n"
+                                "    target_host = %s\n"
+                                "    target_port = %d\n" % (self.hub_ip, hub_port))
+                    else:
+                        f.write("  [[AutoInterface]]\n"
+                                "    type = AutoInterface\n"
+                                "    enabled = yes\n")
+
             reticulum = RNS.Reticulum(configdir=storage)
             self.reticulum = reticulum
         except Exception as e:
@@ -747,6 +781,17 @@ class sHadesClientApp(App):
             self._set_status("connect failed: %s" % e)
             return
         threading.Thread(target=self._connect_after_rns, daemon=True).start()
+
+    def _config_needs_update(self, cfgfile):
+        """Check if the stored RNS config matches the current hub_ip."""
+        try:
+            with open(cfgfile) as f:
+                content = f.read()
+            if self.hub_ip:
+                return "target_host = %s" % self.hub_ip not in content
+            return "AutoInterface" not in content
+        except Exception:
+            return True
 
     def _connect_after_rns(self):
         """Background thread: identity, destinations, link to guild node."""
