@@ -18,6 +18,7 @@ import json
 import time
 import hashlib
 import threading
+import random
 from collections import OrderedDict
 import mimetypes
 
@@ -275,6 +276,40 @@ if KIVY:
         """Circular-ish avatar placeholder with fallback color."""
         pass
 
+    class PFPEditorWidget(BoxLayout):
+        """Round-mask avatar cropper with drag-to-position."""
+        source = StringProperty("")
+        on_save = ObjectProperty(None, allownone=True)
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.orientation = 'vertical'
+            self.img = Image(
+                source=self.source,
+                allow_stretch=True,
+                keep_ratio=False,
+            )
+            self.add_widget(self.img)
+
+        def on_touch_down(self, touch):
+            if self.collide_point(*touch.pos):
+                touch.grab(self)
+                return True
+            return super().on_touch_down(touch)
+
+        def on_touch_move(self, touch):
+            if touch.grab_current is self:
+                self.img.center_x += touch.dx * 0.5
+                self.img.center_y += touch.dy * 0.5
+                return True
+            return super().on_touch_move(touch)
+
+        def on_touch_up(self, touch):
+            if touch.grab_current is self:
+                touch.ungrab(self)
+                return True
+            return super().on_touch_up(touch)
+
     class MessageEmbed(Image, ButtonBehavior):
         """Clickable image embed."""
         source_url = StringProperty("")
@@ -317,6 +352,26 @@ class ChannelButton(ButtonBehavior, BoxLayout):
 # ---------------------------------------------------------------------------
 KV = r"""
 #:import dp kivy.metrics.dp
+
+<PFPEditorWidget>:
+    BoxLayout:
+        orientation: 'vertical'
+        Image:
+            id: pfp_img
+            source: root.source
+            allow_stretch: True
+            keep_ratio: False
+        canvas.after:
+            Color:
+                rgba: 0, 0, 0, 0.6
+            Ellipse:
+                pos: self.center_x - dp(64), self.center_y - dp(64)
+                size: dp(128), dp(128)
+            Color:
+                rgba: 1, 1, 1, 1
+            Line:
+                circle: self.center_x, self.center_y, 64
+                width: 2
 
 <MessageRow>:
     orientation: 'horizontal'
@@ -435,6 +490,13 @@ KV = r"""
             Rectangle:
                 pos: self.pos
                 size: self.size
+        Image:
+            id: banner_config
+            source: root.app.banner_config_path or ''
+            size_hint_y: None
+            height: dp(120)
+            allow_stretch: True
+            keep_ratio: False
         Label:
             text: 'sHades'
             font_size: sp(40)
@@ -537,22 +599,37 @@ KV = r"""
             size_hint_y: None
             height: dp(260)
             spacing: dp(10)
-            PfpImage:
-                id: profile_pfp
-                size_hint: None, None
-                size: dp(80), dp(80)
-                source: root.target_avatar or ''
-                allow_stretch: True
-                keep_ratio: True
-                pos_hint: {'center_x': 0.5}
-            Label:
-                text: root.target_username
-                font_size: sp(20)
-                bold: True
-                color: 1, 1, 1, 1
+            BoxLayout:
+                orientation: 'vertical'
                 size_hint_y: None
-                height: dp(30)
-                halign: 'center'
+                height: dp(200)
+                PfpImage:
+                    id: profile_pfp
+                    size_hint: None, None
+                    size: dp(150), dp(150)
+                    source: root.target_avatar or ''
+                    allow_stretch: True
+                    keep_ratio: True
+                    pos_hint: {'center_x': 0.5}
+                canvas.after:
+                    Color:
+                        rgba: 0, 0, 0, 0.5
+                    Ellipse:
+                        pos: self.center_x - dp(75), self.center_y - dp(75)
+                        size: dp(150), dp(150)
+                    Color:
+                        rgba: 1, 1, 1, 1
+                    Line:
+                        circle: self.center_x, self.center_y, 75
+                        width: 2
+                Label:
+                    text: root.target_username
+                    font_size: sp(20)
+                    bold: True
+                    color: 1, 1, 1, 1
+                    size_hint_y: None
+                    height: dp(30)
+                    halign: 'center'
             TextInput:
                 id: profile_username_input
                 text: root.target_username
@@ -608,13 +685,22 @@ KV = r"""
 
 <MainScreen>:
     BoxLayout:
-        orientation: 'horizontal'
+        orientation: 'vertical'
         canvas.before:
             Color:
                 rgba: 0.14, 0.16, 0.19, 1
             Rectangle:
                 pos: self.pos
                 size: self.size
+        Image:
+            id: banner_channel
+            source: root.app.banner_channel_path or ''
+            size_hint_y: None
+            height: dp(100)
+            allow_stretch: True
+            keep_ratio: False
+        BoxLayout:
+            orientation: 'horizontal'
 
         # ---------------- left: channels (collapsable) ----------------
         BoxLayout:
@@ -816,6 +902,37 @@ class sHadesClientApp(App):
         self._popup = None
         self._poll_error_shown = False
         self._ui_populated = False
+
+        # Banner images - random selection from media folder on startup
+        self.banner_config_path = None
+        self.banner_channel_path = None
+        self._select_random_banners()
+
+    def _select_random_banners(self):
+        """Pick random banner images from media/ folder on startup.
+        One for the connect screen, one for the channel header."""
+        media_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "media"
+        )
+        if not os.path.isdir(media_dir):
+            return
+        images = [
+            f for f in os.listdir(media_dir)
+            if f.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+        ]
+        if not images:
+            return
+        if len(images) == 1:
+            self.banner_config_path = os.path.join(media_dir, images[0])
+            self.banner_channel_path = os.path.join(media_dir, images[0])
+        else:
+            chosen = random.sample(images, 2)
+            self.banner_config_path = os.path.join(media_dir, chosen[0])
+            self.banner_channel_path = os.path.join(media_dir, chosen[1])
+            print("Banner images: config=%s channel=%s" % (
+                os.path.basename(self.banner_config_path),
+                os.path.basename(self.banner_channel_path),
+            ))
 
     def _channel_cid(self, name):
         """Convert a channel name to its RNS destination hash ID,
@@ -1556,9 +1673,114 @@ class sHadesClientApp(App):
             return
         path = selection[0]
         if getattr(self, "_avatar_mode", False):
-            self.upload_avatar(path)
+            self._open_pfp_editor(path)
         else:
             self.attach_file(path)
+
+    def _open_pfp_editor(self, path):
+        """Open round-mask PFP picker popup with drag-to-position.
+
+        User can drag the image to position the crop within the circle.
+
+        Save produces: 256x256 PNG (chat/members) + original (profile top).
+
+        """
+        from kivy.uix.popup import Popup
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.button import Button
+
+        editor = PFPEditorWidget(source=path)
+
+        btn_box = BoxLayout(
+            size_hint_y=None,
+            height=dp(44),
+            spacing=dp(10),
+        )
+        save_btn = Button(text="Save PFP", background_color=(0.36, 0.41, 0.59, 1),
+                          color=(1, 1, 1, 1))
+        cancel_btn = Button(text="Cancel", background_color=(0.5, 0.53, 0.59, 1),
+                            color=(1, 1, 1, 1))
+        btn_box.add_widget(save_btn)
+        btn_box.add_widget(cancel_btn)
+
+        content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(10))
+        content.add_widget(editor)
+        content.add_widget(btn_box)
+
+        popup = Popup(
+            title="Select PFP area (drag inside circle)",
+            content=content,
+            size_hint=(0.85, 0.85),
+            auto_dismiss=False,
+        )
+
+        def do_save(*_):
+            popup.dismiss()
+            self._save_pfp_crop(path)
+
+        def do_cancel(*_):
+            popup.dismiss()
+
+        save_btn.bind(on_press=do_save)
+        cancel_btn.bind(on_press=do_cancel)
+        popup.open()
+
+    def _save_pfp_crop(self, path):
+        """Save 256x256 crop from center (chat/members pfp) + original (profile top).
+
+        Both stored in app data dir under pfps/; 256x256 uploaded to guild.
+
+        """
+        try:
+            from PIL import Image as PILImage
+            pil = PILImage.open(path).convert("RGBA")
+        except Exception:
+            # PIL not available — use original directly
+            pil = None
+
+        app_dir = _app_data_dir()
+        pfp_dir = os.path.join(app_dir, "pfps")
+        os.makedirs(pfp_dir, exist_ok=True)
+
+        name = os.path.basename(path)
+        orig_path = os.path.join(pfp_dir, "orig_" + name)
+        small_path = os.path.join(pfp_dir, "small_" + name)
+
+        if pil is not None:
+            # Save original
+            pil.save(orig_path)
+
+            # Crop center 256x256 (or min dimension if smaller)
+            w, h = pil.size
+            size = min(w, h, 256)
+            left = (w - size) // 2
+            top = (h - size) // 2
+            crop = pil.crop((left, top, left + size, top + size))
+            crop = crop.resize((256, 256), PILImage.LANCZOS)
+            crop.save(small_path, "PNG")
+        else:
+            import shutil
+            shutil.copy(path, orig_path)
+            shutil.copy(path, small_path)
+
+        # Upload 256x256 version to guild as avatar
+        try:
+            with open(small_path, "rb") as f:
+                blob = f.read()
+            res = self.guild_api.avatar_upload(blob)
+        except Exception:
+            res = None
+
+        if res and res.get("ok"):
+            self._set_status("Avatar updated")
+            # Profile screen shows original (full-size)
+            self.profile_screen.target_avatar = orig_path
+            if hasattr(self, "profile_screen"):
+                self.profile_screen.ids.profile_pfp.source = orig_path
+            # Chat/members use 256x256 version
+            self.my_avatar_small = small_path
+        else:
+            self._set_status("avatar upload failed")
 
     def attach_file(self, path):
         """Attach a file to the current message input as an upload."""
