@@ -36,7 +36,6 @@ try:
     )
     from kivy.lang import Builder
     from kivy.uix.behaviors import ButtonBehavior
-    from kivy.animation import Animation
     from kivy.metrics import dp, sp
     KIVY = True
 except Exception as _e:  # pragma: no cover - Kivy missing at import time
@@ -75,13 +74,27 @@ def now():
 
 
 def cache_dir():
-    d = os.path.join(os.path.expanduser("~"), ".sHades_client", "cache")
+    d = os.path.join(_app_data_dir(), "cache")
     os.makedirs(d, exist_ok=True)
     return d
 
 
 def cached_path(key):
     return os.path.join(cache_dir(), hashlib.sha256(key.encode()).hexdigest()[:32])
+
+
+def _app_data_dir():
+    """Cross-platform writable app data directory.
+
+    On Android (p4a) uses the app's internal storage directory so scoped
+    storage (Android 10+) doesn't block writes. On desktop falls back to
+    ~/.sHades_client.
+    """
+    try:
+        from android.storage import app_storage_path  # p4a only, no-op on desktop
+        return app_storage_path()
+    except Exception:
+        return os.path.join(os.path.expanduser("~"), ".sHades_client")
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +289,7 @@ if KIVY:
 
 
 class ChannelButton(ButtonBehavior, BoxLayout):
-    pass
+    channel_name = StringProperty("")
 
 
 # ---------------------------------------------------------------------------
@@ -618,13 +631,9 @@ if KIVY:
 
         def toggle_left(self):
             self.left_open = not self.left_open
-            anim = Animation(width=(dp(220) if self.left_open else dp(0)), d=0.2)
-            anim.start(self.ids.left_sidebar)
 
         def toggle_right(self):
             self.right_open = not self.right_open
-            anim = Animation(width=(dp(200) if self.right_open else dp(0)), d=0.2)
-            anim.start(self.ids.right_sidebar)
 
     Builder.load_string(KV)
 
@@ -680,12 +689,12 @@ class sHadesClientApp(App):
         try:
             self.root.current = "main"
             self._refresh_channels_ui()
-        except Exception:
-            pass
+        except Exception as e:
+            print("open main error:", repr(e))
 
     # -- session ---------------------------------------------------------
     def _session_path(self):
-        d = os.path.join(os.path.expanduser("~"), ".sHades_client")
+        d = _app_data_dir()
         os.makedirs(d, exist_ok=True)
         return os.path.join(d, "session.json")
 
@@ -725,7 +734,7 @@ class sHadesClientApp(App):
 
     def _connect_guild(self):
         try:
-            storage = os.path.join(os.path.expanduser("~"), ".sHades_client", "rns")
+            storage = os.path.join(_app_data_dir(), "rns")
             os.makedirs(storage, exist_ok=True)
             reticulum = RNS.Reticulum(configdir=storage)
             self.reticulum = reticulum
@@ -764,9 +773,11 @@ class sHadesClientApp(App):
 
             Clock.schedule_once(lambda dt: self._switch_main(), 0)
             Clock.schedule_once(lambda dt: self._start_poll(), 0)
-        except Exception:
+        except Exception as e:
+            print("connect guild error:", repr(e))
+            err_msg = "connect failed: %s" % e
             Clock.schedule_once(
-                lambda dt: self._set_status("connect failed"), 0)
+                lambda dt: self._set_status(err_msg), 0)
 
     def _switch_main(self):
         self.root.current = "main"
@@ -804,15 +815,18 @@ class sHadesClientApp(App):
             return
         msgs = res.get("messages", []) or []
         updates = res.get("updates", []) or []
-        main = self.root.get_screen("main")
-        grid = main.ids.message_grid
 
-        def apply():
-            for m in msgs:
-                self._render_message(grid, m)
-            # scroll to bottom
-            Clock.schedule_once(lambda dt: self._scroll_to_bottom(), 0.1)
-        Clock.schedule_once(lambda dt: apply(), 0)
+        def apply(dt):
+            # All widget access must happen on the main thread.
+            try:
+                main = self.root.get_screen("main")
+                grid = main.ids.message_grid
+                for m in msgs:
+                    self._render_message(grid, m)
+                Clock.schedule_once(lambda dt: self._scroll_to_bottom(), 0.1)
+            except Exception as e:
+                print("render messages error:", e)
+        Clock.schedule_once(apply, 0)
 
         for u in updates:
             self._apply_update(u)
@@ -944,14 +958,21 @@ class sHadesClientApp(App):
         self._refresh_members_ui(name)
 
     def _refresh_members_ui(self, channel):
-        main = self.root.get_screen("main")
-        grid = main.ids.member_grid
-        # clear & repopulate from current members set
-        grid.clear_widgets()
-        # show self + any seen authors
-        for h, uname in list(self._members.items())[:50]:
-            row = MemberRow(username=uname, avatar_source="")
-            grid.add_widget(row)
+        # Widget access must happen on the main thread.
+        Clock.schedule_once(lambda dt: self._refresh_members_ui_main(channel), 0)
+
+    def _refresh_members_ui_main(self, channel):
+        try:
+            main = self.root.get_screen("main")
+            grid = main.ids.member_grid
+            # clear & repopulate from current members set
+            grid.clear_widgets()
+            # show self + any seen authors
+            for h, uname in list(self._members.items())[:50]:
+                row = MemberRow(username=uname, avatar_source="")
+                grid.add_widget(row)
+        except Exception as e:
+            print("members ui error:", e)
 
     def _record_member(self, author_hash, username):
         if author_hash and username:
