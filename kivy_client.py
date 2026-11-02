@@ -494,14 +494,16 @@ KV = r"""
             Rectangle:
                 pos: self.pos
                 size: self.size
-        Image:
-            id: banner_config
-            source: app.banner_config_path or ''
+        BoxLayout:
             size_hint_y: None
             height: dp(200)
-            allow_stretch: False
-            keep_ratio: True
-            pos_hint: {'x': 0}
+            Image:
+                id: banner_config
+                source: app.banner_config_path or ''
+                size_hint_x: None
+                width: dp(400)
+                allow_stretch: False
+                keep_ratio: True
         Label:
             text: 'sHades'
             font_size: sp(40)
@@ -697,14 +699,16 @@ KV = r"""
             Rectangle:
                 pos: self.pos
                 size: self.size
-        Image:
-            id: banner_channel
-            source: app.banner_channel_path or ''
+        BoxLayout:
             size_hint_y: None
             height: dp(200)
-            allow_stretch: False
-            keep_ratio: True
-            pos_hint: {'x': 0}
+            Image:
+                id: banner_channel
+                source: app.banner_channel_path or ''
+                size_hint_x: None
+                width: dp(400)
+                allow_stretch: False
+                keep_ratio: True
         BoxLayout:
             orientation: 'horizontal'
 
