@@ -971,21 +971,32 @@ class sHadesClientApp(App):
                     self._poll_error_shown = False
                     seq = st.get("seq", 0)
                     last_ts = st.get("last_ts", 0.0)
+                    msg_count = len(st.get("messages", []))
+                    print("poll state ok: seq=%s last_ts=%s msgs=%s" % (seq, last_ts, msg_count))
                     if seq != self._seq or last_ts != self._last_ts:
                         self._seq = seq
                         self._last_ts = last_ts
                         self._fetch_messages(cid)
                         self._refresh_members_ui(cid)
+                    else:
+                        # no change, but make sure UI is populated on first poll
+                        if not getattr(self, "_ui_populated", False):
+                            self._ui_populated = True
+                            self._fetch_messages(cid)
+                            self._refresh_members_ui(cid)
                 else:
                     err = st.get("error", "unknown")
-                    if not getattr(self, "_poll_error_shown", False):
-                        self._poll_error_shown = True
-                        Clock.schedule_once(
-                            lambda dt: self._set_status("poll failed: %s" % err), 0)
-                # also (re)discover channels: just ensure 'general' exists
+                    self._poll_error_shown = True
+                    Clock.schedule_once(
+                        lambda dt: self._set_status("poll failed: %s" % err), 0)
+                    print("poll state failed: %s" % err)
                 Clock.schedule_once(lambda dt: self._ensure_general_channel(), 0)
-            except Exception as e:
-                print("poll error:", e)
+            except Exception as exc:
+                print("poll exception: %s" % repr(exc))
+                self._poll_error_shown = True
+                err_msg = "poll exception: %s" % exc
+                Clock.schedule_once(
+                    lambda dt: self._set_status(err_msg), 0)
             self._poll_stop.wait(3.0)
 
     def _fetch_messages(self, channel, since_id=None, since_ts=None):

@@ -1158,16 +1158,17 @@ def run(argv=None):
             f.write("[reticulum]\n"
                     "  enable_transport = no\n"
                     "  share_instance = no\n\n"
-                    "[interfaces]\n"
-                    "  [[AutoInterface]]\n"
-                    "    type = AutoInterface\n"
-                    "    enabled = yes\n")
+                    "[interfaces]\n")
             if args.listen:
                 f.write("  [[TCPServerInterface]]\n"
                         "    type = TCPServerInterface\n"
                         "    enabled = yes\n"
                         "    listen_ip = %s\n"
                         "    listen_port = %d\n" % (listen_host, listen_port))
+            else:
+                f.write("  [[AutoInterface]]\n"
+                        "    type = AutoInterface\n"
+                        "    enabled = yes\n")
     reticulum = RNS.Reticulum(configdir=rns_configdir)
 
     ipath = os.path.join(STORAGE, "identity")
