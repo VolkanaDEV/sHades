@@ -1234,8 +1234,8 @@ def run(argv=None):
     threading.Thread(target=announce_all, daemon=True).start()
     try:
         while True:
-            time.sleep(300)
-            _announce_now()   # announce tables expire; keep the guild visible
+            time.sleep(10)
+            _announce_now()   # re-announce frequently so clients can discover us
     except KeyboardInterrupt:
         RNS.log("Shutting down.", RNS.LOG_NOTICE)
 

@@ -855,9 +855,12 @@ class sHadesClientApp(App):
         RNS.Transport.register_announce_handler(handler)
 
         try:
-            # Hub announces on boot and every 5 minutes; we should hear it
-            # within a few seconds of connecting via TCPClientInterface.
-            for _ in range(300):  # up to 30 seconds
+            # Let the TCPClientInterface establish its connection to the
+            # community hub before listening for announces.
+            time.sleep(2.0)
+            # Guild re-announces every 10 seconds; wait up to 60 seconds
+            # to hear one after connecting.
+            for _ in range(600):  # up to 60 seconds
                 if "hash" in discovered:
                     return discovered["hash"]
                 time.sleep(0.1)
