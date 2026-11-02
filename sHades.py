@@ -17,6 +17,7 @@ import os
 import re
 import json
 import time
+import socket
 import argparse
 import sqlite3
 import hashlib
@@ -1113,6 +1114,9 @@ def run(argv=None):
     parser.add_argument("--announce-delay", type=float, default=LXMF.LXMRouter.NODE_ANNOUNCE_DELAY)
     parser.add_argument("--listen", default=None,
                         help="TCP listen address:port for direct client connections (e.g. 0.0.0.0:29221)")
+    parser.add_argument("--discovery-port", type=int, default=None,
+                        help="Port for a simple TCP discovery server that serves guild_info.json "
+                             "(default: --listen port + 1)")
     parser.add_argument("--rns-configdir", default=None,
                         help="Reticulum config dir (default: <storage>/rns)")
     args = parser.parse_args(argv)
@@ -1224,6 +1228,31 @@ def run(argv=None):
             "storage": STORAGE}
     with open(os.path.join(STORAGE, "guild_info.json"), "w") as f:
         json.dump(info, f, indent=2)
+
+    # Start a simple TCP discovery server so setup/clients can retrieve
+    # guild_info.json automatically by connecting to the discovery port.
+    # The discovery protocol: connect, receive JSON guild_info, connection closes.
+    discovery_port = args.discovery_port
+    if discovery_port is None and args.listen:
+        discovery_port = listen_port + 1
+    if discovery_port:
+        def _discovery_loop():
+            try:
+                ds = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                ds.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                ds.bind((listen_host, discovery_port))
+                ds.listen(5)
+                while True:
+                    conn, _ = ds.accept()
+                    try:
+                        conn.sendall(json.dumps(info).encode() + b"\n")
+                    except Exception:
+                        pass
+                    finally:
+                        conn.close()
+            except Exception as e:
+                RNS.log(f"discovery server error: {e}", RNS.LOG_ERROR)
+        threading.Thread(target=_discovery_loop, daemon=True).start()
 
     RNS.log(f"sHades guild '{GUILD_NAME}' active", RNS.LOG_NOTICE)
     RNS.log(f"  browse node : {node_hash}  (NomadNet: add as node)", RNS.LOG_NOTICE)

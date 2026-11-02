@@ -176,21 +176,58 @@ def join_hub():
     print("Defaults to the public RNS community hub: rns.reticulum.world:6666")
     hub_host, hub_port = address_prompt("Hub address (ip:port)", "rns.reticulum.world:6666")
 
-    print("\nOptional: guild destination hashes from the hub's guild_info.json.")
-    print("Leave blank to skip — you'll still reach the hub by address.")
-    node_hash = prompt("Hub node_hash (32 hex, optional)", "").strip().lower() or None
-    delivery_hash = prompt("Hub delivery_hash (32 hex, optional)", "").strip().lower() or None
-    prop_hash = prompt("Hub propagation_hash (32 hex, optional)", "").strip().lower() or None
+    # Try to auto-retrieve guild info from the hub's discovery port
+    default_disco = hub_port + 1
+    disco_port = prompt("Discovery port (blank = hub port + 1)", str(default_disco)).strip()
+    disco_port = int(disco_port) if disco_port else default_disco
 
-    if node_hash and not HUB_HASH_RE.match(node_hash):
-        print("  invalid node_hash, clearing")
-        node_hash = None
-    if delivery_hash and not HUB_HASH_RE.match(delivery_hash):
-        print("  invalid delivery_hash, clearing")
-        delivery_hash = None
-    if prop_hash and not HUB_HASH_RE.match(prop_hash):
-        print("  invalid propagation_hash, clearing")
-        prop_hash = None
+    node_hash = delivery_hash = prop_hash = None
+    try:
+        import socket
+        ds = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ds.settimeout(5)
+        ds.connect((hub_host, disco_port))
+        data = b""
+        while True:
+            chunk = ds.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            if b"\n" in data:
+                break
+        ds.close()
+        if data:
+            guild_info = json.loads(data.decode().strip())
+            node_hash = guild_info.get("node_hash")
+            delivery_hash = guild_info.get("delivery_hash")
+            prop_hash = guild_info.get("prop_hash")
+            print("\nAuto-retrieved from hub discovery port:")
+            print(f"  node_hash    : {node_hash}")
+            print(f"  delivery_hash: {delivery_hash}")
+            print(f"  propagation  : {prop_hash}")
+    except Exception as e:
+        print(f"\nCould not auto-retrieve guild info from discovery port: {e}")
+        print("  Enter hashes manually below (or leave blank for address-only connect).")
+
+    # Optional manual override of any hash
+    manual_node = prompt("Hub node_hash (32 hex, override)", "").strip().lower() or None
+    manual_delivery = prompt("Hub delivery_hash (32 hex, override)", "").strip().lower() or None
+    manual_prop = prompt("Hub propagation_hash (32 hex, override)", "").strip().lower() or None
+
+    if manual_node and HUB_HASH_RE.match(manual_node):
+        node_hash = manual_node
+    elif manual_node:
+        print("  invalid node_hash, ignoring")
+
+    if manual_delivery and HUB_HASH_RE.match(manual_delivery):
+        delivery_hash = manual_delivery
+    elif manual_delivery:
+        print("  invalid delivery_hash, ignoring")
+
+    if manual_prop and HUB_HASH_RE.match(manual_prop):
+        prop_hash = manual_prop
+    elif manual_prop:
+        print("  invalid propagation_hash, ignoring")
 
     # Generate a local client identity
     client_dir = os.path.expanduser("~/.sHades_client")
@@ -208,6 +245,7 @@ def join_hub():
             "address": "%s:%d" % (hub_host, hub_port),
             "host": hub_host,
             "port": hub_port,
+            "discovery_port": disco_port,
             "node_hash": node_hash,
             "delivery_hash": delivery_hash,
             "propagation_hash": prop_hash,
@@ -227,6 +265,11 @@ def join_hub():
         print(f"  hub node_hash : {node_hash}")
     print("\nTo connect, run the sHades client and enter the hub address above.")
     print("The RNS config (~/.sHades_client/rns/config) now routes to the hub directly.")
+    print("\n=== Guild info for sharing ===")
+    print(f"  Hub address : {hub_host}:{hub_port}")
+    print(f"  node_hash   : {node_hash or '(not available)'}")
+    print(f"  delivery_hash: {delivery_hash or '(not available)'}")
+    print("Share the node_hash with others so they can join your hub.")
     print("\nIf you run the sHades server on this machine too, point it at a *different* "
           "storage dir and set share_instance=yes in both RNS configs to share the instance.")
 
