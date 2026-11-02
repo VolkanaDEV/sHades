@@ -828,9 +828,6 @@ class sHadesClientApp(App):
         try:
             reticulum = self.reticulum
 
-            if not self.node_hash:
-                raise RuntimeError("node_hash required to connect to guild")
-
             # identity
             storage = os.path.join(_app_data_dir(), "rns")
             ipath = os.path.join(storage, "identity")
@@ -850,26 +847,31 @@ class sHadesClientApp(App):
                 RNS.Destination.SINGLE, "lxmf", "delivery")
             self.my_hash = hexstr(self.client_dest.hash)
 
-            # link to guild node
-            nh = bytes.fromhex(self.node_hash)
-            nid = RNS.Identity.recall(nh)
-            nd = RNS.Destination(nid, RNS.Destination.OUT,
-                                 RNS.Destination.SINGLE, "nomadnetwork", "node")
-            link = RNS.Link(nd)
-            for _ in range(200):
-                if link.status == RNS.Link.ACTIVE:
-                    break
-                time.sleep(0.1)
-            if link.status != RNS.Link.ACTIVE:
-                raise RuntimeError("link never active")
-            link.identify(self.client_identity)
-            self.link = link
+            # link to guild node — only if we have a node_hash
+            if self.node_hash:
+                nh = bytes.fromhex(self.node_hash)
+                nid = RNS.Identity.recall(nh)
+                nd = RNS.Destination(nid, RNS.Destination.OUT,
+                                     RNS.Destination.SINGLE, "nomadnetwork", "node")
+                link = RNS.Link(nd)
+                for _ in range(200):
+                    if link.status == RNS.Link.ACTIVE:
+                        break
+                    time.sleep(0.1)
+                if link.status != RNS.Link.ACTIVE:
+                    raise RuntimeError("link never active")
+                link.identify(self.client_identity)
+                self.link = link
 
-            self.guild_api = GuildAPI(reticulum, link)
-            self._save_session()
+                self.guild_api = GuildAPI(reticulum, link)
+                self._save_session()
 
-            Clock.schedule_once(lambda dt: self._switch_main(), 0)
-            Clock.schedule_once(lambda dt: self._start_poll(), 0)
+                Clock.schedule_once(lambda dt: self._switch_main(), 0)
+                Clock.schedule_once(lambda dt: self._start_poll(), 0)
+            else:
+                # Connected to hub by address only — no guild node link yet.
+                # Ask the hub admin for its node_hash to enable API access.
+                self._set_status("Connected to hub (no node_hash — limited access)")
         except Exception as e:
             print("connect guild error:", repr(e))
             err_msg = "connect failed: %s" % e
