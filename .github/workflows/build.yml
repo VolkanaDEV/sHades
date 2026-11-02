@@ -111,6 +111,11 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Java 17 (required by Android Gradle plugin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -121,7 +126,7 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y -qq \
-            git zip unzip openjdk-17-jdk python3-pip autoconf libtool \
+            git zip unzip python3-pip autoconf libtool \
             pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 \
             libffi-dev libssl-dev cmake ninja-build
       - name: Install buildozer + deps
