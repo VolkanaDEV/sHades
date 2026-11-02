@@ -34,7 +34,7 @@ try:
     from kivy.core.window import Window
     from kivy.clock import Clock
     from kivy.properties import (
-        StringProperty, ObjectProperty, BooleanProperty,
+        StringProperty, ObjectProperty, BooleanProperty, NumericProperty,
     )
     from kivy.lang import Builder
     from kivy.uix.behaviors import ButtonBehavior
@@ -287,31 +287,84 @@ if KIVY:
         pass
 
     class PFPEditorWidget(BoxLayout):
-        """Round-mask avatar cropper with drag-to-position."""
+        """Round-mask avatar cropper — drag circle center to move, drag outside to resize."""
         source = StringProperty("")
         on_save = ObjectProperty(None, allownone=True)
+        circle_x = NumericProperty(0.5)   # relative center x (0-1)
+        circle_y = NumericProperty(0.5)   # relative center y (0-1)
+        circle_radius = NumericProperty(0.25)  # relative radius (0-1)
+        # Computed pixel values for KV canvas drawing
+        crop_cx = NumericProperty(0)
+        crop_cy = NumericProperty(0)
+        crop_r = NumericProperty(0)
 
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
+            self._drag_mode = None   # 'move' or 'resize'
+            self._last_pos = None
+            self.bind(
+                circle_x=self._update_crop,
+                circle_y=self._update_crop,
+                circle_radius=self._update_crop,
+                width=self._update_crop,
+                height=self._update_crop,
+                pos=self._update_crop,
+            )
+            self._update_crop()
+
+        def _update_crop(self, *args):
+            self.crop_cx = self.x + self.circle_x * self.width
+            self.crop_cy = self.y + self.circle_y * self.height
+            self.crop_r = self.circle_radius * min(self.width, self.height)
+
+        def _circle_hit(self, touch):
+            cx, cy = self.crop_cx, self.crop_cy
+            dx = touch.x - cx
+            dy = touch.y - cy
+            return (dx * dx + dy * dy) ** 0.5
 
         def on_touch_down(self, touch):
-            if self.collide_point(*touch.pos):
-                touch.grab(self)
-                return True
-            return super().on_touch_down(touch)
+            if not self.collide_point(*touch.pos):
+                return super().on_touch_down(touch)
+            r = self._circle_hit(touch)
+            if r <= self.crop_r:
+                self._drag_mode = 'move'
+            else:
+                self._drag_mode = 'resize'
+            self._last_pos = touch.pos
+            touch.grab(self)
+            return True
 
         def on_touch_move(self, touch):
-            if touch.grab_current is self:
-                img = self.ids.get("pfp_img")
-                if img:
-                    img.center_x += touch.dx * 0.5
-                    img.center_y += touch.dy * 0.5
+            if touch.grab_current is not self:
+                return super().on_touch_move(touch)
+            if self._last_pos is None:
                 return True
-            return super().on_touch_move(touch)
+            dx = touch.x - self._last_pos[0]
+            dy = touch.y - self._last_pos[1]
+            if self._drag_mode == 'move':
+                new_cx = self.crop_cx + dx
+                new_cy = self.crop_cy + dy
+                r = self.crop_r
+                new_cx = max(r, min(self.right - r, new_cx))
+                new_cy = max(r, min(self.top - r, new_cy))
+                self.circle_x = (new_cx - self.x) / self.width if self.width > 0 else 0.5
+                self.circle_y = (new_cy - self.y) / self.height if self.height > 0 else 0.5
+            elif self._drag_mode == 'resize':
+                cx, cy = self.crop_cx, self.crop_cy
+                new_dx = touch.x - cx
+                new_dy = touch.y - cy
+                new_r = (new_dx * new_dx + new_dy * new_dy) ** 0.5
+                rel_r = max(0.05, min(new_r / min(self.width, self.height), 0.5))
+                self.circle_radius = rel_r
+            self._last_pos = touch.pos
+            return True
 
         def on_touch_up(self, touch):
             if touch.grab_current is self:
                 touch.ungrab(self)
+                self._drag_mode = None
+                self._last_pos = None
                 return True
             return super().on_touch_up(touch)
 
@@ -364,17 +417,17 @@ KV = r"""
         id: pfp_img
         source: root.source
         allow_stretch: True
-        keep_ratio: True
+        keep_ratio: False
         canvas.after:
             Color:
-                rgba: 0, 0, 0, 0.6
+                rgba: 0, 0, 0, 0.4
             Ellipse:
-                pos: self.center_x - dp(64), self.center_y - dp(64)
-                size: dp(128), dp(128)
+                pos: root.crop_cx - root.crop_r, root.crop_cy - root.crop_r
+                size: root.crop_r * 2, root.crop_r * 2
             Color:
                 rgba: 1, 1, 1, 1
             Line:
-                circle: self.center_x, self.center_y, 64
+                circle: root.crop_cx, root.crop_cy, root.crop_r
                 width: 2
 
 <MessageRow>:
@@ -1706,11 +1759,9 @@ class sHadesClientApp(App):
             self.attach_file(path)
 
     def _open_pfp_editor(self, path):
-        """Open round-mask PFP picker popup with drag-to-position.
+        """Open round-mask PFP picker popup — drag circle to position, drag outside to resize.
 
-        User can drag the image to position the crop within the circle.
-
-        Save produces: 256x256 PNG (chat/members) + original (profile top).
+        Save produces: 256x256 PNG from circle area (chat/members) + original (profile top).
 
         """
         from kivy.uix.popup import Popup
@@ -1736,7 +1787,7 @@ class sHadesClientApp(App):
         content.add_widget(btn_box)
 
         popup = Popup(
-            title="Select PFP area (drag inside circle)",
+            title="Select PFP area — drag circle to move, drag edge to resize",
             content=content,
             size_hint=(0.85, 0.85),
             auto_dismiss=False,
@@ -1744,7 +1795,14 @@ class sHadesClientApp(App):
 
         def do_save(*_):
             popup.dismiss()
-            self._save_pfp_crop(path)
+            self._save_pfp_crop(
+                path,
+                circle_x=editor.circle_x,
+                circle_y=editor.circle_y,
+                circle_radius=editor.circle_radius,
+                editor_w=editor.width,
+                editor_h=editor.height,
+            )
 
         def do_cancel(*_):
             popup.dismiss()
@@ -1753,11 +1811,12 @@ class sHadesClientApp(App):
         cancel_btn.bind(on_press=do_cancel)
         popup.open()
 
-    def _save_pfp_crop(self, path):
-        """Save 256x256 crop from center (chat/members pfp) + original (profile top).
+    def _save_pfp_crop(self, path, circle_x=0.5, circle_y=0.5,
+                       circle_radius=0.25, editor_w=1, editor_h=1):
+        """Save 256x256 crop from circle area (chat/members pfp) + original (profile top).
 
         Both stored in app data dir under pfps/; 256x256 uploaded to guild.
-
+        Circle params are relative (0-1) from the PFPEditorWidget.
         """
         try:
             from PIL import Image as PILImage
@@ -1775,15 +1834,43 @@ class sHadesClientApp(App):
         small_path = os.path.join(pfp_dir, "small_" + name)
 
         if pil is not None:
-            # Save original
+            # Save original (full-size, used at top of profile page)
             pil.save(orig_path)
 
-            # Crop center 256x256 (or min dimension if smaller)
-            w, h = pil.size
-            size = min(w, h, 256)
-            left = (w - size) // 2
-            top = (h - size) // 2
-            crop = pil.crop((left, top, left + size, top + size))
+            # Crop circle's bounding box, map widget-relative to image pixels
+            widget_w = max(editor_w, 1)
+            widget_h = max(editor_h, 1)
+            min_dim = min(widget_w, widget_h)
+
+            cx_px = circle_x * widget_w
+            cy_px = circle_y * widget_h
+            r_px = circle_radius * min_dim
+
+            sx = pil.width / widget_w
+            sy = pil.height / widget_h
+
+            left = int((cx_px - r_px) * sx)
+            right = int((cx_px + r_px) * sx)
+            # Widget uses bottom-left origin; PIL uses top-left origin
+            top = int(pil.height - (cy_px + r_px) * sy)
+            bottom = int(pil.height - (cy_px - r_px) * sy)
+
+            # Clamp to image bounds
+            left = max(0, min(left, pil.width))
+            right = max(0, min(right, pil.width))
+            top = max(0, min(top, pil.height))
+            bottom = max(0, min(bottom, pil.height))
+
+            if right > left and bottom > top:
+                crop = pil.crop((left, top, right, bottom))
+            else:
+                # Fallback: center crop
+                w, h = pil.size
+                size = min(w, h, 256)
+                left = (w - size) // 2
+                top = (h - size) // 2
+                crop = pil.crop((left, top, left + size, top + size))
+
             crop = crop.resize((256, 256), PILImage.LANCZOS)
             crop.save(small_path, "PNG")
         else:
