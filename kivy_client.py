@@ -39,6 +39,7 @@ try:
     from kivy.uix.behaviors import ButtonBehavior
     from kivy.uix.filechooser import FileChooserListView
     from kivy.uix.popup import Popup
+    from kivy.uix.button import Button
     from kivy.metrics import dp, sp
     KIVY = True
 except Exception as _e:  # pragma: no cover - Kivy missing at import time
@@ -940,8 +941,15 @@ class sHadesClientApp(App):
                                 "    type = AutoInterface\n"
                                 "    enabled = yes\n")
 
+                    f.write("  [[TCPServerInterface]]\\n"
+                            "    type = TCPServerInterface\\n"
+                            "    enabled = yes\\n"
+                            "    listen_ip = 0.0.0.0\\n"
+                            "    listen_port = %d\\n" % 29222)
+
             reticulum = RNS.Reticulum(configdir=storage)
             self.reticulum = reticulum
+            self.client_port = 29222
         except Exception as e:
             print("init reticulum error:", repr(e))
             self._set_status("connect failed: %s" % e)
@@ -1067,6 +1075,28 @@ class sHadesClientApp(App):
 
             self.guild_api = GuildAPI(reticulum, link)
             self._save_session()
+
+            # Create this client's own nomadnetwork.node destination
+            # for serving profile pages to other clients.
+            self.node_destination = RNS.Destination(
+                self.client_identity, RNS.Destination.IN,
+                RNS.Destination.SINGLE, "nomadnetwork", "node")
+            self.node_destination.register_request_handler(
+                "/page/profile", self.page_profile_handler,
+                allow=RNS.Destination.ALLOW_ALL)
+            self.node_hash = hexstr(self.node_destination.hash)
+            print(f"My node_hash: {self.node_hash}")
+
+            # Register with guild so others can find me via ip:port
+            try:
+                import socket
+                my_host = socket.gethostbyname(socket.gethostname())
+                self.guild_api.register_node(
+                    self.node_hash, my_host, self.client_port,
+                    hexstr(self.client_identity.hash))
+                print(f"Registered with guild: {my_host}:{self.client_port}")
+            except Exception as e:
+                print(f"Node registration failed: {e}")
 
             Clock.schedule_once(lambda dt: self._switch_main(), 0)
             Clock.schedule_once(lambda dt: self._start_poll(), 0)
@@ -1368,35 +1398,132 @@ class sHadesClientApp(App):
 
     # -- profile ----------------------------------------------------------
     def open_profile(self, target_hash, username):
-        """Open the profile screen for a user (self or another member)."""
+        """Open the profile screen for a user (self or another member).
+        Connects to the remote client's node, fetches their profile page
+        via RNS link, and renders it in a popup."""
         if not self.guild_api:
             return
-        self.profile_screen = self.root.get_screen("profile")
-        self.profile_screen.target_hash = target_hash or self.my_hash or ""
-        self.profile_screen.target_username = username or self.username or "user"
-        # try to fetch avatar from guild
+
+        # If no target_hash, show own profile locally
+        if not target_hash or target_hash == self.my_hash:
+            self._show_own_profile()
+            return
+
+        # Look up node's address via guild
         try:
-            res = self.guild_api.avatar_get(target_hash or self.my_hash or "")
-            if res.get("ok") and res.get("avatar"):
-                import base64
-                avatar_bytes = res["avatar"]
-                if isinstance(avatar_bytes, str):
-                    avatar_bytes = base64.b64decode(avatar_bytes)
-                # save to temp file for Kivy Image to load
-                import tempfile
-                tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-                tmp.write(avatar_bytes)
-                tmp.close()
-                self.profile_screen.target_avatar = tmp.name
-            else:
-                self.profile_screen.target_avatar = ""
+            res = self.guild_api.lookup_node(target_hash)
+            if not res.get("ok"):
+                self._set_status("Node not found: %s" % res.get("error", "unknown"))
+                return
+            address = res.get("address")
+            port = res.get("port")
+            identity_hash = res.get("identity_hash")
         except Exception as e:
-            print("avatar fetch error:", e)
-            self.profile_screen.target_avatar = ""
-        # if viewing own profile, show delivery hash too
-        if target_hash in (None, "", self.my_hash):
-            self.profile_screen.target_hash = self.my_hash or ""
+            self._set_status("Lookup failed: %s" % e)
+            return
+
+        if not address or not port:
+            self._set_status("No address for node: %s" % target_hash)
+            return
+
+        # Connect to remote node via RNS.Link and request profile page
+        try:
+            nh = bytes.fromhex(target_hash)
+            nid = RNS.Identity.recall(nh)
+            if nid is None:
+                # Try with identity_hash from lookup
+                nid = RNS.Identity(bytes.fromhex(identity_hash)) if identity_hash else None
+            if nid is None:
+                self._set_status("RNS does not know identity for %s" % target_hash)
+                return
+            nd = RNS.Destination(nid, RNS.Destination.OUT,
+                                 RNS.Destination.SINGLE, "nomadnetwork", "node")
+            link = RNS.Link(nd)
+            for _ in range(200):
+                if link.status == RNS.Link.ACTIVE:
+                    break
+                time.sleep(0.1)
+            if link.status != RNS.Link.ACTIVE:
+                self._set_status("Link to %s never active" % target_hash[:12])
+                return
+
+            # Request profile page
+            req_path = "/page/profile/%s" % target_hash
+            receipt = link.request(req_path, data={})
+            deadline = time.time() + 10
+            while receipt.response is None and time.time() < deadline:
+                time.sleep(0.1)
+            if receipt.response is None:
+                self._set_status("Profile request timed out")
+                return
+
+            profile_text = receipt.response.decode("utf-8", errors="replace")
+            self._show_profile_popup(target_hash, username, profile_text)
+
+        except Exception as e:
+            print("Profile fetch error:", repr(e))
+            self._set_status("Profile fetch failed: %s" % e)
+
+    def _show_own_profile(self):
+        """Show own profile locally."""
+        self.profile_screen = self.root.get_screen("profile")
+        self.profile_screen.target_hash = self.my_hash or ""
+        self.profile_screen.target_username = self.username or "user"
+        self.profile_screen.target_avatar = ""
         self.root.current = "profile"
+
+    def _show_profile_popup(self, target_hash, username, profile_text):
+        """Show a remote user's profile page in a popup."""
+        from kivy.uix.popup import Popup
+        from kivy.uix.label import Label
+        from kivy.uix.scrollview import ScrollView
+        from kivy.uix.boxlayout import BoxLayout
+
+        # Convert micron/markdown to Kivy markup
+        markup_text = md_to_kivy(profile_text)
+
+        content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
+        scroll = ScrollView()
+        label = Label(text=markup_text, markup=True, size_hint_y=None,
+                      halign="left", valign="top", text_size=(None, None))
+        label.bind(texture_size=lambda *args: label.set_size(label.texture_size))
+        scroll.add_widget(label)
+        content.add_widget(scroll)
+
+        close_btn = Button(text="Close", size_hint_y=None, height=dp(40),
+                           background_color=(0.5, 0.53, 0.59, 1),
+                           color=(1, 1, 1, 1))
+        content.add_widget(close_btn)
+
+        popup = Popup(title="Profile: %s" % (username or target_hash[:12]),
+                      content=content, size_hint=(0.8, 0.8),
+                      auto_dismiss=False)
+        close_btn.bind(on_press=popup.dismiss)
+        popup.open()
+
+    def page_profile_handler(self, path, data, request_id, link_id,
+                             remote_identity, requested_at):
+        """Serve profile page for this client's node.
+        Called by remote clients via RNS.Link.request().
+        Returns micron/markdown profile page."""
+        # Extract target hash from path like /page/profile/<node_hash>
+        parts = path.split("/")
+        target_hash = parts[-1] if len(parts) > 2 else ""
+
+        if target_hash != self.node_hash:
+            return b"Profile not found"
+
+        # Build micron/markdown profile page
+        lines = [
+            "# %s" % (self.username or "user"),
+            "",
+            "Node: %s" % self.node_hash,
+            "Delivery: %s" % (self.delivery_hash or ""),
+            "",
+            "Reticulum-native community hub client",
+            "",
+        ]
+        return ("\n".join(lines)).encode("utf-8")
 
     def open_file_chooser(self, avatar=False):
         """Open a file chooser popup to attach a file or select an avatar."""

@@ -65,6 +65,8 @@ _tokens_lock  = threading.Lock()
 _rate_windows = defaultdict(deque)  # (sender, channel) -> deque[timestamps]
 _rate_lock    = threading.Lock()
 MODERATORS    = set()             # canonical user hashes; seeded from moderators.txt at boot
+NODE_REGISTRY = {}                # node_hash -> {address, port, last_seen}
+NODE_REGISTRY_LOCK = threading.Lock()
 
 FIELD_ATTACHMENTS = LXMF.FIELD_FILE_ATTACHMENTS  # 0x05 — envelope ours (plan §14)
 
@@ -1051,6 +1053,55 @@ def api_register(viewer, data):
                    (viewer, username, profile_node.lower() or None, now()))
         db.commit()
     return msgpack.packb({"ok": 1})
+
+@api_route("/api/register_node")
+@wrap_api
+def api_register_node(viewer, data):
+    """Client registers its node address with the guild index.
+    data: {node_hash, address, port}
+    """
+    node_hash = (data.get("node_hash") or "").strip().lower()
+    address = (data.get("address") or "").strip()
+    port = data.get("port")
+    if not node_hash or not re.match(r"^[0-9a-f]{32}$", node_hash):
+        return api_error("invalid node_hash", 400)
+    if not address:
+        return api_error("address required", 400)
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return api_error("invalid port", 400)
+    with NODE_REGISTRY_LOCK:
+        NODE_REGISTRY[node_hash] = {
+            "address": address,
+            "port": port,
+            "last_seen": now(),
+        }
+    return msgpack.packb({"ok": 1})
+
+@api_route("/api/lookup_node")
+@wrap_api
+def api_lookup_node(viewer, data):
+    """Look up a node's address by node_hash.
+    data: {node_hash}
+    Returns: {ok, address, port} or {ok: 0, error: "not found"}
+    """
+    node_hash = (data.get("node_hash") or "").strip().lower()
+    if not node_hash:
+        return api_error("node_hash required", 400)
+    with NODE_REGISTRY_LOCK:
+        entry = NODE_REGISTRY.get(node_hash)
+    if not entry:
+        return msgpack.packb({"ok": 0, "error": "node not found"})
+    return msgpack.packb({"ok": 1, "address": entry["address"], "port": entry["port"]})
+
+@api_route("/api/nodes")
+@wrap_api
+def api_nodes(viewer, data):
+    """List all registered nodes (for directory browsing)."""
+    with NODE_REGISTRY_LOCK:
+        nodes = {k: v for k, v in NODE_REGISTRY.items()}
+    return msgpack.packb({"ok": 1, "nodes": nodes})
 
 @api_route("/api/avatar")
 @wrap_api
