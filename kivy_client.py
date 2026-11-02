@@ -19,6 +19,7 @@ import time
 import hashlib
 import threading
 from collections import OrderedDict
+import mimetypes
 
 # ---------------------------------------------------------------------------
 # Kivy (guarded so the module can be imported for linting without Kivy present)
@@ -36,6 +37,8 @@ try:
     )
     from kivy.lang import Builder
     from kivy.uix.behaviors import ButtonBehavior
+    from kivy.uix.filechooser import FileChooserListView
+    from kivy.uix.popup import Popup
     from kivy.metrics import dp, sp
     KIVY = True
 except Exception as _e:  # pragma: no cover - Kivy missing at import time
@@ -288,6 +291,11 @@ if KIVY:
             pass
 
 
+class ClickableLabel(ButtonBehavior, Label):
+    """Username label that opens a user profile when tapped."""
+    target_hash = StringProperty("")
+
+
 class ChannelButton(ButtonBehavior, BoxLayout):
     channel_name = StringProperty("")
 
@@ -327,8 +335,9 @@ KV = r"""
         BoxLayout:
             size_hint_y: None
             height: dp(18)
-            Label:
+            ClickableLabel:
                 text: root.username
+                target_hash: root.author_hash
                 color: (1, 1, 1, 1) if root.is_own else (0.9, 0.9, 0.9, 1)
                 bold: True
                 font_size: sp(13)
@@ -338,6 +347,7 @@ KV = r"""
                 halign: 'left'
                 valign: 'middle'
                 shorten: True
+                on_press: app.open_profile(root.author_hash, root.username)
             Label:
                 text: root.ts
                 color: (0.6, 0.63, 0.67, 1)
@@ -391,12 +401,14 @@ KV = r"""
         source: root.avatar_source or ""
         allow_stretch: True
         keep_ratio: True
-    Label:
+    ClickableLabel:
         text: root.username
+        target_hash: root.author_hash
         color: (1, 1, 1, 0.9)
         font_size: sp(13)
         halign: 'left'
         valign: 'middle'
+        on_press: app.open_profile(root.author_hash, root.username)
 
 
 <ConnectScreen>:
@@ -443,7 +455,7 @@ KV = r"""
                 multiline: False
                 size_hint_y: None
                 height: dp(44)
-                background_color: 0.22, 0.24, 0.28, 1
+                background_color: 0.18, 0.2, 0.23, 1
                 foreground_color: 1, 1, 1, 1
                 cursor_color: 1, 1, 1, 1
             Label:
@@ -488,6 +500,98 @@ KV = r"""
             size_hint_y: None
             height: dp(30)
 
+
+<ProfileScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: dp(20)
+        spacing: dp(15)
+        canvas.before:
+            Color:
+                rgba: 0.14, 0.16, 0.19, 1
+            Rectangle:
+                pos: self.pos
+                size: self.size
+        Label:
+            text: 'Profile'
+            font_size: sp(32)
+            bold: True
+            color: 1, 1, 1, 1
+            size_hint_y: None
+            height: dp(50)
+        BoxLayout:
+            orientation: 'vertical'
+            size_hint_y: None
+            height: dp(260)
+            spacing: dp(10)
+            PfpImage:
+                id: profile_pfp
+                size_hint: None, None
+                size: dp(80), dp(80)
+                source: root.target_avatar or ''
+                allow_stretch: True
+                keep_ratio: True
+                pos_hint: {'center_x': 0.5}
+            Label:
+                text: root.target_username
+                font_size: sp(20)
+                bold: True
+                color: 1, 1, 1, 1
+                size_hint_y: None
+                height: dp(30)
+                halign: 'center'
+            TextInput:
+                id: profile_username_input
+                text: root.target_username
+                multiline: False
+                size_hint_y: None
+                height: dp(40)
+                background_color: 0.22, 0.24, 0.28, 1
+                foreground_color: 1, 1, 1, 1
+                cursor_color: 1, 1, 1, 1
+            Label:
+                text: 'Node hash: ' + root.target_hash
+                font_size: sp(11)
+                color: 0.7, 0.73, 0.77, 1
+                size_hint_y: None
+                height: dp(20)
+                halign: 'center'
+                text_size: self.width, None
+                shorten: True
+            Label:
+                text: 'Delivery: ' + root.target_username
+                font_size: sp(11)
+                color: 0.7, 0.73, 0.77, 1
+                size_hint_y: None
+                height: dp(20)
+                halign: 'center'
+                text_size: self.width, None
+                shorten: True
+        BoxLayout:
+            size_hint_y: None
+            height: dp(50)
+            spacing: dp(10)
+            Button:
+                text: 'Change Avatar'
+                size_hint_x: None
+                width: dp(140)
+                background_color: 0.36, 0.41, 0.59, 1
+                color: 1, 1, 1, 1
+                on_press: app.open_file_chooser(avatar=True)
+            Button:
+                text: 'Save Username'
+                size_hint_x: None
+                width: dp(140)
+                background_color: 0.36, 0.41, 0.59, 1
+                color: 1, 1, 1, 1
+                on_press: app.save_profile()
+            Button:
+                text: 'Back'
+                size_hint_x: None
+                width: dp(100)
+                background_color: 0.5, 0.53, 0.59, 1
+                color: 1, 1, 1, 1
+                on_press: app.root.current = 'main'
 
 <MainScreen>:
     BoxLayout:
@@ -588,6 +692,14 @@ KV = r"""
                     background_color: 0.36, 0.41, 0.59, 1
                     color: 1, 1, 1, 1
                     on_press: app.send_message()
+                Button:
+                    id: attach_btn
+                    text: 'Attach'
+                    size_hint_x: None
+                    width: dp(70)
+                    background_color: 0.45, 0.5, 0.59, 1
+                    color: 1, 1, 1, 1
+                    on_press: app.open_file_chooser(avatar=False)
 
         # ---------------- right: members (collapsable) ----------------
         BoxLayout:
@@ -639,9 +751,16 @@ if KIVY:
     class ConnectScreen(Screen):
         pass
 
+    class ProfileScreen(Screen):
+        """Profile view: avatar, username, identity hashes, edit controls."""
+        target_hash = StringProperty("")
+        target_username = StringProperty("")
+        target_avatar = StringProperty("")
+
     class MemberRow(BoxLayout):
         username = StringProperty("")
         avatar_source = StringProperty("")
+        author_hash = StringProperty("")
 
     class MainScreen(Screen):
         left_open = BooleanProperty(True)
@@ -1089,6 +1208,39 @@ class sHadesClientApp(App):
                 grid.add_widget(Label(text="[video] " + url, size_hint_y=None, height=dp(20),
                                       color=(0.7, 0.73, 0.77, 1), font_size=sp(12)))
 
+        # attachment embeds (files uploaded with the message)
+        for att in m.get("attachments") or []:
+            try:
+                att_name = att[0]
+                att_blob = att[2]
+            except Exception:
+                continue
+            if isinstance(att_blob, str):
+                import base64
+                att_blob = base64.b64decode(att_blob)
+            ext = os.path.splitext(att_name)[1].lower()
+            if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+                import tempfile
+                tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+                tmp.write(att_blob)
+                tmp.close()
+                emb = MessageEmbed(source_url=att_name, size_hint_y=None, height=dp(150))
+                from kivy.uix.image import AsyncImage
+                emb.add_widget(AsyncImage(source=tmp.name, allow_stretch=True, keep_ratio=False))
+                grid.add_widget(emb)
+            elif ext in (".mp3", ".ogg", ".wav", ".flac"):
+                grid.add_widget(Label(text="[audio] " + att_name, size_hint_y=None,
+                                      height=dp(20), color=(0.7, 0.73, 0.77, 1),
+                                      font_size=sp(12)))
+            elif ext in (".mp4", ".webm"):
+                grid.add_widget(Label(text="[video] " + att_name, size_hint_y=None,
+                                      height=dp(20), color=(0.7, 0.73, 0.77, 1),
+                                      font_size=sp(12)))
+            else:
+                grid.add_widget(Label(text="[file] " + att_name, size_hint_y=None,
+                                      height=dp(20), color=(0.7, 0.73, 0.77, 1),
+                                      font_size=sp(12)))
+
     def _refresh_avatar(self, key):
         # re-render rows that use this avatar
         path = IMAGE_CACHE.get(key)
@@ -1193,20 +1345,131 @@ class sHadesClientApp(App):
         inp.text = ""
 
         def work():
-            res = self.guild_api.post(cid, text)
+            res = self.guild_api.post(cid, text,
+                                      attachments=[self._pending_attachment]
+                                      if getattr(self, "_pending_attachment",
+                                                 None) else None)
             if res.get("ok"):
                 # optimistically show
                 msg_id = res.get("msg_id")
                 m = {"msg_id": msg_id, "author_hash": self.my_hash,
                      "username": self.username, "content": text,
-                     "ts": now(), "channel_id": cid}
+                     "ts": now(), "channel_id": cid,
+                     "attachments": self._pending_attachment
+                     if getattr(self, "_pending_attachment", None) else None}
                 Clock.schedule_once(lambda dt: self._render_message(
                     main.ids.message_grid, m), 0)
+                self._pending_attachment = None
             else:
                 err = res.get("error", "unknown")
                 Clock.schedule_once(
                     lambda dt: self._set_status("send failed: %s" % err), 0)
         threading.Thread(target=work, daemon=True).start()
+
+    # -- profile ----------------------------------------------------------
+    def open_profile(self, target_hash, username):
+        """Open the profile screen for a user (self or another member)."""
+        if not self.guild_api:
+            return
+        self.profile_screen = self.root.get_screen("profile")
+        self.profile_screen.target_hash = target_hash or self.my_hash or ""
+        self.profile_screen.target_username = username or self.username or "user"
+        # try to fetch avatar from guild
+        try:
+            res = self.guild_api.avatar_get(target_hash or self.my_hash or "")
+            if res.get("ok") and res.get("avatar"):
+                import base64
+                avatar_bytes = res["avatar"]
+                if isinstance(avatar_bytes, str):
+                    avatar_bytes = base64.b64decode(avatar_bytes)
+                # save to temp file for Kivy Image to load
+                import tempfile
+                tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                tmp.write(avatar_bytes)
+                tmp.close()
+                self.profile_screen.target_avatar = tmp.name
+            else:
+                self.profile_screen.target_avatar = ""
+        except Exception as e:
+            print("avatar fetch error:", e)
+            self.profile_screen.target_avatar = ""
+        # if viewing own profile, show delivery hash too
+        if target_hash in (None, "", self.my_hash):
+            self.profile_screen.target_hash = self.my_hash or ""
+        self.root.current = "profile"
+
+    def open_file_chooser(self, avatar=False):
+        """Open a file chooser popup to attach a file or select an avatar."""
+        self._avatar_mode = avatar
+        chooser = FileChooserListView(filters=["*.png", "*.jpg", "*.jpeg",
+                                               "*.gif", "*.webp", "*.mp4",
+                                               "*.mp3", "*.pdf", "*.txt"])
+        popup = Popup(title="Select file", content=chooser,
+                      size_hint=(0.9, 0.9))
+        chooser.bind(on_submit=lambda inst, selection, *args:
+                     self._on_file_selected(selection, popup))
+        popup.open()
+
+    def _on_file_selected(self, selection, popup):
+        popup.dismiss()
+        if not selection:
+            return
+        path = selection[0]
+        if getattr(self, "_avatar_mode", False):
+            self.upload_avatar(path)
+        else:
+            self.attach_file(path)
+
+    def attach_file(self, path):
+        """Attach a file to the current message input as an upload."""
+        try:
+            with open(path, "rb") as f:
+                blob = f.read()
+        except Exception as e:
+            self._set_status("attach failed: %s" % e)
+            return
+        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        name = path.split("/")[-1]
+        self._pending_attachment = [name, mime, blob]
+        self._set_status("Attached: %s (%d bytes)" % (name, len(blob)))
+
+    def upload_avatar(self, path):
+        """Upload an avatar image to the guild."""
+        try:
+            with open(path, "rb") as f:
+                blob = f.read()
+        except Exception as e:
+            self._set_status("avatar upload failed: %s" % e)
+            return
+        try:
+            res = self.guild_api.avatar_upload(blob)
+        except Exception:
+            res = None
+        if res and res.get("ok"):
+            self._set_status("Avatar updated")
+            self.profile_screen.target_avatar = path
+            if hasattr(self, "profile_screen"):
+                self.profile_screen.ids.profile_pfp.source = path
+        else:
+            self._set_status("avatar upload failed")
+
+    def save_profile(self):
+        """Save username to the guild."""
+        try:
+            inp = self.root.get_screen("profile").ids.profile_username_input
+            new_name = (inp.text or "").strip() or "user"
+        except Exception:
+            return
+        try:
+            res = self.guild_api.register(new_name, "")
+            if res.get("ok"):
+                self.username = new_name
+                self.profile_screen.target_username = new_name
+                self._set_status("Profile saved")
+            else:
+                self._set_status("save failed: %s" % res.get("error", "unknown"))
+        except Exception as e:
+            self._set_status("save failed: %s" % e)
 
     # -- ui helpers ------------------------------------------------------
     def _set_status(self, text):
