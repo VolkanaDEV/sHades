@@ -803,6 +803,10 @@ class sHadesClientApp(App):
             ipath = os.path.join(storage, "identity")
             if os.path.exists(ipath):
                 self.client_identity = RNS.Identity.from_file(ipath)
+                if self.client_identity is None:
+                    # Corrupted or empty identity file — create a fresh one
+                    self.client_identity = RNS.Identity()
+                    self.client_identity.to_file(ipath)
             else:
                 self.client_identity = RNS.Identity()
                 self.client_identity.to_file(ipath)
