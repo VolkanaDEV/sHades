@@ -683,6 +683,12 @@ class sHadesClientApp(App):
         self._msg_widgets = {}           # msg_id -> MessageRow
         self._popup = None
         self._poll_error_shown = False
+        self._ui_populated = False
+
+    def _channel_cid(self, name):
+        """Convert a channel name to its RNS destination hash ID,
+        matching the guild's ensure_channel() formula."""
+        return hexstr(RNS.Identity.full_hash(b"main_guild:" + name.encode()))
 
     # -- lifecycle -------------------------------------------------------
     def build(self):
@@ -966,7 +972,7 @@ class sHadesClientApp(App):
             try:
                 main = self.root.get_screen("main")
                 cid = getattr(main, "_current_channel", "general")
-                st = self.guild_api.state(cid)
+                st = self.guild_api.state(self._channel_cid(cid))
                 if st.get("ok"):
                     self._poll_error_shown = False
                     seq = st.get("seq", 0)
@@ -977,13 +983,13 @@ class sHadesClientApp(App):
                         self._seq = seq
                         self._last_ts = last_ts
                         self._fetch_messages(cid)
-                        self._refresh_members_ui(cid)
+                        self._refresh_members_ui(self._channel_cid(cid))
                     else:
                         # no change, but make sure UI is populated on first poll
                         if not getattr(self, "_ui_populated", False):
                             self._ui_populated = True
                             self._fetch_messages(cid)
-                            self._refresh_members_ui(cid)
+                            self._refresh_members_ui(self._channel_cid(cid))
                 else:
                     err = st.get("error", "unknown")
                     self._poll_error_shown = True
@@ -1003,7 +1009,8 @@ class sHadesClientApp(App):
         # Network call must not block the main thread — run it in background,
         # schedule UI updates via Clock.schedule_once.
         def work():
-            res = self.guild_api.messages(channel, since_id=since_id, since_ts=since_ts, limit=100)
+            cid = self._channel_cid(channel)
+            res = self.guild_api.messages(cid, since_id=since_id, since_ts=since_ts, limit=100)
             if not res.get("ok"):
                 err = res.get("error", "unknown")
                 Clock.schedule_once(
@@ -1182,6 +1189,7 @@ class sHadesClientApp(App):
         if not text or not self.guild_api:
             return
         cid = getattr(main, "_current_channel", "general")
+        cid = self._channel_cid(cid)
         inp.text = ""
 
         def work():
