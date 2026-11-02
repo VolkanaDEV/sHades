@@ -28,6 +28,7 @@ import mimetypes
 try:
     from kivy.app import App
     from kivy.uix.boxlayout import BoxLayout
+    from kivy.uix.floatlayout import FloatLayout
     from kivy.uix.label import Label
     from kivy.uix.image import Image
     from kivy.uix.screenmanager import ScreenManager, Screen
@@ -286,8 +287,9 @@ if KIVY:
         """Circular-ish avatar placeholder with fallback color."""
         pass
 
-    class PFPEditorWidget(BoxLayout):
-        """Round-mask avatar cropper — drag circle center to move, drag outside to resize."""
+    class PFPEditorWidget(FloatLayout):
+        """Round-mask avatar cropper — image at natural size (never stretched),
+        circle overlay is draggable and resizable."""
         source = StringProperty("")
         on_save = ObjectProperty(None, allownone=True)
         circle_x = NumericProperty(0.5)   # relative center x (0-1)
@@ -318,9 +320,8 @@ if KIVY:
             self.crop_r = self.circle_radius * min(self.width, self.height)
 
         def _circle_hit(self, touch):
-            cx, cy = self.crop_cx, self.crop_cy
-            dx = touch.x - cx
-            dy = touch.y - cy
+            dx = touch.x - self.crop_cx
+            dy = touch.y - self.crop_cy
             return (dx * dx + dy * dy) ** 0.5
 
         def on_touch_down(self, touch):
@@ -412,23 +413,24 @@ KV = r"""
 #:import dp kivy.metrics.dp
 
 <PFPEditorWidget>:
-    orientation: 'vertical'
+    canvas.after:
+        Color:
+            rgba: 0, 0, 0, 0.4
+        Ellipse:
+            pos: root.crop_cx - root.crop_r, root.crop_cy - root.crop_r
+            size: root.crop_r * 2, root.crop_r * 2
+        Color:
+            rgba: 1, 1, 1, 1
+        Line:
+            circle: root.crop_cx, root.crop_cy, root.crop_r
+            width: 2
     Image:
         id: pfp_img
         source: root.source
-        allow_stretch: True
-        keep_ratio: False
-        canvas.after:
-            Color:
-                rgba: 0, 0, 0, 0.4
-            Ellipse:
-                pos: root.crop_cx - root.crop_r, root.crop_cy - root.crop_r
-                size: root.crop_r * 2, root.crop_r * 2
-            Color:
-                rgba: 1, 1, 1, 1
-            Line:
-                circle: root.crop_cx, root.crop_cy, root.crop_r
-                width: 2
+        allow_stretch: False
+        keep_ratio: True
+        size_hint: None, None
+        pos_hint: {'center_x': 0.5, 'center_y': 0.5}
 
 <MessageRow>:
     orientation: 'horizontal'
@@ -449,7 +451,7 @@ KV = r"""
         size_hint: None, None
         size: dp(32), dp(32)
         source: root.avatar_source or ""
-        allow_stretch: True
+        allow_stretch: False
         keep_ratio: True
 
     BoxLayout:
@@ -522,7 +524,7 @@ KV = r"""
         size_hint: None, None
         size: dp(26), dp(26)
         source: root.avatar_source or ""
-        allow_stretch: True
+        allow_stretch: False
         keep_ratio: True
     ClickableLabel:
         text: root.username
@@ -1426,7 +1428,7 @@ class sHadesClientApp(App):
                 emb = MessageEmbed(source_url=url, size_hint_y=None, height=dp(150))
                 # Kivy AsyncImage loads http directly
                 from kivy.uix.image import AsyncImage
-                emb.add_widget(AsyncImage(source=url, allow_stretch=True, keep_ratio=False))
+                emb.add_widget(AsyncImage(source=url, allow_stretch=False, keep_ratio=True))
                 grid.add_widget(emb)
             elif ext in (".mp3", ".ogg", ".wav", ".flac"):
                 grid.add_widget(Label(text="[audio] " + url, size_hint_y=None, height=dp(20),
@@ -1453,7 +1455,7 @@ class sHadesClientApp(App):
                 tmp.close()
                 emb = MessageEmbed(source_url=att_name, size_hint_y=None, height=dp(150))
                 from kivy.uix.image import AsyncImage
-                emb.add_widget(AsyncImage(source=tmp.name, allow_stretch=True, keep_ratio=False))
+                emb.add_widget(AsyncImage(source=tmp.name, allow_stretch=False, keep_ratio=True))
                 grid.add_widget(emb)
             elif ext in (".mp3", ".ogg", ".wav", ".flac"):
                 grid.add_widget(Label(text="[audio] " + att_name, size_hint_y=None,
@@ -1795,6 +1797,7 @@ class sHadesClientApp(App):
 
         def do_save(*_):
             popup.dismiss()
+            img = editor.ids.pfp_img
             self._save_pfp_crop(
                 path,
                 circle_x=editor.circle_x,
@@ -1802,6 +1805,8 @@ class sHadesClientApp(App):
                 circle_radius=editor.circle_radius,
                 editor_w=editor.width,
                 editor_h=editor.height,
+                image_pos=img.pos,
+                image_size=img.size,
             )
 
         def do_cancel(*_):
@@ -1812,11 +1817,14 @@ class sHadesClientApp(App):
         popup.open()
 
     def _save_pfp_crop(self, path, circle_x=0.5, circle_y=0.5,
-                       circle_radius=0.25, editor_w=1, editor_h=1):
+                       circle_radius=0.25, editor_w=1, editor_h=1,
+                       image_pos=None, image_size=None):
         """Save 256x256 crop from circle area (chat/members pfp) + original (profile top).
 
         Both stored in app data dir under pfps/; 256x256 uploaded to guild.
         Circle params are relative (0-1) from the PFPEditorWidget.
+        Image is displayed at natural size centered in widget — map circle
+        from widget coords to image-relative coords for cropping.
         """
         try:
             from PIL import Image as PILImage
@@ -1837,23 +1845,28 @@ class sHadesClientApp(App):
             # Save original (full-size, used at top of profile page)
             pil.save(orig_path)
 
-            # Crop circle's bounding box, map widget-relative to image pixels
-            widget_w = max(editor_w, 1)
-            widget_h = max(editor_h, 1)
-            min_dim = min(widget_w, widget_h)
+            # Map circle from widget coords to image-relative coords
+            img_x, img_y = image_pos if image_pos else (0, 0)
+            img_w, img_h = image_size if image_size else (pil.width, pil.height)
 
-            cx_px = circle_x * widget_w
-            cy_px = circle_y * widget_h
-            r_px = circle_radius * min_dim
+            # Circle center relative to image (0-1)
+            rel_cx = (circle_x * editor_w - img_x) / img_w if img_w > 0 else 0.5
+            rel_cy = (circle_y * editor_h - img_y) / img_h if img_h > 0 else 0.5
 
-            sx = pil.width / widget_w
-            sy = pil.height / widget_h
+            # Circle radius relative to image dimensions
+            img_min_dim = min(img_w, img_h)
+            rel_r = (circle_radius * min(editor_w, editor_h) / img_min_dim
+                     if img_min_dim > 0 else 0.25)
 
-            left = int((cx_px - r_px) * sx)
-            right = int((cx_px + r_px) * sx)
-            # Widget uses bottom-left origin; PIL uses top-left origin
-            top = int(pil.height - (cy_px + r_px) * sy)
-            bottom = int(pil.height - (cy_px - r_px) * sy)
+            # Crop from original image (PIL uses top-left origin)
+            cx_px = rel_cx * pil.width
+            cy_px = rel_cy * pil.height
+            r_px = rel_r * img_min_dim
+
+            left = int(cx_px - r_px)
+            right = int(cx_px + r_px)
+            top = int(pil.height - (cy_px + r_px))
+            bottom = int(pil.height - (cy_px - r_px))
 
             # Clamp to image bounds
             left = max(0, min(left, pil.width))
