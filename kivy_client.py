@@ -1283,6 +1283,9 @@ class sHadesClientApp(App):
             self.node_destination.register_request_handler(
                 "/page/profile", self.page_profile_handler,
                 allow=RNS.Destination.ALLOW_ALL)
+            self.node_destination.register_request_handler(
+                "/file", self._file_handler,
+                allow=RNS.Destination.ALLOW_ALL)
             self.node_hash = hexstr(self.node_destination.hash)
             print(f"My node_hash: {self.node_hash}")
 
@@ -1664,7 +1667,36 @@ class sHadesClientApp(App):
                 return
 
             profile_text = receipt.response.decode("utf-8", errors="replace")
-            self._show_profile_popup(target_hash, username, profile_text)
+
+            # Fetch any images referenced in the profile page (![alt](/file/name))
+            image_paths = {}  # filename -> local temp path
+            import re as _re
+            for m in _re.finditer(r"!\[([^\]]*)\]\(/file/([^)]+)\)", profile_text):
+                filename = m.group(2)
+                try:
+                    file_req_path = "/file/%s" % filename
+                    file_receipt = link.request(file_req_path, data={})
+                    if isinstance(file_receipt, bool):
+                        if not file_receipt:
+                            continue
+                        file_receipt = link.request(file_req_path, data={})
+                    deadline = time.time() + 10
+                    while (hasattr(file_receipt, "response")
+                           and file_receipt.response is None
+                           and time.time() < deadline):
+                        time.sleep(0.1)
+                    if hasattr(file_receipt, "response") and file_receipt.response is not None:
+                        # Save to temp file
+                        import tempfile as _tempfile
+                        tmp = _tempfile.NamedTemporaryFile(
+                            suffix=".png", delete=False, dir=_app_data_dir())
+                        tmp.write(file_receipt.response)
+                        tmp.close()
+                        image_paths[filename] = tmp.name
+                except Exception:
+                    pass
+
+            self._show_profile_popup(target_hash, username, profile_text, image_paths)
 
         except Exception as e:
             print("Profile fetch error:", repr(e))
@@ -1685,17 +1717,40 @@ class sHadesClientApp(App):
         except Exception:
             self._set_status("Could not switch to profile screen")
 
-    def _show_profile_popup(self, target_hash, username, profile_text):
-        """Show a remote user's profile page in a popup."""
+    def _show_profile_popup(self, target_hash, username, profile_text,
+                            image_paths=None):
+        """Show a remote user's profile page in a popup.
+        Displays any images referenced in the profile page
+        (![alt](/file/name)) fetched from the remote node.
+        """
         from kivy.uix.popup import Popup
         from kivy.uix.label import Label
         from kivy.uix.scrollview import ScrollView
         from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.image import Image as KivyImage
+
+        # Remove image references from markdown (images shown separately)
+        import re as _re
+        clean_text = _re.sub(
+            r"!\[([^\]]*)\]\(/file/[^)]+\)", r"\1", profile_text)
 
         # Convert micron/markdown to Kivy markup
-        markup_text = md_to_kivy(profile_text)
+        markup_text = md_to_kivy(clean_text)
 
         content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
+
+        # Show fetched images at the top
+        if image_paths:
+            for filename, local_path in image_paths.items():
+                img = KivyImage(
+                    source=local_path,
+                    allow_stretch=False,
+                    keep_ratio=True,
+                    size_hint_y=None,
+                    height=dp(200),
+                )
+                content.add_widget(img)
+
         scroll = ScrollView()
         label = Label(text=markup_text, markup=True, size_hint_y=None,
                       halign="left", valign="top", text_size=(None, None))
@@ -1733,10 +1788,37 @@ class sHadesClientApp(App):
             "Node: %s" % self.node_hash,
             "Delivery: %s" % (self.delivery_hash or ""),
             "",
-            "Reticulum-native community hub client",
-            "",
         ]
+        # Reference the original pfp image served from this node's /file handler
+        orig_name = getattr(self, "my_avatar_orig", None)
+        if orig_name:
+            lines.append("![avatar](/file/%s)" % os.path.basename(orig_name))
+            lines.append("")
+        lines.append("Reticulum-native community hub client")
+        lines.append("")
         return ("\n".join(lines)).encode("utf-8")
+
+    def _file_handler(self, path, data, request_id, link_id,
+                      remote_identity, requested_at):
+        """Serve image files from this client's pfps directory.
+        Called by remote clients via RNS.Link.request("/file/<filename>").
+        Returns raw image bytes.
+        """
+        parts = path.split("/")
+        filename = parts[-1] if len(parts) > 1 else ""
+        if not filename:
+            return b"Not found"
+
+        app_dir = _app_data_dir()
+        pfp_dir = os.path.join(app_dir, "pfps")
+        file_path = os.path.join(pfp_dir, filename)
+
+        # Only serve files from the pfps directory (path traversal guard)
+        if not os.path.isfile(file_path):
+            return b"Not found"
+
+        with open(file_path, "rb") as f:
+            return f.read()
 
     def open_file_chooser(self, avatar=False):
         """Open a file chooser popup to attach a file or select an avatar."""
@@ -1906,6 +1988,7 @@ class sHadesClientApp(App):
             self._set_status("Avatar updated")
             # Profile screen shows original (full-size)
             self.profile_screen.target_avatar = orig_path
+            self.my_avatar_orig = orig_path
             if hasattr(self, "profile_screen"):
                 self.profile_screen.ids.profile_pfp.source = orig_path
             # Chat/members use 256x256 version
