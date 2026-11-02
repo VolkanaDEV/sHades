@@ -14,8 +14,6 @@ android.permissions = INTERNET,ACCESS_NETWORK_STATE,READ_EXTERNAL_STORAGE,WRITE_
 android.api = 33
 android.minapi = 24
 android.accept_sdk_license = True
-android.entrypoint = main
-android.manifest_template = AndroidManifest.tmpl
 p4a.branch = develop
 
 [buildozer]
