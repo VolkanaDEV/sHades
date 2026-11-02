@@ -290,6 +290,11 @@ if KIVY:
         """Circular-ish avatar placeholder with fallback color."""
         pass
 
+    class PassThroughImage(Image):
+        """Image that passes touch events through to parent widget."""
+        def on_touch_down(self, touch):
+            return False
+
     class PFPEditorWidget(FloatLayout):
         """Round-mask avatar cropper — image at natural size (never stretched),
         circle overlay is draggable and resizable."""
@@ -390,6 +395,7 @@ if KIVY:
                 new_r = (new_dx * new_dx + new_dy * new_dy) ** 0.5
                 rel_r = max(0.05, min(new_r / min(self.width, self.height), 0.5))
                 self.circle_radius = rel_r
+                print(f"[PFP DEBUG] drag resize: circle_radius={self.circle_radius:.3f}")
             self._last_pos = touch.pos
             return True
 
@@ -456,7 +462,7 @@ KV = r"""
         Line:
             circle: root.crop_cx, root.crop_cy, root.crop_r
             width: 2
-    Image:
+    PassThroughImage:
         id: pfp_img
         source: root.source
         allow_stretch: False
@@ -1955,7 +1961,7 @@ class sHadesClientApp(App):
 
         Both stored in app data dir under pfps/; 256x256 uploaded to guild.
         Circle params are relative (0-1) from the PFPEditorWidget.
-        Image is displayed at natural size centered in widget — map circle
+        image is displayed at natural size centered in widget — map circle
         from widget coords to image-relative coords for cropping.
         """
         try:
