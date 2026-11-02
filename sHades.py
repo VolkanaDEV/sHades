@@ -1111,6 +1111,8 @@ def run(argv=None):
     parser.add_argument("--storage", default=DEFAULT_STORAGE)
     parser.add_argument("--name", default=GUILD_NAME)
     parser.add_argument("--announce-delay", type=float, default=LXMF.LXMRouter.NODE_ANNOUNCE_DELAY)
+    parser.add_argument("--listen", default=None,
+                        help="TCP listen address:port for direct client connections (e.g. 0.0.0.0:29221)")
     parser.add_argument("--rns-configdir", default=None,
                         help="Reticulum config dir (default: <storage>/rns)")
     args = parser.parse_args(argv)
@@ -1127,10 +1129,30 @@ def run(argv=None):
     # Reticulum — RNS.initialize() does not exist in 1.1.3; construct the instance.
     # On first run, write our own config: standalone (share_instance = no, so the
     # guild never attaches to some other local instance's socket) + AutoInterface
-    # for LAN discoverability. If the config exists, it is used untouched.
+    # for LAN discoverability. If --listen is given, also add a TCPServerInterface
+    # so remote clients can connect directly by IP. If the config exists, it is
+    # used untouched unless the listen setting changed.
     rns_configdir = args.rns_configdir or os.path.join(STORAGE, "rns")
     cfgfile = os.path.join(rns_configdir, "config")
-    if not os.path.exists(cfgfile):
+
+    listen_host, listen_port = "0.0.0.0", 29221
+    if args.listen:
+        parts = args.listen.rsplit(":", 1)
+        listen_host = parts[0] if len(parts) == 2 else "0.0.0.0"
+        listen_port = int(parts[-1])
+
+    def _config_matches():
+        try:
+            with open(cfgfile) as f:
+                content = f.read()
+            if args.listen:
+                return ("listen_port = %d" % listen_port) in content and \
+                       ("listen_ip = %s" % listen_host) in content
+            return "AutoInterface" in content and "TCPServerInterface" not in content
+        except Exception:
+            return False
+
+    if not os.path.exists(cfgfile) or not _config_matches():
         os.makedirs(rns_configdir, exist_ok=True)
         with open(cfgfile, "w") as f:
             f.write("[reticulum]\n"
@@ -1140,6 +1162,12 @@ def run(argv=None):
                     "  [[AutoInterface]]\n"
                     "    type = AutoInterface\n"
                     "    enabled = yes\n")
+            if args.listen:
+                f.write("  [[TCPServerInterface]]\n"
+                        "    type = TCPServerInterface\n"
+                        "    enabled = yes\n"
+                        "    listen_ip = %s\n"
+                        "    listen_port = %d\n" % (listen_host, listen_port))
     reticulum = RNS.Reticulum(configdir=rns_configdir)
 
     ipath = os.path.join(STORAGE, "identity")
