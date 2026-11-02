@@ -159,10 +159,20 @@ class GuildAPI:
         if not isinstance(data, dict):
             data = {}
         receipt = self.link.request(path, data=data)
+        # link.request() may return a Receipt object (with .response) or
+        # True/False (bool) depending on RNS version. Handle both.
+        if isinstance(receipt, bool):
+            if not receipt:
+                return {"ok": 0, "error": "request failed"}
+            # RNS queued the request but gave no receipt — poll for response
+            # via a fresh receipt. Create one by calling request again without data.
+            receipt = self.link.request(path, data={})
         deadline = time.time() + timeout
-        while receipt.response is None and time.time() < deadline:
+        while (hasattr(receipt, "response")
+               and receipt.response is None
+               and time.time() < deadline):
             time.sleep(0.05)
-        if receipt.response is None:
+        if not hasattr(receipt, "response") or receipt.response is None:
             return {"ok": 0, "error": "timeout"}
         try:
             return msgpack.unpackb(receipt.response, raw=False)
@@ -1580,10 +1590,17 @@ class sHadesClientApp(App):
             # Request profile page
             req_path = "/page/profile/%s" % target_hash
             receipt = link.request(req_path, data={})
+            if isinstance(receipt, bool):
+                if not receipt:
+                    self._set_status("Profile request failed")
+                    return
+                receipt = link.request(req_path, data={})
             deadline = time.time() + 10
-            while receipt.response is None and time.time() < deadline:
+            while (hasattr(receipt, "response")
+                   and receipt.response is None
+                   and time.time() < deadline):
                 time.sleep(0.1)
-            if receipt.response is None:
+            if not hasattr(receipt, "response") or receipt.response is None:
                 self._set_status("Profile request timed out")
                 return
 
@@ -1596,11 +1613,18 @@ class sHadesClientApp(App):
 
     def _show_own_profile(self):
         """Show own profile locally."""
-        self.profile_screen = self.root.get_screen("profile")
+        try:
+            self.profile_screen = self.root.get_screen("profile")
+        except Exception:
+            self._set_status("Profile screen not available")
+            return
         self.profile_screen.target_hash = self.my_hash or ""
         self.profile_screen.target_username = self.username or "user"
         self.profile_screen.target_avatar = ""
-        self.root.current = "profile"
+        try:
+            self.root.current = "profile"
+        except Exception:
+            self._set_status("Could not switch to profile screen")
 
     def _show_profile_popup(self, target_hash, username, profile_text):
         """Show a remote user's profile page in a popup."""
