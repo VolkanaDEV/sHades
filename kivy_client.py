@@ -1838,12 +1838,15 @@ class sHadesClientApp(App):
         os.makedirs(pfp_dir, exist_ok=True)
 
         name = os.path.basename(path)
-        orig_path = os.path.join(pfp_dir, "orig_" + name)
-        small_path = os.path.join(pfp_dir, "small_" + name)
+        # Always use .png extension for saved pfps — PIL infers format
+        # from extension and cannot save RGBA as JPEG.
+        base = os.path.splitext(name)[0]
+        orig_path = os.path.join(pfp_dir, "orig_" + base + ".png")
+        small_path = os.path.join(pfp_dir, "small_" + base + ".png")
 
         if pil is not None:
             # Save original (full-size, used at top of profile page)
-            pil.save(orig_path)
+            pil.save(orig_path, "PNG")
 
             # Map circle from widget coords to image-relative coords
             img_x, img_y = image_pos if image_pos else (0, 0)
