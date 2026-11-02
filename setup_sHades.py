@@ -62,16 +62,16 @@ def hash_prompt(text):
         print("  not a valid 32-hex destination hash, try again")
 
 
-def address_prompt(text):
+def address_prompt(text, default=None):
     while True:
-        a = prompt(text).strip()
+        a = prompt(text, default).strip()
         if not a:
             print("  hub address is required, try again")
             continue
         m = ADDRESS_RE.match(a)
         if m:
             return m.group(1), int(m.group(2))
-        print("  not a valid ip:port address (e.g. 192.168.1.50:29221), try again")
+        print("  not a valid ip:port address (e.g. rns.reticulum.world:6666), try again")
 
 
 def rns_config_text():
@@ -173,8 +173,8 @@ def join_hub():
     """Configure this machine to join a pre-existing community hub."""
     print("\n=== Join a pre-existing sHades community hub ===")
     print("Connect to the hub by its address (ip:port).")
-    print("Get this from the hub admin, or from the hub's startup output.")
-    hub_host, hub_port = address_prompt("Hub address (ip:port)")
+    print("Defaults to the public RNS community hub: rns.reticulum.world:6666")
+    hub_host, hub_port = address_prompt("Hub address (ip:port)", "rns.reticulum.world:6666")
 
     print("\nOptional: guild destination hashes from the hub's guild_info.json.")
     print("Leave blank to skip — you'll still reach the hub by address.")
