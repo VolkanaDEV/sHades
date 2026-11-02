@@ -29,6 +29,7 @@ DEFAULT_GUILD_NAME = "sHades Hub"
 CLIENT_CONFIG = os.path.expanduser("~/.sHades_client.json")
 
 HUB_HASH_RE = re.compile(r"^[0-9a-f]{32}$")
+ADDRESS_RE = re.compile(r"^([^:]+):(\d+)$")
 
 
 def prompt(text, default=None):
@@ -59,6 +60,18 @@ def hash_prompt(text):
         if HUB_HASH_RE.match(h):
             return h
         print("  not a valid 32-hex destination hash, try again")
+
+
+def address_prompt(text):
+    while True:
+        a = prompt(text).strip()
+        if not a:
+            print("  hub address is required, try again")
+            continue
+        m = ADDRESS_RE.match(a)
+        if m:
+            return m.group(1), int(m.group(2))
+        print("  not a valid ip:port address (e.g. 192.168.1.50:29221), try again")
 
 
 def rns_config_text():
@@ -118,11 +131,16 @@ def fresh_hub():
 
     if yes_no("\nLaunch the sHades guild server now?", True):
         delay = prompt("Announce delay (seconds)", "2") or "2"
+        listen = prompt("Listen address:port for direct client connections "
+                        "(blank = LAN discovery only)", "")
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
+        server_args = ["/usr/bin/python3", SHades_PY, "--storage", storage,
+                       "--name", name, "--announce-delay", delay]
+        if listen:
+            server_args.extend(["--listen", listen])
         proc = subprocess.Popen(
-            ["/usr/bin/python3", SHades_PY, "--storage", storage,
-             "--name", name, "--announce-delay", delay],
+            server_args,
             cwd=RETI_DIR, env=env,
             stdout=open(os.path.join(storage, "sHades.log"), "ab"),
             stderr=subprocess.STDOUT)
@@ -154,10 +172,25 @@ def fresh_hub():
 def join_hub():
     """Configure this machine to join a pre-existing community hub."""
     print("\n=== Join a pre-existing sHades community hub ===")
-    print("You need the hub's destination hashes from its guild_info.json.")
-    node_hash = hash_prompt("Hub node_hash (browse address)")
-    delivery_hash = hash_prompt("Hub delivery_hash (post to this address)")
-    prop_hash = prompt("Hub propagation_hash (optional)", "") or None
+    print("Connect to the hub by its address (ip:port).")
+    print("Get this from the hub admin, or from the hub's startup output.")
+    hub_host, hub_port = address_prompt("Hub address (ip:port)")
+
+    print("\nOptional: guild destination hashes from the hub's guild_info.json.")
+    print("Leave blank to skip — you'll still reach the hub by address.")
+    node_hash = prompt("Hub node_hash (32 hex, optional)", "").strip().lower() or None
+    delivery_hash = prompt("Hub delivery_hash (32 hex, optional)", "").strip().lower() or None
+    prop_hash = prompt("Hub propagation_hash (32 hex, optional)", "").strip().lower() or None
+
+    if node_hash and not HUB_HASH_RE.match(node_hash):
+        print("  invalid node_hash, clearing")
+        node_hash = None
+    if delivery_hash and not HUB_HASH_RE.match(delivery_hash):
+        print("  invalid delivery_hash, clearing")
+        delivery_hash = None
+    if prop_hash and not HUB_HASH_RE.match(prop_hash):
+        print("  invalid propagation_hash, clearing")
+        prop_hash = None
 
     # Generate a local client identity
     client_dir = os.path.expanduser("~/.sHades_client")
@@ -172,6 +205,9 @@ def join_hub():
 
     cfg = {
         "hub": {
+            "address": "%s:%d" % (hub_host, hub_port),
+            "host": hub_host,
+            "port": hub_port,
             "node_hash": node_hash,
             "delivery_hash": delivery_hash,
             "propagation_hash": prop_hash,
@@ -185,11 +221,12 @@ def join_hub():
         json.dump(cfg, f, indent=2)
 
     print(f"\nClient config written: {CLIENT_CONFIG}")
+    print(f"  hub address : {hub_host}:{hub_port}")
     print(f"  client delivery hash: {client_hash}")
-    print("\nTo post to the hub from an LXMF client, message:")
-    print(f"  {delivery_hash}   with a leading '#channel' token, e.g. '#general hello'")
-    print("To browse the hub in NomadNet, add node:")
-    print(f"  {node_hash}")
+    if node_hash:
+        print(f"  hub node_hash : {node_hash}")
+    print("\nTo connect, run the sHades client and enter the hub address above.")
+    print("The RNS config (~/.sHades_client/rns/config) now routes to the hub directly.")
     print("\nIf you run the sHades server on this machine too, point it at a *different* "
           "storage dir and set share_instance=yes in both RNS configs to share the instance.")
 
