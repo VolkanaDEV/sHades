@@ -375,7 +375,7 @@ def ingest(channel_id, author_hash, content, ts=None, attachments=None):
     if is_muted(author_hash):
         return None  # muted: post silently dropped
     content = (content or "").strip()
-    if not content:
+    if not content and not attachments:
         return None
     if len(content) > MAX_CONTENT_LEN:
         content = content[:MAX_CONTENT_LEN]
@@ -1001,13 +1001,16 @@ def api_post(viewer, data):
     with db_lock:
         if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
             return api_error("unknown channel", 404)
-    if not isinstance(content, str) or not content.strip():
+    if not isinstance(content, str):
         return api_error("empty content", 400)
-    if not rate_ok(viewer, cid):
-        return api_error("rate limited", 429)
+    # A message may be attachment-only (no text); require at least one.
     atts = data.get("attachments") or []
     if not isinstance(atts, list):
         atts = []
+    if not content.strip() and not atts:
+        return api_error("empty content", 400)
+    if not rate_ok(viewer, cid):
+        return api_error("rate limited", 429)
     msg_id = ingest(cid, viewer, content, attachments=atts[:MAX_ATTACHMENTS])
     if msg_id is None:
         return api_error("rejected", 400)
