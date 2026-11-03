@@ -459,27 +459,48 @@ if KIVY:
             self.size_hint = (1, 1)
 
         def download_image(self):
-            """Download the image to local storage."""
+            """Save the displayed image to the user's Downloads folder.
+
+            Sources are either local temp files (ephemeral embeds / cached
+            avatars) or /file/attachments/... paths served by the guild over
+            the RNS link. requests/HTTP is not used: it is not a declared
+            dependency and none of these sources are HTTP URLs.
+            """
             import threading
-            import tempfile
-            import requests
+            import shutil
             from kivy.clock import Clock
+            from kivy.app import App
 
             def do_download():
                 try:
-                    url = self.source
-                    resp = requests.get(url, timeout=30, stream=True)
-                    resp.raise_for_status()
-                    ext = os.path.splitext(url.split("?")[0])[1].lower()
-                    if not ext:
-                        ext = ".png"
-                    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        tmp.write(chunk)
-                    tmp.close()
-                    Clock.schedule_once(lambda dt: self._show_status(f"Saved to {tmp.name}"), 0)
-                except Exception:
-                    Clock.schedule_once(lambda dt: self._show_status("Download failed"), 0)
+                    src = self.source
+                    basename = os.path.basename(src.split("?")[0]) or "image.png"
+                    out_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+                    os.makedirs(out_dir, exist_ok=True)
+                    out_path = os.path.join(out_dir, basename)
+
+                    if os.path.isfile(src):
+                        # Local temp file (ephemeral embed or cached avatar).
+                        shutil.copy2(src, out_path)
+                    elif src.startswith("/file/"):
+                        # Server-stored attachment — fetch via RNS link.
+                        app = App.get_running_app()
+                        api = getattr(app, "guild_api", None)
+                        if api is None:
+                            raise RuntimeError("Not connected to guild")
+                        blob = api.fetch_file(src)
+                        if not blob:
+                            raise RuntimeError("Fetch returned empty")
+                        with open(out_path, "wb") as f:
+                            f.write(blob)
+                    else:
+                        raise RuntimeError("Unsupported source: %s" % src)
+
+                    Clock.schedule_once(
+                        lambda dt: self._show_status("Saved to %s" % out_path), 0)
+                except Exception as e:
+                    Clock.schedule_once(
+                        lambda dt: self._show_status("Download failed: %s" % e), 0)
 
             threading.Thread(target=do_download, daemon=True).start()
 
@@ -1070,6 +1091,7 @@ if KIVY:
     class MainScreen(Screen):
         left_open = BooleanProperty(True)
         right_open = BooleanProperty(True)
+        _current_channel = StringProperty("general")
 
         def toggle_left(self):
             self.left_open = not self.left_open
@@ -1236,7 +1258,9 @@ class sHadesClientApp(MDApp):
 
     def _save_session(self):
         try:
-            with open(self._session_path(), "w") as f:
+            path = self._session_path()
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump({
                     "node_hash": self.node_hash,
                     "delivery_hash": self.delivery_hash,
@@ -1245,6 +1269,7 @@ class sHadesClientApp(MDApp):
                     "hub_host": self.hub_host,
                     "hub_port": self.hub_port,
                 }, f)
+            os.replace(tmp, path)  # atomic on POSIX and Windows
         except Exception:
             pass
 
@@ -1671,8 +1696,8 @@ class sHadesClientApp(MDApp):
             path = IMAGE_CACHE.get(key)
             if path:
                 avatar_source = path
-            else:
-                # fetch avatar
+            elif key not in IMAGE_CACHE._loading:
+                # fetch avatar — deduplicate in-flight requests
                 def _do_av(a=author, k=key):
                     res = self.guild_api.avatar_get(a)
                     if res.get("ok") and res.get("avatar"):
@@ -1874,6 +1899,16 @@ class sHadesClientApp(MDApp):
         else:
             row.content = content
             row.content_markup = md_to_kivy(content)
+            # Rebuild embeds to match the updated content (an edit may remove
+            # an image URL that a previous embed widget is still showing).
+            container = row.ids.get("embed_container")
+            if container:
+                container.clear_widgets()
+            for url in find_urls(content):
+                ext = os.path.splitext(url.split("?")[0])[1].lower()
+                if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+                    emb = MessageEmbed(source=url, size_hint_y=None, height=dp(200))
+                    container.add_widget(emb)
 
     def _scroll_to_bottom(self):
         try:
@@ -1903,6 +1938,11 @@ class sHadesClientApp(MDApp):
     def _switch_channel(self, name):
         main = self.root.get_screen("main")
         main._current_channel = name
+        # Keep the channel header in sync with the active channel.
+        try:
+            main.ids.channel_header.text = "#" + name
+        except Exception:
+            pass
         grid = main.ids.message_grid
         grid.clear_widgets()
         self._msg_widgets.clear()
@@ -1977,22 +2017,25 @@ class sHadesClientApp(MDApp):
         """
         # Tab focus traversal on the connect screen
         if key == 9:
-            connect = self.root.get_screen("connect") if self.root else None
-            if connect:
-                fields = [
-                    connect.ids.hub_address,
-                    connect.ids.username,
-                    connect.ids.node_hash,
-                    connect.ids.delivery_hash,
-                ]
-                focused = next(
-                    (f for f in fields if getattr(f, "focus", False)), None
-                )
-                if focused is not None:
-                    idx = fields.index(focused)
-                    next_idx = (idx + 1) % len(fields)
-                    fields[next_idx].focus = True
-                    return True
+            try:
+                connect = self.root.get_screen("connect") if self.root else None
+                if connect and hasattr(connect.ids, "hub_address"):
+                    fields = [
+                        connect.ids.hub_address,
+                        connect.ids.username,
+                        connect.ids.node_hash,
+                        connect.ids.delivery_hash,
+                    ]
+                    focused = next(
+                        (f for f in fields if getattr(f, "focus", False)), None
+                    )
+                    if focused is not None:
+                        idx = fields.index(focused)
+                        next_idx = (idx + 1) % len(fields)
+                        fields[next_idx].focus = True
+                        return True
+            except Exception:
+                pass
 
         main = self.root.get_screen("main") if self.root else None
         inp = main.ids.msg_input if main else None
@@ -2620,7 +2663,8 @@ class sHadesClientApp(MDApp):
         # Force re-render of own avatar in IMAGE_CACHE so new messages pick it up
         if self.my_hash:
             key = "av:" + self.my_hash
-            IMAGE_CACHE.set_bytes(key, open(small_path, "rb").read(), "png")
+            with open(small_path, "rb") as f:
+                IMAGE_CACHE.set_bytes(key, f.read(), "png")
 
     def attach_file(self, path):
         """Attach a file to the current message input as an upload."""

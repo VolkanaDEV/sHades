@@ -952,6 +952,18 @@ def api_messages(viewer, data):
             new_rows = db.execute(
                 "SELECT * FROM messages WHERE channel_id=? AND id>? ORDER BY id ASC LIMIT ?",
                 (cid, since_id, limit)).fetchall()
+        elif isinstance(since_id, str) and since_id:
+            # since_id is a msg_id hash string, not the integer PK. Resolve it
+            # first so delta polling returns rows after the last seen message.
+            bound = db.execute(
+                "SELECT id FROM messages WHERE msg_id=? AND channel_id=?",
+                (since_id, cid)).fetchone()
+            if bound:
+                new_rows = db.execute(
+                    "SELECT * FROM messages WHERE channel_id=? AND id>? ORDER BY id ASC LIMIT ?",
+                    (cid, bound["id"], limit)).fetchall()
+            else:
+                new_rows = []
         else:
             new_rows = db.execute(
                 "SELECT * FROM messages WHERE channel_id=? ORDER BY id DESC LIMIT ?",
@@ -999,7 +1011,21 @@ def api_post(viewer, data):
     msg_id = ingest(cid, viewer, content, attachments=atts[:MAX_ATTACHMENTS])
     if msg_id is None:
         return api_error("rejected", 400)
-    return msgpack.packb({"ok": 1, "msg_id": msg_id})
+    # Return stored attachment metadata so the client knows it's server-stored.
+    with db_lock:
+        att_row = db.execute(
+            "SELECT name, mime, size, path FROM attachments WHERE msg_id=? ORDER BY idx LIMIT 1",
+            (msg_id,),
+        ).fetchone()
+    resp = {"ok": 1, "msg_id": msg_id}
+    if att_row:
+        resp["attachment"] = {
+            "name": att_row["name"],
+            "mime": att_row["mime"],
+            "size": att_row["size"],
+            "path": "/file/attachments/" + att_row["path"],
+        }
+    return msgpack.packb(resp)
 
 def _mutate_msg(viewer, data, action):
     msg_id = data.get("msg")
