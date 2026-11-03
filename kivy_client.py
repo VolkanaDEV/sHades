@@ -1882,12 +1882,20 @@ class sHadesClientApp(MDApp):
             def apply(dt):
                 try:
                     self._remove_placeholder(row)
+                    # Always add the embed to the row's container. The row may
+                    # have been removed from the grid (channel switch) while the
+                    # download was in flight, but the embed container still
+                    # exists on the row object and the embed will show when the
+                    # row is re-added to the grid.
                     main = self.root.get_screen("main")
-                    # channel may have switched while we were downloading
-                    if main.ids.message_grid is not row.parent:
+                    if main is None:
                         return
                     if msg_id and msg_id not in self._msg_widgets:
-                        return
+                        # Row was removed from widgets; re-add it to the grid
+                        # so the embed is visible.
+                        grid = main.ids.message_grid
+                        if grid is not None and row.parent is None:
+                            grid.add_widget(row)
                     print(f"[TRACE] _fetch_attachment.apply: adding embed for {name}", flush=True)
                     dlog(f"_fetch_attachment.apply: adding embed for {name}")
                     self._add_attachment_embed(row, name, blob)
