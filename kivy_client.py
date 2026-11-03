@@ -1977,7 +1977,10 @@ class sHadesClientApp(MDApp):
         main = self.root.get_screen("main")
         inp = main.ids.msg_input
         text = (inp.text or "").strip()
-        if not text or not self.guild_api:
+        if not self.guild_api:
+            return
+        # Allow attachment-only messages (no text) when a file is pending.
+        if not text and not getattr(self, "_pending_attachment", None):
             return
         cid = getattr(main, "_current_channel", "general")
         cid = self._channel_cid(cid)
