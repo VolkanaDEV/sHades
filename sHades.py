@@ -35,6 +35,8 @@ from RNS.vendor import umsgpack as msgpack
 DEFAULT_STORAGE = os.path.expanduser("~/.sHades")
 GUILD_NAME      = "sHades Hub"
 
+DEBUG           = False   # set via --debug; enables verbose attachment/ingest logging
+
 MAX_CONTENT_LEN   = 2000          # per-message character cap (Discord-style)
 MAX_ATTACHMENTS   = 4             # files per message
 MAX_ATTACHMENT_SZ = 8 * 1024 * 1024
@@ -142,6 +144,12 @@ def hexstr(b):
 
 def now():
     return time.time()
+
+
+def dlog(msg):
+    """Debug log — only prints when --debug is passed."""
+    if DEBUG:
+        print(f"[DEBUG] {msg}", flush=True)
 
 # ----------------------------------------------------------------------------------
 # Micron rendering (verified grammar: nomadnet/ui/textui/MicronParser.py, Browser.py)
@@ -345,23 +353,34 @@ def store_attachment(name, mime, data):
     adir = os.path.join(STORAGE, "attachments")
     os.makedirs(adir, exist_ok=True)
     path = os.path.join(adir, fname)
-    if not os.path.exists(path):
-        with open(path, "wb") as f:
-            f.write(data)
+    try:
+        if not os.path.exists(path):
+            with open(path, "wb") as f:
+                f.write(data)
+    except Exception as e:
+        RNS.log(f"store_attachment write failed for {fname}: {e}", RNS.LOG_ERROR)
+        return None
+    dlog(f"store_attachment: name={name!r} mime={mime!r} size={len(data)} fname={fname}")
     if node_destination is not None:
         node_destination.register_request_handler(
             "/file/attachments/" + fname, serve_attachment_file,
             allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
+        dlog(f"store_attachment: registered handler /file/attachments/{fname}")
     return fname
 
 def serve_attachment_file(path, data, request_id, link_id, remote_identity, requested_at):
     fname = path.rsplit("/", 1)[-1]
+    dlog(f"serve_attachment_file: requested fname={fname!r}")
     if not re.match(r"^[0-9a-f]{32}\.[a-z0-9]{1,8}$", fname):
+        dlog(f"serve_attachment_file: invalid fname {fname!r}")
         return b"not found"
     fpath = os.path.join(STORAGE, "attachments", fname)
     if os.path.isfile(fpath):
         with open(fpath, "rb") as f:
-            return f.read()
+            blob = f.read()
+        dlog(f"serve_attachment_file: served {fname} ({len(blob)} bytes)")
+        return blob
+    dlog(f"serve_attachment_file: file not found {fpath}")
     return b"not found"
 
 # ----------------------------------------------------------------------------------
@@ -370,12 +389,14 @@ def serve_attachment_file(path, data, request_id, link_id, remote_identity, requ
 # ----------------------------------------------------------------------------------
 
 def ingest(channel_id, author_hash, content, ts=None, attachments=None):
+    dlog(f"ingest: channel={channel_id[:12]} author={author_hash[:12]} content_len={len(content or '')} attachments={len(attachments or [])}")
     if is_banned(author_hash):
         return None
     if is_muted(author_hash):
         return None  # muted: post silently dropped
     content = (content or "").strip()
     if not content and not attachments:
+        dlog(f"ingest: empty content and no attachments, rejecting")
         return None
     if len(content) > MAX_CONTENT_LEN:
         content = content[:MAX_CONTENT_LEN]
@@ -384,6 +405,7 @@ def ingest(channel_id, author_hash, content, ts=None, attachments=None):
         f"{channel_id}|{author_hash}|{ts}|{content}".encode()))
     with db_lock:
         if db.execute("SELECT 1 FROM messages WHERE msg_id=?", (msg_id,)).fetchone():
+            dlog(f"ingest: duplicate msg_id {msg_id[:12]}")
             return None  # duplicate
         # zero-login: auto-register placeholder username on first post
         db.execute("INSERT OR IGNORE INTO users (dest_hash, username, registered_at) "
@@ -395,12 +417,16 @@ def ingest(channel_id, author_hash, content, ts=None, attachments=None):
             try:
                 name, mime, blob = att
             except Exception:
+                dlog(f"ingest: malformed attachment at idx {idx}, skipping")
                 continue
             fname = store_attachment(str(name)[:128], str(mime)[:64], blob)
             if fname:
+                dlog(f"ingest: stored attachment idx={idx} name={name} fname={fname}")
                 db.execute("INSERT OR REPLACE INTO attachments "
                            "(msg_id, idx, name, mime, size, path) VALUES (?, ?, ?, ?, ?, ?)",
                            (msg_id, idx, str(name)[:128], str(mime)[:64], len(blob), fname))
+            else:
+                dlog(f"ingest: store_attachment returned None for idx={idx} name={name}")
         db.execute("INSERT INTO members (channel_id, member_hash, last_post) VALUES (?, ?, ?) "
                    "ON CONFLICT(channel_id, member_hash) DO UPDATE SET last_post=excluded.last_post",
                    (channel_id, author_hash, ts))
@@ -998,22 +1024,25 @@ def api_messages(viewer, data):
 def api_post(viewer, data):
     cid = data.get("channel")
     content = data.get("content")
+    atts = data.get("attachments") or []
+    if not isinstance(atts, list):
+        atts = []
+    dlog(f"api_post: viewer={viewer[:12]} channel={cid} content_len={len(content or '')} attachments={len(atts)}")
     with db_lock:
         if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
             return api_error("unknown channel", 404)
     if not isinstance(content, str):
         return api_error("empty content", 400)
     # A message may be attachment-only (no text); require at least one.
-    atts = data.get("attachments") or []
-    if not isinstance(atts, list):
-        atts = []
     if not content.strip() and not atts:
         return api_error("empty content", 400)
     if not rate_ok(viewer, cid):
         return api_error("rate limited", 429)
     msg_id = ingest(cid, viewer, content, attachments=atts[:MAX_ATTACHMENTS])
     if msg_id is None:
+        dlog(f"api_post: ingest rejected for channel={cid}")
         return api_error("rejected", 400)
+    dlog(f"api_post: ingest ok msg_id={msg_id[:12]}")
     # Return stored attachment metadata so the client knows it's server-stored.
     with db_lock:
         att_row = db.execute(
@@ -1022,6 +1051,7 @@ def api_post(viewer, data):
         ).fetchone()
     resp = {"ok": 1, "msg_id": msg_id}
     if att_row:
+        dlog(f"api_post: attachment metadata name={att_row['name']} path={att_row['path']}")
         resp["attachment"] = {
             "name": att_row["name"],
             "mime": att_row["mime"],
@@ -1195,11 +1225,14 @@ def run(argv=None):
                         help="TCP listen address:port for direct client connections (e.g. 0.0.0.0:29221)")
     parser.add_argument("--rns-configdir", default=None,
                         help="Reticulum config dir (default: <storage>/rns)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable verbose debug logging for attachments and ingest")
     args = parser.parse_args(argv)
 
     STORAGE = os.path.abspath(args.storage)
     GUILD_NAME = args.name
     ANNOUNCE_DELAY = args.announce_delay
+    DEBUG = args.debug
     os.makedirs(STORAGE, exist_ok=True)
     os.makedirs(os.path.join(STORAGE, "attachments"), exist_ok=True)
     os.makedirs(os.path.join(STORAGE, "avatars"), exist_ok=True)

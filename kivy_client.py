@@ -88,6 +88,8 @@ ATT_SERVER = "server"
 ATT_EPHEMERAL = "ephemeral"
 ATT_PLACEHOLDER_TEXT = "[loading image…]"
 
+DEBUG = False  # set via --debug CLI arg; enables verbose attachment/ingest logging
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -166,6 +168,12 @@ def _escape(s):
 
 def find_urls(text):
     return _URL.findall(text or "")
+
+
+def dlog(msg):
+    """Debug log — only prints when --debug is passed."""
+    if DEBUG:
+        print(f"[DEBUG] {msg}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -251,18 +259,22 @@ class GuildAPI:
 
     def fetch_file(self, path):
         """Fetch raw bytes from a /file/... request handler on the guild."""
+        dlog(f"fetch_file: requesting {path}")
         receipt = self.link.request(path, data={})
         # link.request() may return a Receipt object (with .response) or
         # True/False (bool) depending on RNS version. Handle both.
         if isinstance(receipt, bool):
             if not receipt:
+                dlog(f"fetch_file: link.request returned False for {path}")
                 return None
             receipt = self.link.request(path, data={})
         deadline = time.time() + 15
         while receipt.response is None and time.time() < deadline:
             time.sleep(0.05)
         if receipt.response is None:
+            dlog(f"fetch_file: timeout for {path}")
             return None
+        dlog(f"fetch_file: received {len(receipt.response)} bytes for {path}")
         return receipt.response
 
 
@@ -1791,6 +1803,7 @@ class sHadesClientApp(MDApp):
 
     def _add_attachment_embed(self, row, name, blob):
         """Render one attachment: images inline, everything else as a label."""
+        dlog(f"_add_attachment_embed: name={name} blob_size={len(blob)} ext={os.path.splitext(name)[1].lower()}")
         ext = os.path.splitext(name)[1].lower()
         if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
             import tempfile
@@ -1838,22 +1851,27 @@ class sHadesClientApp(MDApp):
         the embed back on the UI thread. A loading placeholder is shown until
         the image has been received.
         """
+        dlog(f"_fetch_attachment: msg_id={msg_id} name={att.get('name')!r} path={att.get('path')!r}")
         name = att.get("name") or ""
         path = att.get("path") or ""
         if not path:
+            dlog(f"_fetch_attachment: no path, skipping")
             return
 
         self._add_loading_placeholder(row)
 
         def work():
+            dlog(f"_fetch_attachment.work: fetching {path}")
             try:
                 blob = self.guild_api.fetch_file(path)
             except Exception:
                 blob = None
             if not blob:
+                dlog(f"_fetch_attachment.work: fetch returned empty for {path}")
                 Clock.schedule_once(
                     lambda dt: self._remove_placeholder(row), 0)
                 return
+            dlog(f"_fetch_attachment.work: received {len(blob)} bytes for {path}")
 
             def apply(dt):
                 try:
@@ -1864,6 +1882,7 @@ class sHadesClientApp(MDApp):
                         return
                     if msg_id and msg_id not in self._msg_widgets:
                         return
+                    dlog(f"_fetch_attachment.apply: adding embed for {name}")
                     self._add_attachment_embed(row, name, blob)
                 except Exception as e:
                     print("attachment render error:", e)
@@ -2057,6 +2076,7 @@ class sHadesClientApp(MDApp):
     # -- attachments: server-stored vs ephemeral (P2P) -------------------
     def _add_loading_placeholder(self, row):
         """Show a loading placeholder in the row's embed container."""
+        dlog(f"_add_loading_placeholder: row={row.msg_id[:12] if row.msg_id else '?'}")
         lbl = Label(
             text=ATT_PLACEHOLDER_TEXT,
             size_hint_y=None,
@@ -2072,6 +2092,7 @@ class sHadesClientApp(MDApp):
         """Remove the loading placeholder from the row's embed container."""
         lbl = getattr(row, "_loading_placeholder", None)
         if lbl is not None:
+            dlog(f"_remove_placeholder: row={row.msg_id[:12] if row.msg_id else '?'}")
             try:
                 row.ids.embed_container.remove_widget(lbl)
             except Exception:
@@ -2169,6 +2190,7 @@ class sHadesClientApp(MDApp):
         The wire format is always a [name, mime, blob] triple; the chosen
         style only affects how the client persists/re-fetches the attachment.
         """
+        dlog(f"_send_with_attachment: name={name} mime={mime} size={len(blob)} style={style} text_len={len(text or '')}")
         if not self.guild_api:
             self._set_status("Not connected to guild")
             return
@@ -2177,7 +2199,9 @@ class sHadesClientApp(MDApp):
         cid = self._channel_cid(cid)
 
         def work():
+            dlog(f"_send_with_attachment.work: posting to channel={cid}")
             res = self.guild_api.post(cid, text, attachments=[[name, mime, blob]])
+            dlog(f"_send_with_attachment.work: post response ok={res.get('ok')} msg_id={res.get('msg_id')} attachment={res.get('attachment')}")
             if not res.get("ok"):
                 Clock.schedule_once(
                     lambda dt: self._set_status("send failed: %s" % res.get("error", "unknown")), 0)
@@ -2187,10 +2211,12 @@ class sHadesClientApp(MDApp):
             srv_att = res.get("attachment") or {}
             srv_path = srv_att.get("path")
             if style == ATT_SERVER and srv_path:
+                dlog(f"_send_with_attachment.work: server-stored path={srv_path}")
                 att = {"name": name, "mime": mime, "size": len(blob),
                        "kind": ATT_SERVER, "path": srv_path}
             else:
                 # Ephemeral (or server did not ack a path): keep blob locally.
+                dlog(f"_send_with_attachment.work: ephemeral style={style} srv_path={srv_path}")
                 local_path = self._save_attachment_blob(blob, name)
                 att = {"name": name, "mime": mime, "kind": ATT_EPHEMERAL,
                        "local_path": local_path}
@@ -2743,6 +2769,13 @@ if __name__ == "__main__":
         print("Kivy is required to run the client: pip install kivy[base]", file=sys.stderr)
         print(_KIVY_IMPORT_ERROR)
         sys.exit(1)
+
+    # --debug enables verbose attachment/ingest logging on the client.
+    import argparse as _argparse
+    _dbg_parser = _argparse.ArgumentParser(add_help=False)
+    _dbg_parser.add_argument("--debug", action="store_true")
+    _dbg_args, _ = _dbg_parser.parse_known_args()
+    DEBUG = _dbg_args.debug
 
     # Graceful GL backend fallback: Wayland without a GPU, headless runners,
     # and VMs often fail with "No matching FB config found" from SDL2/OpenGL.
