@@ -33,23 +33,34 @@ try:
     from kivy.uix.boxlayout import BoxLayout
     from kivy.uix.floatlayout import FloatLayout
     from kivy.uix.label import Label
-    from kivy.uix.image import Image
+    from kivy.uix.image import Image, AsyncImage
     from kivy.uix.screenmanager import ScreenManager, Screen
     from kivy.core.window import Window
     from kivy.clock import Clock
     from kivy.properties import (
         StringProperty, ObjectProperty, BooleanProperty, NumericProperty,
     )
-    from kivy.lang import Builder
     from kivy.uix.behaviors import ButtonBehavior
     from kivy.uix.filechooser import FileChooserListView
     from kivy.uix.popup import Popup
     from kivy.uix.button import Button
+    from kivy.uix.togglebutton import ToggleButton
     from kivy.metrics import dp, sp
     KIVY = True
 except Exception as _e:  # pragma: no cover - Kivy missing at import time
     KIVY = False
     _KIVY_IMPORT_ERROR = _e
+
+# KivyMD imports (only available if Kivy is present)
+if KIVY:
+    try:
+        from kivymd.app import MDApp
+        KIVYMD = True
+    except Exception as _e:
+        KIVYMD = False
+        _KIVYMD_IMPORT_ERROR = _e
+else:
+    KIVYMD = False
 
 import RNS
 from RNS.vendor import umsgpack as msgpack
@@ -67,6 +78,15 @@ TEXT_MUTED= "#8E9297"   # secondary text
 LINK      = "#00A2E8"   # links / embeds
 ACCENT    = "#5865F2"   # accent / unread divider
 AVATAR_BG = "#7289DA"
+
+# Attachment storage styles:
+#   server   - file is stored on the guild; bytes re-fetched via /file/attachments
+#              path (survives restart, shown with a loading placeholder until received).
+#   ephemeral - file is sent inline as [name, mime, blob] (p2p); bytes kept locally
+#              so they survive restart, but there is no server copy to re-fetch.
+ATT_SERVER = "server"
+ATT_EPHEMERAL = "ephemeral"
+ATT_PLACEHOLDER_TEXT = "[loading image…]"
 
 
 # ---------------------------------------------------------------------------
@@ -407,10 +427,75 @@ if KIVY:
                 return True
             return super().on_touch_up(touch)
 
-    class MessageEmbed(Image, ButtonBehavior):
-        """Clickable image embed."""
+    class MessageEmbed(AsyncImage, ButtonBehavior):
+        """Clickable image embed - click to expand to full screen, click again to minimize.
+
+        Renders at a fixed uniform height (STANDARD_HEIGHT) and scales to fit
+        without stretching (allow_stretch=False, keep_ratio=True).
+        """
+        STANDARD_HEIGHT = dp(200)
         source_url = StringProperty("")
-        pass
+        is_expanded = BooleanProperty(False)
+
+        def on_release(self):
+            app = App.get_running_app()
+            if not app:
+                return True
+            if self.is_expanded:
+                app.dismiss_fullscreen_image(self)
+            else:
+                app.show_fullscreen_image(self.source, embed=self)
+                self.is_expanded = True
+            return True
+
+
+    class FullScreenImageOverlay(FloatLayout):
+        """Full-screen image viewer with dark overlay and download/close buttons."""
+        source = StringProperty("")
+        embed = ObjectProperty(None, allownone=True)
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.size_hint = (1, 1)
+
+        def download_image(self):
+            """Download the image to local storage."""
+            import threading
+            import tempfile
+            import requests
+            from kivy.clock import Clock
+
+            def do_download():
+                try:
+                    url = self.source
+                    resp = requests.get(url, timeout=30, stream=True)
+                    resp.raise_for_status()
+                    ext = os.path.splitext(url.split("?")[0])[1].lower()
+                    if not ext:
+                        ext = ".png"
+                    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        tmp.write(chunk)
+                    tmp.close()
+                    Clock.schedule_once(lambda dt: self._show_status(f"Saved to {tmp.name}"), 0)
+                except Exception:
+                    Clock.schedule_once(lambda dt: self._show_status("Download failed"), 0)
+
+            threading.Thread(target=do_download, daemon=True).start()
+
+        def _show_status(self, text):
+            app = App.get_running_app()
+            if app:
+                app._set_status(text)
+
+        def dismiss(self):
+            """Close the full-screen overlay and tell the embed to minimize."""
+            app = App.get_running_app()
+            if app and self.embed is not None:
+                app.dismiss_fullscreen_image(self.embed)
+            elif self.parent:
+                self.parent.remove_widget(self)
+
 
     class MessageRow(BoxLayout):
         """One chat message."""
@@ -429,6 +514,18 @@ if KIVY:
             self.height = dp(56)
             self.padding = [dp(8), dp(4)]
             self.spacing = dp(8)
+            # Ensure embed_container exists even if KV isn't loaded
+            if not hasattr(self.ids, "embed_container"):
+                from kivy.uix.boxlayout import BoxLayout
+                container = BoxLayout(
+                    orientation="vertical",
+                    size_hint_y=None,
+                    height=0,
+                    spacing=dp(4),
+                )
+                container.bind(minimum_height=container.setter("height"))
+                self.ids["embed_container"] = container
+                self.add_widget(container)
 
         def on_content_markup(self, instance, value):
             # Rebuild content line after markup set
@@ -468,6 +565,10 @@ KV = r"""
         allow_stretch: False
         keep_ratio: True
         size_hint: None, None
+        # Re-size when the texture arrives. on_source() cannot be relied on
+        # for this: `source` is set in the constructor, i.e. before the KV rule
+        # creates pfp_img, so root.ids is still empty when it fires.
+        on_texture_size: root._size_image()
 
 <MessageRow>:
     orientation: 'horizontal'
@@ -976,13 +1077,11 @@ if KIVY:
         def toggle_right(self):
             self.right_open = not self.right_open
 
-    Builder.load_string(KV)
-
 
 # ---------------------------------------------------------------------------
 # Main app
 # ---------------------------------------------------------------------------
-class sHadesClientApp(App):
+class sHadesClientApp(MDApp):
     title = "sHades"
 
     guild_api = ObjectProperty(None, allownone=True)
@@ -991,6 +1090,11 @@ class sHadesClientApp(App):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        # Theme config - KivyMD 2.0.0 Material You color system
+        # Use valid palette names: "Blue", "Purple", "Red", "Green", etc.
+        self.theme_cls.theme_style = "Dark"
+        self.theme_cls.primary_palette = "Blue"
+        self.theme_cls.accent_palette = "Orange"
         self.node_hash = None
         self.delivery_hash = None
         self.client_identity = None
@@ -1052,11 +1156,21 @@ class sHadesClientApp(App):
     # -- lifecycle -------------------------------------------------------
     def build(self):
         if Window:
-            Window.clearcolor = (0.14, 0.16, 0.19, 1)
+            self.theme_cls.set_colors()
+            Window.clearcolor = self.theme_cls.backgroundColor
+        # Import KivyMD widgets so they're registered in Factory before KV loads
+        from kivymd.uix.button import MDButton, MDButtonText, MDIconButton  # noqa: F401
+        from kivymd.uix.textfield import MDTextField  # noqa: F401
+        from kivymd.uix.appbar import MDTopAppBar  # noqa: F401
+        from kivy.lang import Builder
+        Builder.load_file("kv_md.kv")
         sm = ScreenManager()
         sm.add_widget(ConnectScreen(name="connect"))
         sm.add_widget(MainScreen(name="main"))
         sm.add_widget(ProfileScreen(name="profile"))
+        # Plain Enter sends the message; Shift+Enter inserts a newline
+        # (multiline input). Handled via _on_key_down below.
+        Window.bind(on_key_down=self._on_key_down)
         return sm
 
     def on_start(self):
@@ -1071,6 +1185,10 @@ class sHadesClientApp(App):
             self.hub_port = sess.get("hub_port")
             self._open_main()
             Clock.schedule_once(lambda dt: self._init_reticulum(), 0.5)
+            # Re-render persisted history (embeds survive close/re-open) once
+            # the guild API is up; server-stored attachments re-fetch with a
+            # loading placeholder until their bytes arrive.
+            Clock.schedule_once(self._load_history_ui, 2.0)
 
     def _open_main(self):
         """Switch to the main chat screen."""
@@ -1079,6 +1197,36 @@ class sHadesClientApp(App):
             self._refresh_channels_ui()
         except Exception as e:
             print("open main error:", repr(e))
+
+    def show_fullscreen_image(self, source, embed=None):
+        """Show an image in full-screen overlay with dark background and download/close buttons.
+
+        Tracks the overlay so it can be dismissed (minimized) later, and
+        records which embed is expanded so it can be reset on minimize.
+        """
+        # Dismiss any existing overlay first
+        if getattr(self, "_fullscreen_overlay", None) is not None:
+            self.dismiss_fullscreen_image(None)
+        overlay = FullScreenImageOverlay(source=source, embed=embed)
+        self._fullscreen_overlay = overlay
+        # Parent to Window so the overlay covers the entire display regardless
+        # of which screen is current. Parenting to a Screen can leave the
+        # overlay undersized (Screen may not propagate size to late-added
+        # children), which made its buttons appear floating in the corner.
+        Window.add_widget(overlay)
+
+    def dismiss_fullscreen_image(self, embed):
+        """Remove the full-screen overlay and reset the embed's expanded flag."""
+        overlay = getattr(self, "_fullscreen_overlay", None)
+        if overlay is not None:
+            try:
+                if overlay.parent:
+                    overlay.parent.remove_widget(overlay)
+            except Exception:
+                pass
+            self._fullscreen_overlay = None
+        if embed is not None:
+            embed.is_expanded = False
 
     # -- session ---------------------------------------------------------
     def _session_path(self):
@@ -1107,7 +1255,83 @@ class sHadesClientApp(App):
         except Exception:
             return None
 
-    # -- connect ---------------------------------------------------------
+    # -- message history persistence (so embeds survive close/re-open) -----
+    def _history_path(self):
+        return os.path.join(_app_data_dir(), "history.json")
+
+    def _attachments_dir(self):
+        d = os.path.join(_app_data_dir(), "attachments")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _save_attachment_blob(self, blob, name):
+        """Persist an ephemeral attachment blob to disk; return its local path."""
+        d = self._attachments_dir()
+        safe = "".join(c for c in name if c.isalnum() or c in "._-") or "attachment"
+        fname = "%s_%s" % (hashlib.sha256(blob).hexdigest()[:12], safe)
+        fpath = os.path.join(d, fname)
+        try:
+            with open(fpath, "wb") as f:
+                f.write(blob)
+        except Exception:
+            return None
+        return fpath
+
+    def _add_to_history(self, m):
+        if not hasattr(self, "_history"):
+            self._history = []
+        self._history = [x for x in self._history if x.get("msg_id") != m.get("msg_id")]
+        if m.get("msg_id"):
+            self._history.append(m)
+        if len(self._history) > 500:
+            self._history = self._history[-500:]
+
+    def _save_history(self):
+        try:
+            hist = []
+            for m in getattr(self, "_history", []):
+                entry = dict(m)
+                kept = []
+                for att in entry.get("attachments") or []:
+                    if isinstance(att, dict) and att.get("kind") == ATT_EPHEMERAL:
+                        # blob already on disk; keep the local_path reference
+                        lp = att.get("local_path")
+                        if lp and os.path.exists(lp):
+                            kept.append(att)
+                    else:
+                        kept.append(att)
+                entry["attachments"] = kept
+                hist.append(entry)
+            with open(self._history_path(), "w") as f:
+                json.dump(hist, f)
+        except Exception as e:
+            print("save history error:", e)
+
+    def _load_history(self):
+        try:
+            with open(self._history_path()) as f:
+                return json.load(f) or []
+        except Exception:
+            return []
+
+    def _load_history_ui(self, dt=0):
+        """Re-render persisted messages once the guild API is available."""
+        if not getattr(self, "guild_api", None):
+            Clock.schedule_once(self._load_history_ui, 1.0)
+            return
+        try:
+            main = self.root.get_screen("main")
+            grid = main.ids.message_grid
+        except Exception:
+            grid = None
+        if grid is None:
+            Clock.schedule_once(self._load_history_ui, 0.5)
+            return
+        for m in self._load_history():
+            self._render_message(grid, m)
+        Clock.schedule_once(lambda dt: self._scroll_to_bottom(), 0.1)
+
+    # -- connect ----------------------------------------------------------
     def connect_to_guild(self, hub_address, username, node_hash="", delivery_hash=""):
         hub_address = (hub_address or "").strip()
         username = (username or "user").strip() or "user"
@@ -1473,20 +1697,57 @@ class sHadesClientApp(App):
         for url in find_urls(content):
             ext = os.path.splitext(url.split("?")[0])[1].lower()
             if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
-                emb = MessageEmbed(source_url=url, size_hint_y=None, height=dp(150))
-                # Kivy AsyncImage loads http directly
-                from kivy.uix.image import AsyncImage
-                emb.add_widget(AsyncImage(source=url, allow_stretch=False, keep_ratio=True))
-                grid.add_widget(emb)
+                emb = MessageEmbed(source=url, size_hint_y=None, height=dp(200))
+                row.ids.embed_container.add_widget(emb)
             elif ext in (".mp3", ".ogg", ".wav", ".flac"):
-                grid.add_widget(Label(text="[audio] " + url, size_hint_y=None, height=dp(20),
-                                      color=(0.7, 0.73, 0.77, 1), font_size=sp(12)))
+                row.ids.embed_container.add_widget(
+                    Label(
+                        text="[audio] " + url,
+                        size_hint_y=None,
+                        height=dp(20),
+                        color=(0.7, 0.73, 0.77, 1),
+                        font_size=sp(12),
+                    )
+                )
             elif ext in (".mp4", ".webm"):
-                grid.add_widget(Label(text="[video] " + url, size_hint_y=None, height=dp(20),
-                                      color=(0.7, 0.73, 0.77, 1), font_size=sp(12)))
+                row.ids.embed_container.add_widget(
+                    Label(
+                        text="[video] " + url,
+                        size_hint_y=None,
+                        height=dp(20),
+                        color=(0.7, 0.73, 0.77, 1),
+                        font_size=sp(12),
+                    )
+                )
 
         # attachment embeds (files uploaded with the message)
         for att in m.get("attachments") or []:
+            if isinstance(att, dict):
+                kind = att.get("kind")
+                if kind == ATT_SERVER:
+                    # Server-stored: re-fetch bytes on demand (loading
+                    # placeholder until received) — this is what survives a
+                    # restart for server-hosted files.
+                    self._fetch_attachment(row, m.get("msg_id"), att)
+                    continue
+                if kind == ATT_EPHEMERAL:
+                    # Ephemeral (P2P): bytes are kept in a local file; read
+                    # them back and render immediately.
+                    local_path = att.get("local_path") or ""
+                    if not local_path:
+                        continue
+                    try:
+                        with open(local_path, "rb") as f:
+                            att_blob = f.read()
+                    except Exception:
+                        continue
+                    self._add_attachment_embed(
+                        row, att.get("name") or "attachment", att_blob)
+                    continue
+                # Legacy server dict without a kind field: has a path to fetch.
+                if "path" in att:
+                    self._fetch_attachment(row, m.get("msg_id"), att)
+                    continue
             try:
                 att_name = att[0]
                 att_blob = att[2]
@@ -1495,28 +1756,90 @@ class sHadesClientApp(App):
             if isinstance(att_blob, str):
                 import base64
                 att_blob = base64.b64decode(att_blob)
-            ext = os.path.splitext(att_name)[1].lower()
-            if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
-                import tempfile
-                tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
-                tmp.write(att_blob)
-                tmp.close()
-                emb = MessageEmbed(source_url=att_name, size_hint_y=None, height=dp(150))
-                from kivy.uix.image import AsyncImage
-                emb.add_widget(AsyncImage(source=tmp.name, allow_stretch=False, keep_ratio=True))
-                grid.add_widget(emb)
-            elif ext in (".mp3", ".ogg", ".wav", ".flac"):
-                grid.add_widget(Label(text="[audio] " + att_name, size_hint_y=None,
-                                      height=dp(20), color=(0.7, 0.73, 0.77, 1),
-                                      font_size=sp(12)))
-            elif ext in (".mp4", ".webm"):
-                grid.add_widget(Label(text="[video] " + att_name, size_hint_y=None,
-                                      height=dp(20), color=(0.7, 0.73, 0.77, 1),
-                                      font_size=sp(12)))
-            else:
-                grid.add_widget(Label(text="[file] " + att_name, size_hint_y=None,
-                                      height=dp(20), color=(0.7, 0.73, 0.77, 1),
-                                      font_size=sp(12)))
+            self._add_attachment_embed(row, att_name, att_blob)
+
+    def _add_attachment_embed(self, row, name, blob):
+        """Render one attachment: images inline, everything else as a label."""
+        ext = os.path.splitext(name)[1].lower()
+        if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+            tmp.write(blob)
+            tmp.close()
+            emb = MessageEmbed(source=tmp.name, size_hint_y=None, height=dp(200))
+            row.ids.embed_container.add_widget(emb)
+        elif ext in (".mp3", ".ogg", ".wav", ".flac"):
+            row.ids.embed_container.add_widget(
+                Label(
+                    text="[audio] " + name,
+                    size_hint_y=None,
+                    height=dp(20),
+                    color=(0.7, 0.73, 0.77, 1),
+                    font_size=sp(12),
+                )
+            )
+        elif ext in (".mp4", ".webm"):
+            row.ids.embed_container.add_widget(
+                Label(
+                    text="[video] " + name,
+                    size_hint_y=None,
+                    height=dp(20),
+                    color=(0.7, 0.73, 0.77, 1),
+                    font_size=sp(12),
+                )
+            )
+        else:
+            row.ids.embed_container.add_widget(
+                Label(
+                    text="[file] " + name,
+                    size_hint_y=None,
+                    height=dp(20),
+                    color=(0.7, 0.73, 0.77, 1),
+                    font_size=sp(12),
+                )
+            )
+
+    def _fetch_attachment(self, row, msg_id, att):
+        """Download an attachment blob from the guild and render it.
+
+        The guild only returns metadata; the bytes are served by its
+        /file/attachments/... handler. Download off the main thread and add
+        the embed back on the UI thread. A loading placeholder is shown until
+        the image has been received.
+        """
+        name = att.get("name") or ""
+        path = att.get("path") or ""
+        if not path:
+            return
+
+        self._add_loading_placeholder(row)
+
+        def work():
+            try:
+                blob = self.guild_api.fetch_file(path)
+            except Exception:
+                blob = None
+            if not blob:
+                Clock.schedule_once(
+                    lambda dt: self._remove_placeholder(row), 0)
+                return
+
+            def apply(dt):
+                try:
+                    self._remove_placeholder(row)
+                    main = self.root.get_screen("main")
+                    # channel may have switched while we were downloading
+                    if main.ids.message_grid is not row.parent:
+                        return
+                    if msg_id and msg_id not in self._msg_widgets:
+                        return
+                    self._add_attachment_embed(row, name, blob)
+                except Exception as e:
+                    print("attachment render error:", e)
+
+            Clock.schedule_once(apply, 0)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _refresh_avatar(self, key):
         # re-render rows that use this avatar
@@ -1579,7 +1902,6 @@ class sHadesClientApp(App):
 
     def _switch_channel(self, name):
         main = self.root.get_screen("main")
-        main.ids.channel_header.text = "#" + name
         main._current_channel = name
         grid = main.ids.message_grid
         grid.clear_widgets()
@@ -1632,7 +1954,9 @@ class sHadesClientApp(App):
                 m = {"msg_id": msg_id, "author_hash": self.my_hash,
                      "username": self.username, "content": text,
                      "ts": now(), "channel_id": cid,
-                     "attachments": self._pending_attachment
+                     # one attachment = [name, mime, blob]; the list holds
+                     # those triples, matching the guild's ingest format
+                     "attachments": [self._pending_attachment]
                      if getattr(self, "_pending_attachment", None) else None}
                 Clock.schedule_once(lambda dt: self._render_message(
                     main.ids.message_grid, m), 0)
@@ -1641,6 +1965,193 @@ class sHadesClientApp(App):
                 err = res.get("error", "unknown")
                 Clock.schedule_once(
                     lambda dt: self._set_status("send failed: %s" % err), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_key_down(self, window, key, scancode, codepoint, modifier):
+        """Keyboard hook for the message input and connect screen.
+
+        Plain Enter sends the message; Shift+Enter inserts a newline
+        (the multiline input handles the newline itself). Tab moves focus
+        to the next input field on the connect screen. Returns True to
+        claim the key when we handled it.
+        """
+        # Tab focus traversal on the connect screen
+        if key == 9:
+            connect = self.root.get_screen("connect") if self.root else None
+            if connect:
+                fields = [
+                    connect.ids.hub_address,
+                    connect.ids.username,
+                    connect.ids.node_hash,
+                    connect.ids.delivery_hash,
+                ]
+                focused = next(
+                    (f for f in fields if getattr(f, "focus", False)), None
+                )
+                if focused is not None:
+                    idx = fields.index(focused)
+                    next_idx = (idx + 1) % len(fields)
+                    fields[next_idx].focus = True
+                    return True
+
+        main = self.root.get_screen("main") if self.root else None
+        inp = main.ids.msg_input if main else None
+        if inp and getattr(inp, "focus", False) and key in (13, 327):
+            if "shift" not in (modifier or []):
+                self.send_message()
+                return True
+        return None
+
+    # -- attachments: server-stored vs ephemeral (P2P) -------------------
+    def _add_loading_placeholder(self, row):
+        """Show a loading placeholder in the row's embed container."""
+        lbl = Label(
+            text=ATT_PLACEHOLDER_TEXT,
+            size_hint_y=None,
+            height=dp(200),
+            color=(0.7, 0.73, 0.77, 1),
+            font_size=sp(12),
+        )
+        lbl._is_loading_placeholder = True
+        row.ids.embed_container.add_widget(lbl)
+        row._loading_placeholder = lbl
+
+    def _remove_placeholder(self, row):
+        """Remove the loading placeholder from the row's embed container."""
+        lbl = getattr(row, "_loading_placeholder", None)
+        if lbl is not None:
+            try:
+                row.ids.embed_container.remove_widget(lbl)
+            except Exception:
+                pass
+            row._loading_placeholder = None
+
+    def open_attach_dialog(self):
+        """Open a window to pick a file and its storage style; OK auto-sends.
+
+        Storage styles:
+          * server-stored  - guild keeps the file; client re-fetches bytes on
+                             restart (loading placeholder until received).
+          * ephemeral (P2P) - bytes sent inline; kept locally so they survive
+                             restart, but no server copy exists.
+        """
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.label import Label
+        from kivy.uix.button import Button
+        from kivy.uix.popup import Popup
+
+        main = self.root.get_screen("main")
+        text = (main.ids.msg_input.text or "").strip()
+
+        chooser = FileChooserListView(
+            filters=["*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp",
+                     "*.mp4", "*.mp3", ".pdf", ".txt"]
+        )
+        style_box = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        style_box.add_widget(
+            Label(text="Store:", size_hint_x=None, width=dp(50),
+                  color=(1, 1, 1, 1), font_size=sp(12),
+                  halign="left", valign="middle"))
+        btn_server = Button(text="Server-stored", size_hint_x=None, width=dp(130))
+        btn_ephem = Button(text="Ephemeral (P2P)", size_hint_x=None, width=dp(130))
+        selected = {"style": ATT_SERVER}
+
+        def pick(s):
+            selected["style"] = s
+            btn_server.background_color = (0.42, 0.48, 1.0, 1) if s == ATT_SERVER else (0.25, 0.27, 0.31, 1)
+            btn_ephem.background_color = (0.42, 0.48, 1.0, 1) if s == ATT_EPHEMERAL else (0.25, 0.27, 0.31, 1)
+
+        btn_server.bind(on_press=lambda *_: pick(ATT_SERVER))
+        btn_ephem.bind(on_press=lambda *_: pick(ATT_EPHEMERAL))
+        pick(ATT_SERVER)
+        style_box.add_widget(btn_server)
+        style_box.add_widget(btn_ephem)
+
+        btn_ok = Button(text="OK — Send", size_hint_y=None, height=dp(44),
+                        background_color=(0.42, 0.48, 1.0, 1), color=(1, 1, 1, 1))
+        btn_cancel = Button(text="Cancel", size_hint_y=None, height=dp(44),
+                            background_color=(0.25, 0.27, 0.31, 1), color=(1, 1, 1, 1))
+        btn_box = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        btn_box.add_widget(btn_ok)
+        btn_box.add_widget(btn_cancel)
+
+        content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        content.add_widget(Label(text="Attach a file — choose how it is stored:",
+                                 size_hint_y=None, height=dp(24),
+                                 color=(1, 1, 1, 1), font_size=sp(12)))
+        content.add_widget(chooser)
+        content.add_widget(style_box)
+        content.add_widget(btn_box)
+
+        popup = Popup(title="Attach file", content=content, size_hint=(0.9, 0.9),
+                      auto_dismiss=False)
+
+        def do_ok(*_):
+            sel = chooser.selection
+            if not sel:
+                self._set_status("No file selected")
+                return
+            path = sel[0]
+            popup.dismiss()
+            self._send_attached_file(text, path, selected["style"])
+
+        btn_ok.bind(on_press=do_ok)
+        btn_cancel.bind(on_press=lambda *_: popup.dismiss())
+        popup.open()
+
+    def _send_attached_file(self, text, path, style):
+        """Read the chosen file and send it as an attachment of the given style."""
+        try:
+            with open(path, "rb") as f:
+                blob = f.read()
+        except Exception as e:
+            self._set_status("attach failed: %s" % e)
+            return
+        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        name = path.split("/")[-1]
+        self._send_with_attachment(text, name, mime, blob, style)
+
+    def _send_with_attachment(self, text, name, mime, blob, style):
+        """Post a message with one attachment and optimistically render it.
+
+        The wire format is always a [name, mime, blob] triple; the chosen
+        style only affects how the client persists/re-fetches the attachment.
+        """
+        if not self.guild_api:
+            self._set_status("Not connected to guild")
+            return
+        main = self.root.get_screen("main")
+        cid = getattr(main, "_current_channel", "general")
+        cid = self._channel_cid(cid)
+
+        def work():
+            res = self.guild_api.post(cid, text, attachments=[[name, mime, blob]])
+            if not res.get("ok"):
+                Clock.schedule_once(
+                    lambda dt: self._set_status("send failed: %s" % res.get("error", "unknown")), 0)
+                return
+            msg_id = res.get("msg_id")
+            # The guild may ack with stored metadata (path) => server-stored.
+            srv_att = res.get("attachment") or {}
+            srv_path = srv_att.get("path")
+            if style == ATT_SERVER and srv_path:
+                att = {"name": name, "mime": mime, "size": len(blob),
+                       "kind": ATT_SERVER, "path": srv_path}
+            else:
+                # Ephemeral (or server did not ack a path): keep blob locally.
+                local_path = self._save_attachment_blob(blob, name)
+                att = {"name": name, "mime": mime, "kind": ATT_EPHEMERAL,
+                       "local_path": local_path}
+            m = {"msg_id": msg_id, "author_hash": self.my_hash,
+                 "username": self.username, "content": text, "ts": now(),
+                 "channel_id": cid, "attachments": [att]}
+            Clock.schedule_once(lambda dt: self._render_message(
+                main.ids.message_grid, m), 0)
+            Clock.schedule_once(
+                lambda dt: setattr(main.ids.msg_input, "text", ""), 0)
+            self._add_to_history(m)
+            self._save_history()
+
         threading.Thread(target=work, daemon=True).start()
 
     # -- profile ----------------------------------------------------------
@@ -1929,21 +2440,29 @@ class sHadesClientApp(App):
             # Capture all values BEFORE dismissing popup — once dismissed,
             # the FloatLayout tears down and editor.width/height/img.pos/
             # img.size may become (0, 0) or stale, producing wrong crops.
+            #
+            # crop_cx/crop_cy/crop_r are the circle in ABSOLUTE window pixels
+            # (the exact values the overlay ellipse is drawn with) and
+            # img.pos/img.size are the image widget's ABSOLUTE rect — the two
+            # live in the same coordinate space, so the crop maths below can
+            # map one onto the other directly.
             img = editor.ids.pfp_img
-            save_kwargs = dict(
-                path=path,
-                circle_x=editor.circle_x,
-                circle_y=editor.circle_y,
-                circle_radius=editor.circle_radius,
-                editor_w=editor.width,
-                editor_h=editor.height,
-                image_pos=tuple(img.pos),
-                image_size=tuple(img.size),
-            )
+            crop_cx = editor.crop_cx
+            crop_cy = editor.crop_cy
+            crop_r = editor.crop_r
+            image_pos = tuple(img.pos)
+            image_size = tuple(img.size)
             popup.dismiss()
 
             def _do_save(dt):
-                self._save_pfp_crop(**save_kwargs)
+                self._save_pfp_crop(
+                    path=path,
+                    crop_cx=crop_cx,
+                    crop_cy=crop_cy,
+                    crop_r=crop_r,
+                    image_pos=image_pos,
+                    image_size=image_size,
+                )
 
             Clock.schedule_once(_do_save, 0)
 
@@ -1954,15 +2473,41 @@ class sHadesClientApp(App):
         cancel_btn.bind(on_press=do_cancel)
         popup.open()
 
-    def _save_pfp_crop(self, path, circle_x=0.5, circle_y=0.5,
-                       circle_radius=0.25, editor_w=1, editor_h=1,
+    def _save_pfp_crop(self, path, crop_cx=0, crop_cy=0, crop_r=0,
                        image_pos=None, image_size=None):
+        """Save the cropped avatar without ever letting it kill the client.
+
+        Any failure in the image pipeline (unreadable file, unwritable
+        directory, unsupported format) is caught, logged with a traceback and
+        surfaced in the status line. An unhandled exception here used to
+        propagate out of the Clock callback, tear down the event loop and
+        terminate the whole client with "cannot write mode RGBA as JPEG"
+        style errors.
+        """
+        try:
+            self._save_pfp_crop_impl(path, crop_cx, crop_cy, crop_r,
+                                     image_pos, image_size)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._set_status("avatar save failed: %s" % e)
+
+    def _save_pfp_crop_impl(self, path, crop_cx=0, crop_cy=0, crop_r=0,
+                            image_pos=None, image_size=None):
         """Save 256x256 crop from circle area (chat/members pfp) + original (profile top).
 
         Both stored in app data dir under pfps/; 256x256 uploaded to guild.
-        Circle params are relative (0-1) from the PFPEditorWidget.
-        image is displayed at natural size centered in widget — map circle
-        from widget coords to image-relative coords for cropping.
+
+        crop_cx/crop_cy/crop_r are the crop circle in absolute window pixels —
+        the same values the editor draws its overlay ellipse with — and
+        image_pos/image_size are the image widget's absolute rect. Both are in
+        the same (window) coordinate space, so the circle can be mapped onto
+        the image by a plain subtraction before converting to natural pixels.
+
+        The old code mixed spaces: it took the circle centre as
+        circle_x * editor_w (editor-relative) and subtracted the image's
+        absolute pos, which shifted every crop by the editor's position inside
+        the popup — always towards the lower-left of the source image.
         """
         try:
             pil = PILImage.open(path).convert("RGBA")
@@ -1985,7 +2530,7 @@ class sHadesClientApp(App):
             # Save original (full-size, used at top of profile page)
             pil.save(orig_path, "PNG")
 
-            # Map circle from widget coords to image-relative coords
+            # Image widget rect (absolute window pixels)
             img_x, img_y = image_pos if image_pos else (0, 0)
             img_w, img_h = image_size if image_size else (pil.width, pil.height)
 
@@ -1993,17 +2538,17 @@ class sHadesClientApp(App):
             # screen_pixels = natural_pixels * scale
             scale = img_w / pil.width if pil.width > 0 else 1.0
 
-            # Circle center in screen pixels, relative to image top-left
-            cx_img_screen = circle_x * editor_w - img_x
-            cy_img_screen = circle_y * editor_h - img_y
+            # Circle centre relative to the image's bottom-left corner,
+            # in screen pixels (both operands are absolute window coords).
+            cx_img_screen = crop_cx - img_x
+            cy_img_screen = crop_cy - img_y
 
             # Convert screen pixels -> natural image pixels (divide by scale)
             cx_px = cx_img_screen / scale if scale > 0 else cx_img_screen
             cy_px = cy_img_screen / scale if scale > 0 else cy_img_screen
 
             # Circle radius in screen pixels -> natural pixels
-            r_screen = circle_radius * min(editor_w, editor_h)
-            r_px = r_screen / scale if scale > 0 else r_screen
+            r_px = crop_r / scale if scale > 0 else crop_r
 
             # Crop from original image (PIL uses top-left origin)
             left = int(cx_px - r_px)
@@ -2165,5 +2710,10 @@ if __name__ == "__main__":
             else:
                 os.environ["KIVY_GL_BACKEND"] = "mock"
             os.execv(sys.executable, [sys.executable] + sys.argv[1:])
-        print(f"sHades client failed to start: {_e}", file=sys.stderr)
+        # The app may have been running for a long time before this error —
+        # print the traceback so the real cause is visible instead of a
+        # one-line message that claims the client "failed to start".
+        import traceback
+        traceback.print_exc()
+        print(f"sHades client crashed: {_e}", file=sys.stderr)
         sys.exit(1)
