@@ -252,6 +252,12 @@ class GuildAPI:
     def fetch_file(self, path):
         """Fetch raw bytes from a /file/... request handler on the guild."""
         receipt = self.link.request(path, data={})
+        # link.request() may return a Receipt object (with .response) or
+        # True/False (bool) depending on RNS version. Handle both.
+        if isinstance(receipt, bool):
+            if not receipt:
+                return None
+            receipt = self.link.request(path, data={})
         deadline = time.time() + 15
         while receipt.response is None and time.time() < deadline:
             time.sleep(0.05)
