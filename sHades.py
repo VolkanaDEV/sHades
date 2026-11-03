@@ -39,7 +39,7 @@ DEBUG           = False   # set via --debug; enables verbose attachment/ingest l
 
 MAX_CONTENT_LEN   = 2000          # per-message character cap (Discord-style)
 MAX_ATTACHMENTS   = 4             # files per message
-MAX_ATTACHMENT_SZ = 8 * 1024 * 1024
+MAX_ATTACHMENT_SZ = 32 * 1024 * 1024   # 32 MB per attachment
 MAX_AVATAR_SZ     = 64 * 1024
 RATE_MAX_POSTS    = 10            # per sender per channel
 RATE_WINDOW_S     = 60

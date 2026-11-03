@@ -2191,6 +2191,11 @@ class sHadesClientApp(MDApp):
             return
         mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
         name = path.split("/")[-1]
+        # Client-side size check so the user gets a clear message instead of
+        # a silent server rejection. Matches server MAX_ATTACHMENT_SZ (32 MB).
+        if len(blob) > 32 * 1024 * 1024:
+            self._set_status("attach failed: file too large (%d MB, max 32 MB)" % (len(blob) / 1024 / 1024))
+            return
         self._send_with_attachment(text, name, mime, blob, style)
 
     def _send_with_attachment(self, text, name, mime, blob, style):
