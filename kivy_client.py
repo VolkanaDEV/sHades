@@ -1803,6 +1803,7 @@ class sHadesClientApp(MDApp):
 
     def _add_attachment_embed(self, row, name, blob):
         """Render one attachment: images inline, everything else as a label."""
+        print(f"[TRACE] _add_attachment_embed: name={name} blob_size={len(blob)} ext={os.path.splitext(name)[1].lower()}", flush=True)
         dlog(f"_add_attachment_embed: name={name} blob_size={len(blob)} ext={os.path.splitext(name)[1].lower()}")
         ext = os.path.splitext(name)[1].lower()
         if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
@@ -1851,26 +1852,31 @@ class sHadesClientApp(MDApp):
         the embed back on the UI thread. A loading placeholder is shown until
         the image has been received.
         """
+        print(f"[TRACE] _fetch_attachment: msg_id={msg_id} name={att.get('name')!r} path={att.get('path')!r}", flush=True)
         dlog(f"_fetch_attachment: msg_id={msg_id} name={att.get('name')!r} path={att.get('path')!r}")
         name = att.get("name") or ""
         path = att.get("path") or ""
         if not path:
+            print(f"[TRACE] _fetch_attachment: no path, skipping", flush=True)
             dlog(f"_fetch_attachment: no path, skipping")
             return
 
         self._add_loading_placeholder(row)
 
         def work():
+            print(f"[TRACE] _fetch_attachment.work: fetching {path}", flush=True)
             dlog(f"_fetch_attachment.work: fetching {path}")
             try:
                 blob = self.guild_api.fetch_file(path)
             except Exception:
                 blob = None
             if not blob:
+                print(f"[TRACE] _fetch_attachment.work: fetch returned empty for {path}", flush=True)
                 dlog(f"_fetch_attachment.work: fetch returned empty for {path}")
                 Clock.schedule_once(
                     lambda dt: self._remove_placeholder(row), 0)
                 return
+            print(f"[TRACE] _fetch_attachment.work: received {len(blob)} bytes for {path}", flush=True)
             dlog(f"_fetch_attachment.work: received {len(blob)} bytes for {path}")
 
             def apply(dt):
@@ -1882,6 +1888,7 @@ class sHadesClientApp(MDApp):
                         return
                     if msg_id and msg_id not in self._msg_widgets:
                         return
+                    print(f"[TRACE] _fetch_attachment.apply: adding embed for {name}", flush=True)
                     dlog(f"_fetch_attachment.apply: adding embed for {name}")
                     self._add_attachment_embed(row, name, blob)
                 except Exception as e:
@@ -2076,6 +2083,7 @@ class sHadesClientApp(MDApp):
     # -- attachments: server-stored vs ephemeral (P2P) -------------------
     def _add_loading_placeholder(self, row):
         """Show a loading placeholder in the row's embed container."""
+        print(f"[TRACE] _add_loading_placeholder: row={row.msg_id[:12] if row.msg_id else '?'}", flush=True)
         dlog(f"_add_loading_placeholder: row={row.msg_id[:12] if row.msg_id else '?'}")
         lbl = Label(
             text=ATT_PLACEHOLDER_TEXT,
@@ -2092,6 +2100,7 @@ class sHadesClientApp(MDApp):
         """Remove the loading placeholder from the row's embed container."""
         lbl = getattr(row, "_loading_placeholder", None)
         if lbl is not None:
+            print(f"[TRACE] _remove_placeholder: row={row.msg_id[:12] if row.msg_id else '?'}", flush=True)
             dlog(f"_remove_placeholder: row={row.msg_id[:12] if row.msg_id else '?'}")
             try:
                 row.ids.embed_container.remove_widget(lbl)
@@ -2190,6 +2199,7 @@ class sHadesClientApp(MDApp):
         The wire format is always a [name, mime, blob] triple; the chosen
         style only affects how the client persists/re-fetches the attachment.
         """
+        print(f"[TRACE] _send_with_attachment: name={name} mime={mime} size={len(blob)} style={style} text_len={len(text or '')}", flush=True)
         dlog(f"_send_with_attachment: name={name} mime={mime} size={len(blob)} style={style} text_len={len(text or '')}")
         if not self.guild_api:
             self._set_status("Not connected to guild")
@@ -2199,8 +2209,10 @@ class sHadesClientApp(MDApp):
         cid = self._channel_cid(cid)
 
         def work():
+            print(f"[TRACE] _send_with_attachment.work: posting to channel={cid}", flush=True)
             dlog(f"_send_with_attachment.work: posting to channel={cid}")
             res = self.guild_api.post(cid, text, attachments=[[name, mime, blob]])
+            print(f"[TRACE] _send_with_attachment.work: post response ok={res.get('ok')} msg_id={res.get('msg_id')} attachment={res.get('attachment')}", flush=True)
             dlog(f"_send_with_attachment.work: post response ok={res.get('ok')} msg_id={res.get('msg_id')} attachment={res.get('attachment')}")
             if not res.get("ok"):
                 Clock.schedule_once(
