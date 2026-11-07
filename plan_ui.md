@@ -5,8 +5,8 @@ transport as the rest of the API: **JSON over RNS Link requests** on
 `nomadnetwork.node`. HTML, HTTP and IP-socket APIs remain anti-patterns; the
 guild never becomes a web server.
 
-Status: phases U1-U2 are DONE (icons, unread badges, receipts/reactions/search
- groundwork). U3-U8 are designed here, not built.
+Status: U1-U3 are DONE (icons; receipts/reactions/search; context menus +
+mod endpoints + channel deletion). U4-U8 are designed here, not built.
 
 ## U0 — foundations that already exist
 
@@ -29,7 +29,7 @@ ASCII-fallback (`tests` grep `kv_md.kv` for non-ASCII in CI).
 Per-user read watermarks (`receipts`), unread badges on channel buttons,
 reaction chips on messages (toggle, ASCII shortcodes), `⌕` search popup.
 
-## U3 — context menus (right-click desktop / long-press mobile)
+## U3 — context menus (DONE)
 
 **Framework.** One `ContextMenu` widget: a Popup anchored at pointer position
 (usually a vertical list of actions), fed `(label, enabled, callback)` rows.
@@ -43,14 +43,17 @@ left action.
 
 | surface | actions |
 |---|---|
-| message | copy text, reply (quote into input), react, pin, edit (own), delete (own / mod) |
-| member-list row / username | profile, mention (@name → input), add friend, whisper (open DM, see U7), mute (mod), ban (mod), roles (admin) |
-| channel button | open, channel settings (mod), delete channel (admin), mute channel (client-local), copy channel id, invite (see U6) |
-| guild header | server settings (admin), invite, leave guild (client-local disconnect) |
+| message | copy text, reply (quote into input), react, edit (own), delete (own) |
+| member-list row / username | profile, mention (@name → input), mute (mod), ban (mod) |
+| channel button | open, copy channel id, mute channel (client-local), delete channel (mod) |
+| guild header | copy invite link (`shades://host:port/node_hash`) |
 
-Server work: none for the menus themselves — every action already has or gets
-an endpoint in U4-U7. Client work: menu framework, wiring, reply/quote
-composition, pin view.
+Server work that landed with it: `/api/v1/whoami` (drives moderator-affordance
+visibility), `/api/v1/mod/ban|unban|mute|unmute` (moderator gate, 32-hex user
+hash validation, self-moderation rejected), `/api/v1/channels/delete`
+(cascade: messages/attachments/reactions/receipts/members/state + site files +
+term sessions; last-channel protection; `channel_deleted` stream event).
+Client-local: muted-channel persistence (badges suppressed).
 
 ## U4 — slash-commands (one dispatcher, two frontends)
 

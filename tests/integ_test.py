@@ -570,6 +570,20 @@ def main():
               and rx[0]["data"]["counts"].get("+1") == 1, poll)
         japi("/api/v1/stream/unsubscribe", {})
 
+        # ---- U3: whoami + channel deletion over the mesh ----
+        w = japi("/api/v1/whoami", {})
+        check("v1 whoami over the mesh", w.get("ok") == 1
+              and w.get("is_moderator") is True
+              and w.get("user_hash") == my_user_hash, w)
+        r = japi("/api/v1/channels/create", {"name": "ephemeral", "kind": "chat"})
+        eph_cid = r.get("channel", {}).get("id")
+        japi("/api/v1/post", {"channel": eph_cid, "content": "shortlived"})
+        r = japi("/api/v1/channels/delete", {"channel": eph_cid})
+        check("v1 channel delete over the mesh", r.get("ok") == 1, r)
+        cl = japi("/api/v1/channels/list", {})
+        check("deleted channel gone from the list",
+              all(c["id"] != eph_cid for c in cl.get("channels", [])), cl)
+
         # ---- rate limit (kept last: it exhausts the sender window) ----
         codes = []
         for i in range(14):

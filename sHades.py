@@ -18,6 +18,7 @@ import re
 import json
 import time
 import base64
+import shutil
 import argparse
 import sqlite3
 import hashlib
@@ -2371,6 +2372,90 @@ def api_v1_search(viewer, data, link_id):
     with db_lock:
         rows = db.execute(sql, args).fetchall()
     return {"ok": 1, "query": q, "results": [msg_row_json(r) for r in rows]}
+
+# ---- whoami + moderation + channel deletion (U3: context-menu backend) -------------
+
+@api_route("/api/v1/whoami")
+@wrap_json_api
+def api_v1_whoami(viewer, data, link_id):
+    """The requester's own identity as the guild sees it. The client uses
+    this to show/hide moderator affordances (menus are a convenience —
+    every action is still enforced server-side)."""
+    return {"ok": 1, "user_hash": viewer, "username": get_username(viewer),
+            "is_moderator": is_moderator(viewer)}
+
+def _register_mod_endpoint(path, verb, apply_fn):
+    """Register one moderator-gated JSON endpoint. `apply_fn(viewer, target,
+    reason)` performs the action; the gate, hash validation and audit log
+    are shared."""
+    @api_route(path)
+    @wrap_json_api
+    def handler(viewer, data, link_id):
+        if not is_moderator(viewer):
+            return {"ok": 0, "error": "moderator required", "code": 403}
+        target = (data.get("user") or "").strip().lower()
+        if not re.match(r"^[0-9a-f]{32}$", target):
+            return {"ok": 0, "error": "user must be a 32-hex hash", "code": 400}
+        if target == viewer:
+            return {"ok": 0, "error": "cannot moderate yourself", "code": 400}
+        reason = (data.get("reason") or "").strip()[:200]
+        apply_fn(viewer, target, reason)
+        RNS.log("moderation: %s %s %s" % (viewer[:12], verb, target[:12]),
+                RNS.LOG_NOTICE)
+        return {"ok": 1}
+
+_register_mod_endpoint(
+    "/api/v1/mod/ban", "banned",
+    lambda viewer, target, reason: ban_user(
+        target, reason or "banned by %s" % viewer[:12]))
+_register_mod_endpoint(
+    "/api/v1/mod/unban", "unbanned",
+    lambda viewer, target, reason: unban_user(target))
+_register_mod_endpoint(
+    "/api/v1/mod/mute", "muted",
+    lambda viewer, target, reason: mute_user(
+        target, reason or "muted by %s" % viewer[:12], viewer))
+_register_mod_endpoint(
+    "/api/v1/mod/unmute", "unmuted",
+    lambda viewer, target, reason: unmute_user(target))
+
+@api_route("/api/v1/channels/delete")
+@wrap_json_api
+def api_v1_channels_delete(viewer, data, link_id):
+    """Hard-delete a channel (moderator-gated; tightened to ADMIN in U5):
+    messages, attachments rows, reactions, receipts, members, state — and
+    site resources on disk. The last remaining channel cannot be deleted.
+    Subscribers get a guild-wide channel_deleted event."""
+    if not is_moderator(viewer):
+        return {"ok": 0, "error": "moderator required", "code": 403}
+    cid = data.get("channel")
+    with db_lock:
+        row = db.execute("SELECT id, name FROM channels WHERE id=?", (cid,)).fetchone()
+        if not row:
+            return {"ok": 0, "error": "unknown channel", "code": 404}
+        n = db.execute("SELECT COUNT(*) AS n FROM channels").fetchone()["n"]
+        if n <= 1:
+            return {"ok": 0, "error": "cannot delete the last channel", "code": 400}
+        msg_ids = "SELECT msg_id FROM messages WHERE channel_id=?"
+        db.execute("DELETE FROM attachments WHERE msg_id IN (%s)" % msg_ids, (cid,))
+        db.execute("DELETE FROM reactions WHERE msg_id IN (%s)" % msg_ids, (cid,))
+        db.execute("DELETE FROM messages WHERE channel_id=?", (cid,))
+        db.execute("DELETE FROM receipts WHERE channel_id=?", (cid,))
+        db.execute("DELETE FROM members WHERE channel_id=?", (cid,))
+        db.execute("DELETE FROM channel_state WHERE channel_id=?", (cid,))
+        db.execute("DELETE FROM channels WHERE id=?", (cid,))
+        db.commit()
+    with TERM_SESSIONS_LOCK:
+        for sid in [s for s, t in TERM_SESSIONS.items() if t["channel"] == cid]:
+            TERM_SESSIONS.pop(sid, None)
+    cdir = os.path.join(_site_root(), cid)
+    if os.path.isdir(cdir):
+        shutil.rmtree(cdir, ignore_errors=True)
+        # NOTE: per-file /file/sites/<cid>/... request handlers stay registered
+        # on the destination (RNS 1.1.3 has no deregister); they now 404.
+    _emit_event(cid, "channel_deleted",
+                {"channel": cid, "name": row["name"]}, guild_wide=True)
+    return {"ok": 1, "channel": cid, "name": row["name"]}
 
 # ----------------------------------------------------------------------------------
 # Boot (plan §9 skeleton — every call verified against the installed stack)

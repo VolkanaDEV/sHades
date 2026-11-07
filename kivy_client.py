@@ -465,6 +465,26 @@ class GuildAPI:
             data["limit"] = limit
         return self._request_json("/api/v1/search", data)
 
+    def whoami(self):
+        return self._request_json("/api/v1/whoami", {})
+
+    def mod_ban(self, user_hash, reason=""):
+        return self._request_json("/api/v1/mod/ban",
+                                  {"user": user_hash, "reason": reason})
+
+    def mod_unban(self, user_hash):
+        return self._request_json("/api/v1/mod/unban", {"user": user_hash})
+
+    def mod_mute(self, user_hash, reason=""):
+        return self._request_json("/api/v1/mod/mute",
+                                  {"user": user_hash, "reason": reason})
+
+    def mod_unmute(self, user_hash):
+        return self._request_json("/api/v1/mod/unmute", {"user": user_hash})
+
+    def channels_delete(self, channel):
+        return self._request_json("/api/v1/channels/delete", {"channel": channel})
+
     def fetch_file(self, path):
         """Fetch raw bytes from a /file/... request handler on the guild."""
         dlog(f"fetch_file: requesting {path}")
@@ -767,7 +787,7 @@ if KIVY:
             self._color_inst.rgba = value
 
 
-    class MessageRow(BoxLayout):
+    class MessageRow(ContextMenuMixin, BoxLayout):
         """One chat message."""
         author_hash = StringProperty("")
         username = StringProperty("user")
@@ -777,6 +797,25 @@ if KIVY:
         avatar_source = StringProperty("")
         msg_id = StringProperty("")
         is_own = BooleanProperty(False)
+
+        def build_context_menu(self):
+            app = App.get_running_app()
+            actions = [
+                ("copy text", bool(self.content),
+                 lambda: app and app._copy_text(self.content or "")),
+                ("reply", True,
+                 lambda: app and app._reply_quote(self.username,
+                                                  self.content or "")),
+                ("react", True,
+                 lambda: app and app._open_reaction_popup(self.msg_id)),
+            ]
+            if self.is_own and self.msg_id:
+                actions.append(("edit", True,
+                                lambda: app and app._open_edit_popup(
+                                    self.msg_id, self.content or "")))
+                actions.append(("delete", True,
+                                lambda: app and app._delete_message(self.msg_id)))
+            return actions
 
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
@@ -802,14 +841,157 @@ if KIVY:
             pass
 
 
-class ClickableLabel(ButtonBehavior, Label):
-    """Username label that opens a user profile when tapped."""
+class ContextMenuMixin:
+    """Right-click (desktop) / long-press (touch) context menu, Discord-style.
+
+    Subclasses implement `build_context_menu()` returning a list of
+    (label, enabled, callable). Right-click opens immediately; a 0.5 s hold
+    opens it on touch (mouse left-press never does). One code path, two
+    gestures; the menu itself is the app's Window-level overlay."""
+
+    LONG_PRESS_S = 0.5
+
+    def build_context_menu(self):
+        return []
+
+    def _open_ctx_menu(self, window_pos):
+        app = App.get_running_app()
+        if app is not None:
+            app.open_context_menu(self.build_context_menu(), window_pos)
+
+    def on_touch_down(self, touch):
+        if touch.grab_current is self:
+            return super().on_touch_down(touch)
+        if getattr(touch, "button", None) == "right":
+            # desktop right-click: menu instead of the left-press action
+            self._open_ctx_menu(self.to_window(touch.x, touch.y))
+            return True
+        if "button" not in getattr(touch, "profile", []) or \
+                touch.profile == []:
+            # real touch (finger): long-press opens the menu
+            touch.ud["shades_ctx_pos"] = self.to_window(touch.x, touch.y)
+            touch.ud["shades_ctx_fired"] = False
+            touch.grab(self)
+            self._ctx_clock = Clock.schedule_once(
+                lambda dt: self._ctx_fire(touch), self.LONG_PRESS_S)
+        return super().on_touch_down(touch)
+
+    def _ctx_fire(self, touch):
+        touch.ud["shades_ctx_fired"] = True
+        self._open_ctx_menu(touch.ud.get("shades_ctx_pos")
+                            or self.to_window(*self.center))
+
+    def on_touch_up(self, touch):
+        clock = getattr(self, "_ctx_clock", None)
+        if clock:
+            clock.cancel()
+            self._ctx_clock = None
+        if touch.ud.get("shades_ctx_fired"):
+            # the long-press fired: swallow the corresponding up
+            touch.ud["shades_ctx_fired"] = False
+            touch.ungrab(self)
+            return True
+        return super().on_touch_up(touch)
+
+
+class ContextMenuOverlay(FloatLayout):
+    """Full-screen overlay hosting one context menu; a tap anywhere outside
+    the menu dismisses it, a tap on an item acts then dismisses. Parented to
+    Window by the app."""
+
+    def __init__(self, actions, window_pos, **kw):
+        super().__init__(**kw)
+        menu = BoxLayout(orientation="vertical", size_hint=(None, None),
+                         spacing=dp(1),
+                         size=(dp(230), dp(36) * max(1, len(actions))))
+        menu.pos = (max(dp(4), min(window_pos[0],
+                                   Window.width - menu.width - dp(4))),
+                    max(dp(4), min(window_pos[1] - menu.height,
+                                   Window.height - menu.height - dp(4))))
+        for label, enabled, cb in actions:
+            btn = Button(text=label, size_hint_y=None, height=dp(34),
+                         background_color=(0.18, 0.2, 0.24, 1) if enabled
+                         else (0.12, 0.13, 0.15, 1),
+                         color=(0.9, 0.92, 0.95, 1) if enabled
+                         else (0.4, 0.42, 0.46, 1),
+                         font_size=sp(13))
+            if enabled:
+                btn.bind(on_press=lambda inst, cb=cb: self._run(cb))
+            else:
+                btn.disabled = True
+            menu.add_widget(btn)
+        self.add_widget(menu)
+        self.menu = menu
+
+    def on_touch_down(self, touch):
+        # overlay covers the window, so window coords are local coords
+        inside = self.menu.collide_point(*touch.pos)
+        if not inside:
+            self.dismiss_now()
+            return True
+        # let the button get its press; remove the overlay right after
+        Clock.schedule_once(lambda dt: self.dismiss_now(), 0.2)
+        return super().on_touch_down(touch)
+
+    def dismiss_now(self, *a):
+        parent = self.parent
+        if parent is not None:
+            parent.remove_widget(self)
+
+    def _run(self, cb):
+        try:
+            cb()
+        finally:
+            Clock.schedule_once(lambda dt: self.dismiss_now(), 0.1)
+
+
+class CtxHeaderLabel(ContextMenuMixin, Label):
+    """Guild header: right-click/long-press offers the invite share-link."""
+
+    def build_context_menu(self):
+        app = App.get_running_app()
+        return [("copy invite link", True,
+                 lambda: app and app._copy_invite())]
+
+
+class ClickableLabel(ContextMenuMixin, ButtonBehavior, Label):
+    """Username label: tap opens a profile, right-click/long-press offers
+    mention + profile."""
     target_hash = StringProperty("")
 
+    def build_context_menu(self):
+        app = App.get_running_app()
+        name = self.text or ""
+        actions = [("open profile", True,
+                    lambda: app and app.open_profile(
+                        self.target_hash, name)),
+                   ("mention @%s" % name, True,
+                    lambda: app and app._mention(name))]
+        return actions
 
-class ChannelButton(ButtonBehavior, BoxLayout):
+
+
+
+class ChannelButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
     channel_name = StringProperty("")
     badge = NumericProperty(0)
+
+    def build_context_menu(self):
+        app = App.get_running_app()
+        name = self.channel_name
+        cid = app._channels.get(name) if app else None
+        actions = [("open #" + name, True,
+                    lambda: app and app._switch_channel(name))]
+        if cid:
+            actions.append(("copy channel id", True,
+                            lambda: app and app._copy_text(cid)))
+            muted = cid in app._muted_channels
+            actions.append(("unmute channel" if muted else "mute channel", True,
+                            lambda: app and app._toggle_mute_channel(name, cid)))
+            if app and app.i_am_moderator:
+                actions.append(("delete channel", True,
+                                lambda: app and app._delete_channel(name, cid)))
+        return actions
 
 
 if KIVY:
@@ -1459,11 +1641,28 @@ if KIVY:
         target_username = StringProperty("")
         target_avatar = StringProperty("")
 
-    class MemberRow(BoxLayout):
+    class MemberRow(ContextMenuMixin, BoxLayout):
         username = StringProperty("")
         avatar_source = StringProperty("")
         author_hash = StringProperty("")
         presence_color = ListProperty([0.5, 0.5, 0.5, 1])  # gray = unknown/offline
+
+        def build_context_menu(self):
+            app = App.get_running_app()
+            name = self.username or ""
+            uh = self.author_hash or ""
+            actions = [
+                ("open profile", bool(uh),
+                 lambda: app and app.open_profile(uh, name)),
+                ("mention @%s" % name, bool(name),
+                 lambda: app and app._mention(name)),
+            ]
+            if app and app.i_am_moderator and uh and uh != app.my_hash:
+                actions.append(("mute user", True,
+                                lambda: app and app._mod_action("mod_mute", uh, name)))
+                actions.append(("ban user", True,
+                                lambda: app and app._mod_action("mod_ban", uh, name)))
+            return actions
 
     class MainScreen(Screen):
         left_open = BooleanProperty(True)
@@ -1596,6 +1795,18 @@ class sHadesClientApp(MDApp):
         self._term_page = None       # the TermPage currently on screen
         # unread badges per cid (from channels/list receipts)
         self._channel_unread = {}
+        # context menu state + moderator flag (from /api/v1/whoami)
+        self._ctx_menu = None
+        self.i_am_moderator = False
+        # client-muted channels (persisted; suppresses unread badges only)
+        self._muted_channels = set()
+        try:
+            cfg = os.path.join(_app_data_dir(), "muted_channels.json")
+            if os.path.isfile(cfg):
+                with open(cfg) as f:
+                    self._muted_channels = set(json.load(f))
+        except Exception as e:
+            print("muted-channel load failed:", repr(e))
 
         # Presence: mirror the guild's active-user list every PRESENCE_INTERVAL.
         # _active_users maps user_hash -> {"username", "node_hash"} and is
@@ -2134,6 +2345,7 @@ class sHadesClientApp(MDApp):
             Clock.schedule_once(lambda dt: self._start_poll(), 0)
             Clock.schedule_once(lambda dt: self._start_streamer(), 0)
             Clock.schedule_once(lambda dt: self._refresh_channels_from_guild(), 1.0)
+            Clock.schedule_once(lambda dt: self._fetch_whoami(), 1.2)
         except Exception as e:
             print("connect guild error:", repr(e))
             err_msg = "connect failed: %s" % e
@@ -2298,6 +2510,25 @@ class sHadesClientApp(MDApp):
                                             self._reactions_from_counts(
                                                 data.get("msg_id"), data))
                 Clock.schedule_once(apply_rxn, 0)
+            elif kind == "channel_deleted":
+                # a channel (possibly the one we are watching) was deleted
+                def apply_del(dt):
+                    dead = data.get("channel")
+                    self._channel_kinds.pop(dead, None)
+                    self._channel_unread.pop(dead, None)
+                    self._term_sessions.pop(dead, None)
+                    name = data.get("name") or "channel"
+                    self._refresh_channels_from_guild()
+                    try:
+                        main = self.root.get_screen("main")
+                        cur = self._channel_cid(
+                            getattr(main, "_current_channel", "general"))
+                        if cur == dead:
+                            self._set_status("#%s was deleted" % name)
+                            self._switch_channel("general")
+                    except Exception:
+                        pass
+                Clock.schedule_once(apply_del, 0)
             elif kind == "term_data":
                 # console output (server-sanitised); "clear" wipes the buffer
                 def apply_term(dt):
@@ -2886,6 +3117,20 @@ class sHadesClientApp(MDApp):
     def _channel_kind(self, cid):
         return self._channel_kinds.get(cid, "chat")
 
+    def _fetch_whoami(self):
+        """Fetch our own identity/role view (gates moderator menu items)."""
+        if not self.guild_api:
+            return
+        def work():
+            try:
+                res = self.guild_api.whoami()
+            except Exception as e:
+                print("whoami failed:", repr(e))
+                return
+            if res.get("ok"):
+                self.i_am_moderator = bool(res.get("is_moderator"))
+        threading.Thread(target=work, daemon=True).start()
+
     def _update_channel_badges(self):
         """Push unread counts onto the sidebar buttons (UI thread)."""
         try:
@@ -2895,7 +3140,150 @@ class sHadesClientApp(MDApp):
         for child in grid.children:
             if isinstance(child, ChannelButton):
                 cid = self._channels.get(child.channel_name)
-                child.badge = self._channel_unread.get(cid, 0)
+                unread = 0 if cid in self._muted_channels \
+                    else self._channel_unread.get(cid, 0)
+                child.badge = unread
+
+    # -- context menus (U3) ------------------------------------------------
+    def open_context_menu(self, actions, window_pos):
+        """Show the Window-level context menu overlay."""
+        if not actions:
+            return
+        if self._ctx_menu is not None:
+            self._ctx_menu.dismiss_now()
+        self._ctx_menu = ContextMenuOverlay(actions, window_pos)
+        Window.add_widget(self._ctx_menu)
+
+    def _copy_text(self, text):
+        from kivy.core.clipboard import Clipboard
+        Clipboard.copy(text)
+        self._set_status("copied to clipboard")
+
+    def _reply_quote(self, username, content):
+        """Quote a message into the input bar: '> name: line' per line."""
+        lines = (content or "").split("\n")[:3]
+        quote = "\n".join("> %s: %s" % (username, l[:120]) for l in lines)
+        try:
+            main = self.root.get_screen("main")
+            inp = main.ids.msg_input
+            inp.text = (quote + "\n" + (inp.text or "")).strip("\n") + "\n"
+            inp.focus = True
+        except Exception as e:
+            print("reply quote failed:", repr(e))
+
+    def _mention(self, username):
+        try:
+            main = self.root.get_screen("main")
+            inp = main.ids.msg_input
+            inp.text = (inp.text or "") + "@%s " % username
+            inp.focus = True
+        except Exception as e:
+            print("mention failed:", repr(e))
+
+    def _toggle_mute_channel(self, name, cid):
+        if cid in self._muted_channels:
+            self._muted_channels.discard(cid)
+            self._set_status("#%s unmuted" % name)
+        else:
+            self._muted_channels.add(cid)
+            self._set_status("#%s muted (unread badge hidden)" % name)
+        try:
+            cfg = os.path.join(_app_data_dir(), "muted_channels.json")
+            with open(cfg, "w") as f:
+                json.dump(sorted(self._muted_channels), f)
+        except Exception as e:
+            print("muted-channel persist failed:", repr(e))
+        self._update_channel_badges()
+
+    def _delete_channel(self, name, cid):
+        if not self.guild_api:
+            return
+        def work():
+            try:
+                res = self.guild_api.channels_delete(cid)
+            except Exception as e:
+                res = {"ok": 0, "error": repr(e)}
+            if not res.get("ok"):
+                err = res.get("error", "unknown")
+                Clock.schedule_once(
+                    lambda dt: self._set_status("delete failed: %s" % err), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _mod_action(self, method, user_hash, name):
+        """Run a moderation call (mute/ban/...) off the UI thread."""
+        if not self.guild_api:
+            return
+        def work():
+            try:
+                res = getattr(self.guild_api, method)(user_hash)
+            except Exception as e:
+                res = {"ok": 0, "error": repr(e)}
+            ok = res.get("ok")
+            err = res.get("error", "unknown")
+            Clock.schedule_once(lambda dt: self._set_status(
+                ("%s: %s" % (method.replace("mod_", ""), name)) if ok
+                else ("%s failed: %s" % (name, err))), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _delete_message(self, msg_id):
+        if not self.guild_api:
+            return
+        def work():
+            try:
+                res = self.guild_api.delete(msg_id)
+            except Exception as e:
+                res = {"ok": 0, "error": repr(e)}
+            if not res.get("ok"):
+                err = res.get("error", "unknown")
+                Clock.schedule_once(
+                    lambda dt: self._set_status("delete failed: %s" % err), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _open_edit_popup(self, msg_id, content):
+        try:
+            self.root.get_screen("main")
+        except Exception:
+            return
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
+        ti = TextInput(text=content or "", multiline=True, size_hint_y=None,
+                       height=dp(90))
+        row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40),
+                        spacing=dp(8))
+        popup_holder = {}
+
+        def save(*a):
+            new = (ti.text or "").strip()
+            if not new or not self.guild_api:
+                return
+            def work():
+                try:
+                    self.guild_api.edit(msg_id, new)
+                except Exception as e:
+                    print("edit failed:", repr(e))
+            threading.Thread(target=work, daemon=True).start()
+            popup_holder["p"].dismiss()
+        save_btn = Button(text="save")
+        save_btn.bind(on_press=save)
+        cancel_btn = Button(text="cancel")
+        cancel_btn.bind(on_press=lambda *a: popup_holder["p"].dismiss())
+        row.add_widget(save_btn)
+        row.add_widget(cancel_btn)
+        box.add_widget(ti)
+        box.add_widget(row)
+        popup = Popup(title="edit message", content=box, size_hint=(0.8, 0.45))
+        popup_holder["p"] = popup
+        self._popup = popup
+        popup.open()
+
+    def _copy_invite(self):
+        """shades:// share-link for the current hub (connect-screen format)."""
+        host = getattr(self, "hub_host", None)
+        port = getattr(self, "hub_port", None)
+        node = getattr(self, "node_hash", None)
+        if not (host and port and node):
+            self._set_status("invite unavailable (no hub connection)")
+            return
+        self._copy_text("shades://%s:%s/%s" % (host, port, node))
 
     def _add_channel(self, name):
         main = self.root.get_screen("main")
