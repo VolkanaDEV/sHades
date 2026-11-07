@@ -44,6 +44,8 @@ Unit tests (no mesh needed):
     /usr/bin/python3 tests/test_presence.py     # ping registry, expiry, spoof resistance
     /usr/bin/python3 tests/test_streams.py      # JSON v1: channels, stream, typing, presence
     /usr/bin/python3 tests/test_blobs_site.py   # JSON v1: blobs, blob posts, site channels
+    /usr/bin/python3 tests/test_micron_render.py  # micron parser (site pages)
+    /usr/bin/python3 tests/test_term.py         # term channels: console sessions
 
 Setup / deployment:
 
@@ -84,6 +86,10 @@ Endpoints:
     /api/v1/site/get {channel, path, offset?, len?}
     /api/v1/site/manifest {channel}            -> {manifest}
     /api/v1/site/manifest_put {channel, manifest}       (mod only)
+    /api/v1/term/open {channel}                -> {session}      (term channels only)
+    /api/v1/term/data {session, data_b64}      (line-based console input)
+    /api/v1/term/resize {session, rows, cols}
+    /api/v1/term/close {session}
 
 Blobs are content-addressed (`blob_id` = sha256[:32], served at
 `/file/blobs/<id>.<ext>`); site resources live under `/file/sites/<cid>/<path>`
@@ -96,10 +102,27 @@ Stream rules (server-enforced "only the active channel flows"):
 - one subscription per link; a poll older than 120 s is dropped as dead;
 - event kinds: `msg` (full row), `edit`/`del`, `typing` (transitions only, 5 s TTL),
   `presence` (guild-wide: full snapshot when the online set changes),
-  `site_patch` (site resource or manifest update);
+  `site_patch` (site resource or manifest update), `term_data` (console output;
 - cursor = last event seq; the per-channel replay ring holds 200 events, and a
   cursor older than that returns `reset: true` + the head seq to resync to;
 - polls long-poll up to 10 s (`timeout_s` capped) and are woken instantly on events.
+
+## Term channels: the guild console
+
+Term channels host an in-process, line-based console — no pty, no subprocess,
+no shell; the command table in `_term_execute` is the whole surface. Sessions
+(`/api/v1/term/*`) are owned by the opening user, capped (4/user, 32 guild-wide),
+rate-limited (30 commands/min), idle-closed after 300 s, and ANSI-stripped in
+both directions (input and output — `clear` is a structured event flag, never
+an escape sequence). Input is line-buffered server-side; output rides
+`term_data` events on the channel stream.
+
+Commands: `help`, `who`, `channels`, `msg <channel> <text>` (posts through the
+normal ingest path — rate limits and moderation apply), `info <channel>`,
+`presence`, `uptime`, `clear`, `quit`.
+
+The Kivy client shows a `TermPage` console for term channels; the main input
+bar feeds the session, output appends live from the stream.
 
 The Kivy client streams only the visible channel (`_stream_loop`); the 3 s
 reconciler poll and the 4 s ping loop are unchanged.

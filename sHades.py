@@ -70,6 +70,15 @@ STREAM_WAIT_MAX   = 10.0   # hard cap on one poll's wait
 SUB_TTL_S         = 120.0  # a subscription not polled for this long is dropped
 TYPING_TTL_S      = 5.0    # a "typing" flag expires this long after its last ping
 
+# Term channels (JSON API v1 phase 5): a guild console over the stream — a
+# line-based REPL executed in-process. Never a pty, never a subprocess, never
+# a shell: the command table below is the whole attack surface.
+TERM_IDLE_S       = 300.0  # session closed after this much inactivity
+TERM_MAX_PER_USER = 4      # concurrent sessions per user
+TERM_MAX_TOTAL    = 32     # concurrent sessions guild-wide
+TERM_MAX_INPUT    = 2000   # bytes per term/data payload
+TERM_IN_RATE      = (30, 60)  # commands per window (uses rate_ok)
+
 # ----------------------------------------------------------------------------------
 # Globals (set up by run(); import-safe for unit tests)
 # ----------------------------------------------------------------------------------
@@ -328,14 +337,16 @@ def check_token(user, scope, token):
 # Rate limiting + moderation
 # ----------------------------------------------------------------------------------
 
-def rate_ok(sender, channel_id):
+def rate_ok(sender, channel_id, max_posts=None, window_s=None):
     key = (sender, channel_id)
+    max_posts = max_posts if max_posts is not None else RATE_MAX_POSTS
+    window_s = window_s if window_s is not None else RATE_WINDOW_S
     with _rate_lock:
         w = _rate_windows[key]
-        cutoff = now() - RATE_WINDOW_S
+        cutoff = now() - window_s
         while w and w[0] < cutoff:
             w.popleft()
-        if len(w) >= RATE_MAX_POSTS:
+        if len(w) >= max_posts:
             return False
         w.append(now())
         return True
@@ -2011,6 +2022,226 @@ def serve_site_file(path, data, request_id, link_id, remote_identity, requested_
             return f.read()
     return b"not found"
 
+# ---- term channels (phase 5): guild console sessions over the stream ---------------
+
+TERM_SESSIONS = {}                     # session_id -> session dict
+TERM_SESSIONS_LOCK = threading.Lock()
+_GUILD_BOOT = now()                    # updated in run(); uptime command
+
+_TERM_ANSI_RE = re.compile(
+    r"\x1b\[[0-9;?]*[a-zA-Z]"                 # CSI sequences (ESC [ ... letter)
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"    # OSC sequences (ESC ] ... BEL)
+    r"|\x1b.")                                # remaining single-char escapes
+_TERM_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1c\x7f]")   # keep \t (09) and \n
+
+def _term_sanitize(s):
+    """Strip whole ANSI escape sequences first, then any other control
+    characters. Keeps printable text and tabs only."""
+    return _TERM_CTRL_RE.sub("", _TERM_ANSI_RE.sub("", s))
+
+def _term_emit(session, text, clear=False):
+    data = {"session": session["id"],
+            "text": _term_sanitize(text)[:4000]}
+    if clear:
+        # structured clear (the client wipes its buffer) — never ANSI
+        data["clear"] = True
+    _emit_event(session["channel"], "term_data", data)
+
+def _term_purge_idle():
+    """Close sessions idle past TERM_IDLE_S. Called on every term request."""
+    cutoff = now() - TERM_IDLE_S
+    with TERM_SESSIONS_LOCK:
+        dead = [sid for sid, s in TERM_SESSIONS.items() if s["last_seen"] < cutoff]
+        for sid in dead:
+            s = TERM_SESSIONS.pop(sid)
+            _term_emit(s, "\r\n[session closed: idle]\r\n")
+    return dead
+
+def _term_prompt():
+    return "\r\n> "
+
+def _term_execute(session, line):
+    """Run one console command. Pure Python dispatch — no eval, no exec,
+    no subprocess. Output (including the next prompt) rides term_data."""
+    viewer = session["user_hash"]
+    cmd, _, arg = line.strip().partition(" ")
+    cmd = cmd.strip().lower()
+    arg = arg.strip()
+    out = ""
+    if cmd == "":
+        pass
+    elif cmd in ("help", "?"):
+        out = ("\r\n".join([
+            "commands:",
+            "  help                this list",
+            "  who                 who is online (and where they are)",
+            "  channels            channel index",
+            "  msg <channel> <text>   post <text> to an existing channel",
+            "  info <channel>      channel details",
+            "  presence            the active user list",
+            "  uptime              guild uptime",
+            "  clear               clear the terminal",
+            "  quit                close this session",
+        ]))
+    elif cmd == "who":
+        users = online_users()
+        if not users:
+            out = "nobody online"
+        else:
+            active = _active_channels_by_user()
+            out = "\r\n".join(
+                "  %s  node %s  in %s" % (
+                    u["username"], u["node_hash"][:12],
+                    channel_name(active.get(u["user_hash"], "")) or "-")
+                for u in sorted(users.values(), key=lambda x: x["username"].lower()))
+    elif cmd == "channels":
+        with db_lock:
+            rows = db.execute("SELECT name, kind FROM channels ORDER BY name").fetchall()
+        out = "\r\n".join("  #%s (%s)" % (r["name"], r["kind"]) for r in rows) or "  (none)"
+    elif cmd == "msg":
+        chan, _, text = arg.partition(" ")
+        chan = chan.lstrip("#").strip()
+        text = text.strip()
+        if not chan or not text:
+            out = "usage: msg <channel> <text>"
+        else:
+            with db_lock:
+                row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
+                                 (chan,)).fetchone()
+            if not row:
+                out = "unknown channel: #%s" % chan
+            elif not rate_ok(viewer, row["id"]):
+                out = "rate limited"
+            else:
+                mid = ingest(row["id"], viewer, text)
+                out = "posted to #%s" % chan if mid else "rejected"
+    elif cmd == "info":
+        chan = arg.lstrip("#").strip()
+        with db_lock:
+            row = db.execute("SELECT id, kind, created FROM channels "
+                             "WHERE name=? COLLATE NOCASE", (chan,)).fetchone()
+        if not row:
+            out = "unknown channel: #%s" % chan
+        else:
+            out = "  #%s  %s  seq %d" % (chan, row["kind"], get_seq(row["id"]))
+    elif cmd == "presence":
+        users = _presence_payload()
+        out = "\r\n".join(
+            "  %s%s" % (u["username"],
+                       "  in " + channel_name(u["active_channel"])
+                       if u.get("active_channel") else "")
+            for u in users) or "  nobody pinging"
+    elif cmd == "uptime":
+        secs = int(now() - _GUILD_BOOT)
+        out = "up %dd %dh %dm" % (secs // 86400, (secs % 86400) // 3600,
+                                  (secs % 3600) // 60)
+    elif cmd == "clear":
+        # structured clear event; the next prompt arrives separately
+        _term_emit(session, "", clear=True)
+        _term_emit(session, _term_prompt())
+        return
+    elif cmd in ("quit", "exit"):
+        with TERM_SESSIONS_LOCK:
+            TERM_SESSIONS.pop(session["id"], None)
+        _term_emit(session, "\r\n[session closed]")
+        return
+    else:
+        out = "unknown command: %s (try help)" % cmd
+    _term_emit(session, out + _term_prompt())
+
+@api_route("/api/v1/term/open")
+@wrap_json_api
+def api_v1_term_open(viewer, data, link_id):
+    """Open a console session on a term channel. {channel, rows?, cols?} ->
+    {session}. The banner + prompt arrive as term_data stream events."""
+    cid = data.get("channel")
+    with db_lock:
+        row = db.execute("SELECT id, kind FROM channels WHERE id=?", (cid,)).fetchone()
+    if not row or row["kind"] != "term":
+        return {"ok": 0, "error": "unknown or non-term channel", "code": 404}
+    _term_purge_idle()
+    with TERM_SESSIONS_LOCK:
+        mine = sum(1 for s in TERM_SESSIONS.values() if s["user_hash"] == viewer)
+        if mine >= TERM_MAX_PER_USER:
+            return {"ok": 0, "error": "too many sessions", "code": 429}
+        if len(TERM_SESSIONS) >= TERM_MAX_TOTAL:
+            return {"ok": 0, "error": "guild session limit reached", "code": 429}
+        sid = secrets.token_hex(12)
+        TERM_SESSIONS[sid] = {
+            "id": sid, "user_hash": viewer, "link_id": link_id, "channel": cid,
+            "created": now(), "last_seen": now(), "rows": 24, "cols": 80, "line": "",
+        }
+    banner = ("sHades guild console\r\ntype 'help' for commands")
+    _term_emit(TERM_SESSIONS[sid], banner + _term_prompt())
+    return {"ok": 1, "session": sid, "channel": cid}
+
+@api_route("/api/v1/term/data")
+@wrap_json_api
+def api_v1_term_data(viewer, data, link_id):
+    """Feed console input: {session, data_b64}. Lines execute on newline;
+    output rides term_data events on the channel stream."""
+    with TERM_SESSIONS_LOCK:
+        session = TERM_SESSIONS.get(data.get("session") or "")
+    if not session:
+        return {"ok": 0, "error": "unknown session", "code": 404}
+    if session["user_hash"] != viewer:
+        return {"ok": 0, "error": "not your session", "code": 403}
+    raw = _b64_decode(data.get("data_b64"))
+    if raw is None:
+        return {"ok": 0, "error": "data_b64 must be valid base64", "code": 400}
+    if len(raw) > TERM_MAX_INPUT:
+        return {"ok": 0, "error": "input too long", "code": 400}
+    if not rate_ok(viewer, "_term", *TERM_IN_RATE):
+        return {"ok": 0, "error": "rate limited", "code": 429}
+    _term_purge_idle()
+    with TERM_SESSIONS_LOCK:
+        if session["id"] not in TERM_SESSIONS:
+            return {"ok": 0, "error": "session closed", "code": 404}
+        session["last_seen"] = now()
+        session["line"] += _term_sanitize(raw.decode("utf-8", "replace"))
+    # Execute complete lines OUTSIDE the session lock: a command may close
+    # the session (quit) and other handlers need the same lock.
+    closed = False
+    while "\n" in session["line"]:
+        line, _, session["line"] = session["line"].partition("\n")
+        _term_execute(session, line.rstrip("\r"))
+        with TERM_SESSIONS_LOCK:
+            if session["id"] not in TERM_SESSIONS:
+                closed = True
+                break
+    return {"ok": 1, "closed": closed}
+
+@api_route("/api/v1/term/resize")
+@wrap_json_api
+def api_v1_term_resize(viewer, data, link_id):
+    with TERM_SESSIONS_LOCK:
+        session = TERM_SESSIONS.get(data.get("session") or "")
+    if not session:
+        return {"ok": 0, "error": "unknown session", "code": 404}
+    if session["user_hash"] != viewer:
+        return {"ok": 0, "error": "not your session", "code": 403}
+    try:
+        session["rows"] = max(1, min(int(data.get("rows", 24)), 200))
+        session["cols"] = max(1, min(int(data.get("cols", 80)), 500))
+    except (TypeError, ValueError):
+        return {"ok": 0, "error": "bad rows/cols", "code": 400}
+    return {"ok": 1}
+
+@api_route("/api/v1/term/close")
+@wrap_json_api
+def api_v1_term_close(viewer, data, link_id):
+    with TERM_SESSIONS_LOCK:
+        session = TERM_SESSIONS.pop(data.get("session") or "", None)
+    if not session:
+        return {"ok": 0, "error": "unknown session", "code": 404}
+    if session["user_hash"] != viewer:
+        # not ours: put it back rather than letting a stranger close it
+        with TERM_SESSIONS_LOCK:
+            TERM_SESSIONS.setdefault(session["id"], session)
+        return {"ok": 0, "error": "not your session", "code": 403}
+    _term_emit(session, "\r\n[session closed]")
+    return {"ok": 1}
+
 # ----------------------------------------------------------------------------------
 # Boot (plan §9 skeleton — every call verified against the installed stack)
 # ----------------------------------------------------------------------------------
@@ -2055,6 +2286,9 @@ def run(argv=None):
     os.makedirs(os.path.join(STORAGE, "avatars"), exist_ok=True)
     os.makedirs(os.path.join(STORAGE, "blobs"), exist_ok=True)
     os.makedirs(os.path.join(STORAGE, "sites"), exist_ok=True)
+
+    global _GUILD_BOOT
+    _GUILD_BOOT = now()
 
     db = open_db(os.path.join(STORAGE, "sHades.db"))
 

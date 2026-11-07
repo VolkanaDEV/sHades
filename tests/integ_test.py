@@ -514,6 +514,34 @@ def main():
         check("v1 manifest_put over the mesh", r.get("ok") == 1, r)
         japi("/api/v1/stream/unsubscribe", {})
 
+        # ---- term channels: guild console over the stream (phase 5) ----
+        r = japi("/api/v1/channels/create", {"name": "console", "kind": "term"})
+        check("v1 create term channel", r.get("ok") == 1, r)
+        term_cid = r.get("channel", {}).get("id")
+        r = japi("/api/v1/term/open", {"channel": test_cid})
+        check("term open on chat channel rejected", r.get("ok") == 0 and r.get("code") == 404, r)
+        sub = japi("/api/v1/stream/subscribe", {"channel": term_cid})
+        check("subscribe to term channel", sub.get("ok") == 1, sub)
+        r = japi("/api/v1/term/open", {"channel": term_cid})
+        check("term open ok", r.get("ok") == 1 and r.get("session"), r)
+        term_sid = r.get("session")
+        poll = japi("/api/v1/stream/poll", {"timeout_s": 5})
+        banner = [e for e in poll.get("events", []) if e["kind"] == "term_data"]
+        check("term banner + prompt arrive on the stream",
+              banner and "guild console" in banner[0]["data"]["text"], poll)
+        japi("/api/v1/term/data", {"session": term_sid,
+                                   "data_b64": base64.b64encode(b"who\n").decode()})
+        poll = japi("/api/v1/stream/poll", {"timeout_s": 5})
+        outs = " ".join(e["data"]["text"] for e in poll.get("events", [])
+                        if e["kind"] == "term_data")
+        check("console 'who' answers over the mesh", "Page Tester" in outs, outs[:200])
+        japi("/api/v1/term/data", {"session": term_sid,
+                                   "data_b64": base64.b64encode(b"quit\n").decode()})
+        r = japi("/api/v1/term/data", {"session": term_sid,
+                                       "data_b64": base64.b64encode(b"who\n").decode()})
+        check("session gone after quit", r.get("ok") == 0 and r.get("code") == 404, r)
+        japi("/api/v1/stream/unsubscribe", {})
+
         # ---- rate limit (kept last: it exhausts the sender window) ----
         codes = []
         for i in range(14):

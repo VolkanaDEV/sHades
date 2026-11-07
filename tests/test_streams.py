@@ -88,7 +88,6 @@ def main():
     cid_site = r["channel"]["id"]
     r = call("/api/v1/channels/create", {"name": "console", "kind": "term"})
     check("mod creates term channel", r.get("ok") == 1 and r["channel"]["kind"] == "term", r)
-    cid_term = r["channel"]["id"]
     r = call("/api/v1/channels/create", {"name": "weird", "kind": "ftp"})
     check("unknown kind rejected", r.get("ok") == 0 and r.get("code") == 400, r)
     r = call("/api/v1/channels/create", {"name": "bad name!", "kind": "chat"})

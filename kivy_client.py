@@ -428,6 +428,21 @@ class GuildAPI:
     def site_manifest(self, channel):
         return self._request_json("/api/v1/site/manifest", {"channel": channel})
 
+    def term_open(self, channel):
+        """Open a guild console session on a term channel."""
+        return self._request_json("/api/v1/term/open", {"channel": channel},
+                                  timeout=15)
+
+    def term_data(self, session, text):
+        """Feed one line (or fragment) of console input."""
+        return self._request_json("/api/v1/term/data", {
+            "session": session,
+            "data_b64": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+        })
+
+    def term_close(self, session):
+        return self._request_json("/api/v1/term/close", {"session": session})
+
     def fetch_file(self, path):
         """Fetch raw bytes from a /file/... request handler on the guild."""
         dlog(f"fetch_file: requesting {path}")
@@ -813,6 +828,37 @@ if KIVY:
         def _up(self, *a):
             self._rect.pos = self.pos
             self._rect.size = self.size
+
+    class TermPage(BoxLayout):
+        """Guild console view for term channels: one scrolling output label.
+        Output arrives as term_data stream events (server-sanitised text);
+        input goes through the main input bar -> /api/v1/term/data."""
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.orientation = "vertical"
+            self.size_hint_y = None
+            self.padding = [dp(8), dp(8), dp(8), dp(8)]
+            self.bind(minimum_height=lambda w, h: setattr(w, "height", h))
+            self.output = Label(markup=False, halign="left",
+                                color=(0.85, 0.88, 0.9, 1),
+                                font_size=sp(13))
+            self.output.size_hint_y = None
+            self.output.bind(width=lambda inst, w: setattr(
+                inst, "text_size", (w, None)))
+            self.output.bind(texture_size=lambda inst, ts: setattr(
+                inst, "height", max(dp(20), ts[1] if ts else 0)))
+            self.add_widget(self.output)
+
+        def append(self, text):
+            """Append output; keep the buffer bounded (last ~8000 chars)."""
+            buf = (self.output.text or "") + text
+            if len(buf) > 8000:
+                buf = buf[-8000:]
+            self.output.text = buf
+
+        def clear(self):
+            self.output.text = ""
 
 
 # ---------------------------------------------------------------------------
@@ -1468,6 +1514,9 @@ class sHadesClientApp(MDApp):
         self._site_stack = []        # [(cid, path)] back stack
         self._site_current = None    # (cid, path)
         self._site_theme = {}
+        # term channels: one console session per channel, the live TermPage
+        self._term_sessions = {}     # cid -> session id
+        self._term_page = None       # the TermPage currently on screen
 
         # Presence: mirror the guild's active-user list every PRESENCE_INTERVAL.
         # _active_users maps user_hash -> {"username", "node_hash"} and is
@@ -2162,6 +2211,16 @@ class sHadesClientApp(MDApp):
                 if self._site_current:
                     Clock.schedule_once(lambda dt: self._site_load_page(
                         self._site_current[0], self._site_current[1]), 0)
+            elif kind == "term_data":
+                # console output (server-sanitised); "clear" wipes the buffer
+                def apply_term(dt):
+                    if not self._term_page:
+                        return
+                    if data.get("clear"):
+                        self._term_page.clear()
+                    elif data.get("text"):
+                        self._term_page.append(data["text"])
+                Clock.schedule_once(apply_term, 0)
             # "typing" events are consumed by a later phase
         if touched:
             # full refresh of the visible channel; _render_message dedupes
@@ -2628,7 +2687,7 @@ class sHadesClientApp(MDApp):
             self._open_site_channel(name, cid)
             return
         if kind == "term":
-            self._open_term_placeholder(name, cid)
+            self._open_term_channel(name, cid)
             return
         self._older.setdefault(cid, {"oldest_id": None, "has_older": True,
                                      "loading": False})
@@ -2662,20 +2721,57 @@ class sHadesClientApp(MDApp):
             Clock.schedule_once(lambda dt: self._site_load_page(cid, index), 0)
         threading.Thread(target=work, daemon=True).start()
 
-    def _open_term_placeholder(self, name, cid):
+    def _open_term_channel(self, name, cid):
+        """Open (or reuse) a guild console session and show the terminal."""
+        self._term_page = None
         try:
             main = self.root.get_screen("main")
             grid = main.ids.message_grid
             grid.clear_widgets()
             self._msg_widgets.clear()
-            page = SitePage()
-            page.add_widget(self._micron_label("[b]term channel[/b]"))
-            page.add_widget(self._micron_label(
-                "Terminal sessions over Reticulum are not wired into this "
-                "client build yet."))
+            page = TermPage()
+            self._term_page = page
+            page.append("(connecting to the guild console…)\n")
             grid.add_widget(page)
         except Exception as e:
-            print("term placeholder error:", repr(e))
+            print("term open error:", repr(e))
+        if self._term_sessions.get(cid):
+            return   # session survives channel switches until idle expiry
+        def work():
+            try:
+                res = self.guild_api.term_open(cid)
+            except Exception as e:
+                print("term open failed:", repr(e))
+                res = {"ok": 0, "error": repr(e)}
+            if res.get("ok"):
+                self._term_sessions[cid] = res["session"]
+            else:
+                err = res.get("error", "unknown")
+                Clock.schedule_once(lambda dt: self._set_status(
+                    "console: %s" % err), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _send_term_input(self, text):
+        """Send one console line; echo it locally, output rides the stream."""
+        cid = self._stream_cid
+        sid = self._term_sessions.get(cid) if cid else None
+        if not sid:
+            self._set_status("console not connected")
+            return
+        if self._term_page:
+            self._term_page.append("> " + text + "\n")
+        def work():
+            try:
+                res = self.guild_api.term_data(sid, text + "\n")
+                if not res.get("ok"):
+                    err = res.get("error", "unknown")
+                    if err == "unknown session":
+                        self._term_sessions.pop(cid, None)
+                    Clock.schedule_once(lambda dt: self._set_status(
+                        "console: %s" % err), 0)
+            except Exception as e:
+                print("term data failed:", repr(e))
+        threading.Thread(target=work, daemon=True).start()
 
     def _site_load_page(self, cid, path, push=False):
         """Fetch + render one micron page. /page/... targets are the guild's
@@ -2927,10 +3023,16 @@ class sHadesClientApp(MDApp):
         text = (inp.text or "").strip()
         if not self.guild_api:
             return
+        cid = getattr(main, "_current_channel", "general")
+        # term channels: the input bar drives the guild console instead
+        if self._channel_kind(self._channel_cid(cid)) == "term":
+            if text:
+                inp.text = ""
+                self._send_term_input(text)
+            return
         # Allow attachment-only messages (no text) when a file is pending.
         if not text and not getattr(self, "_pending_attachment", None):
             return
-        cid = getattr(main, "_current_channel", "general")
         cid = self._channel_cid(cid)
         inp.text = ""
 
@@ -3724,6 +3826,13 @@ class sHadesClientApp(MDApp):
         self._stream_stop.set()
         self._announce_stop.set()
         self._presence_stop.set()
+        # close any open console sessions so they don't idle out server-side
+        for sid in list(self._term_sessions.values()):
+            try:
+                self.guild_api.term_close(sid)
+            except Exception:
+                pass
+        self._term_sessions.clear()
 
 
 # ---------------------------------------------------------------------------
