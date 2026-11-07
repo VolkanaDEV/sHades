@@ -48,6 +48,20 @@ def main():
     from kivy.uix.gridlayout import GridLayout
 
     Builder.load_file("kv_md.kv")
+
+    # KV rules read app.theme_colors[...], which Kivy resolves through
+    # App.get_running_app(); the KV proxy also calls app.bind(). With no app
+    # running, building any themed widget raises
+    # "'NoneType' object has no attribute 'bind'". sHadesClientApp is an MDApp
+    # (KivyMD widgets refuse to build under a plain kivy.app.App), constructs
+    # without RNS, and we pin the palette for determinism.
+    class _ThemeApp(kc.sHadesClientApp):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.theme_colors = dict(kc.DEFAULT_THEME_COLORS)
+
+    _ThemeApp()
+
     MessageRow = kc.MessageRow
     MessageEmbed = kc.MessageEmbed
 
@@ -113,9 +127,14 @@ def main():
     check("embeds start collapsed", emb.is_expanded is False)
 
     calls = []
-    class FakeApp:
+
+    # _ThemeApp subclass, not a bare object: the KV `app` proxy calls .bind()
+    # and rules read app.theme_colors, so a plain fake breaks as soon as any
+    # themed rule is evaluated while this is the patched get_running_app().
+    class FakeApp(_ThemeApp):
         def show_fullscreen_image(self, source, embed=None):
             calls.append(("show", source))
+
         def dismiss_fullscreen_image(self, embed):
             calls.append(("dismiss", embed))
             if embed is not None:
@@ -135,6 +154,31 @@ def main():
         check("emb collapsed after minimize", emb.is_expanded is False)
     finally:
         kc.App.get_running_app = orig
+
+    # --- FullScreenImageOverlay.download_image failure reporting -----
+    # Regression: the failure branch built its message inside a lambda that
+    # closed over the `except ... as e` name. Python unbinds that name when the
+    # block exits, so a failed download raised NameError inside the Clock
+    # callback and reported nothing at all.
+    import time as _time
+
+    class _StatusApp(_ThemeApp):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.status = []
+
+        def _set_status(self, text):
+            self.status.append(text)
+
+    stapp = _StatusApp()
+    overlay = kc.FullScreenImageOverlay(source="/nonexistent/not-a-file.zip")
+    overlay.download_image()
+    deadline = _time.time() + 5
+    while _time.time() < deadline and not stapp.status:
+        Clock.tick()
+        _time.sleep(0.02)
+    check("failed download reports an error (no NameError)",
+          any("Download failed" in s for s in stapp.status), stapp.status)
 
     # --- Enter / Shift+Enter logic ----------------------------------
     class FakeInp:

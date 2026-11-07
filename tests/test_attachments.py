@@ -133,6 +133,19 @@ def main():
     # Load KV so MessageRow has embed_container id
     Builder.load_file("kv_md.kv")
 
+    # KV rules read app.theme_colors[...], which Kivy resolves through
+    # App.get_running_app(); the KV proxy also calls app.bind(). StubApp below
+    # is deliberately not a Kivy App, so without this a themed widget built by
+    # _render_message raises "'NoneType' object has no attribute 'bind'".
+    # sHadesClientApp is an MDApp (KivyMD widgets refuse to build under a plain
+    # kivy.app.App), constructs without RNS, and we pin the palette.
+    class _ThemeApp(kc.sHadesClientApp):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.theme_colors = dict(kc.DEFAULT_THEME_COLORS)
+
+    _ThemeApp()
+
     # --- 1. guild-style attachment metadata (dict) ------------------------
     grid = GridLayout(cols=1)
     app = StubApp(kc, grid, files={"/file/attachments/abc.png": PNG_1PX})

@@ -49,6 +49,19 @@ def main():
 
     Builder.load_file("kv_md.kv")
 
+    # KV rules read app.theme_colors[...], which Kivy resolves through
+    # App.get_running_app(); the KV proxy also calls app.bind(). With no app
+    # running, building any themed widget raises
+    # "'NoneType' object has no attribute 'bind'". sHadesClientApp is an MDApp
+    # (KivyMD widgets refuse to build under a plain kivy.app.App), constructs
+    # without RNS, and we pin the palette for determinism.
+    class _ThemeApp(kc.sHadesClientApp):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.theme_colors = dict(kc.DEFAULT_THEME_COLORS)
+
+    _ThemeApp()
+
     MessageRow = kc.MessageRow
     MessageEmbed = kc.MessageEmbed
 
