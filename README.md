@@ -33,18 +33,97 @@ three destination hashes.
 Options: `--storage`, `--name`, `--announce-delay`, `--rns-configdir`.
 
 Run the verification suite (boots a real guild + client over a TCP loopback RNS mesh,
-41 checks — ingest, seq, usernames, edit/delete, pages, escaping, attachments, avatars,
-rate limit, delta API, ban/unban, mute/unmute, settings):
+54 checks — ingest, seq, usernames, edit/delete, pages, escaping, attachments, avatars,
+presence/ping pruning, rate limit, delta API, ban/unban, mute/unmute, settings):
 
     /usr/bin/python3 tests/integ_test.py
 
-Moderation unit tests (no mesh needed):
+Unit tests (no mesh needed):
 
-    /usr/bin/python3 tests/test_moderation.py
+    /usr/bin/python3 tests/test_moderation.py   # ban / mute / delete authorisation
+    /usr/bin/python3 tests/test_presence.py     # ping registry, expiry, spoof resistance
+    /usr/bin/python3 tests/test_streams.py      # JSON v1: channels, stream, typing, presence
+    /usr/bin/python3 tests/test_blobs_site.py   # JSON v1: blobs, blob posts, site channels
 
 Setup / deployment:
 
     /usr/bin/python3 setup_sHades.py   # fresh community hub or join pre-existing hub
+
+## JSON API v1 (Reticulum-native, no HTTP)
+
+Everything rides RNS Link requests on `nomadnetwork.node` — same transport as the
+Micron pages, never HTML/HTTP/TCP-sockets at the API layer. `/api/*` (msgpack) is
+the legacy surface; `/api/v1/*` speaks **JSON**: request payload = `json.dumps(args)`
+bytes, response = `{"ok": 1, ...}` or `{"ok": 0, "error", "code"}` JSON bytes. Auth is
+the identified link identity (never payload-supplied hashes).
+
+Channels have a **kind**: `chat` (message ledger), `site` (NomadNet micron
+"website": manifest + micron pages + images/audio/video, rendered by the existing
+Micron path), `term` (terminal stream; sessions land in a later phase). `site`/`term`
+creation is moderator-only.
+
+Endpoints:
+
+    /api/v1/channels/list                      -> {channels: [{id, name, kind, seq, created}]}
+    /api/v1/channels/create {name, kind, manifest?}  (site/term: mod only)
+    /api/v1/channels/info {channel}            -> {channel: {..., manifest, seq}}
+    /api/v1/stream/subscribe {channel, cursor?}      (one subscription per link —
+                                                subscribing replaces; cursor=int)
+    /api/v1/stream/poll {cursor?, timeout_s?}  -> {events, cursor, reset, typing}
+    /api/v1/stream/unsubscribe
+    /api/v1/typing {channel, active}
+    /api/v1/presence                           -> {users: [{user_hash, username,
+                                                   node_hash, active_channel, ...}]}
+    /api/v1/blobs/put {name?, mime?, data_b64} -> {blob_id, size, mime, path}
+    /api/v1/blobs/get {blob_id, offset?, len?} -> {data_b64, total, offset, eof}
+    /api/v1/post {channel, content, attachments?}    (JSON chat post; attachments
+                                                are {blob_id} refs or inline
+                                                {name, mime, data_b64})
+    /api/v1/site/put {channel, path, data_b64, mime?}   (mod only; micron pages,
+                                                images, audio, video)
+    /api/v1/site/get {channel, path, offset?, len?}
+    /api/v1/site/manifest {channel}            -> {manifest}
+    /api/v1/site/manifest_put {channel, manifest}       (mod only)
+
+Blobs are content-addressed (`blob_id` = sha256[:32], served at
+`/file/blobs/<id>.<ext>`); site resources live under `/file/sites/<cid>/<path>`
+with traversal guards. Blob and site gets are chunked (256 KB default, 1 MB max)
+so large media reads stay bounded on slow links. `site/put` and `manifest_put`
+emit `site_patch` events on the channel stream.
+
+Stream rules (server-enforced "only the active channel flows"):
+
+- one subscription per link; a poll older than 120 s is dropped as dead;
+- event kinds: `msg` (full row), `edit`/`del`, `typing` (transitions only, 5 s TTL),
+  `presence` (guild-wide: full snapshot when the online set changes),
+  `site_patch` (site resource or manifest update);
+- cursor = last event seq; the per-channel replay ring holds 200 events, and a
+  cursor older than that returns `reset: true` + the head seq to resync to;
+- polls long-poll up to 10 s (`timeout_s` capped) and are woken instantly on events.
+
+The Kivy client streams only the visible channel (`_stream_loop`); the 3 s
+reconciler poll and the 4 s ping loop are unchanged.
+
+## Site channels in the client
+
+The client learns each channel's kind from `/api/v1/channels/list` and routes by
+kind: `chat` renders the message ledger, `site` renders Micron pages, `term`
+shows a placeholder until terminal sessions land. Site rendering (`micron.py` +
+`_render_site_page`) is NomadNet Micron → Kivy — **never HTML**:
+
+- supported grammar: `#!bg=` directives, `>` headings, `-` separators, `c`
+  centered lines, `` `!bold!` `` / `` `*italic*` `` / `` `_under_` `` / `` `F8a8`f `` /
+  `` `B333`b `` runs, `` `[label`:/target`vars] `` links (colon-prefixed same-node
+  targets), `` `{:/path`8`vars} `` partials (as links), `` `= `` literal blocks;
+- page navigation: links to `/file/sites/<cid>/*.mu` fetch that resource via
+  `site/get` and render it (back stack via `< Back`); links to `/page/...` fetch
+  the guild's own pages raw; everything else lands in the status line;
+- media: a line that is only a link to `/file/...` media renders inline —
+  images as `MessageEmbed` (bytes fetched over the link, cached locally),
+  audio/video as tappable download rows;
+- theming: manifest `theme.bg` (or the page's `#!bg=`) paints the page; the
+  manifest is a token set, not CSS — Micron has no stylesheets;
+- `site_patch` stream events re-theme/re-render the open page live.
 
 ## systemd (user unit)
 
@@ -58,6 +137,7 @@ Setup / deployment:
     setup_sHades.py        fresh-hub / join-existing-hub setup script
     tests/integ_test.py    end-to-end verification (mesh)
     tests/test_moderation.py moderation unit tests
+    tests/test_presence.py presence / ping-expiry unit tests
     plan.md                the design (v2.2) with verified-API citations
     plan_review.md         teardown of the original v1 plan (why it was rebuilt)
     plan_v1.md             original (superseded) design

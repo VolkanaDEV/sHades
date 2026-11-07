@@ -17,6 +17,7 @@ import os
 import re
 import json
 import time
+import base64
 import argparse
 import sqlite3
 import hashlib
@@ -48,6 +49,27 @@ TOKEN_TTL_S       = 900
 ATTACHMENT_EXT    = {"png", "jpg", "jpeg", "gif", "webp", "mp3", "ogg", "wav",
                      "flac", "mp4", "webm", "pdf", "txt"}
 
+# Channel kinds: chat, a NomadNet micron "site", or a terminal stream.
+CHANNEL_KINDS     = ("chat", "site", "term")
+
+# Blobs + site resources (JSON API v1 phases 3-4): content-addressed media,
+# uploaded once and referenced by id. Chunked get keeps memory bounded.
+BLOB_CHUNK_DEFAULT = 256 * 1024   # /api/v1/blobs/get default slice
+BLOB_CHUNK_MAX     = 1024 * 1024  # ... and hard cap per request
+SITE_PATH_RE       = re.compile(r"^/[a-zA-Z0-9][a-zA-Z0-9._/\-]{0,127}$")
+EXT_MIME           = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                      "gif": "image/gif", "webp": "image/webp", "mp3": "audio/mpeg",
+                      "ogg": "audio/ogg", "wav": "audio/wav", "flac": "audio/flac",
+                      "mp4": "video/mp4", "webm": "video/webm", "pdf": "application/pdf",
+                      "txt": "text/plain", "mu": "text/micron"}
+
+# JSON API v1 stream state
+EVENT_LOG_MAX     = 200    # per-channel event ring; a cursor older than this resyncs
+STREAM_WAIT_S     = 4.0    # default long-poll wait (server side)
+STREAM_WAIT_MAX   = 10.0   # hard cap on one poll's wait
+SUB_TTL_S         = 120.0  # a subscription not polled for this long is dropped
+TYPING_TTL_S      = 5.0    # a "typing" flag expires this long after its last ping
+
 # ----------------------------------------------------------------------------------
 # Globals (set up by run(); import-safe for unit tests)
 # ----------------------------------------------------------------------------------
@@ -69,6 +91,21 @@ _rate_lock    = threading.Lock()
 MODERATORS    = set()             # canonical user hashes; seeded from moderators.txt at boot
 NODE_REGISTRY = {}                # node_hash -> {address, port, last_seen}
 NODE_REGISTRY_LOCK = threading.Lock()
+NODE_ANNOUNCE_INTERVAL = 4.0      # clients re-register (ping) this often
+NODE_MISS_LIMIT = 2               # miss this many consecutive announcements → drop
+NODE_STALE_S = NODE_ANNOUNCE_INTERVAL * NODE_MISS_LIMIT   # 8.0 s
+
+# Stream state for the JSON API. One subscription per link: subscribing to a
+# channel replaces whatever that link was streaming, which is what makes
+# "only the active channel flows" a server-side rule rather than a convention.
+EVENT_COND    = threading.Condition()   # guards EVENT_LOG and wakes stream pollers
+EVENT_LOG     = {}                      # channel_id -> deque[(seq, event)], maxlen EVENT_LOG_MAX
+EVENT_SEQ     = 0                       # single global sequence; cursors are per-channel views of it
+SUBSCRIPTIONS = {}                      # link_id -> {user_hash, channel, cursor, at}
+SUB_BY_USER   = {}                      # user_hash -> {channel, link_id, at}
+SUB_LOCK      = threading.Lock()
+TYPING        = {}                      # channel_id -> {user_hash: expires_at}
+TYPING_LOCK   = threading.Lock()
 
 FIELD_ATTACHMENTS = LXMF.FIELD_FILE_ATTACHMENTS  # 0x05 — envelope ours (plan §14)
 
@@ -80,7 +117,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS guilds (
     id TEXT PRIMARY KEY, name TEXT, node_hash TEXT, delivery_hash TEXT, prop_hash TEXT);
 CREATE TABLE IF NOT EXISTS channels (
-    id TEXT PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE, created REAL);
+    id TEXT PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE, created REAL,
+    kind TEXT NOT NULL DEFAULT 'chat', manifest TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS channel_state (
     channel_id TEXT PRIMARY KEY, seq INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS members (
@@ -103,25 +141,45 @@ CREATE TABLE IF NOT EXISTS muted (
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, id);
 """
 
+def _migrate_schema(conn):
+    """Additive migrations for databases written by earlier versions.
+
+    CREATE TABLE IF NOT EXISTS never alters an existing table, so a column added
+    to SCHEMA after a guild has already booted has to be added explicitly."""
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(channels)").fetchall()}
+    for col, decl in (("kind", "TEXT NOT NULL DEFAULT 'chat'"), ("manifest", "TEXT")):
+        if col not in have:
+            conn.execute("ALTER TABLE channels ADD COLUMN %s %s" % (col, decl))
+
 def open_db(path):
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
     conn.executescript(SCHEMA)
+    _migrate_schema(conn)
     conn.commit()
     return conn
 
-def ensure_channel(name):
-    """Create a channel + its revision counter if needed. Returns channel id."""
-    cid = hexstr(RNS.Identity.full_hash(f"{GUILD_ID}:{name}".encode()))
+def ensure_channel(name, kind="chat"):
+    """Create a channel + its revision counter if needed. Returns channel id.
+
+    A channel's id is a hash of its name, so it is case-sensitive, while the
+    channels.name unique index is COLLATE NOCASE. The name lookup below is
+    therefore NOCASE: '#General' resolves to the existing 'general' channel
+    instead of computing a different id that the unique index then refuses.
+    """
     with db_lock:
-        row = db.execute("SELECT id FROM channels WHERE id=?", (cid,)).fetchone()
-        if not row:
-            db.execute("INSERT INTO channels (id, name, created) VALUES (?, ?, ?)",
-                       (cid, name, time.time()))
-            db.execute("INSERT OR IGNORE INTO channel_state (channel_id, seq) VALUES (?, 0)", (cid,))
-            db.commit()
+        row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
+                         (name,)).fetchone()
+        if row:
+            return row["id"]
+        cid = hexstr(RNS.Identity.full_hash(f"{GUILD_ID}:{name}".encode()))
+        db.execute("INSERT OR IGNORE INTO channels (id, name, created, kind) "
+                   "VALUES (?, ?, ?, ?)",
+                   (cid, name, time.time(), kind if kind in CHANNEL_KINDS else "chat"))
+        db.execute("INSERT OR IGNORE INTO channel_state (channel_id, seq) VALUES (?, 0)", (cid,))
+        db.commit()
     return cid
 
 def channel_name(cid):
@@ -331,6 +389,69 @@ def load_moderators(path):
                     MODERATORS.add(line)
     return len(MODERATORS)
 
+def _reap_stale_nodes():
+    """Drop NODE_REGISTRY entries whose last_seen is older than NODE_STALE_S,
+    i.e. the client missed NODE_MISS_LIMIT consecutive 4s announcements.
+
+    The presence event fires when a user loses their LAST node — comparing
+    online-set snapshots around the deletion can't see the transition: by the
+    time the reaper runs, the entries it drops are already too stale to be
+    'online' from the snapshot's point of view."""
+    cutoff = now() - NODE_STALE_S
+    stale = []
+    gone_users = set()
+    with NODE_REGISTRY_LOCK:
+        stale = [h for h, e in list(NODE_REGISTRY.items())
+                 if e["last_seen"] < cutoff]
+        if stale:
+            gone_users = {NODE_REGISTRY[h].get("user_hash") for h in stale}
+            for h in stale:
+                del NODE_REGISTRY[h]
+                RNS.log("dropped stale node %s (missed %d consecutive announcements)"
+                        % (h[:12], NODE_MISS_LIMIT), RNS.LOG_NOTICE)
+            gone_users -= {e.get("user_hash") for e in NODE_REGISTRY.values()}
+    if gone_users:
+        # users just went offline — guild-wide event for every streamer
+        _emit_event(None, "presence", {"users": _presence_payload()}, guild_wide=True)
+    return stale
+
+def _node_reaper():
+    while True:
+        time.sleep(1.0)
+        try:
+            _reap_stale_nodes()
+        except Exception as e:
+            RNS.log("node reaper error: %s" % e, RNS.LOG_ERROR)
+
+def online_users():
+    """The active user list, derived from the client ping registry.
+
+    Presence is *read out of* NODE_REGISTRY rather than kept in a second table:
+    every client re-registers every NODE_ANNOUNCE_INTERVAL seconds (its IRC-style
+    ping), and _node_reaper drops an entry that misses NODE_MISS_LIMIT consecutive
+    pings. Deriving presence from that single structure means it prunes for free
+    and can never disagree with the reaper.
+
+    Keyed by canonical user hash (the lxmf.delivery destination hash) so the
+    result joins directly against messages.author_hash / members.member_hash.
+    A user with several registered nodes keeps only their most recent entry.
+
+    Returns {user_hash: {user_hash, username, node_hash, last_seen}}.
+    """
+    cutoff = now() - NODE_STALE_S
+    with NODE_REGISTRY_LOCK:
+        entries = [(e.get("user_hash"), h, e.get("last_seen", 0.0))
+                   for h, e in NODE_REGISTRY.items()
+                   if e.get("last_seen", 0.0) >= cutoff and e.get("user_hash")]
+    users = {}
+    for user_hash, node_hash, last_seen in entries:
+        prev = users.get(user_hash)
+        if prev is None or last_seen > prev["last_seen"]:
+            users[user_hash] = {"user_hash": user_hash, "node_hash": node_hash,
+                                "last_seen": last_seen,
+                                "username": get_username(user_hash)}
+    return users
+
 # ----------------------------------------------------------------------------------
 # Attachments (content-addressed on disk; one request handler per file, the
 # nomadnet/Node.py register_files pattern)
@@ -403,6 +524,7 @@ def ingest(channel_id, author_hash, content, ts=None, attachments=None):
     ts = ts if isinstance(ts, (int, float)) and ts > 0 else now()
     msg_id = hexstr(RNS.Identity.full_hash(
         f"{channel_id}|{author_hash}|{ts}|{content}".encode()))
+    att_meta = []
     with db_lock:
         if db.execute("SELECT 1 FROM messages WHERE msg_id=?", (msg_id,)).fetchone():
             dlog(f"ingest: duplicate msg_id {msg_id[:12]}")
@@ -425,6 +547,8 @@ def ingest(channel_id, author_hash, content, ts=None, attachments=None):
                 db.execute("INSERT OR REPLACE INTO attachments "
                            "(msg_id, idx, name, mime, size, path) VALUES (?, ?, ?, ?, ?, ?)",
                            (msg_id, idx, str(name)[:128], str(mime)[:64], len(blob), fname))
+                att_meta.append({"name": str(name)[:128], "mime": str(mime)[:64],
+                                 "size": len(blob), "path": "/file/attachments/" + fname})
             else:
                 dlog(f"ingest: store_attachment returned None for idx={idx} name={name}")
         db.execute("INSERT INTO members (channel_id, member_hash, last_post) VALUES (?, ?, ?) "
@@ -434,6 +558,13 @@ def ingest(channel_id, author_hash, content, ts=None, attachments=None):
         db.commit()
     RNS.log(f"ingest #{channel_name(channel_id)} msg {msg_id[:12]} from {author_hash[:12]}",
             RNS.LOG_DEBUG)
+    # Stream event: subscribers of this channel get the full message row.
+    _emit_event(channel_id, "msg", {"msg": {
+        "msg_id": msg_id, "channel_id": channel_id, "ts": ts,
+        "author_hash": author_hash, "username": get_username(author_hash),
+        "content": content, "edited_at": None, "deleted_at": None,
+        "attachments": att_meta,
+    }})
     return msg_id
 
 def extract_channel(content):
@@ -741,10 +872,28 @@ def page_members(path, data, request_id, link_id, remote_identity, requested_at)
             "LEFT JOIN users u ON u.dest_hash = m.member_hash "
             "WHERE m.channel_id=? ORDER BY m.last_post DESC LIMIT 100", (cid,)).fetchall()
     viewer = viewer_of(remote_identity)
+    online = online_users()
     out = [page_header()]
     out.append("> Members of #" + esc_micron_text(chan["name"]) + "\n-\n")
+    # Presence, straight from the client ping registry: everyone still pinging.
+    # Stale clients are already gone — the reaper drops a node that misses
+    # NODE_MISS_LIMIT consecutive pings, so this list prunes itself.
+    out.append("`!Online now`!  `F555" + str(len(online)) +
+               " pinging (guild-wide)`f\n")
+    if online:
+        for u in sorted(online.values(), key=lambda u: u["username"].lower()):
+            # "+" and not "*"/"_": those are Micron formatting controls, so
+            # inside a formatting run they toggle style instead of printing.
+            out.append("`F2a2+`f " + username_fragment(u["user_hash"]))
+            if u["user_hash"] == viewer:
+                out.append(" `F555(you)`f")
+            out.append("\n")
+    else:
+        out.append("`F555(nobody pinging)`f\n")
+    out.append("\n`!Channel history`!\n")
     for r in rows:
-        out.append(username_fragment(r["member_hash"]) +
+        out.append(("`F2a2+`f " if r["member_hash"] in online else "  ") +
+                   username_fragment(r["member_hash"]) +
                    " `F555last post " + fmt_time(r["last_post"]) + "`f")
         if is_moderator(viewer) and r["member_hash"] != viewer:
             bt = issue_token(viewer, f"ban:{r['member_hash']}")
@@ -1072,13 +1221,21 @@ def _mutate_msg(viewer, data, action):
             content = data.get("content")
             if not isinstance(content, str) or not content.strip():
                 return api_error("empty content", 400)
+            new_content = content.strip()[:MAX_CONTENT_LEN]
+            edited_at = now()
             db.execute("UPDATE messages SET content=?, edited_at=? WHERE msg_id=?",
-                       (content.strip()[:MAX_CONTENT_LEN], now(), msg_id))
+                       (new_content, edited_at, msg_id))
+            event = {"msg_id": msg_id, "content": new_content,
+                     "edited_at": edited_at, "deleted_at": None}
         else:
-            db.execute("UPDATE messages SET deleted_at=? WHERE msg_id=?", (now(), msg_id))
+            deleted_at = now()
+            db.execute("UPDATE messages SET deleted_at=? WHERE msg_id=?", (deleted_at, msg_id))
+            event = {"msg_id": msg_id, "content": "", "edited_at": None,
+                     "deleted_at": deleted_at}
         bump_seq(row["channel_id"])
         db.commit()
         seq = get_seq(row["channel_id"])
+    _emit_event(row["channel_id"], action, event)
     return msgpack.packb({"ok": 1, "seq": seq})
 
 @api_route("/api/edit")
@@ -1117,7 +1274,16 @@ def api_register(viewer, data):
 @wrap_api
 def api_register_node(viewer, data):
     """Client registers its node address with the guild index.
-    data: {node_hash, address, port}
+
+    This call is also the presence ping: each client repeats it every
+    NODE_ANNOUNCE_INTERVAL seconds and the guild treats the ping as "still
+    here". data: {node_hash, address, port, identity_hash?}
+
+    The user identity is taken from the *identified link* the request arrived
+    on (viewer = the lxmf.delivery hash derived from the requester's identity),
+    NOT from anything in the payload. A client-supplied identity could be
+    forged — one client could report a victim as online, or claim a name that
+    isn't theirs — whereas the link identity is bound by the RNS handshake.
     """
     node_hash = (data.get("node_hash") or "").strip().lower()
     address = (data.get("address") or "").strip()
@@ -1130,12 +1296,17 @@ def api_register_node(viewer, data):
         port = int(port)
     except (TypeError, ValueError):
         return api_error("invalid port", 400)
+    before = set(online_users())
     with NODE_REGISTRY_LOCK:
         NODE_REGISTRY[node_hash] = {
             "address": address,
             "port": port,
             "last_seen": now(),
+            "user_hash": viewer,
         }
+    # A first ping (or the last ping before a reap) changes the online set —
+    # streamers get a guild-wide presence event so member lists update live.
+    _emit_presence_if_changed(before)
     return msgpack.packb({"ok": 1})
 
 @api_route("/api/lookup_node")
@@ -1161,6 +1332,33 @@ def api_nodes(viewer, data):
     with NODE_REGISTRY_LOCK:
         nodes = {k: v for k, v in NODE_REGISTRY.items()}
     return msgpack.packb({"ok": 1, "nodes": nodes})
+
+@api_route("/api/presence")
+@wrap_api
+def api_presence(viewer, data):
+    """The active user list (who is currently pinging), for member presence.
+
+    Strictly ping-driven: the requesting client is NOT added just for asking —
+    being able to make a request is not the same as being present. A client
+    whose ping loop has died drops off this list even if it is still polling,
+    which is the point of ping-based presence. Its first ping lands at connect,
+    so a healthy client always sees itself.
+
+    Stale users are *absent*, not flagged: the reaper has already dropped them
+    from the ping registry, so a client that stops pinging disappears from this
+    list within at most ttl seconds.
+
+    Returns {ok, users: [{user_hash, username, node_hash, last_seen}],
+             interval, ttl, now}.
+    """
+    users = online_users()
+    return msgpack.packb({
+        "ok": 1,
+        "users": sorted(users.values(), key=lambda u: u["username"].lower()),
+        "interval": NODE_ANNOUNCE_INTERVAL,
+        "ttl": NODE_STALE_S,
+        "now": now(),
+    })
 
 @api_route("/api/avatar")
 @wrap_api
@@ -1193,6 +1391,625 @@ def api_avatar_get(viewer, data):
         return msgpack.packb({"ok": 1, "avatar": None})
     with open(fpath, "rb") as f:
         return msgpack.packb({"ok": 1, "avatar": f.read()})
+
+# ----------------------------------------------------------------------------------
+# JSON API v1 (msgpack /api/* stays for the legacy client; v1 speaks JSON).
+# Same transport as every other endpoint: RNS Link requests on nomadnetwork.node,
+# auth = identified link identity. RNS wraps request/response payloads in its own
+# internal msgpack envelope, but the payload itself passes through opaquely — so
+# the wire format the API sees is plain JSON (utf-8), never HTML/HTTP.
+#
+# Stream model: one subscription per link (subscribing replaces), cursor = last
+# event seq seen, long-poll wait capped at STREAM_WAIT_MAX. Event kinds:
+#   msg / edit / del   — channel events (from ingest/_mutate_msg)
+#   typing             — channel event (transitions only, TTL TYPING_TTL_S)
+#   presence           — guild-wide event, fanned into every channel's ring
+#   site_patch         — reserved for site-channel resource updates
+# ----------------------------------------------------------------------------------
+
+def _json_resp(d):
+    return json.dumps(d).encode("utf-8")
+
+def _json_args(data):
+    """Accept JSON bytes/str payloads; tolerate a plain dict (tests, clients
+    that let RNS msgpack-encode a dict). Anything else is a bad request."""
+    if isinstance(data, (bytes, bytearray)):
+        try:
+            args = json.loads(data.decode("utf-8"))
+        except Exception:
+            return None
+    elif isinstance(data, str):
+        try:
+            args = json.loads(data)
+        except Exception:
+            return None
+    elif isinstance(data, dict):
+        args = data
+    else:
+        return None
+    return args if isinstance(args, dict) else None
+
+def wrap_json_api(fn):
+    """v1 handlers are fn(viewer, args, link_id) -> dict; the wrapper turns the
+    dict into a JSON response and maps every failure to {ok:0, error, code}."""
+    def handler(path, data, request_id, link_id, remote_identity, requested_at):
+        viewer = viewer_of(remote_identity)
+        if viewer is None:
+            return _json_resp({"ok": 0, "error": "identified link required", "code": 401})
+        args = _json_args(data)
+        if args is None:
+            return _json_resp({"ok": 0, "error": "invalid JSON payload", "code": 400})
+        try:
+            resp = fn(viewer, args, link_id)
+        except Exception as e:
+            RNS.log(f"api v1 error {path}: {e}", RNS.LOG_ERROR)
+            resp = {"ok": 0, "error": "internal error", "code": 500}
+        return _json_resp(resp)
+    return handler
+
+# ---- stream internals -------------------------------------------------------------
+
+def _emit_event(channel_id, kind, data, guild_wide=False):
+    """Append an event to the rings that should carry it. A single global
+    EVENT_SEQ keeps cursors ordered; each channel's deque is a window over
+    that channel's events (plus, for guild-wide events only, a copy for every
+    channel that currently has a subscriber — presence must reach everyone,
+    while a channel's own events never leak into another channel's stream)."""
+    global EVENT_SEQ
+    with SUB_LOCK:
+        subscribed = {s["channel"] for s in SUBSCRIPTIONS.values()}
+    if guild_wide:
+        targets = subscribed
+    else:
+        targets = {channel_id} if channel_id else set()
+    if not targets:
+        return  # nobody is streaming; presence history is served on demand
+    with EVENT_COND:
+        EVENT_SEQ += 1
+        ev = {"seq": EVENT_SEQ, "kind": kind, "ts": now(), "data": data}
+        for cid in targets:
+            ring = EVENT_LOG.setdefault(cid, deque(maxlen=EVENT_LOG_MAX))
+            ring.append((EVENT_SEQ, ev))
+        EVENT_COND.notify_all()
+
+def _emit_presence_if_changed(before):
+    """Emit a guild-wide presence event when the online set changed."""
+    if set(online_users()) != before:
+        _emit_event(None, "presence", {"users": _presence_payload()}, guild_wide=True)
+
+def _purge_subs():
+    """Drop subscriptions that have not been polled within SUB_TTL_S — the
+    server-side stand-in for link teardown, which request handlers can't see."""
+    cutoff = now() - SUB_TTL_S
+    with SUB_LOCK:
+        dead = [lid for lid, s in SUBSCRIPTIONS.items() if s["at"] < cutoff]
+        for lid in dead:
+            s = SUBSCRIPTIONS.pop(lid)
+            cur = SUB_BY_USER.get(s["user_hash"])
+            if cur and cur.get("link_id") == lid:
+                del SUB_BY_USER[s["user_hash"]]
+
+def _stream_collect(cid, cursor):
+    """(events after cursor, head seq, gap?) for one channel's ring.
+    A gap means the ring rotated past the client's cursor: it must resync."""
+    with EVENT_COND:
+        head = EVENT_SEQ
+        ring = EVENT_LOG.get(cid)
+        if not ring:
+            return [], head, cursor < head
+        oldest = ring[0][0]
+        if cursor < oldest - 1:
+            return [], head, True
+        return [ev for seq, ev in ring if seq > cursor], head, False
+
+def _typing_snapshot(cid):
+    cutoff = now()
+    with TYPING_LOCK:
+        return [{"user_hash": uh, "username": get_username(uh)}
+                for uh, exp in TYPING.get(cid, {}).items() if exp >= cutoff]
+
+def _active_channels_by_user():
+    with SUB_LOCK:
+        return {uh: s["channel"] for uh, s in SUB_BY_USER.items()
+                if now() - s["at"] <= SUB_TTL_S}
+
+def _presence_payload():
+    """online_users() enriched with the channel each user is streaming."""
+    active = _active_channels_by_user()
+    return [dict(u, active_channel=active.get(u["user_hash"]))
+            for u in sorted(online_users().values(),
+                            key=lambda x: x["username"].lower())]
+
+# ---- channels ---------------------------------------------------------------------
+
+@api_route("/api/v1/channels/list")
+@wrap_json_api
+def api_v1_channels_list(viewer, data, link_id):
+    with db_lock:
+        rows = db.execute("SELECT id, name, kind, created FROM channels "
+                          "ORDER BY name ASC").fetchall()
+        chans = [{"id": r["id"], "name": r["name"], "kind": r["kind"],
+                  "created": r["created"], "seq": get_seq(r["id"])} for r in rows]
+    return {"ok": 1, "channels": chans}
+
+@api_route("/api/v1/channels/create")
+@wrap_json_api
+def api_v1_channels_create(viewer, data, link_id):
+    name = (data.get("name") or "").strip()
+    kind = (data.get("kind") or "chat").strip().lower()
+    if not re.match(r"^[a-zA-Z0-9_\-]{1,32}$", name):
+        return {"ok": 0, "error": "invalid channel name", "code": 400}
+    if kind not in CHANNEL_KINDS:
+        return {"ok": 0, "error": "kind must be one of: " + ", ".join(CHANNEL_KINDS),
+                "code": 400}
+    if kind in ("site", "term") and not is_moderator(viewer):
+        return {"ok": 0, "error": "moderator required to create site/term channels",
+                "code": 403}
+    manifest = data.get("manifest")
+    if manifest is not None and not isinstance(manifest, dict):
+        return {"ok": 0, "error": "manifest must be an object", "code": 400}
+    manifest_json = json.dumps(manifest)[:4096] if manifest else "{}"
+    cid = hexstr(RNS.Identity.full_hash(f"{GUILD_ID}:{name}".encode()))
+    with db_lock:
+        if db.execute("SELECT 1 FROM channels WHERE id=? OR (name=? COLLATE NOCASE)",
+                      (cid, name)).fetchone():
+            return {"ok": 0, "error": "channel exists", "code": 409}
+        db.execute("INSERT INTO channels (id, name, created, kind, manifest) "
+                   "VALUES (?, ?, ?, ?, ?)",
+                   (cid, name, now(), kind, manifest_json))
+        db.execute("INSERT OR IGNORE INTO channel_state (channel_id, seq) VALUES (?, 0)", (cid,))
+        db.commit()
+    return {"ok": 1, "channel": {"id": cid, "name": name, "kind": kind,
+                                 "manifest": manifest or {}, "seq": 0}}
+
+@api_route("/api/v1/channels/info")
+@wrap_json_api
+def api_v1_channels_info(viewer, data, link_id):
+    cid = data.get("channel")
+    with db_lock:
+        r = db.execute("SELECT id, name, kind, manifest, created FROM channels "
+                       "WHERE id=?", (cid,)).fetchone()
+        if not r:
+            return {"ok": 0, "error": "unknown channel", "code": 404}
+        seq = get_seq(cid)
+        try:
+            manifest = json.loads(r["manifest"] or "{}")
+        except Exception:
+            manifest = {}
+    return {"ok": 1, "channel": {"id": r["id"], "name": r["name"], "kind": r["kind"],
+                                 "manifest": manifest, "created": r["created"], "seq": seq}}
+
+# ---- stream -----------------------------------------------------------------------
+
+@api_route("/api/v1/stream/subscribe")
+@wrap_json_api
+def api_v1_stream_subscribe(viewer, data, link_id):
+    cid = data.get("channel")
+    with db_lock:
+        chan = db.execute("SELECT id, kind FROM channels WHERE id=?", (cid,)).fetchone()
+    if not chan:
+        return {"ok": 0, "error": "unknown channel", "code": 404}
+    _purge_subs()
+    with EVENT_COND:
+        head = EVENT_SEQ
+    cursor = data.get("cursor")
+    cursor = int(cursor) if isinstance(cursor, (int, float)) and cursor >= 0 else head
+    # One subscription per link: this replaces whatever the link streamed before,
+    # which is what makes "only the active channel flows" a server-side rule.
+    with SUB_LOCK:
+        old = SUBSCRIPTIONS.get(link_id)
+        if old and old["user_hash"] == viewer:
+            cur = SUB_BY_USER.get(viewer)
+            if cur and cur.get("link_id") == link_id:
+                del SUB_BY_USER[viewer]
+        SUBSCRIPTIONS[link_id] = {"user_hash": viewer, "channel": cid,
+                                  "cursor": cursor, "at": now()}
+        SUB_BY_USER[viewer] = {"channel": cid, "link_id": link_id, "at": now()}
+    return {"ok": 1, "channel": cid, "kind": chan["kind"],
+            "seq": head, "cursor": cursor, "typing": _typing_snapshot(cid)}
+
+@api_route("/api/v1/stream/poll")
+@wrap_json_api
+def api_v1_stream_poll(viewer, data, link_id):
+    wait_s = data.get("timeout_s", STREAM_WAIT_S)
+    try:
+        wait_s = min(max(float(wait_s), 0.0), STREAM_WAIT_MAX)
+    except (TypeError, ValueError):
+        wait_s = STREAM_WAIT_S
+    deadline = now() + wait_s
+    while True:
+        with SUB_LOCK:
+            sub = SUBSCRIPTIONS.get(link_id)
+        if not sub:
+            return {"ok": 0, "error": "not subscribed", "code": 409}
+        cid = sub["channel"]
+        cursor = sub["cursor"]
+        pc = data.get("cursor")
+        if isinstance(pc, (int, float)) and pc >= 0:
+            cursor = int(pc)          # client override (reconnect/resync)
+        events, head, reset = _stream_collect(cid, cursor)
+        if events or reset or now() >= deadline:
+            out_cursor = events[-1]["seq"] if events else (head if reset else cursor)
+            with SUB_LOCK:
+                s = SUBSCRIPTIONS.get(link_id)
+                # don't clobber a newer subscription that raced us on this link
+                if s and s["channel"] == cid:
+                    s["cursor"] = out_cursor
+                    s["at"] = now()
+            if reset:
+                return {"ok": 1, "channel": cid, "events": [], "cursor": head,
+                        "seq": head, "reset": True}
+            return {"ok": 1, "channel": cid, "events": events, "cursor": out_cursor,
+                    "reset": False, "typing": _typing_snapshot(cid)}
+        # Long-poll: sleep on the event condition in short slices so a
+        # resubscribe from this link is honoured promptly.
+        with EVENT_COND:
+            EVENT_COND.wait(min(0.5, max(0.0, deadline - now())))
+
+@api_route("/api/v1/stream/unsubscribe")
+@wrap_json_api
+def api_v1_stream_unsubscribe(viewer, data, link_id):
+    with SUB_LOCK:
+        sub = SUBSCRIPTIONS.pop(link_id, None)
+        if sub:
+            cur = SUB_BY_USER.get(sub["user_hash"])
+            if cur and cur.get("link_id") == link_id:
+                del SUB_BY_USER[sub["user_hash"]]
+    return {"ok": 1}
+
+# ---- typing -----------------------------------------------------------------------
+
+@api_route("/api/v1/typing")
+@wrap_json_api
+def api_v1_typing(viewer, data, link_id):
+    cid = data.get("channel")
+    active = bool(data.get("active"))
+    with db_lock:
+        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
+            return {"ok": 0, "error": "unknown channel", "code": 404}
+    with TYPING_LOCK:
+        bucket = TYPING.setdefault(cid, {})
+        was_active = bucket.get(viewer, 0) >= now()
+        if active:
+            bucket[viewer] = now() + TYPING_TTL_S
+        elif viewer in bucket:
+            del bucket[viewer]
+    if active != was_active:
+        # transitions only: a held-down typing ping refreshes the TTL silently
+        _emit_event(cid, "typing", {"user_hash": viewer,
+                                    "username": get_username(viewer),
+                                    "active": active})
+    return {"ok": 1}
+
+# ---- presence ---------------------------------------------------------------------
+
+@api_route("/api/v1/presence")
+@wrap_json_api
+def api_v1_presence(viewer, data, link_id):
+    """Ping-driven active users (same discipline as /api/presence) plus the
+    channel each user is currently streaming, and the ping cadence."""
+    return {"ok": 1, "users": _presence_payload(),
+            "interval": NODE_ANNOUNCE_INTERVAL, "ttl": NODE_STALE_S, "now": now()}
+
+# ---- blobs (phase 3): content-addressed image/media get+put ------------------------
+
+def _blob_dir():
+    return os.path.join(STORAGE, "blobs")
+
+def _b64_decode(data):
+    """Strict base64 (whitespace tolerated around the payload). None on error."""
+    if not isinstance(data, str):
+        return None
+    try:
+        blob = base64.b64decode(data.strip(), validate=True)
+    except Exception:
+        return None
+    return blob or None
+
+def _blob_fname(digest):
+    """Find a stored blob by its 32-hex digest (ext is content-derived)."""
+    if not re.match(r"^[0-9a-f]{32}$", digest or ""):
+        return None
+    bdir = _blob_dir()
+    try:
+        for fname in os.listdir(bdir):
+            if fname.startswith(digest + "."):
+                return fname
+    except OSError:
+        pass
+    return None
+
+def _read_slice(fpath, offset, length):
+    """Read one chunk of a file. Returns (total, chunk) or (None, None)."""
+    try:
+        total = os.path.getsize(fpath)
+        with open(fpath, "rb") as f:
+            f.seek(offset)
+            chunk = f.read(length)
+        return total, chunk
+    except OSError:
+        return None, None
+
+def _chunk_params(data):
+    """Common offset/length parsing for blob and site gets."""
+    try:
+        offset = int(data.get("offset", 0))
+    except (TypeError, ValueError):
+        offset = 0
+    try:
+        length = int(data.get("len", BLOB_CHUNK_DEFAULT))
+    except (TypeError, ValueError):
+        length = BLOB_CHUNK_DEFAULT
+    offset = max(0, offset)
+    length = min(max(1, length), BLOB_CHUNK_MAX)
+    return offset, length
+
+@api_route("/api/v1/blobs/put")
+@wrap_json_api
+def api_v1_blobs_put(viewer, data, link_id):
+    """Upload one content-addressed blob. Returns {blob_id, size, path} —
+    reference it from chat posts (attachments: [{blob_id}]) or site pages.
+    Rate-limited like posting: 10 uploads / 60 s per user."""
+    if not rate_ok(viewer, "_blobs"):
+        return {"ok": 0, "error": "rate limited", "code": 429}
+    blob = _b64_decode(data.get("data_b64"))
+    if blob is None:
+        return {"ok": 0, "error": "data_b64 must be valid base64", "code": 400}
+    if len(blob) > MAX_ATTACHMENT_SZ:
+        return {"ok": 0, "error": "blob too large", "code": 413}
+    name = (data.get("name") or "").strip()[:128]
+    mime = (data.get("mime") or "").strip()[:64]
+    digest = hashlib.sha256(blob).hexdigest()[:32]
+    ext = safe_ext(name, mime)
+    fname = f"{digest}.{ext}"
+    bdir = _blob_dir()
+    os.makedirs(bdir, exist_ok=True)
+    fpath = os.path.join(bdir, fname)
+    if not os.path.exists(fpath):
+        try:
+            with open(fpath, "wb") as f:
+                f.write(blob)
+        except OSError as e:
+            RNS.log(f"blob store failed for {fname}: {e}", RNS.LOG_ERROR)
+            return {"ok": 0, "error": "storage failed", "code": 500}
+    if node_destination is not None:
+        node_destination.register_request_handler(
+            "/file/blobs/" + fname, serve_blob_file,
+            allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
+    return {"ok": 1, "blob_id": digest, "size": len(blob),
+            "mime": EXT_MIME.get(ext, mime or "application/octet-stream"),
+            "name": name or fname, "path": "/file/blobs/" + fname}
+
+@api_route("/api/v1/blobs/get")
+@wrap_json_api
+def api_v1_blobs_get(viewer, data, link_id):
+    """Chunked blob read: {blob_id, offset?, len?} ->
+    {data_b64, total, offset, eof}. len is capped at BLOB_CHUNK_MAX."""
+    digest = (data.get("blob_id") or "").strip().lower()
+    fname = _blob_fname(digest)
+    if not fname:
+        return {"ok": 0, "error": "unknown blob_id", "code": 404}
+    offset, length = _chunk_params(data)
+    total, chunk = _read_slice(os.path.join(_blob_dir(), fname), offset, length)
+    if total is None:
+        return {"ok": 0, "error": "blob unreadable", "code": 500}
+    return {"ok": 1, "blob_id": digest, "total": total, "offset": offset,
+            "eof": offset + len(chunk) >= total,
+            "data_b64": base64.b64encode(chunk).decode("ascii")}
+
+def serve_blob_file(path, data, request_id, link_id, remote_identity, requested_at):
+    """Raw /file/blobs/<fname> handler (one per stored blob, attachments
+    pattern). Path is the registration key; validate before touching disk."""
+    fname = path.rsplit("/", 1)[-1]
+    if not re.match(r"^[0-9a-f]{32}\.[a-z0-9]{1,8}$", fname):
+        return b"not found"
+    fpath = os.path.join(_blob_dir(), fname)
+    if os.path.isfile(fpath):
+        with open(fpath, "rb") as f:
+            return f.read()
+    return b"not found"
+
+# ---- chat posts over v1 JSON (phase 3): inline or blob-referenced attachments ------
+
+def _resolve_v1_attachments(atts):
+    """v1 attachment entries: {name, mime, data_b64} (inline) or
+    {name?, mime?, blob_id} (reference an earlier blobs/put upload).
+    Returns (triples, error) — triples are the [name, mime, bytes] lists
+    ingest() expects."""
+    triples = []
+    for att in (atts or [])[:MAX_ATTACHMENTS]:
+        if not isinstance(att, dict):
+            return None, "each attachment must be an object"
+        name = (att.get("name") or "").strip()[:128]
+        mime = (att.get("mime") or "").strip()[:64]
+        if att.get("data_b64") is not None:
+            blob = _b64_decode(att.get("data_b64"))
+            if blob is None:
+                return None, "attachment data_b64 must be valid base64"
+        elif att.get("blob_id"):
+            bid = (att.get("blob_id") or "").strip().lower()
+            fname = _blob_fname(bid)
+            if not fname:
+                return None, "unknown blob_id: " + bid[:12]
+            try:
+                with open(os.path.join(_blob_dir(), fname), "rb") as f:
+                    blob = f.read()
+            except OSError:
+                return None, "blob unreadable"
+            ext = fname.rsplit(".", 1)[-1]
+            mime = mime or EXT_MIME.get(ext, "application/octet-stream")
+            name = name or fname
+        else:
+            return None, "attachment needs data_b64 or blob_id"
+        if len(blob) > MAX_ATTACHMENT_SZ:
+            return None, "attachment too large (max 32 MB)"
+        triples.append([name or "attachment.bin", mime or "application/octet-stream", blob])
+    return triples, None
+
+@api_route("/api/v1/post")
+@wrap_json_api
+def api_v1_post(viewer, data, link_id):
+    """JSON chat post: {channel, content, attachments?: [{data_b64|blob_id, ...}]}.
+    Same ingest path as the msgpack /api/post (rate limit, moderation, ledger)."""
+    cid = data.get("channel")
+    content = data.get("content")
+    with db_lock:
+        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
+            return {"ok": 0, "error": "unknown channel", "code": 404}
+    if not isinstance(content, str):
+        return {"ok": 0, "error": "empty content", "code": 400}
+    triples, err = _resolve_v1_attachments(data.get("attachments"))
+    if err:
+        return {"ok": 0, "error": err, "code": 400}
+    if not content.strip() and not triples:
+        return {"ok": 0, "error": "empty content", "code": 400}
+    if not rate_ok(viewer, cid):
+        return {"ok": 0, "error": "rate limited", "code": 429}
+    msg_id = ingest(cid, viewer, content, attachments=triples)
+    if msg_id is None:
+        return {"ok": 0, "error": "rejected", "code": 400}
+    with db_lock:
+        atts = db.execute("SELECT name, mime, size, path FROM attachments "
+                          "WHERE msg_id=? ORDER BY idx", (msg_id,)).fetchall()
+    return {"ok": 1, "msg_id": msg_id,
+            "attachments": [{"name": a["name"], "mime": a["mime"], "size": a["size"],
+                             "path": "/file/attachments/" + a["path"]} for a in atts]}
+
+# ---- site channels (phase 4): micron pages + media under a manifest ----------------
+
+def _site_root():
+    return os.path.join(STORAGE, "sites")
+
+def _site_safe_rel(path):
+    """Validate a site resource path. Returns the relative path (no leading
+    slash) or None. Rejects traversal, backslashes and empty segments."""
+    if not path or not SITE_PATH_RE.match(path):
+        return None
+    rel = path.lstrip("/")
+    if not rel or ".." in rel.split("/") or any(not seg for seg in rel.split("/")):
+        return None
+    return rel
+
+def _site_channel(cid):
+    with db_lock:
+        r = db.execute("SELECT id, kind FROM channels WHERE id=?", (cid,)).fetchone()
+    return r if (r and r["kind"] == "site") else None
+
+@api_route("/api/v1/site/put")
+@wrap_json_api
+def api_v1_site_put(viewer, data, link_id):
+    """Store one site resource (micron page, image, audio, video).
+    {channel, path, data_b64, mime?} -> registers /file/sites/<cid>/<path> and
+    emits a site_patch event on the channel stream. Moderator-only."""
+    if not is_moderator(viewer):
+        return {"ok": 0, "error": "moderator required", "code": 403}
+    cid = data.get("channel")
+    if not _site_channel(cid):
+        return {"ok": 0, "error": "unknown or non-site channel", "code": 404}
+    rel = _site_safe_rel(data.get("path"))
+    if not rel:
+        return {"ok": 0, "error": "invalid resource path", "code": 400}
+    if not rate_ok(viewer, cid):
+        return {"ok": 0, "error": "rate limited", "code": 429}
+    blob = _b64_decode(data.get("data_b64"))
+    if blob is None:
+        return {"ok": 0, "error": "data_b64 must be valid base64", "code": 400}
+    if len(blob) > MAX_ATTACHMENT_SZ:
+        return {"ok": 0, "error": "resource too large", "code": 413}
+    cdir = os.path.join(_site_root(), cid)
+    fpath = os.path.join(cdir, rel)
+    os.makedirs(os.path.dirname(fpath), exist_ok=True)
+    try:
+        with open(fpath, "wb") as f:
+            f.write(blob)
+    except OSError as e:
+        RNS.log(f"site store failed {cid}/{rel}: {e}", RNS.LOG_ERROR)
+        return {"ok": 0, "error": "storage failed", "code": 500}
+    reg_path = f"/file/sites/{cid}/{rel}"
+    if node_destination is not None:
+        node_destination.register_request_handler(
+            reg_path, serve_site_file,
+            allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
+    ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
+    mime = (data.get("mime") or "").strip()[:64] or EXT_MIME.get(ext, "application/octet-stream")
+    _emit_event(cid, "site_patch", {"path": "/" + rel, "mime": mime, "size": len(blob)})
+    return {"ok": 1, "channel": cid, "path": "/" + rel, "size": len(blob),
+            "mime": mime, "file_path": reg_path}
+
+@api_route("/api/v1/site/get")
+@wrap_json_api
+def api_v1_site_get(viewer, data, link_id):
+    """Chunked site resource read: {channel, path, offset?, len?}."""
+    cid = data.get("channel")
+    if not _site_channel(cid):
+        return {"ok": 0, "error": "unknown or non-site channel", "code": 404}
+    rel = _site_safe_rel(data.get("path"))
+    if not rel:
+        return {"ok": 0, "error": "invalid resource path", "code": 400}
+    fpath = os.path.join(_site_root(), cid, rel)
+    # traversal guard: the resolved file must stay inside this site's dir
+    if os.path.realpath(fpath) != os.path.join(os.path.realpath(_site_root()), cid, rel):
+        return {"ok": 0, "error": "invalid resource path", "code": 400}
+    offset, length = _chunk_params(data)
+    total, chunk = _read_slice(fpath, offset, length)
+    if total is None:
+        return {"ok": 0, "error": "resource not found", "code": 404}
+    ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
+    return {"ok": 1, "channel": cid, "path": "/" + rel, "total": total,
+            "offset": offset, "eof": offset + len(chunk) >= total,
+            "mime": EXT_MIME.get(ext, "application/octet-stream"),
+            "data_b64": base64.b64encode(chunk).decode("ascii")}
+
+@api_route("/api/v1/site/manifest")
+@wrap_json_api
+def api_v1_site_manifest(viewer, data, link_id):
+    """Get a site channel's manifest: {channel} -> {manifest}."""
+    cid = data.get("channel")
+    with db_lock:
+        r = db.execute("SELECT kind, manifest FROM channels WHERE id=?", (cid,)).fetchone()
+    if not r or r["kind"] != "site":
+        return {"ok": 0, "error": "unknown or non-site channel", "code": 404}
+    try:
+        manifest = json.loads(r["manifest"] or "{}")
+    except Exception:
+        manifest = {}
+    return {"ok": 1, "channel": cid, "manifest": manifest}
+
+@api_route("/api/v1/site/manifest_put")
+@wrap_json_api
+def api_v1_site_manifest_put(viewer, data, link_id):
+    """Update a site manifest (mod-only): {channel, manifest} — emits a
+    site_patch event carrying the manifest so open clients re-theme."""
+    if not is_moderator(viewer):
+        return {"ok": 0, "error": "moderator required", "code": 403}
+    cid = data.get("channel")
+    if not _site_channel(cid):
+        return {"ok": 0, "error": "unknown or non-site channel", "code": 404}
+    manifest = data.get("manifest")
+    if not isinstance(manifest, dict):
+        return {"ok": 0, "error": "manifest must be an object", "code": 400}
+    with db_lock:
+        db.execute("UPDATE channels SET manifest=? WHERE id=?",
+                   (json.dumps(manifest)[:4096], cid))
+        db.commit()
+    _emit_event(cid, "site_patch", {"manifest": manifest})
+    return {"ok": 1, "channel": cid, "manifest": manifest}
+
+def serve_site_file(path, data, request_id, link_id, remote_identity, requested_at):
+    """Raw /file/sites/<cid>/<rel> handler. The registration key IS the path,
+    but re-validate anyway: the resolved file must stay inside sites/<cid>."""
+    m = re.match(r"^/file/sites/([0-9a-f]{64})/(.+)$", path or "")
+    if not m:
+        return b"not found"
+    cid, rel = m.group(1), m.group(2)
+    if not _site_safe_rel("/" + rel):
+        return b"not found"
+    fpath = os.path.join(_site_root(), cid, rel)
+    root = os.path.realpath(os.path.join(_site_root(), cid))
+    if os.path.realpath(fpath).startswith(root) and os.path.isfile(fpath):
+        with open(fpath, "rb") as f:
+            return f.read()
+    return b"not found"
 
 # ----------------------------------------------------------------------------------
 # Boot (plan §9 skeleton — every call verified against the installed stack)
@@ -1236,6 +2053,8 @@ def run(argv=None):
     os.makedirs(STORAGE, exist_ok=True)
     os.makedirs(os.path.join(STORAGE, "attachments"), exist_ok=True)
     os.makedirs(os.path.join(STORAGE, "avatars"), exist_ok=True)
+    os.makedirs(os.path.join(STORAGE, "blobs"), exist_ok=True)
+    os.makedirs(os.path.join(STORAGE, "sites"), exist_ok=True)
 
     db = open_db(os.path.join(STORAGE, "sHades.db"))
 
@@ -1318,6 +2137,26 @@ def run(argv=None):
             "/file/attachments/" + fname, serve_attachment_file,
             allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
 
+    # re-register v1 blobs and site resources from previous runs (one handler
+    # per file, the nomadnet Node.py register_files pattern)
+    bdir = os.path.join(STORAGE, "blobs")
+    for fname in os.listdir(bdir):
+        node_destination.register_request_handler(
+            "/file/blobs/" + fname, serve_blob_file,
+            allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
+    sroot = os.path.join(STORAGE, "sites")
+    for cid in os.listdir(sroot):
+        cdir = os.path.join(sroot, cid)
+        if not os.path.isdir(cdir):
+            continue
+        for root, _, files in os.walk(cdir):
+            for fn in files:
+                rel = os.path.relpath(os.path.join(root, fn), cdir)
+                rel = rel.replace(os.sep, "/")
+                node_destination.register_request_handler(
+                    f"/file/sites/{cid}/{rel}", serve_site_file,
+                    allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
+
     ensure_channel("general")
 
     # Seed the moderator set from moderators.txt (boot-time source of truth).
@@ -1344,6 +2183,8 @@ def run(argv=None):
     RNS.log(f"  post via LXM: {delivery_hash}  (#channel first token)", RNS.LOG_NOTICE)
     RNS.log(f"  propagation : {prop_hash}", RNS.LOG_NOTICE)
 
+    # Reap clients that miss two consecutive 4s announcements (8 s stale).
+    threading.Thread(target=_node_reaper, daemon=True).start()
     threading.Thread(target=announce_all, daemon=True).start()
     try:
         while True:

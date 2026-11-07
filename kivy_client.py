@@ -16,6 +16,7 @@ import sys
 import re
 import json
 import time
+import base64
 import hashlib
 import threading
 import random
@@ -39,12 +40,15 @@ try:
     from kivy.clock import Clock
     from kivy.properties import (
         StringProperty, ObjectProperty, BooleanProperty, NumericProperty,
+        DictProperty, ListProperty,
     )
     from kivy.uix.behaviors import ButtonBehavior
     from kivy.uix.filechooser import FileChooserListView
     from kivy.uix.popup import Popup
     from kivy.uix.button import Button
     from kivy.uix.togglebutton import ToggleButton
+    from kivy.uix.widget import Widget
+    from kivy.graphics import Color, Ellipse, Rectangle
     from kivy.metrics import dp, sp
     KIVY = True
 except Exception as _e:  # pragma: no cover - Kivy missing at import time
@@ -64,6 +68,9 @@ else:
 
 import RNS
 from RNS.vendor import umsgpack as msgpack
+import micron
+from micron import (micron_parse, micron_page_bg, micron_media_target,
+                    micron_hex3, runs_to_markup, MICRON_MEDIA_EXTS)
 
 # ---------------------------------------------------------------------------
 # Theme (Discord-like dark palette)
@@ -87,6 +94,33 @@ AVATAR_BG = "#7289DA"
 ATT_SERVER = "server"
 ATT_EPHEMERAL = "ephemeral"
 ATT_PLACEHOLDER_TEXT = "[loading image…]"
+
+# Default UI palette — the single source of truth for theme colors. The app
+# seeds theme_colors from this, the config screen's Reset restores it, and
+# headless callers install it on a bare App so KV's app.theme_colors[...]
+# expressions resolve (see THEME_KEYS order for the config screen's c_<key> ids).
+DEFAULT_THEME_COLORS = {
+    "bg_main": (0.14, 0.16, 0.19, 1),      # screens / root background
+    "panel": (0.21, 0.23, 0.27, 1),        # center chat area
+    "panel_darker": (0.25, 0.27, 0.31, 1),  # input bar / dropdowns
+    "bg_sidebar": (0.18, 0.2, 0.23, 1),    # side window backgrounds
+    "sidebar_ctrl": (0.24, 0.26, 0.3, 1),  # sidebar buttons / slim bars
+    "topbar": (0.42, 0.48, 1.0, 1),        # top bar / primary actions
+    "primary": (0.42, 0.48, 1.0, 1),       # primary buttons
+    "accent": (1.0, 0.6, 0.0, 1),          # accent / destructive
+    "text": (1, 1, 1, 1),                  # body text
+    "text_muted": (0.7, 0.73, 0.77, 1),    # secondary text
+    "text_dim": (0.6, 0.63, 0.67, 1),      # dimmer secondary text
+    "input_bg": (0.22, 0.24, 0.28, 1),     # text field fill
+    "input_bg_focus": (0.25, 0.27, 0.31, 1),
+    "msg_own": (0.2, 0.22, 0.25, 1),       # own-message bubble / embeds
+}
+
+THEME_KEYS = (
+    "bg_main", "panel", "panel_darker", "bg_sidebar", "sidebar_ctrl",
+    "topbar", "primary", "accent", "text", "text_muted", "text_dim",
+    "input_bg", "input_bg_focus", "msg_own",
+)
 
 DEBUG = False  # set via --debug CLI arg; enables verbose attachment/ingest logging
 
@@ -128,46 +162,72 @@ def _app_data_dir():
         return os.path.join(os.path.expanduser("~"), ".sHades_client")
 
 
+def rgba_to_hex(rgba):
+    return "#%02x%02x%02x" % (
+        int(max(0, min(1, rgba[0])) * 255),
+        int(max(0, min(1, rgba[1])) * 255),
+        int(max(0, min(1, rgba[2])) * 255),
+    )
+
+
+def hex_to_rgba(text):
+    text = (text or "").lstrip("#").strip()
+    if len(text) != 6 or any(c not in "0123456789abcdefABCDEF" for c in text):
+        raise ValueError("bad hex color: %r" % text)
+    return (
+        int(text[0:2], 16) / 255.0,
+        int(text[2:4], 16) / 255.0,
+        int(text[4:6], 16) / 255.0,
+        1.0,
+    )
+
+
 # ---------------------------------------------------------------------------
-# Markdown -> Kivy markup
+# Markdown -> Kivy markup (NomadNet subset, mirrored with the guild renderer)
 # ---------------------------------------------------------------------------
-_URL = re.compile(r"(https?://[^\s<>\"]+)")
+# The guild translates this same message-markdown subset to Micron
+# (sHades.md_to_micron_line); the client renders it to Kivy markup instead.
+# Subset: **bold**, *italic*, __underline__, `code`, [label](target).
+# Links are inert text — there is no HTTP on Reticulum, and micron link
+# targets (node hashes, /page/... paths) are not browsable from the Kivy
+# client — so no clickable hyperlinks are ever created.
 _MD = re.compile(
-    r"\*\*(?P<b>[^*\n]{1,200})\*\*"
-    r"|\*(?P<i>[^*\n]{1,200})\*"
     r"`(?P<code>[^`\n]{1,120})`"
+    r"|\*\*(?P<bold>[^*\n]{1,200})\*\*"
+    r"|__(?P<under>[^_\n]{1,200})__"
+    r"|\[(?P<label>[^\]\n]{1,128})\]\((?P<target>[^)\s]{1,256})\)"
+    r"|\*(?P<i>[^*\n]{1,200})\*"
 )
 
 
 def md_to_kivy(text):
-    """Convert a small markdown subset to Kivy markup."""
+    """Convert the NomadNet message-markdown subset to Kivy markup."""
     if not text:
         return ""
     out = []
     pos = 0
     for m in _MD.finditer(text):
         out.append(_escape(text[pos:m.start()]))
-        g = m.lastgroup
-        if g == "b":
-            out.append("[b]" + _escape(m.group("b")) + "[/b]")
-        elif g == "i":
-            out.append("[i]" + _escape(m.group("i")) + "[/i]")
-        elif g == "code":
+        if m.group("code") is not None:
             out.append("[color=#BFBFBF]" + _escape(m.group("code")) + "[/color]")
+        elif m.group("bold") is not None:
+            out.append("[b]" + _escape(m.group("bold")) + "[/b]")
+        elif m.group("under") is not None:
+            out.append("[u]" + _escape(m.group("under")) + "[/u]")
+        elif m.group("label") is not None:
+            out.append(_escape(m.group("label")) + " (" + _escape(m.group("target")) + ")")
+        elif m.group("i") is not None:
+            out.append("[i]" + _escape(m.group("i")) + "[/i]")
         pos = m.end()
     out.append(_escape(text[pos:]))
     return "".join(out)
 
 
 def _escape(s):
-    s = s.replace("&", "&amp;")
+    s = s.replace("&", "&" + "amp;")
     s = s.replace("[", "&bl;")
     s = s.replace("]", "&br;")
     return s
-
-
-def find_urls(text):
-    return _URL.findall(text or "")
 
 
 def dlog(msg):
@@ -237,6 +297,13 @@ class GuildAPI:
         return self._request("/api/delete", {"msg": msg_id})
 
     def register_node(self, node_hash, address, port, identity_hash):
+        """Register this client's node address with the guild index.
+
+        This is also the presence ping: the client repeats it every
+        ANNOUNCE_INTERVAL and the guild reads each call as "still here". No
+        identity is asserted in the payload — the guild derives the user hash
+        from the identity this link was identified with, so it cannot be forged.
+        """
         return self._request("/api/register_node", {
             "node_hash": node_hash,
             "address": address,
@@ -256,6 +323,110 @@ class GuildAPI:
 
     def avatar_get(self, user_hash):
         return self._request("/api/avatar_get", {"user": user_hash})
+
+    def nodes(self):
+        """Fetch the current active node registry from the guild."""
+        return self._request("/api/nodes", {})
+
+    def presence(self):
+        """Fetch the active user list — who is currently pinging the guild.
+
+        Stale clients are absent from the response, not flagged, so a caller
+        that mirrors this list is pruned automatically.
+        """
+        return self._request("/api/presence", {})
+
+    # ---- JSON API v1 (json bytes over the same RNS link; no HTTP anywhere) ----
+
+    def _request_json(self, path, data, timeout=10.0):
+        payload = json.dumps(data if data is not None else {}).encode("utf-8")
+        receipt = self.link.request(path, data=payload)
+        # link.request() may return a Receipt object or True/False depending
+        # on the RNS version (see _request). Re-issue with the SAME payload.
+        if isinstance(receipt, bool):
+            if not receipt:
+                return {"ok": 0, "error": "request failed"}
+            receipt = self.link.request(path, data=payload)
+        deadline = time.time() + timeout
+        while (hasattr(receipt, "response")
+               and receipt.response is None
+               and time.time() < deadline):
+            time.sleep(0.05)
+        if not hasattr(receipt, "response") or receipt.response is None:
+            return {"ok": 0, "error": "timeout"}
+        try:
+            return json.loads(receipt.response.decode("utf-8"))
+        except Exception as e:
+            return {"ok": 0, "error": "bad response: %s" % e}
+
+    def channels_list(self):
+        return self._request_json("/api/v1/channels/list", {})
+
+    def channels_create(self, name, kind="chat", manifest=None):
+        data = {"name": name, "kind": kind}
+        if manifest is not None:
+            data["manifest"] = manifest
+        return self._request_json("/api/v1/channels/create", data)
+
+    def channels_info(self, channel):
+        return self._request_json("/api/v1/channels/info", {"channel": channel})
+
+    def stream_subscribe(self, channel, cursor=None):
+        data = {"channel": channel}
+        if cursor is not None:
+            data["cursor"] = cursor
+        return self._request_json("/api/v1/stream/subscribe", data)
+
+    def stream_poll(self, cursor=None, timeout_s=4.0):
+        data = {"timeout_s": timeout_s}
+        if cursor is not None:
+            data["cursor"] = cursor
+        # server may hold the poll for timeout_s; allow RTT on top
+        return self._request_json("/api/v1/stream/poll", data, timeout=timeout_s + 8)
+
+    def stream_unsubscribe(self):
+        return self._request_json("/api/v1/stream/unsubscribe", {})
+
+    def typing(self, channel, active=True):
+        return self._request_json("/api/v1/typing",
+                                  {"channel": channel, "active": bool(active)})
+
+    def presence_v1(self):
+        """Active users plus the channel each one is streaming."""
+        return self._request_json("/api/v1/presence", {})
+
+    def blobs_put(self, name, mime, data):
+        """Upload one content-addressed blob (v1). Returns
+        {ok, blob_id, size, path} — reference blob_id from post_v1."""
+        return self._request_json("/api/v1/blobs/put", {
+            "name": name, "mime": mime,
+            "data_b64": base64.b64encode(data).decode("ascii"),
+        })
+
+    def post_v1(self, channel, content, attachments=None):
+        """JSON chat post; attachments are [{blob_id, name?, mime?}] refs or
+        inline {name, mime, data_b64} dicts."""
+        data = {"channel": channel, "content": content}
+        if attachments:
+            data["attachments"] = attachments
+        return self._request_json("/api/v1/post", data, timeout=30)
+
+    def blobs_get(self, blob_id, offset=0, length=None):
+        """Chunked blob read; returns {data_b64, total, offset, eof}."""
+        data = {"blob_id": blob_id, "offset": offset}
+        if length is not None:
+            data["len"] = length
+        return self._request_json("/api/v1/blobs/get", data)
+
+    def site_get(self, channel, path, offset=0, length=None):
+        """Chunked site resource read (micron pages, images, media)."""
+        data = {"channel": channel, "path": path, "offset": offset}
+        if length is not None:
+            data["len"] = length
+        return self._request_json("/api/v1/site/get", data)
+
+    def site_manifest(self, channel):
+        return self._request_json("/api/v1/site/manifest", {"channel": channel})
 
     def fetch_file(self, path):
         """Fetch raw bytes from a /file/... request handler on the guild."""
@@ -452,7 +623,6 @@ if KIVY:
         without stretching (allow_stretch=False, keep_ratio=True).
         """
         STANDARD_HEIGHT = dp(200)
-        source_url = StringProperty("")
         is_expanded = BooleanProperty(False)
 
         def on_release(self):
@@ -517,8 +687,13 @@ if KIVY:
                     Clock.schedule_once(
                         lambda dt: self._show_status("Saved to %s" % out_path), 0)
                 except Exception as e:
+                    # Format the message NOW and close over the string: Python
+                    # unbinds the `except ... as e` name when the block exits,
+                    # so a lambda that referenced `e` would raise NameError when
+                    # the Clock callback actually ran.
+                    err = "Download failed: %s" % e
                     Clock.schedule_once(
-                        lambda dt: self._show_status("Download failed: %s" % e), 0)
+                        lambda dt: self._show_status(err), 0)
 
             threading.Thread(target=do_download, daemon=True).start()
 
@@ -534,6 +709,25 @@ if KIVY:
                 app.dismiss_fullscreen_image(self.embed)
             elif self.parent:
                 self.parent.remove_widget(self)
+
+
+    class CanvasWidget(Widget):
+        """Simple widget that draws a colored circle on its canvas."""
+        color = ListProperty([0.5, 0.5, 0.5, 1])  # default gray
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            with self.canvas:
+                self._color_inst = Color(*self.color)
+                self._ellipse = Ellipse(size=self.size, pos=self.pos)
+            self.bind(pos=self._update_gfx, size=self._update_gfx, color=self._update_color)
+
+        def _update_gfx(self, *args):
+            self._ellipse.pos = self.pos
+            self._ellipse.size = self.size
+
+        def _update_color(self, instance, value):
+            self._color_inst.rgba = value
 
 
     class MessageRow(BoxLayout):
@@ -578,6 +772,47 @@ class ClickableLabel(ButtonBehavior, Label):
 
 class ChannelButton(ButtonBehavior, BoxLayout):
     channel_name = StringProperty("")
+
+
+if KIVY:
+    class SitePage(BoxLayout):
+        """One rendered micron page (site channels). bg_color paints the page
+        canvas; the blocks are added as children by _render_site_page."""
+        bg_color = ListProperty([0, 0, 0, 0])
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.orientation = "vertical"
+            self.size_hint_y = None
+            self.spacing = dp(4)
+            self.padding = [dp(8), dp(8), dp(8), dp(8)]
+            self.bind(minimum_height=lambda w, h: setattr(w, "height", h))
+            with self.canvas.before:
+                self._bg_instr = Color(rgba=self.bg_color)
+                self._bg_rect = Rectangle(pos=self.pos, size=self.size)
+            self.bind(pos=self._update_bg, size=self._update_bg,
+                      bg_color=self._update_bg)
+
+        def _update_bg(self, *a):
+            self._bg_instr.rgba = self.bg_color
+            self._bg_rect.pos = self.pos
+            self._bg_rect.size = self.size
+
+    class MicronSep(Widget):
+        """A thin micron separator line."""
+
+        def __init__(self, color=(0.35, 0.37, 0.42, 1), **kw):
+            super().__init__(**kw)
+            self.size_hint_y = None
+            self.height = dp(2)
+            with self.canvas:
+                Color(*color)
+                self._rect = Rectangle(pos=self.pos, size=self.size)
+            self.bind(pos=self._up, size=self._up)
+
+        def _up(self, *a):
+            self._rect.pos = self.pos
+            self._rect.size = self.size
 
 
 # ---------------------------------------------------------------------------
@@ -1105,6 +1340,7 @@ if KIVY:
         username = StringProperty("")
         avatar_source = StringProperty("")
         author_hash = StringProperty("")
+        presence_color = ListProperty([0.5, 0.5, 0.5, 1])  # gray = unknown/offline
 
     class MainScreen(Screen):
         left_open = BooleanProperty(True)
@@ -1117,6 +1353,62 @@ if KIVY:
         def toggle_right(self):
             self.right_open = not self.right_open
 
+    class ConfigScreen(Screen):
+        """Config screen: unified UI theme colors, persisted to ui_config.json."""
+
+        def on_pre_enter(self):
+            """Prefill the color fields from the current theme when shown."""
+            from kivy.app import App as _App
+            app = _App.get_running_app()
+            for key in THEME_KEYS:
+                try:
+                    self.ids["c_" + key].text = rgba_to_hex(
+                        app.theme_colors.get(key, (1, 1, 1, 1)))
+                except Exception:
+                    pass
+            try:
+                self.ids["config_status"].text = ""
+            except Exception:
+                pass
+
+        def save_config(self):
+            """Parse the hex fields, apply the theme and persist it."""
+            from kivy.app import App as _App
+            app = _App.get_running_app()
+            status = ""
+            try:
+                status = self.ids["config_status"]
+            except Exception:
+                status = None
+            for key in THEME_KEYS:
+                try:
+                    text = self.ids["c_" + key].text
+                except Exception:
+                    continue
+                try:
+                    app.theme_colors[key] = hex_to_rgba(text)
+                except Exception as e:
+                    if status:
+                        status.text = "Invalid color for %s: %s" % (key, e)
+                    return
+            app._save_ui_config()
+            # Reassign the whole property so KV bindings re-evaluate every
+            # app.theme_colors['key'] expression (item mutation alone does not
+            # dispatch the property change).
+            app.theme_colors = dict(app.theme_colors)
+            if status:
+                status.text = "Theme saved."
+
+        def reset_config(self):
+            from kivy.app import App as _App
+            app = _App.get_running_app()
+            app.theme_colors = dict(DEFAULT_THEME_COLORS)
+            app._save_ui_config()
+            try:
+                self.ids["config_status"].text = "Theme reset to defaults."
+            except Exception:
+                pass
+
 
 # ---------------------------------------------------------------------------
 # Main app
@@ -1127,6 +1419,9 @@ class sHadesClientApp(MDApp):
     guild_api = ObjectProperty(None, allownone=True)
     reticulum = ObjectProperty(None, allownone=True)
     link = ObjectProperty(None, allownone=True)
+    # Unified UI palette: edited in the config screen, persisted to
+    # ui_config.json, referenced by kv_md.kv as app.theme_colors['key'].
+    theme_colors = DictProperty({})
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -1151,8 +1446,54 @@ class sHadesClientApp(MDApp):
         self._popup = None
         self._poll_error_shown = False
         self._ui_populated = False
+        # Presence / ping: re-register (ping) every ANNOUNCE_INTERVAL
+        # seconds; the guild drops a node that misses two consecutive pings.
+        self._announce_stop = threading.Event()
+        self._announce_thread = None
+        self.ANNOUNCE_INTERVAL = 4.0
+        self.announce_host = None
+        self.announce_port = None
+        self.identity_hash = None
+        # v1 stream: long-polls ONLY the visible channel. _stream_cid is the
+        # channel the guild should stream to us; setting it (with a None
+        # cursor) makes the stream loop resubscribe — one subscription per
+        # link is a server-side rule, so switching channels reroutes the flow.
+        self._stream_stop = threading.Event()
+        self._stream_thread = None
+        self._stream_cid = None
+        self._stream_cursor = None
+        # site channels: kind per cid, the rendered page stack, the page
+        # currently shown, and the active theme from the manifest
+        self._channel_kinds = {}     # cid -> chat|site|term
+        self._site_stack = []        # [(cid, path)] back stack
+        self._site_current = None    # (cid, path)
+        self._site_theme = {}
 
-        # Banner images - random selection from media folder on startup
+        # Presence: mirror the guild's active-user list every PRESENCE_INTERVAL.
+        # _active_users maps user_hash -> {"username", "node_hash"} and is
+        # rebuilt from each /api/presence response, so a member who stops
+        # pinging drops out of the member list instead of lingering in it.
+        self._presence_stop = threading.Event()
+        self._presence_thread = None
+        self.PRESENCE_INTERVAL = 5.0
+        self._active_users = {}
+        # Has the guild answered a presence request? Distinguishes "nobody is
+        # online" from "this guild has no presence API" — different UI each.
+        self._presence_ok = False
+
+        # Unified UI palette (single source of truth; edited in the config
+        # screen, persisted to ui_config.json, referenced by kv as
+        # app.theme_colors['key']). Seeded from DEFAULT_THEME_COLORS, then
+        # overlaid with whatever the user saved.
+        self.theme_colors = dict(DEFAULT_THEME_COLORS)
+        self._load_ui_config()
+
+        # Chat pagination: per channel, oldest loaded message id + whether
+        # older messages remain. Used by scroll-triggered loading.
+        self._older = {}          # cid -> {oldest_id, has_older, loading}
+        self._scroll_bound = False
+
+        # Banner images - random selection from media folder on startup.
         self.banner_config_path = None
         self.banner_channel_path = None
         self._select_random_banners()
@@ -1188,6 +1529,43 @@ class sHadesClientApp(MDApp):
                 os.path.basename(self.banner_channel_path),
             ))
 
+    # -- UI theme / config ----------------------------------------------
+
+    def _ui_config_path(self):
+        return os.path.join(_app_data_dir(), "ui_config.json")
+
+    def _load_ui_config(self):
+        """Load persisted user theme colors from ui_config.json, if any."""
+        try:
+            with open(self._ui_config_path()) as f:
+                saved = json.load(f)
+        except Exception:
+            return
+        if not isinstance(saved, dict):
+            return
+        for key, value in list(self.theme_colors.items()):
+            if key in saved and isinstance(saved[key], str):
+                try:
+                    self.theme_colors[key] = hex_to_rgba(saved[key])
+                except Exception:
+                    pass
+
+    def _save_ui_config(self):
+        """Persist the current theme colors to ui_config.json."""
+        try:
+            os.makedirs(_app_data_dir(), exist_ok=True)
+            data = {key: rgba_to_hex(value)
+                    for key, value in self.theme_colors.items()}
+            with open(self._ui_config_path(), "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print("save ui config failed:", repr(e))
+
+    def open_config(self):
+        """Open the config screen (theme colors)."""
+        self.root.current = "config"
+
+
     def _channel_cid(self, name):
         """Convert a channel name to its RNS destination hash ID,
         matching the guild's ensure_channel() formula."""
@@ -1208,6 +1586,7 @@ class sHadesClientApp(MDApp):
         sm.add_widget(ConnectScreen(name="connect"))
         sm.add_widget(MainScreen(name="main"))
         sm.add_widget(ProfileScreen(name="profile"))
+        sm.add_widget(ConfigScreen(name="config"))
         # Plain Enter sends the message; Shift+Enter inserts a newline
         # (multiline input). Handled via _on_key_down below.
         Window.bind(on_key_down=self._on_key_down)
@@ -1373,6 +1752,13 @@ class sHadesClientApp(MDApp):
         for m in self._load_history():
             self._render_message(grid, m)
         Clock.schedule_once(lambda dt: self._scroll_to_bottom(), 0.1)
+        if not self._scroll_bound:
+            self._scroll_bound = True
+            try:
+                scroll = main.ids.scroll
+                scroll.bind(scroll_y=lambda inst, val: self._on_scroll_y(val))
+            except Exception:
+                pass
 
     # -- connect ----------------------------------------------------------
     def connect_to_guild(self, hub_address, username, node_hash="", delivery_hash=""):
@@ -1597,19 +1983,29 @@ class sHadesClientApp(MDApp):
             self.node_hash = hexstr(self.node_destination.hash)
             print(f"My node_hash: {self.node_hash}")
 
-            # Register with guild so others can find me via ip:port
+            # Register with guild so others can find me via ip:port, then
+            # re-register every ANNOUNCE_INTERVAL seconds — each re-register
+            # is a ping; the guild drops a node that misses two consecutive
+            # pings (8 s) from its active user list.
             try:
                 import socket
                 my_host = socket.gethostbyname(socket.gethostname())
+                self.announce_host = my_host
+                self.announce_port = self.client_port
+                self.identity_hash = hexstr(self.client_identity.hash)
                 self.guild_api.register_node(
                     self.node_hash, my_host, self.client_port,
-                    hexstr(self.client_identity.hash))
+                    self.identity_hash)
                 print(f"Registered with guild: {my_host}:{self.client_port}")
+                self._start_announce()
+                self._start_presence()
             except Exception as e:
                 print(f"Node registration failed: {e}")
 
             Clock.schedule_once(lambda dt: self._switch_main(), 0)
             Clock.schedule_once(lambda dt: self._start_poll(), 0)
+            Clock.schedule_once(lambda dt: self._start_streamer(), 0)
+            Clock.schedule_once(lambda dt: self._refresh_channels_from_guild(), 1.0)
         except Exception as e:
             print("connect guild error:", repr(e))
             err_msg = "connect failed: %s" % e
@@ -1620,6 +2016,18 @@ class sHadesClientApp(MDApp):
         self.root.current = "main"
         # load channels (placeholder: general + anything discovered)
         self._refresh_channels_ui()
+        # Ensure self is in member list
+        if self.my_hash and self.username:
+            self._record_member(self.my_hash, self.username)
+        # start streaming the default channel right away — otherwise the
+        # streamer idles until the first manual channel switch
+        name = "general"
+        try:
+            name = getattr(self.root.get_screen("main"), "_current_channel", "general")
+        except Exception:
+            pass
+        self._stream_cid = self._channel_cid(name)
+        self._stream_cursor = None
 
     def _start_poll(self):
         self._poll_stop.clear()
@@ -1664,12 +2072,184 @@ class sHadesClientApp(MDApp):
                     lambda dt: self._set_status(err_msg), 0)
             self._poll_stop.wait(3.0)
 
-    def _fetch_messages(self, channel, since_id=None, since_ts=None):
+    def _start_streamer(self):
+        """Long-poll stream for the visible channel only (JSON API v1)."""
+        if self._stream_thread is not None and self._stream_thread.is_alive():
+            return
+        self._stream_stop.clear()
+        self._stream_thread = threading.Thread(target=self._stream_loop,
+                                               daemon=True)
+        self._stream_thread.start()
+
+    def _stream_loop(self):
+        """Subscribe to the active channel and long-poll it.
+
+        Only ONE subscription per link exists server-side, so pointing
+        _stream_cid at a new channel (cursor=None) reroutes the stream —
+        background channels get nothing until they are opened again.
+        """
+        while not self._stream_stop.is_set():
+            if not self.guild_api or not self._stream_cid:
+                self._stream_stop.wait(1.0)
+                continue
+            try:
+                if self._stream_cursor is None:
+                    res = self.guild_api.stream_subscribe(self._stream_cid)
+                    if res.get("ok"):
+                        self._stream_cursor = res.get("seq", 0)
+                    else:
+                        self._stream_stop.wait(2.0)
+                    continue
+                res = self.guild_api.stream_poll(self._stream_cursor, timeout_s=4.0)
+                if not res.get("ok"):
+                    if res.get("error") == "not subscribed":
+                        self._stream_cursor = None
+                    self._stream_stop.wait(2.0)
+                    continue
+                if res.get("reset"):
+                    # replay window rotated past our cursor: resync
+                    self._stream_cursor = None
+                    self._resync_stream_channel()
+                    continue
+                events = res.get("events") or []
+                if events:
+                    self._stream_cursor = res.get("cursor", self._stream_cursor)
+                    self._apply_stream_events(events)
+            except Exception as e:
+                print("stream exception:", repr(e))
+                self._stream_stop.wait(2.0)
+
+    def _resync_stream_channel(self):
+        """Fetch the subscribed channel's history after a gap/reset."""
+        try:
+            main = self.root.get_screen("main")
+            name = getattr(main, "_current_channel", "general")
+            if self._channel_cid(name) == self._stream_cid:
+                self._fetch_messages(name)
+        except Exception:
+            pass
+
+    def _apply_stream_events(self, events):
+        """Dispatch stream events. Runs on the stream thread: UI changes go
+        through _fetch_messages (which Clock-schedules) or Clock directly."""
+        cid = self._stream_cid
+        touched = False
+        for ev in events:
+            kind = ev.get("kind")
+            data = ev.get("data") or {}
+            if kind == "msg":
+                if (data.get("msg") or {}).get("channel_id") == cid:
+                    touched = True
+            elif kind in ("edit", "del"):
+                touched = True
+            elif kind == "presence":
+                users = {}
+                for u in data.get("users") or []:
+                    if not isinstance(u, dict):
+                        continue
+                    uh = (u.get("user_hash") or "").lower()
+                    if uh:
+                        users[uh] = {"username": u.get("username") or "",
+                                     "node_hash": u.get("node_hash")}
+                self._active_users = users
+                self._presence_ok = True
+                Clock.schedule_once(lambda dt: self._refresh_presence_ui(), 0)
+            elif kind == "site_patch":
+                # a site resource or the manifest changed under us: re-theme
+                # and re-render the page we are on
+                if isinstance(data.get("manifest"), dict):
+                    self._site_theme = data["manifest"].get("theme") or self._site_theme
+                if self._site_current:
+                    Clock.schedule_once(lambda dt: self._site_load_page(
+                        self._site_current[0], self._site_current[1]), 0)
+            # "typing" events are consumed by a later phase
+        if touched:
+            # full refresh of the visible channel; _render_message dedupes
+            # by msg_id, so events already rendered are skipped
+            self._resync_stream_channel()
+
+    def _start_announce(self):
+        """Re-register our node every ANNOUNCE_INTERVAL seconds.
+
+        Each re-register is a ping; the guild drops a node that misses two
+        consecutive pings (8 s) from its active user list. Safe to call more
+        than once: an existing thread is stopped before a new one starts.
+        """
+        if self._announce_thread is not None and self._announce_thread.is_alive():
+            self._announce_stop.set()
+        self._announce_stop.clear()
+        self._announce_thread = threading.Thread(target=self._announce_loop,
+                                                 daemon=True)
+        self._announce_thread.start()
+
+    def _announce_loop(self):
+        while not self._announce_stop.wait(self.ANNOUNCE_INTERVAL):
+            if not self.guild_api or not self.node_hash:
+                continue
+            try:
+                self.guild_api.register_node(
+                    self.node_hash, self.announce_host,
+                    self.announce_port, self.identity_hash)
+            except Exception as e:
+                print("announce ping failed:", repr(e))
+
+    def _start_presence(self):
+        """Fetch active node list from guild every PRESENCE_INTERVAL seconds."""
+        if self._presence_thread is not None and self._presence_thread.is_alive():
+            self._presence_stop.set()
+        self._presence_stop.clear()
+        self._presence_thread = threading.Thread(target=self._presence_loop,
+                                                 daemon=True)
+        self._presence_thread.start()
+
+    def _presence_loop(self):
+        while not self._presence_stop.wait(self.PRESENCE_INTERVAL):
+            if not self.guild_api:
+                continue
+            try:
+                res = self.guild_api.presence()
+                if not res.get("ok"):
+                    continue
+                users = {}
+                for u in res.get("users") or []:
+                    if not isinstance(u, dict):
+                        continue
+                    uh = (u.get("user_hash") or "").lower()
+                    if uh:
+                        users[uh] = {"username": u.get("username") or "",
+                                     "node_hash": u.get("node_hash")}
+                self._active_users = users
+                self._presence_ok = True
+                Clock.schedule_once(lambda dt: self._refresh_presence_ui(), 0)
+            except Exception as e:
+                print("presence fetch failed:", repr(e))
+
+    def _refresh_presence_ui(self):
+        """Rebuild the member sidebar from the presence list.
+
+        The list is *rebuilt*, never just recoloured: members come straight from
+        the guild's active-user list, so a client that stops pinging is dropped
+        by the guild's reaper and then disappears from the sidebar on the next
+        presence tick. Nothing accumulates.
+        """
+        try:
+            main = self.root.get_screen("main")
+        except Exception:
+            return
+        self._refresh_members_ui_main(getattr(main, "_current_channel", "general"))
+
+    def _fetch_messages(self, channel, since_id=None, since_ts=None,
+                        before=None, limit=50, prepend=False):
+        # site/term channels don't have a message ledger — their grid is a
+        # rendered micron page; never stomp it with chat fetches
+        if self._channel_kinds.get(self._channel_cid(channel), "chat") != "chat":
+            return
         # Network call must not block the main thread — run it in background,
         # schedule UI updates via Clock.schedule_once.
         def work():
             cid = self._channel_cid(channel)
-            res = self.guild_api.messages(cid, since_id=since_id, since_ts=since_ts, limit=100)
+            res = self.guild_api.messages(cid, since_id=since_id, since_ts=since_ts,
+                                          before=before, limit=limit)
             if not res.get("ok"):
                 err = res.get("error", "unknown")
                 Clock.schedule_once(
@@ -1682,9 +2262,47 @@ class sHadesClientApp(MDApp):
                 try:
                     main = self.root.get_screen("main")
                     grid = main.ids.message_grid
-                    for m in msgs:
-                        self._render_message(grid, m)
-                    Clock.schedule_once(lambda dt: self._scroll_to_bottom(), 0.1)
+                    if prepend:
+                        if not msgs:
+                            # Server has no older pages; stop trying.
+                            st = self._older.setdefault(
+                                cid, {"oldest_id": None, "has_older": False,
+                                      "loading": False})
+                            st["loading"] = False
+                            return
+                        # Scroll-triggered pagination: insert older messages
+                        # at the top of the grid while keeping the viewport
+                        # anchored on the content that was already visible.
+                        scroll = main.ids.scroll
+                        viewport_h = scroll.height
+                        old_content = grid.height
+                        old_sy = scroll.scroll_y
+                        offset = (1 - old_sy) * max(0, old_content - viewport_h)
+                        for m in reversed(msgs):
+                            self._render_message(grid, m)
+
+                        def restore(dt2):
+                            new_content = grid.height
+                            span = max(0, new_content - viewport_h)
+                            sy = 1.0 - offset / span if span > 0 else 1.0
+                            try:
+                                scroll.scroll_y = min(1.0, max(0.0, sy))
+                            except Exception:
+                                pass
+                        Clock.schedule_once(restore, 0)
+                        st = self._older.setdefault(
+                            cid, {"oldest_id": None, "has_older": True,
+                                  "loading": False})
+                        st["oldest_id"] = msgs[0]["msg_id"]
+                        st["has_older"] = len(msgs) == limit
+                        st["loading"] = False
+                    else:
+                        for m in msgs:
+                            self._render_message(grid, m)
+                        Clock.schedule_once(
+                            lambda dt: self._scroll_to_bottom(), 0.1)
+                    for u in updates:
+                        self._apply_update(u)
                 except Exception as e:
                     print("render messages error:", e)
             Clock.schedule_once(apply, 0)
@@ -1692,6 +2310,26 @@ class sHadesClientApp(MDApp):
             for u in updates:
                 self._apply_update(u)
         threading.Thread(target=work, daemon=True).start()
+
+    def _on_scroll_y(self, value):
+        """Scroll-triggered pagination: when the user reaches the top of the
+        chat and older messages remain, load the next page and prepend it."""
+        try:
+            main = self.root.get_screen("main")
+        except Exception:
+            return
+        name = getattr(main, "_current_channel", "general")
+        cid = self._channel_cid(name)
+        st = self._older.get(cid)
+        if not st or st.get("loading") or not st.get("has_older"):
+            return
+        if value < 0.97:
+            return
+        oldest = st.get("oldest_id")
+        if not oldest:
+            return
+        st["loading"] = True
+        self._fetch_messages(name, before=oldest, limit=50, prepend=True)
 
     def _render_message(self, grid, m):
         msg_id = m.get("msg_id")
@@ -1735,33 +2373,6 @@ class sHadesClientApp(MDApp):
         )
         self._msg_widgets[msg_id] = row
         grid.add_widget(row)
-
-        # embeds for URLs in content
-        for url in find_urls(content):
-            ext = os.path.splitext(url.split("?")[0])[1].lower()
-            if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
-                emb = MessageEmbed(source=url, size_hint_y=None, height=dp(200))
-                row.ids.embed_container.add_widget(emb)
-            elif ext in (".mp3", ".ogg", ".wav", ".flac"):
-                row.ids.embed_container.add_widget(
-                    Label(
-                        text="[audio] " + url,
-                        size_hint_y=None,
-                        height=dp(20),
-                        color=(0.7, 0.73, 0.77, 1),
-                        font_size=sp(12),
-                    )
-                )
-            elif ext in (".mp4", ".webm"):
-                row.ids.embed_container.add_widget(
-                    Label(
-                        text="[video] " + url,
-                        size_hint_y=None,
-                        height=dp(20),
-                        color=(0.7, 0.73, 0.77, 1),
-                        font_size=sp(12),
-                    )
-                )
 
         # attachment embeds (files uploaded with the message)
         for att in m.get("attachments") or []:
@@ -1939,16 +2550,9 @@ class sHadesClientApp(MDApp):
         else:
             row.content = content
             row.content_markup = md_to_kivy(content)
-            # Rebuild embeds to match the updated content (an edit may remove
-            # an image URL that a previous embed widget is still showing).
-            container = row.ids.get("embed_container")
-            if container:
-                container.clear_widgets()
-            for url in find_urls(content):
-                ext = os.path.splitext(url.split("?")[0])[1].lower()
-                if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
-                    emb = MessageEmbed(source=url, size_hint_y=None, height=dp(200))
-                    container.add_widget(emb)
+            # No embed rebuild: embeds come only from message attachments
+            # (RNS-fetched bytes rendered at post time), never from URLs in
+            # the text, so a text edit cannot add or remove one.
 
     def _scroll_to_bottom(self):
         try:
@@ -1964,6 +2568,33 @@ class sHadesClientApp(MDApp):
             self._channels_added = True
             for name in ("general", "announcements", "random"):
                 self._add_channel(name)
+
+    def _refresh_channels_from_guild(self):
+        """Pull the channel index from the guild (v1 JSON): fills the sidebar
+        with every channel and records each one's kind (chat/site/term)."""
+        if not self.guild_api:
+            return
+        def work():
+            res = self.guild_api.channels_list()
+            if not res.get("ok"):
+                return
+            chans = res.get("channels") or []
+            def apply(dt):
+                for c in chans:
+                    if not isinstance(c, dict):
+                        continue
+                    cid, name = c.get("id"), c.get("name")
+                    if not cid or not name:
+                        continue
+                    self._channel_kinds[cid] = c.get("kind", "chat")
+                    if name not in self._channels:
+                        self._channels[name] = cid
+                        self._add_channel(name)
+            Clock.schedule_once(apply, 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _channel_kind(self, cid):
+        return self._channel_kinds.get(cid, "chat")
 
     def _add_channel(self, name):
         main = self.root.get_screen("main")
@@ -1988,23 +2619,300 @@ class sHadesClientApp(MDApp):
         self._msg_widgets.clear()
         self._seq = 0
         self._last_ts = 0.0
+        cid = self._channel_cid(name)
+        # reroute the stream: only the visible channel flows
+        self._stream_cid = cid
+        self._stream_cursor = None
+        kind = self._channel_kind(cid)
+        if kind == "site":
+            self._open_site_channel(name, cid)
+            return
+        if kind == "term":
+            self._open_term_placeholder(name, cid)
+            return
+        self._older.setdefault(cid, {"oldest_id": None, "has_older": True,
+                                     "loading": False})
         self._fetch_messages(name)
         self._refresh_members_ui(name)
+
+    # -- site channels (micron pages over RNS; no HTML anywhere) ---------
+    def _open_site_channel(self, name, cid):
+        """Open a site channel: fetch its manifest, then render the index."""
+        self._site_stack = []
+        self._site_current = None
+        self._site_theme = {}
+        try:
+            main = self.root.get_screen("main")
+            grid = main.ids.message_grid
+            grid.clear_widgets()
+            self._msg_widgets.clear()
+            grid.add_widget(self._micron_label("[i]loading site…[/i]"))
+        except Exception as e:
+            print("site open error:", repr(e))
+        def work():
+            manifest = {}
+            try:
+                res = self.guild_api.channels_info(cid)
+                if res.get("ok"):
+                    manifest = (res.get("channel") or {}).get("manifest") or {}
+            except Exception as e:
+                print("site manifest error:", repr(e))
+            self._site_theme = manifest.get("theme") or {}
+            index = manifest.get("index") or "/index.mu"
+            Clock.schedule_once(lambda dt: self._site_load_page(cid, index), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _open_term_placeholder(self, name, cid):
+        try:
+            main = self.root.get_screen("main")
+            grid = main.ids.message_grid
+            grid.clear_widgets()
+            self._msg_widgets.clear()
+            page = SitePage()
+            page.add_widget(self._micron_label("[b]term channel[/b]"))
+            page.add_widget(self._micron_label(
+                "Terminal sessions over Reticulum are not wired into this "
+                "client build yet."))
+            grid.add_widget(page)
+        except Exception as e:
+            print("term placeholder error:", repr(e))
+
+    def _site_load_page(self, cid, path, push=False):
+        """Fetch + render one micron page. /page/... targets are the guild's
+        own pages (raw request); everything else is a site resource (v1)."""
+        if push and self._site_current:
+            self._site_stack.append(self._site_current)
+        self._site_current = (cid, path)
+        if not self.guild_api:
+            return
+        def work():
+            text, err = None, "unknown"
+            try:
+                if path.startswith("/page/"):
+                    raw = self.guild_api.fetch_file(path)
+                    if raw is not None:
+                        text = raw.decode("utf-8", "replace")
+                    else:
+                        err = "no response"
+                else:
+                    res = self.guild_api.site_get(cid, path)
+                    if res.get("ok"):
+                        text = base64.b64decode(
+                            res.get("data_b64") or "").decode("utf-8", "replace")
+                    else:
+                        err = res.get("error", "not found")
+            except Exception as e:
+                err = repr(e)
+                print("site page fetch failed:", err)
+            if text is not None:
+                Clock.schedule_once(lambda dt: self._render_site_page(cid, text), 0)
+            else:
+                Clock.schedule_once(
+                    lambda dt: self._set_status("page failed: %s" % err), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_site_page(self, cid, text):
+        try:
+            main = self.root.get_screen("main")
+        except Exception:
+            return
+        cur = getattr(main, "_current_channel", None)
+        if cur and self._channel_cid(cur) != cid:
+            return   # user switched away while the page was in flight
+        grid = main.ids.message_grid
+        grid.clear_widgets()
+        self._msg_widgets.clear()
+        blocks = micron_parse(text)
+        page = SitePage()
+        bg = micron_page_bg(blocks, self._site_theme)
+        if bg:
+            page.bg_color = self._hex6_to_rgba(bg)
+        if self._site_stack:
+            page.add_widget(self._micron_label(
+                "[ref=shades:back][b]< Back[/b][/ref]"))
+        for b in blocks:
+            t = b["type"]
+            if t == "directive":
+                continue
+            if t == "sep":
+                page.add_widget(MicronSep())
+                continue
+            if t == "heading":
+                page.add_widget(self._micron_label(
+                    runs_to_markup(b["runs"], _escape), heading=True))
+                continue
+            if t == "code":
+                page.add_widget(self._micron_label(_escape(b["text"]), code=True))
+                continue
+            runs = b.get("runs") or []
+            if len(runs) == 1 and micron_media_target(runs[0].get("link") or ""):
+                self._add_site_media(page, cid, runs[0])
+            else:
+                page.add_widget(self._micron_label(
+                    runs_to_markup(runs, _escape), center=b.get("center")))
+        grid.add_widget(page)
+        try:
+            main.ids.scroll.scroll_y = 1.0
+        except Exception:
+            pass
+
+    def _micron_label(self, markup, heading=False, center=False, code=False):
+        lbl = Label(markup=True, text=markup)
+        lbl.size_hint_y = None
+        lbl.font_size = sp(18) if heading else (sp(13) if code else sp(15))
+        lbl.halign = "center" if center else "left"
+        lbl.color = (0.62, 0.65, 0.7, 1) if code else (0.88, 0.9, 0.93, 1)
+        lbl.bind(width=lambda inst, w: setattr(inst, "text_size", (w, None)))
+        lbl.bind(texture_size=lambda inst, ts: setattr(
+            inst, "height", max(dp(18), ts[1] if ts else 0)))
+        lbl.bind(on_ref_press=lambda inst, ref: self._micron_link_tapped(ref))
+        return lbl
+
+    @staticmethod
+    def _hex6_to_rgba(h):
+        """'#88aa88' -> (r, g, b, 1.0) floats."""
+        h = (h or "#").lstrip("#")
+        if len(h) == 3:
+            h = "".join(c + c for c in h)
+        if len(h) != 6:
+            return (0, 0, 0, 0)
+        return (int(h[0:2], 16) / 255.0, int(h[2:4], 16) / 255.0,
+                int(h[4:6], 16) / 255.0, 1.0)
+
+    def _add_site_media(self, container, cid, run):
+        """A media-only line: images render inline (MessageEmbed, bytes
+        fetched over the link), audio/video as a tappable download row."""
+        target = (run.get("link") or "").split("`")[0].strip()
+        name = target.rsplit("/", 1)[-1] or "media"
+        ext = micron_media_target(target)
+        if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+            container.add_widget(self._micron_label(
+                "[ref=%s]♪ %s[/ref]" % (_escape(target), _escape(name))))
+            return
+        emb = MessageEmbed()
+        emb.source = ""    # placeholder box until the bytes arrive
+        container.add_widget(emb)
+        def work():
+            blob = None
+            try:
+                if target.startswith("/file/sites/"):
+                    parts = target.split("/", 4)
+                    if len(parts) == 5:
+                        res = self.guild_api.site_get(parts[3], "/" + parts[4])
+                        if res.get("ok"):
+                            blob = base64.b64decode(res.get("data_b64") or "")
+                else:
+                    raw = self.guild_api.fetch_file(target)
+                    if raw:
+                        blob = raw
+            except Exception as e:
+                print("site media fetch failed:", repr(e))
+            if not blob:
+                return
+            fpath = self._save_attachment_blob(blob, name)
+            Clock.schedule_once(lambda dt: setattr(emb, "source", fpath), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _micron_link_tapped(self, target):
+        """Dispatch a micron link ref press: back stack, media download,
+        intra-site pages, guild /page/... pages, everything else -> status."""
+        target = (target or "").split("`")[0].strip()
+        if target == "shades:back":
+            if self._site_stack:
+                cid, path = self._site_stack.pop()
+                self._site_load_page(cid, path)
+            return
+        if micron_media_target(target):
+            self._site_download_media(target)
+            return
+        if target.startswith("/file/sites/") and target.endswith(".mu"):
+            parts = target.split("/", 4)
+            if len(parts) == 5 and re.match(r"^[0-9a-f]{64}$", parts[3]):
+                self._site_load_page(parts[3], "/" + parts[4], push=True)
+                return
+        if target.startswith("/page/"):
+            try:
+                main = self.root.get_screen("main")
+                name = getattr(main, "_current_channel", "general")
+                self._site_load_page(self._channel_cid(name), target, push=True)
+            except Exception:
+                pass
+            return
+        self._set_status("link: %s" % (target or "(empty)"))
+
+    def _site_download_media(self, target):
+        """Download a media target to the local attachments dir."""
+        name = target.rsplit("/", 1)[-1] or "media"
+        self._set_status("downloading %s…" % name)
+        def work():
+            blob = None
+            try:
+                if target.startswith("/file/sites/"):
+                    parts = target.split("/", 4)
+                    if len(parts) == 5:
+                        res = self.guild_api.site_get(parts[3], "/" + parts[4])
+                        if res.get("ok"):
+                            blob = base64.b64decode(res.get("data_b64") or "")
+                else:
+                    raw = self.guild_api.fetch_file(target)
+                    if raw:
+                        blob = raw
+            except Exception as e:
+                print("site media download failed:", repr(e))
+            if blob:
+                fpath = self._save_attachment_blob(blob, name)
+                Clock.schedule_once(
+                    lambda dt: self._set_status("saved %s" % fpath), 0)
+            else:
+                Clock.schedule_once(
+                    lambda dt: self._set_status("download failed: %s" % name), 0)
+        threading.Thread(target=work, daemon=True).start()
+
 
     def _refresh_members_ui(self, channel):
         # Widget access must happen on the main thread.
         Clock.schedule_once(lambda dt: self._refresh_members_ui_main(channel), 0)
 
     def _refresh_members_ui_main(self, channel):
+        """Render the member sidebar.
+
+        Online members come from the guild's active-user list (the ping
+        registry), so the sidebar shows who is present *now*: a member whose
+        client stops pinging is dropped by the guild's reaper and disappears
+        from here on the next presence tick. The list therefore prunes itself
+        and never accumulates users who have gone away.
+
+        If the guild exposes no presence endpoint, fall back to the authors seen
+        this session, shown as unknown/offline rather than hidden.
+        """
         try:
             main = self.root.get_screen("main")
             grid = main.ids.member_grid
-            # clear & repopulate from current members set
             grid.clear_widgets()
-            # show self + any seen authors
+            if self._presence_ok:
+                for user_hash, info in sorted(
+                        self._active_users.items(),
+                        key=lambda kv: (kv[1].get("username") or "").lower()):
+                    grid.add_widget(MemberRow(
+                        username=info.get("username") or ("user-" + user_hash[:6]),
+                        avatar_source="",
+                        author_hash=user_hash,
+                        presence_color=[0.2, 0.8, 0.2, 1],   # green = online
+                    ))
+                if not self._active_users:
+                    # A Label, not a MemberRow: rows are clickable profiles.
+                    grid.add_widget(Label(
+                        text="nobody online", size_hint_y=None, height=dp(28),
+                        color=(0.7, 0.73, 0.77, 1), font_size=sp(12)))
+                return
+            # Fallback: authors seen this session; presence unknown.
             for h, uname in list(self._members.items())[:50]:
-                row = MemberRow(username=uname, avatar_source="")
-                grid.add_widget(row)
+                grid.add_widget(MemberRow(
+                    username=uname,
+                    avatar_source="",
+                    author_hash=h,
+                    presence_color=[0.5, 0.5, 0.5, 1],
+                ))
         except Exception as e:
             print("members ui error:", e)
 
@@ -2224,7 +3132,24 @@ class sHadesClientApp(MDApp):
         def work():
             print(f"[TRACE] _send_with_attachment.work: posting to channel={cid}", flush=True)
             dlog(f"_send_with_attachment.work: posting to channel={cid}")
-            res = self.guild_api.post(cid, text, attachments=[[name, mime, blob]])
+            # v1 path: upload the blob once, post by reference (no re-transfer
+            # on retry). Fall back to the legacy inline msgpack post when the
+            # guild predates /api/v1.
+            res = None
+            try:
+                up = self.guild_api.blobs_put(name, mime, blob)
+                if up.get("ok"):
+                    res = self.guild_api.post_v1(
+                        cid, text,
+                        attachments=[{"name": name, "mime": mime,
+                                      "blob_id": up["blob_id"]}])
+                else:
+                    print("[TRACE] blob upload failed: %s" % up.get("error"), flush=True)
+            except Exception as e:
+                print("[TRACE] v1 blob path failed, falling back:", repr(e), flush=True)
+            if res is None or not res.get("ok"):
+                legacy = self.guild_api.post(cid, text, attachments=[[name, mime, blob]])
+                res = legacy if (res is None or not res.get("ok")) else res
             print(f"[TRACE] _send_with_attachment.work: post response ok={res.get('ok')} msg_id={res.get('msg_id')} attachment={res.get('attachment')}", flush=True)
             dlog(f"_send_with_attachment.work: post response ok={res.get('ok')} msg_id={res.get('msg_id')} attachment={res.get('attachment')}")
             if not res.get("ok"):
@@ -2234,7 +3159,8 @@ class sHadesClientApp(MDApp):
             msg_id = res.get("msg_id")
             # The guild may ack with stored metadata (path) => server-stored.
             srv_att = res.get("attachment") or {}
-            srv_path = srv_att.get("path")
+            atts = res.get("attachments") or []
+            srv_path = srv_att.get("path") or (atts[0].get("path") if atts else None)
             if style == ATT_SERVER and srv_path:
                 dlog(f"_send_with_attachment.work: server-stored path={srv_path}")
                 att = {"name": name, "mime": mime, "size": len(blob),
@@ -2270,9 +3196,15 @@ class sHadesClientApp(MDApp):
             self._show_own_profile()
             return
 
+        # target_hash is a *user* hash (the message-author key), but the guild's
+        # node index is keyed by *node* hash. Presence carries the user->node
+        # link, so resolve through it; fall back to the raw hash for old guilds.
+        info = self._active_users.get((target_hash or "").lower())
+        lookup_hash = (info or {}).get("node_hash") or target_hash
+
         # Look up node's address via guild
         try:
-            res = self.guild_api.lookup_node(target_hash)
+            res = self.guild_api.lookup_node(lookup_hash)
             if not res.get("ok"):
                 self._set_status("Node not found: %s" % res.get("error", "unknown"))
                 return
@@ -2284,12 +3216,12 @@ class sHadesClientApp(MDApp):
             return
 
         if not address or not port:
-            self._set_status("No address for node: %s" % target_hash)
+            self._set_status("No address for node: %s" % lookup_hash)
             return
 
         # Connect to remote node via RNS.Link and request profile page
         try:
-            nh = bytes.fromhex(target_hash)
+            nh = bytes.fromhex(lookup_hash)
             nid = RNS.Identity.recall(nh)
             if nid is None:
                 # Try with identity_hash from lookup
@@ -2785,7 +3717,13 @@ class sHadesClientApp(MDApp):
             pass
 
     def on_stop(self):
+        # Stop every background loop: the poller, the presence ping, and the
+        # presence fetcher. Without the last one a reconnect would leak a
+        # presence thread per session.
         self._poll_stop.set()
+        self._stream_stop.set()
+        self._announce_stop.set()
+        self._presence_stop.set()
 
 
 # ---------------------------------------------------------------------------

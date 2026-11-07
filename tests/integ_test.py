@@ -8,7 +8,7 @@ Topology (all on localhost):
 
 Run:  /usr/bin/python3 tests/integ_test.py
 """
-import os, sys, json, time, re, sqlite3, subprocess, tempfile
+import os, sys, json, time, re, sqlite3, subprocess, tempfile, base64
 
 RETI_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GUILD_PY = os.path.join(RETI_DIR, "sHades.py")
@@ -59,7 +59,12 @@ def main():
     proc = subprocess.Popen(
         ["/usr/bin/python3", GUILD_PY, "--storage", g_store,
          "--rns-configdir", os.path.join(g_store, "rns-guild"),
-         "--announce-delay", "2"],
+         "--announce-delay", "2",
+         # --listen must match the TCPServerInterface written above: without it
+         # the guild's config check sees no listen_ip/listen_port, decides the
+         # config is stale, and rewrites it to AutoInterface-only -- so the
+         # server never opens this port and the client can never connect.
+         "--listen", "127.0.0.1:42421"],
         cwd=RETI_DIR, env=env,
         stdout=open(os.path.join(base, "guild.log"), "ab"),
         stderr=subprocess.STDOUT)
@@ -341,6 +346,173 @@ def main():
         check("api/avatar ok", r.get("ok") == 1, r)
         r = api("/api/avatar_get", {"user": hexstr(client_dest.hash)})
         check("avatar roundtrip", r.get("avatar") == png, r)
+
+        # ================= PRESENCE: ping-driven active users =================
+        # The client's node_hash is the hash of its own nomadnetwork.node
+        # destination; the guild keys presence by the *user* hash it derives
+        # from the identified link, which is the lxmf.delivery hash.
+        my_user_hash = hexstr(client_dest.hash)
+        my_node_dest = RNS.Destination(client_identity, RNS.Destination.IN,
+                                       RNS.Destination.SINGLE,
+                                       "nomadnetwork", "node")
+        my_node_hash = hexstr(my_node_dest.hash)
+
+        r = api("/api/register_node", {"node_hash": my_node_hash,
+                                       "address": "127.0.0.1", "port": 29222,
+                                       "identity_hash": hexstr(client_identity.hash)})
+        check("api/register_node (presence ping) ok", r.get("ok") == 1, r)
+
+        pres = api("/api/presence", {})
+        check("api/presence ok", pres.get("ok") == 1, pres)
+        check("api/presence reports the ping cadence + stale window",
+              pres.get("interval") == 4.0 and pres.get("ttl") == 8.0, pres)
+        pusers = {u["user_hash"]: u for u in pres.get("users", [])}
+        check("a pinging client is online, keyed by user hash",
+              my_user_hash in pusers, list(pusers))
+        check("presence entry carries the username",
+              (pusers.get(my_user_hash) or {}).get("username") == "Page Tester",
+              pusers.get(my_user_hash))
+        check("presence entry links user -> node for profile lookup",
+              (pusers.get(my_user_hash) or {}).get("node_hash") == my_node_hash,
+              pusers.get(my_user_hash))
+
+        # the node index resolves by node_hash (this is what profile clicks use)
+        lk = api("/api/lookup_node", {"node_hash": my_node_hash})
+        check("lookup_node resolves the registered node",
+              lk.get("ok") == 1 and lk.get("address") == "127.0.0.1", lk)
+
+        # the Micron members page surfaces presence to NomadNet users too
+        members_page = page("/page/sHades/members.mu", {"var_channel": test_cid})
+        check("members page shows the online section",
+              b"Online now" in members_page, members_page[:200])
+        check("members page lists the online client",
+              b"Page Tester" in members_page, members_page[-400:])
+
+        # ---- prune: a client that stops pinging drops off the list ----
+        # Nothing pings for longer than the 8s stale window; the guild's reaper
+        # should evict the node and presence should stop reporting the user.
+        time.sleep(8.0 + 2.0)
+        pres2 = api("/api/presence", {})
+        present2 = {u["user_hash"] for u in pres2.get("users", [])}
+        check("stale client is pruned from presence",
+              my_user_hash not in present2, present2)
+        lk2 = api("/api/lookup_node", {"node_hash": my_node_hash})
+        check("stale node is evicted from the node index",
+              lk2.get("ok") == 0, lk2)
+        members_page2 = page("/page/sHades/members.mu", {"var_channel": test_cid})
+        check("members page no longer lists the stale client as online",
+              b"nobody pinging" in members_page2 or
+              b"`F2a2+`f Page Tester" not in members_page2, members_page2[-400:])
+
+        # and pinging again brings the client back
+        api("/api/register_node", {"node_hash": my_node_hash,
+                                   "address": "127.0.0.1", "port": 29222,
+                                   "identity_hash": hexstr(client_identity.hash)})
+        pres3 = api("/api/presence", {})
+        check("re-pinging restores presence",
+              my_user_hash in {u["user_hash"] for u in pres3.get("users", [])}, pres3)
+
+        # ================= JSON API v1: channel kinds + stream =================
+        # v1 speaks JSON bytes over the same RNS link (no HTTP anywhere).
+        def japi(path, data):
+            payload = json.dumps(data or {}).encode("utf-8")
+            r = link.request(path, data=payload)
+            for _ in range(300):
+                if r.response is not None: break
+                time.sleep(0.1)
+            return json.loads(r.response.decode("utf-8")) if r.response else {"ok": 0, "error": "no response"}
+
+        cl = japi("/api/v1/channels/list", {})
+        check("v1 channels/list over JSON", cl.get("ok") == 1 and
+              any(c["name"] == "test" and c["kind"] == "chat" for c in cl.get("channels", [])), cl)
+
+        r = japi("/api/v1/channels/create", {"name": "lounge", "kind": "site",
+                                             "manifest": {"index": "/index.mu",
+                                                          "theme": {"bg": "223"}}})
+        check("v1 create site channel (client is a mod)", r.get("ok") == 1 and
+              r["channel"]["kind"] == "site", r)
+        site_cid = r.get("channel", {}).get("id")
+        r = japi("/api/v1/channels/create", {"name": "x", "kind": "ftp"})
+        check("v1 rejects unknown kind", r.get("ok") == 0 and r.get("code") == 400, r)
+        info = japi("/api/v1/channels/info", {"channel": site_cid})
+        check("v1 channel info returns the manifest",
+              info.get("ok") == 1 and info["channel"]["manifest"].get("index") == "/index.mu", info)
+
+        sub = japi("/api/v1/stream/subscribe", {"channel": test_cid})
+        check("v1 stream subscribe", sub.get("ok") == 1 and isinstance(sub.get("cursor"), int), sub)
+        cur = sub["cursor"]
+
+        # typing transition is visible on the stream
+        japi("/api/v1/typing", {"channel": test_cid, "active": True})
+        poll = japi("/api/v1/stream/poll", {"cursor": cur, "timeout_s": 5})
+        tev = [e for e in poll.get("events", []) if e["kind"] == "typing"]
+        check("v1 typing event flows to the stream", tev and tev[0]["data"]["active"] is True, poll)
+        cur = poll.get("cursor", cur)
+
+        # a legacy msgpack post lands as a JSON stream event
+        api("/api/post", {"channel": test_cid, "content": "stream probe via msgpack post"})
+        poll = japi("/api/v1/stream/poll", {"cursor": cur, "timeout_s": 5})
+        mev = [e for e in poll.get("events", []) if e["kind"] == "msg"]
+        check("msgpack post arrives as a JSON msg event",
+              mev and mev[0]["data"]["msg"]["content"] == "stream probe via msgpack post", poll)
+        cur = poll.get("cursor", cur)
+
+        # replay: resubscribe with the pre-typing cursor returns the backlog
+        r = japi("/api/v1/stream/subscribe", {"channel": test_cid, "cursor": cur - 1})
+        poll = japi("/api/v1/stream/poll", {"timeout_s": 0})
+        check("v1 replay from an older cursor",
+              any(e["kind"] == "msg" for e in poll.get("events", [])), poll)
+
+        # unsubscribed links get nothing
+        japi("/api/v1/stream/unsubscribe", {})
+        r = japi("/api/v1/stream/poll", {"timeout_s": 0})
+        check("v1 poll after unsubscribe -> not subscribed",
+              r.get("ok") == 0 and r.get("code") == 409, r)
+        pres = japi("/api/v1/presence", {})
+        me = [u for u in pres.get("users", []) if u["user_hash"] == my_user_hash]
+        check("v1 presence ok (ping cadence intact)",
+              pres.get("ok") == 1 and pres.get("interval") == 4.0, pres)
+        check("v1 presence active_channel cleared after unsubscribe",
+              me and me[0]["active_channel"] is None, pres)
+        # re-subscribe for nothing: leave the stream clean for later sections
+
+        # ================= v1 blobs + site (phases 3-4) =================
+        blob = bytes(range(256)) * 16
+        up = japi("/api/v1/blobs/put", {"name": "mesh.png", "mime": "image/png",
+                                        "data_b64": base64.b64encode(blob).decode()})
+        check("v1 blobs/put over the mesh", up.get("ok") == 1
+              and up.get("blob_id") == __import__("hashlib").sha256(blob).hexdigest()[:32], up)
+        got = japi("/api/v1/blobs/get", {"blob_id": up["blob_id"]})
+        check("v1 blobs/get roundtrip over the mesh", got.get("ok") == 1
+              and base64.b64decode(got["data_b64"]) == blob, got)
+        r = japi("/api/v1/post", {"channel": test_cid, "content": "blob by ref",
+                                  "attachments": [{"name": "mesh.png",
+                                                   "blob_id": up["blob_id"]}]})
+        check("v1 post with blob_id over the mesh", r.get("ok") == 1
+              and (r.get("attachments") or [{}])[0].get("path"), r)
+        if (r.get("attachments") or [{}])[0].get("path"):
+            served = page(r["attachments"][0]["path"], {})
+            check("blob-referenced attachment served byte-identical", served == blob,
+                  len(served))
+
+        # site channel: put micron page + image, get back, see the patch event
+        sub = japi("/api/v1/stream/subscribe", {"channel": site_cid})
+        check("subscribe to site channel", sub.get("ok") == 1 and sub.get("kind") == "site", sub)
+        page_html = "> Lounge\nhello micron site"
+        r = japi("/api/v1/site/put", {"channel": site_cid, "path": "/index.mu",
+                                      "data_b64": base64.b64encode(page_html.encode()).decode()})
+        check("v1 site/put over the mesh", r.get("ok") == 1 and r.get("mime") == "text/micron", r)
+        poll = japi("/api/v1/stream/poll", {"timeout_s": 5})
+        check("site_patch event arrives on the stream",
+              any(e["kind"] == "site_patch" and e["data"].get("path") == "/index.mu"
+                  for e in poll.get("events", [])), poll)
+        got = japi("/api/v1/site/get", {"channel": site_cid, "path": "/index.mu"})
+        check("v1 site/get roundtrip", got.get("ok") == 1
+              and base64.b64decode(got["data_b64"]).decode() == page_html, got)
+        r = japi("/api/v1/site/manifest_put",
+                 {"channel": site_cid, "manifest": {"index": "/index.mu", "theme": {"bg": "223"}}})
+        check("v1 manifest_put over the mesh", r.get("ok") == 1, r)
+        japi("/api/v1/stream/unsubscribe", {})
 
         # ---- rate limit (kept last: it exhausts the sender window) ----
         codes = []
