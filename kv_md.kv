@@ -360,12 +360,7 @@
                 Rectangle:
                     pos: self.pos
                     size: self.size
-            Button:
-                text: '≡'
-                size_hint_x: None
-                width: dp(40)
-                background_color: 0, 0, 0, 0
-                color: 1, 1, 1, 1
+            HamburgerIcon:
                 on_press: root.toggle_left()
             Label:
                 id: channel_header
@@ -377,20 +372,9 @@
                 halign: 'left'
                 valign: 'middle'
                 text_size: self.width, None
-            Button:
-                text: '⌕'
-                size_hint_x: None
-                width: dp(40)
-                background_color: 0, 0, 0, 0
-                color: 1, 1, 1, 1
-                font_size: sp(18)
+            SearchIcon:
                 on_press: app.open_search()
-            Button:
-                text: '⚙'
-                size_hint_x: None
-                width: dp(40)
-                background_color: 0, 0, 0, 0
-                color: 1, 1, 1, 1
+            GearIcon:
                 on_press: app.open_profile(app.my_hash or '', app.username or '')
         BoxLayout:
             orientation: 'horizontal'
@@ -433,7 +417,7 @@
                         md_bg_color: app.theme_colors['sidebar_ctrl']
                         on_press: app.open_config()
                         MDButtonText:
-                            text: '⚙'
+                            text: 'cfg'
                             shorten: True
                 MDButton:
                     style: 'outlined'
@@ -443,7 +427,7 @@
                     md_bg_color: app.theme_colors['sidebar_ctrl']
                     on_press: root.toggle_left()
                     MDButtonText:
-                        text: 'channels \\u25bc' if root.left_open else 'channels \\u25b6'
+                        text: 'channels v' if root.left_open else 'channels >'
                 ScrollView:
                     do_scroll_x: False
                     GridLayout:
@@ -455,7 +439,7 @@
                         padding: [dp(6), dp(6)]
 
             SlimButton:
-                text: '‹'
+                text: '<'
                 on_press: root.toggle_left()
             # ---------------- center: chat ----------------
             BoxLayout:
@@ -530,7 +514,7 @@
                             text: 'Attach'
 
             SlimButton:
-                text: '›'
+                text: '>'
                 on_press: root.toggle_right()
             # ---------------- right: members (collapsable) ----------------
             BoxLayout:

@@ -187,5 +187,7 @@ shows a placeholder until terminal sessions land. Site rendering (`micron.py` +
     tests/test_moderation.py moderation unit tests
     tests/test_presence.py presence / ping-expiry unit tests
     plan.md                the design (v2.2) with verified-API citations
+    plan_ui.md             the UI/interaction plan (context menus, roles,
+                           slash-commands, admin panel — not yet built)
     plan_review.md         teardown of the original v1 plan (why it was rebuilt)
     plan_v1.md             original (superseded) design

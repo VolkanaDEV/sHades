@@ -17,6 +17,7 @@ import re
 import json
 import time
 import base64
+import math
 import hashlib
 import threading
 import random
@@ -49,7 +50,7 @@ try:
     from kivy.uix.togglebutton import ToggleButton
     from kivy.uix.textinput import TextInput
     from kivy.uix.widget import Widget
-    from kivy.graphics import Color, Ellipse, Rectangle
+    from kivy.graphics import Color, Ellipse, Line, Rectangle
     from kivy.metrics import dp, sp
     KIVY = True
 except Exception as _e:  # pragma: no cover - Kivy missing at import time
@@ -850,6 +851,60 @@ if KIVY:
         def _up(self, *a):
             self._rect.pos = self.pos
             self._rect.size = self.size
+
+    class IconBase(ButtonBehavior, Widget):
+        """Canvas-drawn top-bar icon. The default Kivy font (Roboto) has no
+        glyphs for ☰/⌕/⚙ — they render as boxes with X's — so the icons are
+        drawn, not typed. Geometry lives in ui_geom.py (Kivy-free, unit
+        tested); this class only emits the instructions."""
+        color = ListProperty([1, 1, 1, 1])
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.size_hint = (None, None)
+            self.size = (dp(40), dp(40))
+            self.bind(pos=self._redraw, size=self._redraw, color=self._redraw)
+            Clock.schedule_once(lambda dt: self._redraw(), 0)
+
+        def _redraw(self, *a):
+            self.canvas.clear()
+            with self.canvas:
+                Color(*self.color)
+                self.render_icon()
+
+        def render_icon(self):  # pragma: no cover - abstract
+            pass
+
+    class HamburgerIcon(IconBase):
+        """Sidebar toggle: three horizontal bars."""
+
+        def render_icon(self):
+            for px, py, bw, bh in ui_geom.hamburger_bars(
+                    self.x, self.y, self.width, self.height):
+                Rectangle(pos=(px, py), size=(bw, bh))
+
+    class SearchIcon(IconBase):
+        """Search: a circle outline with a handle."""
+
+        def render_icon(self):
+            cx, cy, r = ui_geom.search_circle(self.x, self.y,
+                                              self.width, self.height)
+            Line(circle=(cx, cy, r))
+            Line(points=list(ui_geom.search_handle(self.x, self.y,
+                                                   self.width, self.height)),
+                 width=dp(1.5))
+
+    class GearIcon(IconBase):
+        """Settings: toothed ring around a hub dot."""
+
+        def render_icon(self):
+            cx = self.x + self.width / 2.0
+            cy = self.y + self.height / 2.0
+            r1, teeth = ui_geom.gear(cx, cy, min(self.width, self.height))
+            Line(circle=(cx, cy, r1), width=dp(1.4))
+            for x1, y1, x2, y2 in teeth:
+                Line(points=[x1, y1, x2, y2], width=dp(1.4))
+            Ellipse(pos=(cx - dp(2.5), cy - dp(2.5)), size=(dp(5), dp(5)))
 
     class TermPage(BoxLayout):
         """Guild console view for term channels: one scrolling output label.
@@ -3070,7 +3125,7 @@ class sHadesClientApp(MDApp):
         ext = micron_media_target(target)
         if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
             container.add_widget(self._micron_label(
-                "[ref=%s]♪ %s[/ref]" % (_escape(target), _escape(name))))
+                "[ref=%s]audio: %s[/ref]" % (_escape(target), _escape(name))))
             return
         emb = MessageEmbed()
         emb.source = ""    # placeholder box until the bytes arrive

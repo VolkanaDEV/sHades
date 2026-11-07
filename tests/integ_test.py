@@ -74,7 +74,11 @@ def main():
         info = None
         for _ in range(200):
             if os.path.isfile(info_path):
-                info = json.load(open(info_path)); break
+                try:
+                    info = json.load(open(info_path)); break
+                except json.JSONDecodeError:
+                    # caught the file mid-write (created, not yet populated)
+                    time.sleep(0.05)
             if proc.poll() is not None:
                 print(open(os.path.join(base, "guild.log")).read()); sys.exit("guild died")
             time.sleep(0.25)
