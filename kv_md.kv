@@ -114,13 +114,28 @@
     height: dp(44)
     padding: [dp(10), 0]
     spacing: dp(4)
-    Label:
-        text: root.channel_name
-        color: (1, 1, 1, 0.85)
-        font_size: sp(13)
-        halign: 'left'
-        valign: 'middle'
-        text_size: self.width, None
+    BoxLayout:
+        orientation: 'horizontal'
+        size_hint_y: None
+        height: dp(20)
+        Label:
+            text: root.channel_name
+            color: (1, 1, 1, 0.85)
+            font_size: sp(13)
+            halign: 'left'
+            valign: 'middle'
+            text_size: self.width, None
+            size_hint_x: 1
+        Label:
+            id: badge
+            text: str(root.badge) if root.badge else ''
+            color: (1, 1, 1, 1)
+            bold: True
+            font_size: sp(12)
+            size_hint_x: None
+            width: dp(40) if root.badge else 0
+            halign: 'right'
+            valign: 'middle'
 
 <MessageEmbed>:
     size_hint_y: None
@@ -362,6 +377,14 @@
                 halign: 'left'
                 valign: 'middle'
                 text_size: self.width, None
+            Button:
+                text: '⌕'
+                size_hint_x: None
+                width: dp(40)
+                background_color: 0, 0, 0, 0
+                color: 1, 1, 1, 1
+                font_size: sp(18)
+                on_press: app.open_search()
             Button:
                 text: '⚙'
                 size_hint_x: None

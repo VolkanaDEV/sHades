@@ -542,6 +542,30 @@ def main():
         check("session gone after quit", r.get("ok") == 0 and r.get("code") == 404, r)
         japi("/api/v1/stream/unsubscribe", {})
 
+        # ---- receipts, reactions, search (phase 6) ----
+        r = japi("/api/v1/receipts", {"channel": test_cid})
+        check("v1 receipts report unread", r.get("ok") == 1 and r.get("unread", 0) >= 1, r)
+        cl = japi("/api/v1/channels/list", {})
+        trow = [c for c in cl.get("channels", []) if c["id"] == test_cid]
+        check("channels/list carries unread for this viewer",
+              trow and trow[0].get("unread", 0) >= 1, cl)
+        # react to the stream-probe message and see the event
+        probe = japi("/api/v1/search", {"q": "stream probe", "channel": test_cid})
+        check("v1 search over the mesh", probe.get("ok") == 1
+              and any("stream probe via msgpack post" == x["content"]
+                      for x in probe.get("results", [])), probe)
+        target = (probe.get("results") or [{}])[0].get("msg_id")
+        sub = japi("/api/v1/stream/subscribe", {"channel": test_cid})
+        cur = sub["cursor"]
+        r = japi("/api/v1/react", {"msg": target, "emoji": "+1"})
+        check("v1 react ok", r.get("ok") == 1 and r.get("active") is True, r)
+        poll = japi("/api/v1/stream/poll", {"cursor": cur, "timeout_s": 5})
+        rx = [e for e in poll.get("events", []) if e["kind"] == "reaction"]
+        check("reaction event flows over the mesh",
+              rx and rx[0]["data"]["emoji"] == "+1"
+              and rx[0]["data"]["counts"].get("+1") == 1, poll)
+        japi("/api/v1/stream/unsubscribe", {})
+
         # ---- rate limit (kept last: it exhausts the sender window) ----
         codes = []
         for i in range(14):

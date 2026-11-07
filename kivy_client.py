@@ -47,6 +47,7 @@ try:
     from kivy.uix.popup import Popup
     from kivy.uix.button import Button
     from kivy.uix.togglebutton import ToggleButton
+    from kivy.uix.textinput import TextInput
     from kivy.uix.widget import Widget
     from kivy.graphics import Color, Ellipse, Rectangle
     from kivy.metrics import dp, sp
@@ -443,6 +444,26 @@ class GuildAPI:
     def term_close(self, session):
         return self._request_json("/api/v1/term/close", {"session": session})
 
+    def receipts(self, channel, msg_id=None):
+        """Read watermark: mark up to msg_id, or report {last_read_id, unread}."""
+        data = {"channel": channel}
+        if msg_id:
+            data["msg_id"] = msg_id
+        return self._request_json("/api/v1/receipts", data)
+
+    def react(self, msg_id, emoji):
+        """Toggle a reaction (ASCII shortcode)."""
+        return self._request_json("/api/v1/react",
+                                  {"msg": msg_id, "emoji": emoji})
+
+    def search(self, q, channel=None, limit=None):
+        data = {"q": q}
+        if channel:
+            data["channel"] = channel
+        if limit:
+            data["limit"] = limit
+        return self._request_json("/api/v1/search", data)
+
     def fetch_file(self, path):
         """Fetch raw bytes from a /file/... request handler on the guild."""
         dlog(f"fetch_file: requesting {path}")
@@ -787,6 +808,7 @@ class ClickableLabel(ButtonBehavior, Label):
 
 class ChannelButton(ButtonBehavior, BoxLayout):
     channel_name = StringProperty("")
+    badge = NumericProperty(0)
 
 
 if KIVY:
@@ -1517,6 +1539,8 @@ class sHadesClientApp(MDApp):
         # term channels: one console session per channel, the live TermPage
         self._term_sessions = {}     # cid -> session id
         self._term_page = None       # the TermPage currently on screen
+        # unread badges per cid (from channels/list receipts)
+        self._channel_unread = {}
 
         # Presence: mirror the guild's active-user list every PRESENCE_INTERVAL.
         # _active_users maps user_hash -> {"username", "node_hash"} and is
@@ -2211,6 +2235,14 @@ class sHadesClientApp(MDApp):
                 if self._site_current:
                     Clock.schedule_once(lambda dt: self._site_load_page(
                         self._site_current[0], self._site_current[1]), 0)
+            elif kind == "reaction":
+                # update the affected row's chips in place (react does not
+                # bump the channel seq, so the reconciler will not refetch)
+                def apply_rxn(dt):
+                    self._set_row_reactions(data.get("msg_id"),
+                                            self._reactions_from_counts(
+                                                data.get("msg_id"), data))
+                Clock.schedule_once(apply_rxn, 0)
             elif kind == "term_data":
                 # console output (server-sanitised); "clear" wipes the buffer
                 def apply_term(dt):
@@ -2316,6 +2348,15 @@ class sHadesClientApp(MDApp):
                 return
             msgs = res.get("messages", []) or []
             updates = res.get("updates", []) or []
+            # reading the channel: mark the newest message read (never for
+            # pagination prepends — those are older than the watermark)
+            if msgs and not prepend and not since_ts:
+                newest = msgs[-1].get("msg_id")
+                if newest:
+                    try:
+                        self.guild_api.receipts(cid, newest)
+                    except Exception as e:
+                        print("receipt send failed:", repr(e))
 
             def apply(dt):
                 try:
@@ -2470,6 +2511,137 @@ class sHadesClientApp(MDApp):
                 import base64
                 att_blob = base64.b64decode(att_blob)
             self._add_attachment_embed(row, att_name, att_blob)
+
+        # reaction summary line (tappable: toggles that emoji for me)
+        self._set_row_reactions(msg_id, m.get("reactions") or [])
+
+    # -- reactions (phase 6) ----------------------------------------------
+    REACTION_PRESETS = ("+1", "-1", "laugh", "heart", "eyes", "question")
+
+    def _set_row_reactions(self, msg_id, reactions):
+        """Replace a row's reaction chips with the given summary. Safe to
+        call with an empty list (removes the line)."""
+        row = self._msg_widgets.get(msg_id)
+        if not row:
+            return
+        container = row.ids.get("embed_container")
+        if not container:
+            return
+        for w in getattr(row, "_reaction_widgets", []):
+            try:
+                container.remove_widget(w)
+            except Exception:
+                pass
+        row._reaction_widgets = []
+        if not reactions:
+            return
+        line = BoxLayout(orientation="horizontal", size_hint_y=None,
+                         height=dp(20), spacing=dp(6))
+        for e in reactions:
+            if not isinstance(e, dict) or not e.get("emoji"):
+                continue
+            chip = ClickableLabel(text=":%s %d" % (e["emoji"], e.get("count", 0)),
+                                  color=(0.75, 0.78, 0.85, 1), font_size=sp(12))
+            chip.size_hint_x = None
+            chip.width = dp(24 + 9 * len(e["emoji"]))
+            chip.bind(on_press=lambda inst, m=msg_id, em=e["emoji"]:
+                      self._toggle_reaction(m, em))
+            line.add_widget(chip)
+        plus = ClickableLabel(text="[+]", color=(0.5, 0.53, 0.6, 1), font_size=sp(12))
+        plus.size_hint_x = None
+        plus.width = dp(30)
+        plus.bind(on_press=lambda inst, m=msg_id: self._open_reaction_popup(m))
+        line.add_widget(plus)
+        row._reaction_widgets.append(line)
+        container.add_widget(line)
+
+    def _toggle_reaction(self, msg_id, emoji):
+        if not self.guild_api:
+            return
+        def work():
+            try:
+                self.guild_api.react(msg_id, emoji)
+            except Exception as e:
+                print("react failed:", repr(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_reaction_counts(self, msg_id, reactions):
+        """Update a rendered row from a reaction event or fetched row."""
+        self._set_row_reactions(msg_id, reactions or [])
+
+    @staticmethod
+    def _reactions_from_counts(msg_id, data):
+        """Rebuild a reaction summary from a stream event's counts dict."""
+        counts = data.get("counts") or {}
+        return [{"emoji": e, "count": n, "users": []}
+                for e, n in sorted(counts.items())]
+
+    def _open_reaction_popup(self, msg_id):
+        try:
+            main = self.root.get_screen("main")
+        except Exception:
+            return
+        box = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(10))
+        line = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint_y=None,
+                         height=dp(40))
+        for emoji in self.REACTION_PRESETS:
+            btn = Button(text=":%s" % emoji, size_hint_x=None, width=dp(70))
+            btn.bind(on_press=lambda inst, m=msg_id, em=emoji:
+                     (self._toggle_reaction(m, em), popup.dismiss()))
+            line.add_widget(btn)
+        box.add_widget(line)
+        popup = Popup(title="react", content=box, size_hint=(0.7, 0.25))
+        self._popup = popup
+        popup.open()
+
+    # -- search (phase 6) --------------------------------------------------
+    def open_search(self):
+        try:
+            self.root.get_screen("main")
+        except Exception:
+            return
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
+        query = TextInput(multiline=False, size_hint_y=None, height=dp(40),
+                          hint_text="search messages (min 2 chars)")
+        results = Label(markup=True, halign="left", valign="top",
+                        color=(0.85, 0.88, 0.9, 1), font_size=sp(13))
+        results.size_hint_y = 1
+        results.bind(width=lambda inst, w: setattr(inst, "text_size", (w, None)))
+
+        def run_search(*a):
+            q = (query.text or "").strip()
+            if len(q) < 2:
+                return
+            def work():
+                try:
+                    res = self.guild_api.search(q)
+                except Exception as e:
+                    res = {"ok": 0, "error": repr(e)}
+                def apply(dt):
+                    if not res.get("ok"):
+                        results.text = "[i]search failed: %s[/i]" % res.get("error", "")
+                        return
+                    rows = res.get("results") or []
+                    if not rows:
+                        results.text = "[i]no matches[/i]"
+                        return
+                    out = []
+                    for r in rows[:20]:
+                        ts = time.strftime("%m-%d %H:%M", time.localtime(r.get("ts", 0)))
+                        snippet = (r.get("content") or "")[:80].replace("\n", " ")
+                        out.append("[b]%s[/b]  %s\n  %s" % (r.get("username", "?"), ts, snippet))
+                    results.text = "\n".join(out)
+                Clock.schedule_once(apply, 0)
+            threading.Thread(target=work, daemon=True).start()
+        query.bind(on_text_validate=run_search)
+        btn = Button(text="search", size_hint_y=None, height=dp(36))
+        btn.bind(on_press=run_search)
+        box.add_widget(query)
+        box.add_widget(btn)
+        box.add_widget(results)
+        popup = Popup(title="search", content=box, size_hint=(0.85, 0.6))
+        self._popup = popup
+        popup.open()
 
     def _add_attachment_embed(self, row, name, blob):
         """Render one attachment: images inline, everything else as a label."""
@@ -2649,11 +2821,26 @@ class sHadesClientApp(MDApp):
                     if name not in self._channels:
                         self._channels[name] = cid
                         self._add_channel(name)
+            self._channel_unread.update(
+                {c["id"]: c.get("unread", 0) for c in chans
+                 if isinstance(c, dict) and c.get("id")})
+            Clock.schedule_once(lambda dt: self._update_channel_badges(), 0)
             Clock.schedule_once(apply, 0)
         threading.Thread(target=work, daemon=True).start()
 
     def _channel_kind(self, cid):
         return self._channel_kinds.get(cid, "chat")
+
+    def _update_channel_badges(self):
+        """Push unread counts onto the sidebar buttons (UI thread)."""
+        try:
+            grid = self.root.get_screen("main").ids.channel_grid
+        except Exception:
+            return
+        for child in grid.children:
+            if isinstance(child, ChannelButton):
+                cid = self._channels.get(child.channel_name)
+                child.badge = self._channel_unread.get(cid, 0)
 
     def _add_channel(self, name):
         main = self.root.get_screen("main")

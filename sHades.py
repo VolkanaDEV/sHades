@@ -147,6 +147,13 @@ CREATE TABLE IF NOT EXISTS banned (
     dest_hash TEXT PRIMARY KEY, reason TEXT, at REAL);
 CREATE TABLE IF NOT EXISTS muted (
     dest_hash TEXT PRIMARY KEY, reason TEXT, at REAL, by TEXT);
+CREATE TABLE IF NOT EXISTS receipts (
+    channel_id TEXT, user_hash TEXT, last_id INTEGER NOT NULL DEFAULT 0, ts REAL,
+    PRIMARY KEY (channel_id, user_hash));
+CREATE TABLE IF NOT EXISTS reactions (
+    msg_id TEXT, user_hash TEXT, emoji TEXT, ts REAL,
+    PRIMARY KEY (msg_id, user_hash, emoji));
+CREATE INDEX IF NOT EXISTS idx_reactions_msg ON reactions(msg_id);
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, id);
 """
 
@@ -574,7 +581,7 @@ def ingest(channel_id, author_hash, content, ts=None, attachments=None):
         "msg_id": msg_id, "channel_id": channel_id, "ts": ts,
         "author_hash": author_hash, "username": get_username(author_hash),
         "content": content, "edited_at": None, "deleted_at": None,
-        "attachments": att_meta,
+        "attachments": att_meta, "reactions": [],
     }})
     return msg_id
 
@@ -658,6 +665,15 @@ def msg_row_json(row):
     with db_lock:
         atts = db.execute("SELECT idx, name, mime, size, path FROM attachments "
                           "WHERE msg_id=? ORDER BY idx", (row["msg_id"],)).fetchall()
+        rx = db.execute("SELECT emoji, user_hash FROM reactions "
+                        "WHERE msg_id=? ORDER BY ts", (row["msg_id"],)).fetchall()
+    summary = {}
+    for r in rx:
+        e = summary.setdefault(r["emoji"],
+                               {"emoji": r["emoji"], "count": 0, "users": []})
+        e["count"] += 1
+        if len(e["users"]) < 32:
+            e["users"].append(r["user_hash"])
     return {
         "id": row["id"], "msg_id": row["msg_id"], "channel_id": row["channel_id"],
         "ts": row["ts"], "author_hash": row["author_hash"],
@@ -666,6 +682,7 @@ def msg_row_json(row):
         "edited_at": row["edited_at"], "deleted_at": row["deleted_at"],
         "attachments": [{"name": a["name"], "mime": a["mime"], "size": a["size"],
                          "path": "/file/attachments/" + a["path"]} for a in atts],
+        "reactions": list(summary.values()),
     }
 
 @route("/page/index.mu")
@@ -1241,6 +1258,7 @@ def _mutate_msg(viewer, data, action):
         else:
             deleted_at = now()
             db.execute("UPDATE messages SET deleted_at=? WHERE msg_id=?", (deleted_at, msg_id))
+            db.execute("DELETE FROM reactions WHERE msg_id=?", (msg_id,))
             event = {"msg_id": msg_id, "content": "", "edited_at": None,
                      "deleted_at": deleted_at}
         bump_seq(row["channel_id"])
@@ -1541,6 +1559,9 @@ def api_v1_channels_list(viewer, data, link_id):
                           "ORDER BY name ASC").fetchall()
         chans = [{"id": r["id"], "name": r["name"], "kind": r["kind"],
                   "created": r["created"], "seq": get_seq(r["id"])} for r in rows]
+    for c in chans:
+        last_id = _receipt_last_id(c["id"], viewer)
+        c["unread"] = _unread_count(c["id"], last_id)
     return {"ok": 1, "channels": chans}
 
 @api_route("/api/v1/channels/create")
@@ -2241,6 +2262,115 @@ def api_v1_term_close(viewer, data, link_id):
         return {"ok": 0, "error": "not your session", "code": 403}
     _term_emit(session, "\r\n[session closed]")
     return {"ok": 1}
+
+# ---- receipts, reactions, search (phase 6) -----------------------------------------
+
+_EMOJI_RE = re.compile(r"^[a-z0-9_+\-]{1,16}$")
+MAX_EMOJI_PER_MSG = 16   # distinct shortcodes per message
+
+def _receipt_last_id(cid, viewer):
+    with db_lock:
+        row = db.execute("SELECT last_id FROM receipts WHERE channel_id=? AND user_hash=?",
+                         (cid, viewer)).fetchone()
+    return row["last_id"] if row else 0
+
+def _unread_count(cid, last_id):
+    with db_lock:
+        row = db.execute("SELECT COUNT(*) AS n FROM messages WHERE channel_id=? AND id>?",
+                         (cid, last_id)).fetchone()
+    return row["n"]
+
+@api_route("/api/v1/receipts")
+@wrap_json_api
+def api_v1_receipts(viewer, data, link_id):
+    """Read watermarks. With msg_id: mark read up to that message (it must
+    belong to the channel). Without: report {last_read_id, unread}."""
+    cid = data.get("channel")
+    with db_lock:
+        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
+            return {"ok": 0, "error": "unknown channel", "code": 404}
+    msg_id = data.get("msg_id")
+    if msg_id:
+        with db_lock:
+            row = db.execute("SELECT id FROM messages WHERE msg_id=? AND channel_id=?",
+                             (msg_id, cid)).fetchone()
+            if not row:
+                return {"ok": 0, "error": "unknown message in channel", "code": 404}
+            db.execute("INSERT INTO receipts (channel_id, user_hash, last_id, ts) "
+                       "VALUES (?, ?, ?, ?) "
+                       "ON CONFLICT(channel_id, user_hash) DO UPDATE SET "
+                       "last_id=MAX(receipts.last_id, excluded.last_id), ts=excluded.ts",
+                       (cid, viewer, row["id"], now()))
+            db.commit()
+    last_id = _receipt_last_id(cid, viewer)
+    return {"ok": 1, "channel": cid, "last_read_id": last_id,
+            "unread": _unread_count(cid, last_id)}
+
+@api_route("/api/v1/react")
+@wrap_json_api
+def api_v1_react(viewer, data, link_id):
+    """Toggle a reaction (one emoji per user per message). Emoji are ASCII
+    shortcodes ('+1', 'laugh', ...), never raw unicode from the wire."""
+    msg_id = data.get("msg")
+    emoji = (data.get("emoji") or "").strip().lower()
+    if not _EMOJI_RE.match(emoji):
+        return {"ok": 0, "error": "emoji must be a shortcode (a-z0-9_+-)", "code": 400}
+    with db_lock:
+        row = db.execute("SELECT channel_id, deleted_at FROM messages WHERE msg_id=?",
+                         (msg_id,)).fetchone()
+        if not row:
+            return {"ok": 0, "error": "unknown message", "code": 404}
+        existing = db.execute("SELECT 1 FROM reactions WHERE msg_id=? AND user_hash=? "
+                              "AND emoji=?", (msg_id, viewer, emoji)).fetchone()
+        if existing:
+            db.execute("DELETE FROM reactions WHERE msg_id=? AND user_hash=? AND emoji=?",
+                       (msg_id, viewer, emoji))
+            active = False
+        else:
+            distinct = db.execute("SELECT COUNT(DISTINCT emoji) AS n FROM reactions "
+                                  "WHERE msg_id=?", (msg_id,)).fetchone()["n"]
+            if distinct >= MAX_EMOJI_PER_MSG:
+                return {"ok": 0, "error": "too many reactions on this message", "code": 400}
+            db.execute("INSERT INTO reactions (msg_id, user_hash, emoji, ts) "
+                       "VALUES (?, ?, ?, ?)", (msg_id, viewer, emoji, now()))
+            active = True
+        counts = {r["emoji"]: r["n"] for r in db.execute(
+            "SELECT emoji, COUNT(*) AS n FROM reactions WHERE msg_id=? "
+            "GROUP BY emoji", (msg_id,)).fetchall()}
+        db.commit()
+    _emit_event(row["channel_id"], "reaction", {
+        "msg_id": msg_id, "emoji": emoji, "user_hash": viewer,
+        "username": get_username(viewer), "active": active, "counts": counts,
+    })
+    return {"ok": 1, "active": active, "counts": counts}
+
+@api_route("/api/v1/search")
+@wrap_json_api
+def api_v1_search(viewer, data, link_id):
+    """Substring search over the ledger. {q, channel?, limit?} — deleted
+    messages are excluded; LIKE wildcards in the query are escaped."""
+    q = (data.get("q") or "").strip()
+    if len(q) < 2:
+        return {"ok": 0, "error": "query too short (min 2 chars)", "code": 400}
+    try:
+        limit = min(max(int(data.get("limit", 20)), 1), 50)
+    except (TypeError, ValueError):
+        limit = 20
+    sql = ("SELECT * FROM messages WHERE deleted_at IS NULL AND content LIKE ? "
+           "ESCAPE '\\' ")
+    args = ["%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"]
+    cid = data.get("channel")
+    if cid:
+        with db_lock:
+            if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
+                return {"ok": 0, "error": "unknown channel", "code": 404}
+        sql += "AND channel_id=? "
+        args.append(cid)
+    sql += "ORDER BY id DESC LIMIT ?"
+    args.append(limit)
+    with db_lock:
+        rows = db.execute(sql, args).fetchall()
+    return {"ok": 1, "query": q, "results": [msg_row_json(r) for r in rows]}
 
 # ----------------------------------------------------------------------------------
 # Boot (plan §9 skeleton — every call verified against the installed stack)

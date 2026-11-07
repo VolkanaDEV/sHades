@@ -90,6 +90,15 @@ Endpoints:
     /api/v1/term/data {session, data_b64}      (line-based console input)
     /api/v1/term/resize {session, rows, cols}
     /api/v1/term/close {session}
+    /api/v1/receipts {channel, msg_id?}        -> {last_read_id, unread}
+    /api/v1/react {msg, emoji}                 (toggle; ASCII shortcodes only)
+    /api/v1/search {q, channel?, limit?}       (live messages, deleted excluded)
+
+`channels/list` includes a per-viewer `unread` count from the receipts table.
+Reactions are ASCII shortcodes (`+1`, `laugh`, ...) with one emoji per user per
+message (toggle), capped at 16 distinct per message, and cleaned up when a
+message is deleted; they flow as `reaction` stream events. Search excludes
+tombstones and escapes LIKE wildcards.
 
 Blobs are content-addressed (`blob_id` = sha256[:32], served at
 `/file/blobs/<id>.<ext>`); site resources live under `/file/sites/<cid>/<path>`
@@ -123,6 +132,22 @@ normal ingest path — rate limits and moderation apply), `info <channel>`,
 
 The Kivy client shows a `TermPage` console for term channels; the main input
 bar feeds the session, output appends live from the stream.
+
+## Receipts, reactions, search
+
+- **Receipts** (`receipts` table): `⌕`-adjacent to the channel ledger, each
+  viewer keeps a monotonic last-read message id; `channels/list` returns
+  per-viewer `unread` counts, the sidebar shows badges, and the client marks
+  the newest message read whenever it fetches a channel (never for pagination
+  prepends).
+- **Reactions** (`reactions` table): toggle via `/api/v1/react`, one emoji
+  per user per message, ASCII shortcodes only (`+1`, `laugh`, ...), 16
+  distinct per message max, removed when the message is deleted. Summaries
+  ride `msg_row_json` and `reaction` stream events; the client renders
+  tappable chips under each message and a preset picker popup.
+- **Search**: `/api/v1/search` — live (non-deleted) messages, channel-scoped
+  optional, LIKE wildcards escaped, limit ≤ 50. The client's `⌕` top-bar
+  button opens a results popup.
 
 The Kivy client streams only the visible channel (`_stream_loop`); the 3 s
 reconciler poll and the 4 s ping loop are unchanged.
