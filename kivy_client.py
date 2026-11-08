@@ -71,6 +71,7 @@ else:
 import RNS
 from RNS.vendor import umsgpack as msgpack
 import micron
+import invite
 from micron import (micron_parse, micron_page_bg, micron_media_target,
                     micron_hex3, runs_to_markup, MICRON_MEDIA_EXTS)
 
@@ -1319,13 +1320,15 @@ KV = r"""
             height: dp(340)
             TextInput:
                 id: hub_address
-                hint_text: 'Hub address (ip:port, e.g. 192.168.1.50:29221)'
+                hint_text: 'Hub address or invite (ip:port or shades://...)'
                 multiline: False
                 size_hint_y: None
                 height: dp(44)
                 background_color: 0.22, 0.24, 0.28, 1
                 foreground_color: 1, 1, 1, 1
                 cursor_color: 1, 1, 1, 1
+                on_focus: app._invite_prefill(hub_address, node_hash)
+                on_text_validate: app._invite_prefill(hub_address, node_hash)
             TextInput:
                 id: username
                 hint_text: 'Your username'
@@ -2128,11 +2131,37 @@ class sHadesClientApp(MDApp):
                 pass
 
     # -- connect ----------------------------------------------------------
+    def _invite_prefill(self, hub_widget, node_widget):
+        """U6a: when the hub-address field loses focus holding a shades://
+        invite, split it into the address and node-hash fields so the user
+        sees what will be dialed. Explicitly-filled hash fields win."""
+        if getattr(hub_widget, "focus", False):
+            return  # only on focus loss
+        inv = invite.parse_invite(hub_widget.text or "")
+        if not inv:
+            return
+        host, port = inv["host"], inv["port"]
+        if host is not None:
+            hub_widget.text = host if port is None else "%s:%s" % (host, port)
+        if inv["node_hash"] and not (node_widget.text or "").strip():
+            node_widget.text = inv["node_hash"]
+
     def connect_to_guild(self, hub_address, username, node_hash="", delivery_hash=""):
         hub_address = (hub_address or "").strip()
         username = (username or "user").strip() or "user"
         node_hash = (node_hash or "").strip().lower()
         delivery_hash = (delivery_hash or "").strip().lower()
+
+        # U6a: a shades:// invite pasted into the address field carries the
+        # hub endpoint and optionally the guild node hash. Split it here too,
+        # so Connect works even without the focus-loss prefill pass.
+        inv = invite.parse_invite(hub_address)
+        if inv:
+            if inv["host"] is not None:
+                hub_address = inv["host"] if inv["port"] is None \
+                    else "%s:%s" % (inv["host"], inv["port"])
+            if inv["node_hash"] and not node_hash:
+                node_hash = inv["node_hash"]
 
         if not hub_address:
             self._set_status("Hub address required (ip:port)")
@@ -3410,7 +3439,7 @@ class sHadesClientApp(MDApp):
         if not (host and port and node):
             self._set_status("invite unavailable (no hub connection)")
             return
-        self._copy_text("shades://%s:%s/%s" % (host, port, node))
+        self._copy_text(invite.build_invite(host, port, node))
 
     # -- slash commands (U4) -----------------------------------------------
     def _handle_slash(self, text, current_channel):

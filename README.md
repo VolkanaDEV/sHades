@@ -202,6 +202,18 @@ check. `/api/v1/whoami` carries `is_admin` and the member's roles; the client
 uses that only to show or hide the role manager popup (right-click a member ->
 "roles..."), which lists roles, toggles assignment, and creates roles.
 
+## Invites (U6a)
+
+Right-click the guild header -> "copy invite" puts
+`shades://<hub-ip>:<hub-port>/<node_hash>` on the clipboard — the RNS
+*interface* endpoint plus the guild's node hash (no HTTP; the client dials
+the hub over RNS and everything after that rides RNS links). Pasting an
+invite into the connect screen's address field splits it automatically
+(on focus loss or enter, and again at Connect press): address into the
+address field, node hash into the node-hash field. Explicitly typed hash
+fields win over the invite's. Parsing lives in `invite.py` (Kivy-free,
+stdlib only) and is covered by `tests/test_invite.py`.
+
 ## Site channels in the client
 
 The client learns each channel's kind from `/api/v1/channels/list` and routes by

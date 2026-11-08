@@ -123,9 +123,17 @@ denied then re-allowed by role assignment).
 The real join path is already "share host:port + node hash" (connect-by-
 address). Two layers:
 
-1. **Share-link (client-only, phase A):** `shades://<host>:<port>/<node_hash>`
-   — right-click guild header → "copy invite"; client parses the string on the
-   connect screen (prefills fields). No server changes.
+1. **Share-link (client-only, phase A: DONE).** `shades://<host>:<port>/<node_hash>`
+   — right-click guild header → "copy invite" (U4) builds it via
+   `invite.build_invite`; the connect screen parses it via `invite.parse_invite`
+   (new Kivy-free `invite.py`, stdlib only): paste into the hub-address field,
+   focus loss / enter splits it into `ip:port` + node-hash fields (explicitly
+   typed hashes win), and `connect_to_guild` re-parses as a fallback so Connect
+   works on a raw paste. Tolerates SHADES case, whitespace, missing port,
+   missing hash, bracketed IPv6, trailing slash; invalid hash/port are dropped
+   to None (auto-discovery covers the rest). The link carries the RNS
+   *interface* endpoint only — no HTTP anywhere; after the dial everything
+   rides RNS links.
 2. **Join gate (phase B, optional):** guild-side `invites` table (code, uses,
    expiry) + registration policy setting (`open` | `code`); first identified
    link presents `/api/v1/join {code}` to register. Default stays open.
