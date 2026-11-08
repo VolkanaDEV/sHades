@@ -113,7 +113,7 @@ def main():
     r = slash("/rename lounge2 general")
     check("rename collision denied", "name already taken" in r["output"], r)
     r = slash("/rename lounge2 x", ident=other)
-    check("non-mod rename denied", "moderator required" in r["output"], r)
+    check("non-mod rename denied", "manage channel permission required" in r["output"], r)
     r = slash("/topic lounge2 welcome to the new lounge")
     check("mod sets topic", "topic set" in r["output"], r)
     info = call("/api/v1/channels/info", {"channel": lounge})
