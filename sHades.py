@@ -128,7 +128,8 @@ CREATE TABLE IF NOT EXISTS guilds (
     id TEXT PRIMARY KEY, name TEXT, node_hash TEXT, delivery_hash TEXT, prop_hash TEXT);
 CREATE TABLE IF NOT EXISTS channels (
     id TEXT PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE, created REAL,
-    kind TEXT NOT NULL DEFAULT 'chat', manifest TEXT NOT NULL DEFAULT '{}');
+    kind TEXT NOT NULL DEFAULT 'chat', manifest TEXT NOT NULL DEFAULT '{}',
+    topic TEXT);
 CREATE TABLE IF NOT EXISTS channel_state (
     channel_id TEXT PRIMARY KEY, seq INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS members (
@@ -164,7 +165,8 @@ def _migrate_schema(conn):
     CREATE TABLE IF NOT EXISTS never alters an existing table, so a column added
     to SCHEMA after a guild has already booted has to be added explicitly."""
     have = {r["name"] for r in conn.execute("PRAGMA table_info(channels)").fetchall()}
-    for col, decl in (("kind", "TEXT NOT NULL DEFAULT 'chat'"), ("manifest", "TEXT")):
+    for col, decl in (("kind", "TEXT NOT NULL DEFAULT 'chat'"), ("manifest", "TEXT"),
+                      ("topic", "TEXT")):
         if col not in have:
             conn.execute("ALTER TABLE channels ADD COLUMN %s %s" % (col, decl))
 
@@ -1556,43 +1558,54 @@ def _presence_payload():
 @wrap_json_api
 def api_v1_channels_list(viewer, data, link_id):
     with db_lock:
-        rows = db.execute("SELECT id, name, kind, created FROM channels "
+        rows = db.execute("SELECT id, name, kind, created, topic FROM channels "
                           "ORDER BY name ASC").fetchall()
         chans = [{"id": r["id"], "name": r["name"], "kind": r["kind"],
-                  "created": r["created"], "seq": get_seq(r["id"])} for r in rows]
+                  "created": r["created"], "topic": r["topic"],
+                  "seq": get_seq(r["id"])} for r in rows]
     for c in chans:
         last_id = _receipt_last_id(c["id"], viewer)
         c["unread"] = _unread_count(c["id"], last_id)
     return {"ok": 1, "channels": chans}
 
-@api_route("/api/v1/channels/create")
-@wrap_json_api
-def api_v1_channels_create(viewer, data, link_id):
-    name = (data.get("name") or "").strip()
-    kind = (data.get("kind") or "chat").strip().lower()
+def _create_channel_txn(viewer, name, kind, manifest=None):
+    """Shared channel creation (API + slash command). Returns
+    (cid, None) or (None, error)."""
+    name = (name or "").strip()
+    kind = (kind or "chat").strip().lower()
     if not re.match(r"^[a-zA-Z0-9_\-]{1,32}$", name):
-        return {"ok": 0, "error": "invalid channel name", "code": 400}
+        return None, "invalid channel name"
     if kind not in CHANNEL_KINDS:
-        return {"ok": 0, "error": "kind must be one of: " + ", ".join(CHANNEL_KINDS),
-                "code": 400}
+        return None, "kind must be one of: " + ", ".join(CHANNEL_KINDS)
     if kind in ("site", "term") and not is_moderator(viewer):
-        return {"ok": 0, "error": "moderator required to create site/term channels",
-                "code": 403}
-    manifest = data.get("manifest")
+        return None, "moderator required to create site/term channels"
     if manifest is not None and not isinstance(manifest, dict):
-        return {"ok": 0, "error": "manifest must be an object", "code": 400}
+        return None, "manifest must be an object"
     manifest_json = json.dumps(manifest)[:4096] if manifest else "{}"
     cid = hexstr(RNS.Identity.full_hash(f"{GUILD_ID}:{name}".encode()))
     with db_lock:
         if db.execute("SELECT 1 FROM channels WHERE id=? OR (name=? COLLATE NOCASE)",
                       (cid, name)).fetchone():
-            return {"ok": 0, "error": "channel exists", "code": 409}
+            return None, "channel exists"
         db.execute("INSERT INTO channels (id, name, created, kind, manifest) "
                    "VALUES (?, ?, ?, ?, ?)",
                    (cid, name, now(), kind, manifest_json))
         db.execute("INSERT OR IGNORE INTO channel_state (channel_id, seq) VALUES (?, 0)", (cid,))
         db.commit()
-    return {"ok": 1, "channel": {"id": cid, "name": name, "kind": kind,
+    return cid, None
+
+@api_route("/api/v1/channels/create")
+@wrap_json_api
+def api_v1_channels_create(viewer, data, link_id):
+    cid, err = _create_channel_txn(viewer, data.get("name"), data.get("kind") or "chat",
+                                   data.get("manifest"))
+    if err:
+        return {"ok": 0, "error": err,
+                "code": 403 if "moderator" in err else (409 if "exists" in err else 400)}
+    kind = (data.get("kind") or "chat").strip().lower()
+    manifest = data.get("manifest")
+    return {"ok": 1, "channel": {"id": cid, "name": (data.get("name") or "").strip(),
+                                 "kind": kind if kind in CHANNEL_KINDS else "chat",
                                  "manifest": manifest or {}, "seq": 0}}
 
 @api_route("/api/v1/channels/info")
@@ -1600,7 +1613,7 @@ def api_v1_channels_create(viewer, data, link_id):
 def api_v1_channels_info(viewer, data, link_id):
     cid = data.get("channel")
     with db_lock:
-        r = db.execute("SELECT id, name, kind, manifest, created FROM channels "
+        r = db.execute("SELECT id, name, kind, manifest, created, topic FROM channels "
                        "WHERE id=?", (cid,)).fetchone()
         if not r:
             return {"ok": 0, "error": "unknown channel", "code": 404}
@@ -1610,7 +1623,8 @@ def api_v1_channels_info(viewer, data, link_id):
         except Exception:
             manifest = {}
     return {"ok": 1, "channel": {"id": r["id"], "name": r["name"], "kind": r["kind"],
-                                 "manifest": manifest, "created": r["created"], "seq": seq}}
+                                 "manifest": manifest, "created": r["created"],
+                                 "topic": r["topic"], "seq": seq}}
 
 # ---- stream -----------------------------------------------------------------------
 
@@ -2082,10 +2096,21 @@ def _term_purge_idle():
 def _term_prompt():
     return "\r\n> "
 
-def _term_execute(session, line):
-    """Run one console command. Pure Python dispatch — no eval, no exec,
-    no subprocess. Output (including the next prompt) rides term_data."""
-    viewer = session["user_hash"]
+def _resolve_user(token):
+    """32-hex hash passthrough, else exact-username (NOCASE) lookup."""
+    token = (token or "").strip()
+    if re.match(r"^[0-9a-f]{32}$", token):
+        return token
+    with db_lock:
+        row = db.execute("SELECT dest_hash FROM users WHERE username=? COLLATE NOCASE",
+                         (token,)).fetchone()
+    return row["dest_hash"] if row else None
+
+def _dispatch_command(viewer, line):
+    """Run one console/slash command as `viewer`. Returns
+    {"out": str, "clear": bool, "quit": bool} — no emission, no session side
+    effects; the term console and /api/v1/command decide how to deliver.
+    Moderator denials come back as plain output (Discord-style ephemeral)."""
     cmd, _, arg = line.strip().partition(" ")
     cmd = cmd.strip().lower()
     arg = arg.strip()
@@ -2102,6 +2127,12 @@ def _term_execute(session, line):
             "  info <channel>      channel details",
             "  presence            the active user list",
             "  uptime              guild uptime",
+            "  create <name> [kind]   new channel (site/term: moderator)",
+            "  delete <channel>    delete a channel (moderator)",
+            "  rename <channel> <name>   rename (moderator)",
+            "  topic <channel> <text>    set the channel topic (moderator)",
+            "  ban <user> / unban <user>        moderator",
+            "  mute <user> / unmute <user>      moderator",
             "  clear               clear the terminal",
             "  quit                close this session",
         ]))
@@ -2140,12 +2171,14 @@ def _term_execute(session, line):
     elif cmd == "info":
         chan = arg.lstrip("#").strip()
         with db_lock:
-            row = db.execute("SELECT id, kind, created FROM channels "
+            row = db.execute("SELECT id, kind, created, topic FROM channels "
                              "WHERE name=? COLLATE NOCASE", (chan,)).fetchone()
         if not row:
             out = "unknown channel: #%s" % chan
         else:
-            out = "  #%s  %s  seq %d" % (chan, row["kind"], get_seq(row["id"]))
+            out = "  #%s  %s  seq %d%s" % (chan, row["kind"], get_seq(row["id"]),
+                                           ("  topic: " + row["topic"])
+                                           if row["topic"] else "")
     elif cmd == "presence":
         users = _presence_payload()
         out = "\r\n".join(
@@ -2157,19 +2190,100 @@ def _term_execute(session, line):
         secs = int(now() - _GUILD_BOOT)
         out = "up %dd %dh %dm" % (secs // 86400, (secs % 86400) // 3600,
                                   (secs % 3600) // 60)
+    elif cmd == "create":
+        name, _, kind = arg.partition(" ")
+        cid, err = _create_channel_txn(viewer, name.strip(), kind.strip().lower() or "chat")
+        out = ("created #%s" % name.strip()) if cid else err
+    elif cmd == "delete":
+        chan = arg.lstrip("#").strip()
+        with db_lock:
+            row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
+                             (chan,)).fetchone()
+        if not row:
+            out = "unknown channel: #%s" % chan
+        else:
+            err, name = _delete_channel_txn(row["id"], viewer)
+            out = "deleted #%s" % (name or chan) if not err else err
+    elif cmd == "rename":
+        chan, _, new = arg.partition(" ")
+        new = new.strip()
+        if not is_moderator(viewer):
+            out = "moderator required"
+        elif not re.match(r"^[a-zA-Z0-9_\-\s]{1,32}$", chan) or \
+                not re.match(r"^[a-zA-Z0-9_\-]{1,32}$", new):
+            out = "usage: rename <channel> <newname>"
+        else:
+            with db_lock:
+                row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
+                                 (chan.lstrip("#").strip(),)).fetchone()
+                if not row:
+                    out = "unknown channel: #%s" % chan
+                elif db.execute("SELECT 1 FROM channels WHERE name=? COLLATE NOCASE "
+                                "AND id<>?", (new, row["id"])).fetchone():
+                    out = "name already taken"
+                else:
+                    db.execute("UPDATE channels SET name=? WHERE id=?",
+                               (new, row["id"]))
+                    db.commit()
+                    out = "renamed #%s -> #%s" % (chan, new)
+    elif cmd == "topic":
+        chan, _, text = arg.partition(" ")
+        text = text.strip()[:200]
+        if not is_moderator(viewer):
+            out = "moderator required"
+        else:
+            with db_lock:
+                row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
+                                 (chan.lstrip("#").strip(),)).fetchone()
+                if not row:
+                    out = "unknown channel: #%s" % chan
+                else:
+                    db.execute("UPDATE channels SET topic=? WHERE id=?",
+                               (text or None, row["id"]))
+                    db.commit()
+                    out = ("topic set on #%s: %s" % (chan, text)) if text \
+                        else "topic cleared on #%s" % chan
+    elif cmd in ("ban", "mute", "unban", "unmute"):
+        target = _resolve_user(arg)
+        if not is_moderator(viewer):
+            out = "moderator required"
+        elif not target:
+            out = "unknown user: %s" % arg
+        elif target == viewer:
+            out = "cannot moderate yourself"
+        else:
+            name = get_username(target)
+            if cmd == "ban":
+                ban_user(target, "banned by %s" % viewer[:12])
+            elif cmd == "mute":
+                mute_user(target, "muted by %s" % viewer[:12], viewer)
+            elif cmd == "unban":
+                unban_user(target)
+            else:
+                unmute_user(target)
+            out = "%s %s" % ({"ban": "banned", "mute": "muted",
+                              "unban": "unbanned", "unmute": "unmuted"}[cmd], name)
     elif cmd == "clear":
-        # structured clear event; the next prompt arrives separately
-        _term_emit(session, "", clear=True)
-        _term_emit(session, _term_prompt())
-        return
+        return {"out": "", "clear": True, "quit": False}
     elif cmd in ("quit", "exit"):
+        return {"out": "[session closed]", "clear": False, "quit": True}
+    else:
+        out = "unknown command: %s (try help)" % cmd
+    return {"out": out, "clear": False, "quit": False}
+
+def _term_execute(session, line):
+    """Console wrapper: run one command, emit output (+ prompt) as term_data."""
+    res = _dispatch_command(session["user_hash"], line)
+    if res["quit"]:
         with TERM_SESSIONS_LOCK:
             TERM_SESSIONS.pop(session["id"], None)
         _term_emit(session, "\r\n[session closed]")
         return
-    else:
-        out = "unknown command: %s (try help)" % cmd
-    _term_emit(session, out + _term_prompt())
+    if res["clear"]:
+        _term_emit(session, "", clear=True)
+        _term_emit(session, _term_prompt())
+        return
+    _term_emit(session, res["out"] + _term_prompt())
 
 @api_route("/api/v1/term/open")
 @wrap_json_api
@@ -2419,23 +2533,19 @@ _register_mod_endpoint(
     "/api/v1/mod/unmute", "unmuted",
     lambda viewer, target, reason: unmute_user(target))
 
-@api_route("/api/v1/channels/delete")
-@wrap_json_api
-def api_v1_channels_delete(viewer, data, link_id):
-    """Hard-delete a channel (moderator-gated; tightened to ADMIN in U5):
-    messages, attachments rows, reactions, receipts, members, state — and
-    site resources on disk. The last remaining channel cannot be deleted.
-    Subscribers get a guild-wide channel_deleted event."""
+def _delete_channel_txn(cid, viewer):
+    """Shared channel deletion (API + slash command). Returns
+    (error_or_None, name_or_None)."""
     if not is_moderator(viewer):
-        return {"ok": 0, "error": "moderator required", "code": 403}
-    cid = data.get("channel")
+        return "moderator required", None
     with db_lock:
         row = db.execute("SELECT id, name FROM channels WHERE id=?", (cid,)).fetchone()
         if not row:
-            return {"ok": 0, "error": "unknown channel", "code": 404}
+            return "unknown channel", None
         n = db.execute("SELECT COUNT(*) AS n FROM channels").fetchone()["n"]
         if n <= 1:
-            return {"ok": 0, "error": "cannot delete the last channel", "code": 400}
+            return "cannot delete the last channel", None
+        name = row["name"]
         msg_ids = "SELECT msg_id FROM messages WHERE channel_id=?"
         db.execute("DELETE FROM attachments WHERE msg_id IN (%s)" % msg_ids, (cid,))
         db.execute("DELETE FROM reactions WHERE msg_id IN (%s)" % msg_ids, (cid,))
@@ -2454,8 +2564,40 @@ def api_v1_channels_delete(viewer, data, link_id):
         # NOTE: per-file /file/sites/<cid>/... request handlers stay registered
         # on the destination (RNS 1.1.3 has no deregister); they now 404.
     _emit_event(cid, "channel_deleted",
-                {"channel": cid, "name": row["name"]}, guild_wide=True)
-    return {"ok": 1, "channel": cid, "name": row["name"]}
+                {"channel": cid, "name": name}, guild_wide=True)
+    return None, name
+
+@api_route("/api/v1/channels/delete")
+@wrap_json_api
+def api_v1_channels_delete(viewer, data, link_id):
+    """Hard-delete a channel (moderator-gated; tightened to ADMIN in U5):
+    messages, attachments rows, reactions, receipts, members, state — and
+    site resources on disk. The last remaining channel cannot be deleted.
+    Subscribers get a guild-wide channel_deleted event."""
+    err, name = _delete_channel_txn(data.get("channel"), viewer)
+    if err:
+        return {"ok": 0, "error": err,
+                "code": 403 if "moderator" in err
+                else (404 if "unknown" in err else 400)}
+    return {"ok": 1, "channel": data.get("channel"), "name": name}
+
+@api_route("/api/v1/command")
+@wrap_json_api
+def api_v1_command(viewer, data, link_id):
+    """Slash-command endpoint: runs the shared console dispatcher and returns
+    the output ephemerally to the requester — nothing is posted to a channel."""
+    line = data.get("input")
+    if not isinstance(line, str) or not line.strip():
+        return {"ok": 0, "error": "input required", "code": 400}
+    if len(line) > TERM_MAX_INPUT:
+        return {"ok": 0, "error": "input too long", "code": 400}
+    if not rate_ok(viewer, "_term", *TERM_IN_RATE):
+        return {"ok": 0, "error": "rate limited", "code": 429}
+    # same input sanitisation as the term console: strip ANSI sequences and
+    # control characters before anything reaches the dispatcher or ledger
+    res = _dispatch_command(viewer, _term_sanitize(line.lstrip("/")))
+    return {"ok": 1, "output": _term_sanitize(res["out"])[:4000],
+            "clear": res["clear"], "quit": res["quit"]}
 
 # ----------------------------------------------------------------------------------
 # Boot (plan §9 skeleton — every call verified against the installed stack)

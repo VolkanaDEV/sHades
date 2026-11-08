@@ -584,6 +584,23 @@ def main():
         check("deleted channel gone from the list",
               all(c["id"] != eph_cid for c in cl.get("channels", [])), cl)
 
+        # ---- U4: slash-commands over the mesh ----
+        r = japi("/api/v1/command", {"input": "/create cmdmade site"})
+        check("v1 slash create over the mesh", r.get("ok") == 1
+              and "created #cmdmade" in r.get("output", ""), r)
+        cmd_cid = RNS.hexrep(RNS.Identity.full_hash(b"main_guild:cmdmade"),
+                             delimit=False)
+        r = japi("/api/v1/command", {"input": "/topic cmdmade slash-built"})
+        check("v1 slash topic over the mesh", "topic set" in r.get("output", ""), r)
+        info = japi("/api/v1/channels/info", {"channel": cmd_cid})
+        check("topic persisted via slash", info["channel"]["topic"] == "slash-built", info)
+        r = japi("/api/v1/command", {"input": "/msg general from the slash console"})
+        check("v1 slash msg over the mesh", "posted to #general" in r.get("output", ""), r)
+        msgs = japi("/api/v1/search", {"q": "from the slash console"})
+        check("slash msg landed in the ledger", len(msgs.get("results", [])) == 1, msgs)
+        r = japi("/api/v1/command", {"input": "/delete cmdmade"})
+        check("v1 slash delete over the mesh", "deleted #cmdmade" in r.get("output", ""), r)
+
         # ---- rate limit (kept last: it exhausts the sender window) ----
         codes = []
         for i in range(14):

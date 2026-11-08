@@ -93,6 +93,7 @@ Endpoints:
     /api/v1/receipts {channel, msg_id?}        -> {last_read_id, unread}
     /api/v1/react {msg, emoji}                 (toggle; ASCII shortcodes only)
     /api/v1/search {q, channel?, limit?}       (live messages, deleted excluded)
+    /api/v1/command {input}                    (slash commands; ephemeral output)
 
 `channels/list` includes a per-viewer `unread` count from the receipts table.
 Reactions are ASCII shortcodes (`+1`, `laugh`, ...) with one emoji per user per
@@ -151,6 +152,27 @@ bar feeds the session, output appends live from the stream.
 
 The Kivy client streams only the visible channel (`_stream_loop`); the 3 s
 reconciler poll and the 4 s ping loop are unchanged.
+
+## Slash commands (U4)
+
+One dispatcher (`_dispatch_command`) serves both the term console and chat
+`/`-commands — commands exist in exactly one place. `/api/v1/command {input}`
+runs it and returns the output **ephemeral** to the requester (nothing is
+posted). Input is ANSI/control-stripped like the console; errors come back as
+plain output; the 30/min console rate limit applies.
+
+Server commands: `help`, `who`, `channels`, `msg <channel> <text>`,
+`info <channel>`, `presence`, `uptime`, `create <name> [kind]` (site/term:
+mod), `delete <channel>` (mod), `rename <channel> <name>` (mod),
+`topic <channel> <text>` (mod; stored in `channels.topic`, visible in
+list/info), `ban/unban/mute/unmute <user>` (mod; by 32-hex hash or exact
+username). Client-local only: `/me` (italic post), `/join <channel>`,
+`/search <q>`, `/invite` (copies the share-link), and `/help` (prepends the
+client-local list to the server's).
+
+The client renders command output as an ephemeral console row (never
+persisted, never in the ledger) and refreshes the channel index every ~15 s so
+renames/topics/badges stay current.
 
 ## Site channels in the client
 

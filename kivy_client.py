@@ -485,6 +485,11 @@ class GuildAPI:
     def channels_delete(self, channel):
         return self._request_json("/api/v1/channels/delete", {"channel": channel})
 
+    def command(self, line):
+        """Slash-command passthrough: runs the shared console dispatcher,
+        returns the output ephemerally."""
+        return self._request_json("/api/v1/command", {"input": line})
+
     def fetch_file(self, path):
         """Fetch raw bytes from a /file/... request handler on the guild."""
         dlog(f"fetch_file: requesting {path}")
@@ -2375,8 +2380,14 @@ class sHadesClientApp(MDApp):
         self._poll_thread.start()
 
     def _poll_loop(self):
+        tick = 0
         while not self._poll_stop.is_set():
+            tick += 1
             try:
+                # periodic channel-index refresh: renames, topics, new
+                # channels and unread badges stay current (cheap JSON call)
+                if tick % 5 == 0:
+                    self._refresh_channels_from_guild()
                 main = self.root.get_screen("main")
                 cid = getattr(main, "_current_channel", "general")
                 st = self.guild_api.state(self._channel_cid(cid))
@@ -2730,7 +2741,7 @@ class sHadesClientApp(MDApp):
 
         # avatar
         avatar_source = ""
-        if is_own and getattr(self, "my_avatar_small", None):
+        if author and is_own and getattr(self, "my_avatar_small", None):
             # Use our own saved circular pfp immediately
             avatar_source = self.my_avatar_small
         else:
@@ -2738,8 +2749,9 @@ class sHadesClientApp(MDApp):
             path = IMAGE_CACHE.get(key)
             if path:
                 avatar_source = path
-            elif key not in IMAGE_CACHE._loading:
-                # fetch avatar — deduplicate in-flight requests
+            elif author and key not in IMAGE_CACHE._loading:
+                # fetch avatar — deduplicate in-flight requests (never for
+                # empty authors: system rows like command notices)
                 def _do_av(a=author, k=key):
                     res = self.guild_api.avatar_get(a)
                     if res.get("ok") and res.get("avatar"):
@@ -2881,13 +2893,14 @@ class sHadesClientApp(MDApp):
         popup.open()
 
     # -- search (phase 6) --------------------------------------------------
-    def open_search(self):
+    def open_search(self, prefill=""):
         try:
             self.root.get_screen("main")
         except Exception:
             return
         box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
-        query = TextInput(multiline=False, size_hint_y=None, height=dp(40),
+        query = TextInput(text=prefill or "", multiline=False, size_hint_y=None,
+                          height=dp(40),
                           hint_text="search messages (min 2 chars)")
         results = Label(markup=True, halign="left", valign="top",
                         color=(0.85, 0.88, 0.9, 1), font_size=sp(13))
@@ -3285,6 +3298,78 @@ class sHadesClientApp(MDApp):
             return
         self._copy_text("shades://%s:%s/%s" % (host, port, node))
 
+    # -- slash commands (U4) -----------------------------------------------
+    def _handle_slash(self, text, current_channel):
+        """Client-local commands first; everything else goes to the guild's
+        shared dispatcher (/api/v1/command) and shows as an ephemeral notice."""
+        parts = text[1:].split(" ", 1)
+        cmd = (parts[0] or "").lower()
+        rest = (parts[1] if len(parts) > 1 else "").strip()
+        if cmd == "me" and rest:
+            self.send_raw_text("*%s*" % rest)
+            return
+        if cmd == "join" and rest:
+            self._switch_channel(rest.lstrip("#").strip())
+            return
+        if cmd == "search":
+            self.open_search(prefill=rest)
+            return
+        if cmd == "invite":
+            self._copy_invite()
+            return
+        if not self.guild_api:
+            return
+        def work():
+            try:
+                res = self.guild_api.command(text)
+            except Exception as e:
+                res = {"ok": 0, "error": repr(e)}
+            if not res.get("ok"):
+                err = res.get("error", "unknown")
+                Clock.schedule_once(
+                    lambda dt: self._set_status("command failed: %s" % err), 0)
+                return
+            out = res.get("output") or "(no output)"
+            if cmd == "help":
+                out = ("client: /me /join /search /invite\n" + out)
+            Clock.schedule_once(lambda dt: self._show_notice(out), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def send_raw_text(self, text):
+        """Post text to the current channel bypassing slash handling."""
+        try:
+            main = self.root.get_screen("main")
+            name = getattr(main, "_current_channel", "general")
+            cid = self._channel_cid(name)
+            inp = main.ids.msg_input
+        except Exception as e:
+            print("raw send failed:", repr(e))
+            return
+        if not text.strip() or not self.guild_api:
+            return
+        def work():
+            res = self.guild_api.post(cid, text)
+            if not res.get("ok"):
+                err = res.get("error", "unknown")
+                Clock.schedule_once(
+                    lambda dt: self._set_status("send failed: %s" % err), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_notice(self, text):
+        """Ephemeral command output rendered as a system row (not persisted,
+        not part of the ledger)."""
+        try:
+            main = self.root.get_screen("main")
+            grid = main.ids.message_grid
+        except Exception:
+            return
+        m = {"msg_id": "notice-%f-%d" % (time.time(), len(text)),
+             "author_hash": "", "username": "console", "content": text[:2000],
+             "ts": time.time(), "reactions": [], "attachments": [],
+             "channel_id": self._stream_cid}
+        self._render_message(grid, m)
+        Clock.schedule_once(lambda dt: self._scroll_to_bottom(), 0.1)
+
     def _add_channel(self, name):
         main = self.root.get_screen("main")
         grid = main.ids.channel_grid
@@ -3659,6 +3744,11 @@ class sHadesClientApp(MDApp):
             if text:
                 inp.text = ""
                 self._send_term_input(text)
+            return
+        # slash commands: client-local first, then the shared dispatcher
+        if text.startswith("/"):
+            inp.text = ""
+            self._handle_slash(text, cid)
             return
         # Allow attachment-only messages (no text) when a file is pending.
         if not text and not getattr(self, "_pending_attachment", None):

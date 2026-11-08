@@ -5,7 +5,7 @@ transport as the rest of the API: **JSON over RNS Link requests** on
 `nomadnetwork.node`. HTML, HTTP and IP-socket APIs remain anti-patterns; the
 guild never becomes a web server.
 
-Status: U1-U3 are DONE (icons; receipts/reactions/search; context menus +
+Status: U1-U4 are DONE (icons; receipts/reactions/search; context menus +
 mod endpoints + channel deletion). U4-U8 are designed here, not built.
 
 ## U0 — foundations that already exist
@@ -55,27 +55,33 @@ hash validation, self-moderation rejected), `/api/v1/channels/delete`
 term sessions; last-channel protection; `channel_deleted` stream event).
 Client-local: muted-channel persistence (badges suppressed).
 
-## U4 — slash-commands (one dispatcher, two frontends)
+## U4 — slash-commands (DONE, one dispatcher, two frontends)
 
-A single server-side command dispatcher shared by the term console and chat:
+A single server-side dispatcher `_dispatch_command(viewer, line)` shared by
+the term console (`_term_execute` wraps it) and chat:
 
-- new endpoint `/api/v1/command {channel?, input}` → runs the same
-  `_term_execute` table, returns the output **ephemerally to the requester**
-  (never posted to the channel). Term console reuses it verbatim — commands
-  exist in one place.
-- client input bar: text starting `/` is sent to `/command` instead of
-  `post`; output shows in a toast/notice line, not the ledger.
-- command table grows: `create <name> [kind]` (perm-gated), `delete
-  <channel>` (admin), `rename <channel> <name>`, `topic <channel> <text>`,
-  `ban <user>`, `mute <user>`, `unban/unmute`, `roles` (see U5), `pin
-  <msg>`, `slowmode <channel> <seconds>`, `invite` (U6), `who`, `channels`,
-  `help`. Client-local only (no round-trip): `/me <action>` (renders italic),
-  `/shrug`, `/join <channel>` (switch), `/search <q>` (opens the popup).
-- permission errors are per-command; unknown commands say so.
+- `/api/v1/command {input}` → runs it, returns the output **ephemerally to
+  the requester** (never posted to the channel). Input is sanitized exactly
+  like the console (ANSI/control-strip) BEFORE dispatch — the term path
+  sanitizes in term/data, and this endpoint must too (a gap the tests caught:
+  unsanitized /msg content reached the ledger).
+- client input bar: text starting `/` goes to `/command`; output renders as
+  an ephemeral console row in the grid. `/help` prepends client-local
+  commands. The client refreshes channels/list every ~15 s so renames,
+  topics and badges stay current.
+- command table: `create <name> [kind]` (site/term: mod), `delete <channel>`
+  (mod), `rename <channel> <name>` (mod), `topic <channel> <text>` (mod;
+  `channels.topic` column via _migrate_schema, in list/info),
+  `ban/unban/mute/unmute <user>` (mod; by 32-hex hash or exact username via
+  `_resolve_user`). Client-local only: `/me` (italic post), `/join`,
+  `/search <q>` (opens the popup), `/invite` (copy share-link), `/help`.
+- permission errors are per-command plain output; unknown commands say so.
+- deferred to later phases: `pin` (needs a pins table), `slowmode` (needs
+  channel settings storage), `roles` (U5).
 
-Tests: dispatcher unit tests (existing `test_term.py` pattern grows command
-cases), permission matrix tests, integ passes a `/create` through `/command`
-over the mesh.
+Tests: `tests/test_command.py` (dispatcher via the JSON endpoint: ephemeral
+contract, name/space moderation, create/rename/topic/delete, quit/clear
+inertness, sanitisation, rate limit) + integ slash checks over the mesh.
 
 ## U5 — roles + admin whitelist
 
