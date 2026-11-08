@@ -53,6 +53,10 @@ def main():
         "lxmf", "delivery").hash)
     with open(os.path.join(g_store, "moderators.txt"), "w") as f:
         f.write(mod_hash + "\n")
+    # U5: the client also gets the Admin role (MANAGE_ROLES etc. for the
+    # roles section below) via the role-seeding path.
+    with open(os.path.join(g_store, "admin.txt"), "w") as f:
+        f.write(mod_hash + "\n")
 
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
@@ -272,8 +276,9 @@ def main():
         victim_dest = victim_router.register_delivery_identity(victim_identity, display_name="Victim")
         victim_hash = hexstr(victim_dest.hash)
 
-        def post_as_victim(content):
-            lxm = LXMF.LXMessage(guild_out, victim_dest, "#test " + content,
+        def post_as_victim(content, channel="test"):
+            lxm = LXMF.LXMessage(guild_out, victim_dest,
+                                 "#%s %s" % (channel, content),
                                  title="chat", desired_method=LXMF.LXMessage.DIRECT)
             victim_router.handle_outbound(lxm)
             time.sleep(4)
@@ -420,11 +425,15 @@ def main():
         # v1 speaks JSON bytes over the same RNS link (no HTTP anywhere).
         def japi(path, data):
             payload = json.dumps(data or {}).encode("utf-8")
-            r = link.request(path, data=payload)
-            for _ in range(300):
-                if r.response is not None: break
-                time.sleep(0.1)
-            return json.loads(r.response.decode("utf-8")) if r.response else {"ok": 0, "error": "no response"}
+            # one retry: a busy link can occasionally miss the response window
+            for attempt in range(2):
+                r = link.request(path, data=payload)
+                for _ in range(300):
+                    if r.response is not None: break
+                    time.sleep(0.1)
+                if r.response:
+                    return json.loads(r.response.decode("utf-8"))
+            return {"ok": 0, "error": "no response"}
 
         cl = japi("/api/v1/channels/list", {})
         check("v1 channels/list over JSON", cl.get("ok") == 1 and
@@ -600,6 +609,55 @@ def main():
         check("slash msg landed in the ledger", len(msgs.get("results", [])) == 1, msgs)
         r = japi("/api/v1/command", {"input": "/delete cmdmade"})
         check("v1 slash delete over the mesh", "deleted #cmdmade" in r.get("output", ""), r)
+
+        # ---- U5: roles over the mesh ----
+        r = japi("/api/v1/whoami", {})
+        check("whoami is_admin via admin.txt seeding", r.get("is_admin") is True, r)
+        check("whoami carries the Admin role",
+              any(x.get("name") == "Admin" for x in r.get("roles", [])), r.get("roles"))
+        r = japi("/api/v1/roles/create", {"name": "integ-role", "perms": 3})
+        check("roles/create over the mesh", r.get("ok") == 1
+              and r["role"]["perms"] == 3, r)
+        integ_role_id = r["role"]["role_id"]
+        r = japi("/api/v1/roles/create", {"name": "integ-role"})
+        check("duplicate role -> 409 over the mesh", r.get("code") == 409, r)
+        # hide a channel from @everyone (deny POST for role-less users)
+        r = japi("/api/v1/channels/create", {"name": "locked", "kind": "chat"})
+        locked_cid = r["channel"]["id"]
+        r = japi("/api/v1/channels/patch",
+                 {"channel": locked_cid, "overwrites": {"0": 0}})
+        check("channels/patch overwrites over the mesh", r.get("ok") == 1, r)
+        cl = japi("/api/v1/channels/list", {})
+        check("admin (short-circuit) still sees hidden channel",
+              any(c["id"] == locked_cid for c in cl.get("channels", [])), cl)
+        # role-less victim posting into the hidden channel is dropped
+        post_as_victim("stealth drop", channel="locked")
+        time.sleep(2.0)
+        msgs = api("/api/messages", {"channel": locked_cid})
+        check("role-less POST denied over the mesh",
+              all("stealth drop" not in (m.get("content") or "")
+                  for m in msgs.get("messages", [])), msgs)
+        # grant the victim's hash the role -> role perms union re-allows POST
+        r = japi("/api/v1/roles/assign", {"role_id": integ_role_id,
+                                          "user": victim_hash})
+        check("roles/assign over the mesh", r.get("ok") == 1, r)
+        rl = japi("/api/v1/roles/list", {})
+        ir = [x for x in rl.get("roles", []) if x["role_id"] == integ_role_id]
+        check("role members list carries the victim",
+              ir and victim_hash in ir[0]["members"], rl)
+        post_as_victim("stealth allowed", channel="locked")
+        time.sleep(2.0)
+        msgs = api("/api/messages", {"channel": locked_cid})
+        check("role POST union re-allows over the mesh",
+              any("stealth allowed" in (m.get("content") or "")
+                  for m in msgs.get("messages", [])), msgs)
+        # cleanup: unassign + delete the role
+        r = japi("/api/v1/roles/unassign", {"role_id": integ_role_id,
+                                            "user": victim_hash})
+        check("roles/unassign over the mesh", r.get("ok") == 1, r)
+        r = japi("/api/v1/roles/delete", {"role_id": integ_role_id})
+        check("roles/delete over the mesh", r.get("ok") == 1, r)
+        japi("/api/v1/channels/delete", {"channel": locked_cid})
 
         # ---- rate limit (kept last: it exhausts the sender window) ----
         codes = []

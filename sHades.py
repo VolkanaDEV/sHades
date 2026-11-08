@@ -53,6 +53,17 @@ ATTACHMENT_EXT    = {"png", "jpg", "jpeg", "gif", "webp", "mp3", "ogg", "wav",
 # Channel kinds: chat, a NomadNet micron "site", or a terminal stream.
 CHANNEL_KINDS     = ("chat", "site", "term")
 
+# Permission bitmask (U5). Guild-wide bits (MANAGE_*/ADMIN) live on roles;
+# channel-scoped bits (VIEW/POST) live in channel_overwrites keyed by role
+# (role_id 0 = @everyone). Missing @everyone row defaults to open reading
+# and posting, which preserves pre-roles behaviour.
+PERMS = {"VIEW": 1, "POST": 2, "MANAGE_MESSAGES": 4, "MANAGE_CHANNEL": 8,
+         "MANAGE_ROLES": 16, "ADMIN": 32}
+PERM_ALL = 63
+DEFAULT_CHANNEL_PERMS = PERMS["VIEW"] | PERMS["POST"]
+_GUILD_MANAGE_BITS = (PERMS["MANAGE_MESSAGES"] | PERMS["MANAGE_CHANNEL"] |
+                      PERMS["MANAGE_ROLES"] | PERMS["ADMIN"])
+
 # Blobs + site resources (JSON API v1 phases 3-4): content-addressed media,
 # uploaded once and referenced by id. Chunked get keeps memory bounded.
 BLOB_CHUNK_DEFAULT = 256 * 1024   # /api/v1/blobs/get default slice
@@ -155,6 +166,16 @@ CREATE TABLE IF NOT EXISTS receipts (
 CREATE TABLE IF NOT EXISTS reactions (
     msg_id TEXT, user_hash TEXT, emoji TEXT, ts REAL,
     PRIMARY KEY (msg_id, user_hash, emoji));
+CREATE TABLE IF NOT EXISTS roles (
+    role_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE COLLATE NOCASE, color TEXT, position INTEGER DEFAULT 0,
+    perms INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS user_roles (
+    user_hash TEXT, role_id INTEGER,
+    PRIMARY KEY (user_hash, role_id));
+CREATE TABLE IF NOT EXISTS channel_overwrites (
+    channel_id TEXT, role_id INTEGER, perms INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (channel_id, role_id));
 CREATE INDEX IF NOT EXISTS idx_reactions_msg ON reactions(msg_id);
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, id);
 """
@@ -365,9 +386,6 @@ def is_banned(sender):
     with db_lock:
         return db.execute("SELECT 1 FROM banned WHERE dest_hash=?", (sender,)).fetchone() is not None
 
-def is_moderator(user):
-    return user is not None and user in MODERATORS
-
 def can_delete(viewer, row):
     """Author or guild moderator (plan §7)."""
     return viewer is not None and (row["author_hash"] == viewer or is_moderator(viewer))
@@ -409,6 +427,100 @@ def load_moderators(path):
                 if line and not line.startswith("#") and re.match(r"^[0-9a-f]{32}$", line):
                     MODERATORS.add(line)
     return len(MODERATORS)
+
+def is_moderator(user):
+    """Guild-wide moderator check: any role carrying MANAGE_MESSAGES or
+    ADMIN, or the legacy MODERATORS set (moderators.txt, kept for backward
+    compatibility with existing deployments and tests)."""
+    if user is None:
+        return False
+    if user in MODERATORS:
+        return True
+    return has_role_perm(user, PERMS["MANAGE_MESSAGES"] | PERMS["ADMIN"])
+
+def has_role_perm(user, bits):
+    """Guild-wide: does any of the user's roles carry any of `bits`?
+    The legacy MODERATORS set (moderators.txt without roles) counts as
+    carrying MANAGE_MESSAGES and MANAGE_CHANNEL."""
+    if user is None:
+        return False
+    if user in MODERATORS and bits & (PERMS["MANAGE_MESSAGES"] |
+                                      PERMS["MANAGE_CHANNEL"]):
+        return True
+    with db_lock:
+        row = db.execute(
+            "SELECT 1 FROM user_roles ur JOIN roles r ON r.role_id = ur.role_id "
+            "WHERE ur.user_hash = ? AND (r.perms & ?) != 0 LIMIT 1",
+            (user, bits)).fetchone()
+    return row is not None
+
+def has_perm(user, channel_id, bit):
+    """Effective permission for one channel. VIEW/POST = the @everyone
+    overwrite (or the open default) UNION each of the user's roles' own
+    perms UNION each role's per-channel overwrite. Guild-wide bits
+    (MANAGE_*/ADMIN) delegate to the user's roles; ADMIN short-circuits."""
+    if user is None:
+        return False
+    if bit & _GUILD_MANAGE_BITS:
+        return has_role_perm(user, bit)
+    with db_lock:
+        base = db.execute("SELECT perms FROM channel_overwrites "
+                          "WHERE channel_id=? AND role_id=0",
+                          (channel_id,)).fetchone()
+        rows = db.execute(
+            "SELECT co.perms AS operms, r.perms AS rperms "
+            "FROM user_roles ur JOIN roles r ON r.role_id = ur.role_id "
+            "LEFT JOIN channel_overwrites co ON co.role_id = ur.role_id "
+            "AND co.channel_id=? WHERE ur.user_hash=?",
+            (channel_id, user)).fetchall()
+        is_admin = db.execute(
+            "SELECT 1 FROM user_roles ur JOIN roles r ON r.role_id = ur.role_id "
+            "WHERE ur.user_hash=? AND (r.perms & ?) != 0 LIMIT 1",
+            (user, PERMS["ADMIN"])).fetchone()
+    perms = base["perms"] if base else DEFAULT_CHANNEL_PERMS
+    for r in rows:
+        perms |= (r["operms"] or 0) | (r["rperms"] or 0)
+    if is_admin:
+        return True
+    return (perms & bit) != 0
+
+def _ensure_role(name, perms, position=0, color=None):
+    """Create a role if missing (boot seeding / role editor). Returns id."""
+    with db_lock:
+        row = db.execute("SELECT role_id FROM roles WHERE name=? COLLATE NOCASE",
+                         (name,)).fetchone()
+        if row:
+            return row["role_id"]
+        cur = db.execute("INSERT INTO roles (name, color, position, perms) "
+                         "VALUES (?, ?, ?, ?)", (name, color, position, perms))
+        db.commit()
+        return cur.lastrowid
+
+def _assign_role(user_hash, role_id):
+    with db_lock:
+        db.execute("INSERT OR IGNORE INTO user_roles (user_hash, role_id) "
+                   "VALUES (?, ?)", (user_hash, role_id))
+        db.commit()
+
+def load_role_seeds(storage):
+    """Boot-time role seeding (U5): admin.txt hashes get the Admin role
+    (ADMIN + all manage bits), moderators.txt hashes the Moderator role
+    (MANAGE_MESSAGES|MANAGE_CHANNEL). Same one-hash-per-line format as
+    moderators.txt; '#' comments allowed."""
+    admin_id = _ensure_role("Admin", PERM_ALL, position=100, color="F8a8")
+    mod_id = _ensure_role("Moderator",
+                          PERMS["MANAGE_MESSAGES"] | PERMS["MANAGE_CHANNEL"],
+                          position=50, color="8a8")
+    for fname, role_id in (("admin.txt", admin_id), ("moderators.txt", mod_id)):
+        path = os.path.join(storage, fname)
+        if not os.path.isfile(path):
+            continue
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and \
+                        re.match(r"^[0-9a-f]{32}$", line):
+                    _assign_role(line, role_id)
 
 def _reap_stale_nodes():
     """Drop NODE_REGISTRY entries whose last_seen is older than NODE_STALE_S,
@@ -536,6 +648,11 @@ def ingest(channel_id, author_hash, content, ts=None, attachments=None):
         return None
     if is_muted(author_hash):
         return None  # muted: post silently dropped
+    if not has_perm(author_hash, channel_id, PERMS["POST"]):
+        RNS.log("ingest: POST denied for %s in %s" % (author_hash[:12],
+                                                      channel_id[:12]),
+                RNS.LOG_WARNING)
+        return None  # no POST permission in this channel
     content = (content or "").strip()
     if not content and not attachments:
         dlog(f"ingest: empty content and no attachments, rejecting")
@@ -1140,6 +1257,8 @@ def api_state(viewer, data):
 @wrap_api
 def api_messages(viewer, data):
     cid = data.get("channel")
+    if not has_perm(viewer, cid, PERMS["VIEW"]):
+        return api_error("view permission required", 403)
     with db_lock:
         if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
             return api_error("unknown channel", 404)
@@ -1563,6 +1682,8 @@ def api_v1_channels_list(viewer, data, link_id):
         chans = [{"id": r["id"], "name": r["name"], "kind": r["kind"],
                   "created": r["created"], "topic": r["topic"],
                   "seq": get_seq(r["id"])} for r in rows]
+    # VIEW permission: channels the viewer cannot read are absent entirely
+    chans = [c for c in chans if has_perm(viewer, c["id"], PERMS["VIEW"])]
     for c in chans:
         last_id = _receipt_last_id(c["id"], viewer)
         c["unread"] = _unread_count(c["id"], last_id)
@@ -1990,6 +2111,8 @@ def api_v1_site_get(viewer, data, link_id):
     cid = data.get("channel")
     if not _site_channel(cid):
         return {"ok": 0, "error": "unknown or non-site channel", "code": 404}
+    if not has_perm(viewer, cid, PERMS["VIEW"]):
+        return {"ok": 0, "error": "view permission required", "code": 403}
     rel = _site_safe_rel(data.get("path"))
     if not rel:
         return {"ok": 0, "error": "invalid resource path", "code": 400}
@@ -2207,42 +2330,43 @@ def _dispatch_command(viewer, line):
     elif cmd == "rename":
         chan, _, new = arg.partition(" ")
         new = new.strip()
-        if not is_moderator(viewer):
-            out = "moderator required"
-        elif not re.match(r"^[a-zA-Z0-9_\-\s]{1,32}$", chan) or \
+        if not re.match(r"^[a-zA-Z0-9_\-\s]{1,32}$", chan) or \
                 not re.match(r"^[a-zA-Z0-9_\-]{1,32}$", new):
             out = "usage: rename <channel> <newname>"
         else:
             with db_lock:
                 row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
                                  (chan.lstrip("#").strip(),)).fetchone()
-                if not row:
-                    out = "unknown channel: #%s" % chan
-                elif db.execute("SELECT 1 FROM channels WHERE name=? COLLATE NOCASE "
-                                "AND id<>?", (new, row["id"])).fetchone():
-                    out = "name already taken"
-                else:
+            if not row:
+                out = "unknown channel: #%s" % chan
+            elif not has_perm(viewer, row["id"], PERMS["MANAGE_CHANNEL"]):
+                out = "manage channel permission required"
+            elif db.execute("SELECT 1 FROM channels WHERE name=? COLLATE NOCASE "
+                            "AND id<>?", (new, row["id"])).fetchone():
+                out = "name already taken"
+            else:
+                with db_lock:
                     db.execute("UPDATE channels SET name=? WHERE id=?",
                                (new, row["id"]))
                     db.commit()
-                    out = "renamed #%s -> #%s" % (chan, new)
+                out = "renamed #%s -> #%s" % (chan, new)
     elif cmd == "topic":
         chan, _, text = arg.partition(" ")
         text = text.strip()[:200]
-        if not is_moderator(viewer):
-            out = "moderator required"
+        with db_lock:
+            row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
+                             (chan.lstrip("#").strip(),)).fetchone()
+        if not row:
+            out = "unknown channel: #%s" % chan
+        elif not has_perm(viewer, row["id"], PERMS["MANAGE_CHANNEL"]):
+            out = "manage channel permission required"
         else:
             with db_lock:
-                row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
-                                 (chan.lstrip("#").strip(),)).fetchone()
-                if not row:
-                    out = "unknown channel: #%s" % chan
-                else:
-                    db.execute("UPDATE channels SET topic=? WHERE id=?",
-                               (text or None, row["id"]))
-                    db.commit()
-                    out = ("topic set on #%s: %s" % (chan, text)) if text \
-                        else "topic cleared on #%s" % chan
+                db.execute("UPDATE channels SET topic=? WHERE id=?",
+                           (text or None, row["id"]))
+                db.commit()
+            out = ("topic set on #%s: %s" % (chan, text)) if text \
+                else "topic cleared on #%s" % chan
     elif cmd in ("ban", "mute", "unban", "unmute"):
         target = _resolve_user(arg)
         if not is_moderator(viewer):
@@ -2295,6 +2419,8 @@ def api_v1_term_open(viewer, data, link_id):
         row = db.execute("SELECT id, kind FROM channels WHERE id=?", (cid,)).fetchone()
     if not row or row["kind"] != "term":
         return {"ok": 0, "error": "unknown or non-term channel", "code": 404}
+    if not has_perm(viewer, cid, PERMS["VIEW"]):
+        return {"ok": 0, "error": "view permission required", "code": 403}
     _term_purge_idle()
     with TERM_SESSIONS_LOCK:
         mine = sum(1 for s in TERM_SESSIONS.values() if s["user_hash"] == viewer)
@@ -2404,6 +2530,8 @@ def api_v1_receipts(viewer, data, link_id):
     with db_lock:
         if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
             return {"ok": 0, "error": "unknown channel", "code": 404}
+    if not has_perm(viewer, cid, PERMS["VIEW"]):
+        return {"ok": 0, "error": "view permission required", "code": 403}
     msg_id = data.get("msg_id")
     if msg_id:
         with db_lock:
@@ -2435,6 +2563,9 @@ def api_v1_react(viewer, data, link_id):
                          (msg_id,)).fetchone()
         if not row:
             return {"ok": 0, "error": "unknown message", "code": 404}
+    if not has_perm(viewer, row["channel_id"], PERMS["VIEW"]):
+        return {"ok": 0, "error": "view permission required", "code": 403}
+    with db_lock:
         existing = db.execute("SELECT 1 FROM reactions WHERE msg_id=? AND user_hash=? "
                               "AND emoji=?", (msg_id, viewer, emoji)).fetchone()
         if existing:
@@ -2479,12 +2610,16 @@ def api_v1_search(viewer, data, link_id):
         with db_lock:
             if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
                 return {"ok": 0, "error": "unknown channel", "code": 404}
+        if not has_perm(viewer, cid, PERMS["VIEW"]):
+            return {"ok": 0, "error": "view permission required", "code": 403}
         sql += "AND channel_id=? "
         args.append(cid)
     sql += "ORDER BY id DESC LIMIT ?"
     args.append(limit)
     with db_lock:
         rows = db.execute(sql, args).fetchall()
+    # unscoped search never leaks channels the viewer cannot read
+    rows = [r for r in rows if has_perm(viewer, r["channel_id"], PERMS["VIEW"])]
     return {"ok": 1, "query": q, "results": [msg_row_json(r) for r in rows]}
 
 # ---- whoami + moderation + channel deletion (U3: context-menu backend) -------------
@@ -2495,8 +2630,17 @@ def api_v1_whoami(viewer, data, link_id):
     """The requester's own identity as the guild sees it. The client uses
     this to show/hide moderator affordances (menus are a convenience —
     every action is still enforced server-side)."""
+    with db_lock:
+        rows = db.execute(
+            "SELECT r.role_id, r.name, r.perms, r.color FROM user_roles ur "
+            "JOIN roles r ON r.role_id = ur.role_id WHERE ur.user_hash=? "
+            "ORDER BY r.position DESC", (viewer,)).fetchall()
+    roles = [{"role_id": r["role_id"], "name": r["name"], "perms": r["perms"],
+              "color": r["color"]} for r in rows]
+    is_admin = any(r["perms"] & PERMS["ADMIN"] for r in roles)
     return {"ok": 1, "user_hash": viewer, "username": get_username(viewer),
-            "is_moderator": is_moderator(viewer)}
+            "is_moderator": is_moderator(viewer) or is_admin,
+            "is_admin": is_admin, "roles": roles}
 
 def _register_mod_endpoint(path, verb, apply_fn):
     """Register one moderator-gated JSON endpoint. `apply_fn(viewer, target,
@@ -2536,8 +2680,8 @@ _register_mod_endpoint(
 def _delete_channel_txn(cid, viewer):
     """Shared channel deletion (API + slash command). Returns
     (error_or_None, name_or_None)."""
-    if not is_moderator(viewer):
-        return "moderator required", None
+    if not has_perm(viewer, cid, PERMS["MANAGE_CHANNEL"]):
+        return "manage channel permission required", None
     with db_lock:
         row = db.execute("SELECT id, name FROM channels WHERE id=?", (cid,)).fetchone()
         if not row:
@@ -2577,7 +2721,7 @@ def api_v1_channels_delete(viewer, data, link_id):
     err, name = _delete_channel_txn(data.get("channel"), viewer)
     if err:
         return {"ok": 0, "error": err,
-                "code": 403 if "moderator" in err
+                "code": 403 if "permission required" in err or "moderator" in err
                 else (404 if "unknown" in err else 400)}
     return {"ok": 1, "channel": data.get("channel"), "name": name}
 
@@ -2598,6 +2742,154 @@ def api_v1_command(viewer, data, link_id):
     res = _dispatch_command(viewer, _term_sanitize(line.lstrip("/")))
     return {"ok": 1, "output": _term_sanitize(res["out"])[:4000],
             "clear": res["clear"], "quit": res["quit"]}
+
+# ---- roles (U5): role CRUD, assignment, channel overwrites -------------------------
+
+def _require_manage_roles(viewer):
+    if not has_role_perm(viewer, PERMS["MANAGE_ROLES"] | PERMS["ADMIN"]):
+        return {"ok": 0, "error": "manage roles permission required", "code": 403}
+    return None
+
+def _role_row(r):
+    with db_lock:
+        members = db.execute("SELECT user_hash FROM user_roles WHERE role_id=? "
+                             "ORDER BY user_hash LIMIT 64", (r["role_id"],)).fetchall()
+    return {"role_id": r["role_id"], "name": r["name"], "color": r["color"],
+            "position": r["position"], "perms": r["perms"],
+            "members": [m["user_hash"] for m in members]}
+
+@api_route("/api/v1/roles/list")
+@wrap_json_api
+def api_v1_roles_list(viewer, data, link_id):
+    with db_lock:
+        rows = db.execute("SELECT * FROM roles ORDER BY position DESC, name").fetchall()
+    return {"ok": 1, "roles": [_role_row(r) for r in rows]}
+
+@api_route("/api/v1/roles/create")
+@wrap_json_api
+def api_v1_roles_create(viewer, data, link_id):
+    denied = _require_manage_roles(viewer)
+    if denied:
+        return denied
+    name = (data.get("name") or "").strip()
+    if not re.match(r"^[A-Za-z0-9_\- ]{1,32}$", name):
+        return {"ok": 0, "error": "invalid role name", "code": 400}
+    perms = data.get("perms", 0)
+    if not isinstance(perms, int) or perms < 0 or perms > PERM_ALL:
+        return {"ok": 0, "error": "perms must be a bitmask 0-63", "code": 400}
+    color = (data.get("color") or "").strip().upper()
+    if color and not re.match(r"^[0-9A-F]{3}$", color):
+        return {"ok": 0, "error": "color must be 3-hex", "code": 400}
+    position = data.get("position", 0)
+    try:
+        position = max(0, min(int(position), 1000))
+    except (TypeError, ValueError):
+        position = 0
+    with db_lock:
+        if db.execute("SELECT 1 FROM roles WHERE name=? COLLATE NOCASE",
+                      (name,)).fetchone():
+            return {"ok": 0, "error": "role exists", "code": 409}
+        cur = db.execute("INSERT INTO roles (name, color, position, perms) "
+                         "VALUES (?, ?, ?, ?)", (name, color or None, position, perms))
+        db.commit()
+        role_id = cur.lastrowid
+    return {"ok": 1, "role": {"role_id": role_id, "name": name, "perms": perms,
+                              "color": color or None, "position": position}}
+
+@api_route("/api/v1/roles/delete")
+@wrap_json_api
+def api_v1_roles_delete(viewer, data, link_id):
+    denied = _require_manage_roles(viewer)
+    if denied:
+        return denied
+    role_id = data.get("role_id")
+    with db_lock:
+        row = db.execute("SELECT name FROM roles WHERE role_id=?", (role_id,)).fetchone()
+        if not row:
+            return {"ok": 0, "error": "unknown role", "code": 404}
+        db.execute("DELETE FROM user_roles WHERE role_id=?", (role_id,))
+        db.execute("DELETE FROM channel_overwrites WHERE role_id=?", (role_id,))
+        db.execute("DELETE FROM roles WHERE role_id=?", (role_id,))
+        db.commit()
+    return {"ok": 1, "role_id": role_id, "name": row["name"]}
+
+@api_route("/api/v1/roles/assign")
+@wrap_json_api
+def api_v1_roles_assign(viewer, data, link_id):
+    denied = _require_manage_roles(viewer)
+    if denied:
+        return denied
+    role_id = data.get("role_id")
+    target = _resolve_user(data.get("user"))
+    if not target:
+        return {"ok": 0, "error": "unknown user", "code": 404}
+    with db_lock:
+        if not db.execute("SELECT 1 FROM roles WHERE role_id=?", (role_id,)).fetchone():
+            return {"ok": 0, "error": "unknown role", "code": 404}
+        db.execute("INSERT OR IGNORE INTO user_roles (user_hash, role_id) VALUES (?, ?)",
+                   (target, role_id))
+        db.commit()
+    return {"ok": 1, "role_id": role_id, "user": target}
+
+@api_route("/api/v1/roles/unassign")
+@wrap_json_api
+def api_v1_roles_unassign(viewer, data, link_id):
+    denied = _require_manage_roles(viewer)
+    if denied:
+        return denied
+    role_id = data.get("role_id")
+    target = _resolve_user(data.get("user"))
+    if not target:
+        return {"ok": 0, "error": "unknown user", "code": 404}
+    with db_lock:
+        db.execute("DELETE FROM user_roles WHERE user_hash=? AND role_id=?",
+                   (target, role_id))
+        db.commit()
+    return {"ok": 1, "role_id": role_id, "user": target}
+
+@api_route("/api/v1/channels/patch")
+@wrap_json_api
+def api_v1_channels_patch(viewer, data, link_id):
+    """Channel settings: topic and permission overwrites. Needs
+    MANAGE_CHANNEL (guild-wide) for topic, and for overwrites the caller
+    must also carry MANAGE_CHANNEL; overwrites are {role_id: perms} with
+    perms null deleting the row (falling back to the default)."""
+    cid = data.get("channel")
+    with db_lock:
+        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
+            return {"ok": 0, "error": "unknown channel", "code": 404}
+    if not has_perm(viewer, cid, PERMS["MANAGE_CHANNEL"]):
+        return {"ok": 0, "error": "manage channel permission required", "code": 403}
+    topic = data.get("topic")
+    if topic is not None:
+        with db_lock:
+            db.execute("UPDATE channels SET topic=? WHERE id=?",
+                       (str(topic).strip()[:200] or None, cid))
+            db.commit()
+    overwrites = data.get("overwrites")
+    if overwrites is not None:
+        if not isinstance(overwrites, dict):
+            return {"ok": 0, "error": "overwrites must be an object", "code": 400}
+        for rid, perms in overwrites.items():
+            try:
+                rid = int(rid)
+            except (TypeError, ValueError):
+                return {"ok": 0, "error": "role_id must be an integer", "code": 400}
+            with db_lock:
+                if perms is None:
+                    db.execute("DELETE FROM channel_overwrites "
+                               "WHERE channel_id=? AND role_id=?", (cid, rid))
+                else:
+                    if not isinstance(perms, int) or perms < 0 or perms > PERM_ALL:
+                        return {"ok": 0, "error": "perms must be a bitmask 0-63",
+                                "code": 400}
+                    db.execute("INSERT INTO channel_overwrites "
+                               "(channel_id, role_id, perms) VALUES (?, ?, ?) "
+                               "ON CONFLICT(channel_id, role_id) "
+                               "DO UPDATE SET perms=excluded.perms", (cid, rid, perms))
+        with db_lock:
+            db.commit()
+    return {"ok": 1, "channel": cid}
 
 # ----------------------------------------------------------------------------------
 # Boot (plan §9 skeleton — every call verified against the installed stack)
@@ -2753,6 +3045,8 @@ def run(argv=None):
     # Seed the moderator set from moderators.txt (boot-time source of truth).
     # Without this, MODERATORS stays empty and ban/mod paths never authorize.
     load_moderators(os.path.join(STORAGE, "moderators.txt"))
+    # Role seeding (U5): admin.txt -> Admin role, moderators.txt -> Moderator.
+    load_role_seeds(STORAGE)
 
     node_hash     = hexstr(node_destination.hash)
     delivery_hash = hexstr(guild_delivery.hash)

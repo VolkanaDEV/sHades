@@ -5,7 +5,7 @@ transport as the rest of the API: **JSON over RNS Link requests** on
 `nomadnetwork.node`. HTML, HTTP and IP-socket APIs remain anti-patterns; the
 guild never becomes a web server.
 
-Status: U1-U4 are DONE (icons; receipts/reactions/search; context menus +
+Status: U1-U5 are DONE (icons; receipts/reactions/search; context menus +
 mod endpoints + channel deletion). U4-U8 are designed here, not built.
 
 ## U0 — foundations that already exist
@@ -83,50 +83,40 @@ Tests: `tests/test_command.py` (dispatcher via the JSON endpoint: ephemeral
 contract, name/space moderation, create/rename/topic/delete, quit/clear
 inertness, sanitisation, rate limit) + integ slash checks over the mesh.
 
-## U5 — roles + admin whitelist
+## U5 — roles + admin whitelist (DONE)
 
-**Storage.**
+- tables: `roles(role_id, name UNIQUE, color, position, perms)`,
+  `user_roles(user_hash, role_id)`, `channel_overwrites(channel_id, role_id,
+  perms)` with role_id 0 = @everyone. MANAGE_*/ADMIN live on the role itself
+  (guild-wide); VIEW/POST live in the per-channel overwrites.
+- boot: `load_role_seeds(STORAGE)` — admin.txt -> Admin role (all bits,
+  position 100), moderators.txt -> Moderator (MANAGE_MESSAGES|MANAGE_CHANNEL,
+  position 50). INSERT OR IGNORE by name; re-runnable.
+- `has_perm(viewer, cid, bit)`: guild bits delegate to
+  `has_role_perm(viewer, bit)`; VIEW/POST = @everyone overwrite (default
+  VIEW|POST) UNION role.perms UNION per-role overwrite; ADMIN short-circuits.
+  `has_role_perm` also honours the legacy MODERATORS set for
+  MANAGE_MESSAGES|MANAGE_CHANNEL so pre-roles moderators keep working.
+- enforcement matrix (all server-side): ingest POST (silent drop),
+  channels/list VIEW (hidden channels absent), legacy /api/messages VIEW,
+  react/receipts VIEW (via the message's channel), search VIEW (scoped 403,
+  unscoped result filtering), site/get + term/open VIEW, rename/topic/delete
+  + channels/patch MANAGE_CHANNEL, ban/mute guild-wide is_moderator, roles
+  endpoints MANAGE_ROLES. ADMIN short-circuits.
+- endpoints: `/api/v1/roles/list|create|delete|assign|unassign`,
+  `/api/v1/channels/patch {channel, topic?, overwrites?}` (overwrites is
+  {role_id: perms}, perms null deletes the row), `/api/v1/whoami` extended
+  with is_admin + roles.
+- client: PERM_* constants mirror the server (UI gating only);
+  whoami -> my_roles/i_am_admin; `_can_manage_roles()` gates a "roles..."
+  item on the member context menu -> `_open_roles_popup` (role list with
+  [x]/[  ] assign toggles + create-role row). Role colors on usernames and
+  the full channel-overwrite editor are deferred to U8.
 
-```sql
-CREATE TABLE roles (role_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT UNIQUE COLLATE NOCASE,
-                    color TEXT,          -- 3-hex micron-style, optional
-                    position INTEGER);   -- higher = more powerful
-CREATE TABLE user_roles (user_hash TEXT, role_id INTEGER,
-                         PRIMARY KEY (user_hash, role_id));
-CREATE TABLE channel_overwrites (channel_id TEXT, role_id INTEGER,
-                                 perms INTEGER,   -- bitmask; role_id 0 = @everyone
-                                 PRIMARY KEY (channel_id, role_id));
-```
-
-**Permission bitmask** (single int, checked in one place `has_perm(viewer,
-channel, bit)`): VIEW 1, POST 2, MANAGE_MESSAGES 4, MANAGE_CHANNEL 8,
-MANAGE_ROLES 16, ADMIN 32. A member's perms = union of their roles'
-overwrites for the channel, falling back to the `@everyone` overwrite;
-`ADMIN` short-circuits everything.
-
-**Admin whitelist.** `admin.txt` next to `moderators.txt` (same format, one
-canonical user hash per line) seeds `ADMIN` at boot. `moderators.txt` seeds a
-`Moderator` role with MANAGE_MESSAGES|MANAGE_CHANNEL. The existing
-`is_moderator()` becomes `has_perm(viewer, channel, MANAGE_MESSAGES)`; all
-existing mod call sites switch to it.
-
-**Enforcement points.** `ingest()` → POST check; `channels/list` → VIEW filter;
-react/receipts → VIEW; manage endpoints → respective bits. Site/term `put` →
-MANAGE_CHANNEL. Existing behavior (open posting) preserved: default
-`@everyone` overwrite = VIEW|POST.
-
-**API.** `/api/v1/roles/list|create|delete|assign|unassign`,
-`/api/v1/channels/patch {channel, overwrites|name|topic}`,
-`/api/v1/channels/delete {channel}` (soft: `channels.kind='deleted'`? no —
-hard delete + cascading message/receipt/reaction cleanup, guild choice).
-
-**Client.** Role color drives username/member-list colors (micron-style 3-hex
-like `theme.accent`); admin gets role editor; usernames in menus show roles.
-
-Tests: permission matrix unit tests (the highest-value suite in this plan —
-every bit × every endpoint), admin-whitelist boot test, overwrite fallback
-tests.
+Tests: `tests/test_roles.py` (36 checks: seeding, union matrix, deny/grant
+over writes, API gating, patch semantics, slash permission) + integ U5 section
+over the mesh (seeding, role CRUD, hidden-channel list filter, victim POST
+denied then re-allowed by role assignment).
 
 ## U6 — invites
 

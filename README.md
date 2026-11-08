@@ -94,6 +94,8 @@ Endpoints:
     /api/v1/react {msg, emoji}                 (toggle; ASCII shortcodes only)
     /api/v1/search {q, channel?, limit?}       (live messages, deleted excluded)
     /api/v1/command {input}                    (slash commands; ephemeral output)
+    /api/v1/roles/list|create|delete|assign|unassign   (roles; MANAGE_ROLES)
+    /api/v1/channels/patch {channel, topic?, overwrites?} (MANAGE_CHANNEL)
 
 `channels/list` includes a per-viewer `unread` count from the receipts table.
 Reactions are ASCII shortcodes (`+1`, `laugh`, ...) with one emoji per user per
@@ -173,6 +175,32 @@ client-local list to the server's).
 The client renders command output as an ephemeral console row (never
 persisted, never in the ledger) and refreshes the channel index every ~15 s so
 renames/topics/badges stay current.
+
+## Roles and permissions (U5)
+
+Permission bitmask (0-63): VIEW 1, POST 2, MANAGE_MESSAGES 4,
+MANAGE_CHANNEL 8, MANAGE_ROLES 16, ADMIN 32. Two layers:
+
+- **Roles** (`roles`, `user_roles`): guild-wide bits (MANAGE_*/ADMIN) live on
+  the role itself; `role.perms` is one number. Boot seeding: every hash in
+  `admin.txt` gets the Admin role (all bits), every hash in `moderators.txt`
+  the Moderator role (MANAGE_MESSAGES|MANAGE_CHANNEL) — same one-hash-per-line
+  format as before, and the legacy in-memory moderator set still counts for
+  MANAGE_MESSAGES/MANAGE_CHANNEL so old deployments keep working.
+- **Channel overwrites** (`channel_overwrites`, role 0 = @everyone):
+  per-channel VIEW/POST grants UNIONed with the member's role bits. A channel
+  with no @everyone row is open (VIEW|POST) — pre-roles behaviour; set
+  `{"0": 0}` to lock one down, then grant roles.
+
+Enforcement (server-side, no exceptions): `ingest` drops posts without POST
+(silently, like mutes); `channels/list` omits channels without VIEW; the
+message/react/receipt/search/site-read/term-open surfaces all require VIEW
+(unscoped search filters results per-channel); rename/topic/delete and
+`channels/patch` need MANAGE_CHANNEL; ban/mute keep the guild-wide moderator
+check; all five roles endpoints need MANAGE_ROLES. ADMIN short-circuits every
+check. `/api/v1/whoami` carries `is_admin` and the member's roles; the client
+uses that only to show or hide the role manager popup (right-click a member ->
+"roles..."), which lists roles, toggles assignment, and creates roles.
 
 ## Site channels in the client
 

@@ -490,6 +490,26 @@ class GuildAPI:
         returns the output ephemerally."""
         return self._request_json("/api/v1/command", {"input": line})
 
+    # ---- roles (U5) ----
+    def roles_list(self):
+        return self._request_json("/api/v1/roles/list", {})
+
+    def roles_create(self, name, perms=0, color=None, position=0):
+        return self._request_json("/api/v1/roles/create",
+                                  {"name": name, "perms": perms,
+                                   "color": color, "position": position})
+
+    def roles_delete(self, role_id):
+        return self._request_json("/api/v1/roles/delete", {"role_id": role_id})
+
+    def roles_assign(self, role_id, user):
+        return self._request_json("/api/v1/roles/assign",
+                                  {"role_id": role_id, "user": user})
+
+    def roles_unassign(self, role_id, user):
+        return self._request_json("/api/v1/roles/unassign",
+                                  {"role_id": role_id, "user": user})
+
     def fetch_file(self, path):
         """Fetch raw bytes from a /file/... request handler on the guild."""
         dlog(f"fetch_file: requesting {path}")
@@ -1667,6 +1687,9 @@ if KIVY:
                                 lambda: app and app._mod_action("mod_mute", uh, name)))
                 actions.append(("ban user", True,
                                 lambda: app and app._mod_action("mod_ban", uh, name)))
+            if app and app._can_manage_roles() and uh and uh != app.my_hash:
+                actions.append(("roles...", True,
+                                lambda: app and app._open_roles_popup(uh, name)))
             return actions
 
     class MainScreen(Screen):
@@ -3142,7 +3165,98 @@ class sHadesClientApp(MDApp):
                 return
             if res.get("ok"):
                 self.i_am_moderator = bool(res.get("is_moderator"))
+                self.i_am_admin = bool(res.get("is_admin"))
+                self.my_roles = res.get("roles") or []
         threading.Thread(target=work, daemon=True).start()
+
+    def _can_manage_roles(self):
+        """UI gate: any of my roles carries MANAGE_ROLES or ADMIN."""
+        return any(r.get("perms", 0) & (self.PERM_MANAGE_ROLES |
+                                        self.PERM_ADMIN)
+                   for r in self.my_roles)
+
+    def _open_roles_popup(self, target_hash, target_name):
+        """Role manager (U5): list roles, toggle assignment for one user,
+        create a new role. Server enforces MANAGE_ROLES; this popup only
+        appears for users who have it."""
+        if not self.guild_api or not self._can_manage_roles():
+            return
+        box = BoxLayout(orientation="vertical", spacing=4, padding=4)
+        title = Label(text="roles: @%s" % (target_name or target_hash[:8]),
+                      size_hint_y=None, height=22)
+        box.add_widget(title)
+        scroll = ScrollView(size_hint=(1, 1))
+        grid = GridLayout(cols=1, size_hint_y=None, spacing=2)
+        grid.bind(minimum_height=grid.setter("height"))
+        scroll.add_widget(grid)
+        box.add_widget(scroll)
+        row = BoxLayout(size_hint_y=None, height=30, spacing=4)
+        name_in = TextInput(hint_text="new role name", multiline=False)
+        row.add_widget(name_in)
+        create_btn = Button(text="create", size_hint_x=None, width=70)
+        row.add_widget(create_btn)
+        box.add_widget(row)
+        close = Button(text="close", size_hint_y=None, height=28)
+        box.add_widget(close)
+        popup = Popup(title="roles", content=box, size_hint=(0.7, 0.6))
+        self._popup = popup
+
+        def refresh():
+            grid.clear_widgets()
+
+            def add_role(r, member):
+                def toggle(btn):
+                    try:
+                        if member:
+                            res = self.guild_api.roles_unassign(r["role_id"],
+                                                                target_hash)
+                        else:
+                            res = self.guild_api.roles_assign(r["role_id"],
+                                                              target_hash)
+                    except Exception as e:
+                        self._show_notice("roles: %r" % e)
+                        return
+                    if res.get("ok"):
+                        Clock.schedule_once(lambda dt: refresh(), 0)
+                    else:
+                        self._show_notice("roles: %s" %
+                                            res.get("error", "failed"))
+                mark = "[x] " if member else "[  ] "
+                btn = Button(text=mark + r["name"], size_hint_y=None, height=24,
+                             background_color=(0.2, 0.2, 0.25, 1))
+                btn.bind(on_press=toggle)
+                grid.add_widget(btn)
+            try:
+                res = self.guild_api.roles_list()
+            except Exception as e:
+                self._show_notice("roles: %r" % e)
+                return
+            if not res.get("ok"):
+                self._show_notice("roles: %s" % res.get("error", "failed"))
+                return
+            members = set()
+            for r in res.get("roles", []):
+                members = set(r.get("members") or [])
+                add_role(r, target_hash in members)
+
+        def on_create():
+            name = name_in.text.strip()
+            if not name:
+                return
+            try:
+                res = self.guild_api.roles_create(name)
+            except Exception as e:
+                self._show_notice("roles: %r" % e)
+                return
+            if res.get("ok"):
+                name_in.text = ""
+                Clock.schedule_once(lambda dt: refresh(), 0)
+            else:
+                self._show_notice("roles: %s" % res.get("error", "failed"))
+        create_btn.bind(on_press=lambda inst: on_create())
+        close.bind(on_press=lambda inst: popup.dismiss())
+        refresh()
+        popup.open()
 
     def _update_channel_badges(self):
         """Push unread counts onto the sidebar buttons (UI thread)."""
