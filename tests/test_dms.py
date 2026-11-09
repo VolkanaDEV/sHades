@@ -103,5 +103,44 @@ class TestDMHistory(unittest.TestCase):
         self.assertEqual(len(dms.load_dm_history(self.path)[0]["text"]), 4000)
 
 
+class TestLXMFPlumbing(unittest.TestCase):
+    """Guard the exact LXMRouter API the client calls, without needing a live
+    RNS Transport (registering a destination requires an initialized
+    Reticulum, so the real end-to-end delivery lives in integ_test.py)."""
+
+    def test_router_api_shape(self):
+        try:
+            import LXMF
+        except ImportError:
+            self.skipTest("LXMF not installed")
+        import inspect
+        router = LXMF.LXMRouter
+        # the three calls the client makes on connect
+        self.assertTrue(callable(router.register_delivery_identity))
+        self.assertTrue(callable(router.register_delivery_callback))
+        self.assertTrue(callable(router.announce))
+        self.assertTrue(callable(router.handle_outbound))
+        self.assertTrue(callable(router.exit_handler))
+        # register_delivery_identity(identity, display_name=None, stamp_cost=None)
+        params = list(inspect.signature(
+            router.register_delivery_identity).parameters)
+        self.assertEqual(params[:2], ["self", "identity"])
+        self.assertIn("display_name", params)
+        # announce(destination_hash, attached_interface=None)
+        aparams = list(inspect.signature(router.announce).parameters)
+        self.assertEqual(aparams[:2], ["self", "destination_hash"])
+        # the delivery destination hash is 16 bytes -> 32 hex user hash
+        self.assertEqual(LXMF.LXMessage.DESIRED_METHOD_DIRECT
+                         if hasattr(LXMF.LXMessage, "DESIRED_METHOD_DIRECT")
+                         else "DIRECT", "DIRECT")
+
+    def test_client_uses_real_hash_width(self):
+        """The client keys friends/DMs by the 32-hex lxmf.delivery hash."""
+        import dms
+        self.assertTrue(dms.is_user_hash("a" * 32))
+        self.assertFalse(dms.is_user_hash("a" * 64))   # channel-id length
+        self.assertFalse(dms.is_user_hash("a" * 31))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

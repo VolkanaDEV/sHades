@@ -9,9 +9,11 @@ Topology (all on localhost):
 Run:  /usr/bin/python3 tests/integ_test.py
 """
 import os, sys, json, time, re, sqlite3, subprocess, tempfile, base64
+import threading
 
 RETI_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GUILD_PY = os.path.join(RETI_DIR, "sHades.py")
+sys.path.insert(0, RETI_DIR)   # for dms.py (client-side helpers under test)
 
 import RNS
 import LXMF
@@ -34,7 +36,11 @@ def main():
     os.makedirs(os.path.join(c_store, "rns-client"), exist_ok=True)
 
     with open(os.path.join(g_store, "rns-guild", "config"), "w") as f:
-        f.write("[reticulum]\n  enable_transport = no\n  share_instance = no\n\n"
+        # enable_transport = yes makes the guild a HUB for the clients that
+        # connect to it: it relays announces and answers path requests, which
+        # is what lets two clients on the same mesh find each other (the DM
+        # path in U7). A leaf-only config cannot route between clients.
+        f.write("[reticulum]\n  enable_transport = yes\n  share_instance = no\n\n"
                 "[interfaces]\n"
                 "  [[TCP Server Interface]]\n    type = TCPServerInterface\n"
                 "    enabled = yes\n    listen_ip = 127.0.0.1\n    listen_port = 42421\n")
@@ -658,6 +664,63 @@ def main():
         r = japi("/api/v1/roles/delete", {"role_id": integ_role_id})
         check("roles/delete over the mesh", r.get("ok") == 1, r)
         japi("/api/v1/channels/delete", {"channel": locked_cid})
+
+        # ---- U7: direct client-to-client DM over the mesh (LXMF) ----
+        # The guild is NOT a party. The peer runs as its OWN process with its
+        # OWN RNS instance (two LXMF routers in one process share a single
+        # transport and can never learn a path to each other — the path has
+        # to come over the wire). It connects to the same TCP server the
+        # client uses, announces its own lxmf.delivery, waits for a path to
+        # the client's delivery destination, then sends one DIRECT message.
+        import dms
+        dm_rx = {"text": None, "event": threading.Event()}
+
+        def dm_callback(lxm):
+            c = lxm.content
+            if isinstance(c, bytes):
+                c = c.decode("utf-8", "replace")
+            dm_rx["text"] = c
+            dm_rx["event"].set()
+
+        # The client's own delivery destination already exists (client_dest,
+        # registered by client_router above) — a second registration of the
+        # same identity is a KeyError, so reuse it and just install the
+        # delivery callback + announce, exactly like the app does.
+        main_router = client_router
+        main_delivery = client_dest
+        main_router.register_delivery_callback(dm_callback)
+        main_router.announce(main_delivery.hash)
+        time.sleep(1.5)
+
+        # peer config: its own TCP client interface onto the same server
+        peer_cfg = os.path.join(c_store, "rns-peer")
+        os.makedirs(peer_cfg, exist_ok=True)
+        with open(os.path.join(peer_cfg, "config"), "w") as f:
+            f.write("[reticulum]\n  enable_transport = no\n  share_instance = no\n\n"
+                    "[interfaces]\n"
+                    "  [[TCP Client Interface]]\n    type = TCPClientInterface\n"
+                    "    enabled = yes\n    target_host = 127.0.0.1\n"
+                    "    target_port = 42421\n")
+        peer = subprocess.Popen(
+            ["/usr/bin/python3", os.path.join(RETI_DIR, "tests", "dm_peer.py"),
+             peer_cfg, hexstr(main_delivery.hash), "mesh hello u7"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            out = peer.communicate(timeout=120)[0] or ""
+        except subprocess.TimeoutExpired:
+            peer.kill()
+            out = peer.communicate()[0] or ""
+        got_it = dm_rx["event"].wait(5)
+        check("direct lxmf dm delivered over the mesh",
+              got_it and dm_rx["text"] == "mesh hello u7",
+              "peer=%r rx=%r" % (out.strip()[-200:], dm_rx.get("text")))
+        # the exact client-side persistence path: append in, load back
+        peer_hash = hexstr(victim_dest.hash)
+        dms.append_dm(dms.dm_history_path(c_store, peer_hash), "in", dm_rx["text"])
+        rows = dms.load_dm_history(dms.dm_history_path(c_store, peer_hash))
+        check("dm history persisted client-local",
+              len(rows) == 1 and rows[0]["dir"] == "in"
+              and rows[0]["text"] == "mesh hello u7", rows)
 
         # ---- rate limit (kept last: it exhausts the sender window) ----
         codes = []

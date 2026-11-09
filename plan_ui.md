@@ -5,7 +5,7 @@ transport as the rest of the API: **JSON over RNS Link requests** on
 `nomadnetwork.node`. HTML, HTTP and IP-socket APIs remain anti-patterns; the
 guild never becomes a web server.
 
-Status: U1-U5 are DONE (icons; receipts/reactions/search; context menus +
+Status: U1-U7 are DONE (icons; receipts/reactions/search; context menus +
 mod endpoints + channel deletion). U4-U8 are designed here, not built.
 
 ## U0 — foundations that already exist
@@ -170,6 +170,31 @@ Tests: `tests/test_dms.py` (11: roster dedupe/rename/remove/validation,
 persistence + corruption, junk filtering; DM history append/cap/validate/
 corrupt recovery). The LXMF wire path itself needs two live clients —
 not covered by integ; verify manually on two machines.
+
+## U7 — friends + DMs (DONE, client-local)
+
+- `dms.py` (Kivy-free, stdlib only): friends roster (`friends.json`:
+  `{user_hash, nickname}`, 32-hex lxmf.delivery hashes) + per-thread DM
+  history (`dms/<user_hash>.json`, newest 200 rows, atomic replace). Both
+  loaders tolerate missing/corrupt files and never raise.
+- client: the client identity runs its OWN `LXMRouter` (announces its
+  `lxmf.delivery` destination at connect; the delivery callback IS the DM
+  inbox — guild chat rides the API link and never touches this path).
+  `_send_dm` resolves the peer's identity via `RNS.Identity.recall` and
+  ensures a transport PATH to their delivery destination
+  (`request_path` + short wait) — LXMF silently never transmits without
+  one. Router init failure degrades to "DMs disabled", chat unaffected.
+- UI: right-click a member or a message -> "message" (DM thread popup:
+  local history + send) and "add friend"/"remove friend"; friends render
+  above the member list with presence coloring.
+- Tests: `tests/test_dms.py` (13: roster add/rename/dedupe/remove, bad
+  hashes incl. the 64-hex channel-id length, persistence + corruption
+  tolerance, history append/cap/direction/truncation, LXMF API-shape guard)
+  and an integ section proving a real peer-to-peer DM over the mesh —
+  `tests/dm_peer.py` runs as its OWN process with its own RNS instance
+  (two LXMF routers in one process share one transport and can never learn a
+  path to each other) and the guild's RNS config needs
+  `enable_transport = yes` so it can relay announces between clients.
 
 ## U8 — server config panel (admin only)
 

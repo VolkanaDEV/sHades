@@ -216,17 +216,34 @@ stdlib only) and is covered by `tests/test_invite.py`.
 
 ## Friends + DMs (U7, client-local)
 
-Right-click a member (or message author) -> "add friend" builds a local
-roster (`friends.json` in the app data dir — the guild never sees it).
-Friends head the member sidebar with their own section; online state is
-best-effort from the guild presence map. "message" on the same menu opens
-the DM thread: a popup backed by a real `LXMRouter` on the client identity
-(direct client-to-client LXMF, `lxmf/delivery` — the guild is not a party,
-and chat keeps working even if it's down). Threads persist client-local as
-`dms/<user_hash>.json` (200-message cap). Inbound DMs arrive at the
-client's own lxmf.delivery destination and surface as a status line or
-refresh an open thread. Everything lives in `dms.py` (Kivy-free) and is
-covered by `tests/test_dms.py`.
+Both are entirely client-side — the guild is not a party and never sees
+them.
+
+- **Friends roster**: `friends.json` in the app data dir
+  (`{user_hash, nickname}` per entry; user_hash = the 32-hex lxmf.delivery
+  hash). Right-click a member (or message author) -> "add friend" /
+  "remove friend". Friends head the member sidebar with their own section;
+  online state is best-effort from the guild presence map (green/gray).
+- **DMs**: direct client-to-client LXMF — the popup is backed by a real
+  `LXMRouter` on the client identity, which announces its own
+  `lxmf.delivery` destination at connect; everything arriving there is a
+  DM (guild chat rides the API link and never touches this path). "message"
+  on the same menu opens the thread. Chat keeps working even if the router
+  fails to initialise ("DMs disabled"). Threads persist client-local as
+  `dms/<user_hash>.json` (200-message cap). Inbound DMs surface as a status
+  line or refresh an open thread. Everything lives in `dms.py` (Kivy-free)
+  and is covered by `tests/test_dms.py`.
+
+Sending needs two things from the mesh, and the client handles both: the
+peer's identity must be known (`RNS.Identity.recall` — they must have
+announced) **and** the transport must have a path to their delivery
+destination (`RNS.Transport.request_path` + a short wait). Without a path
+LXMF silently never transmits, so the client reports "dm: no path to ...".
+
+Note for mesh setup: two clients can only find each other if something
+between them routes — a hub with `enable_transport = yes` relays announces
+and answers path requests; a leaf-only node cannot. `tests/dm_peer.py` is a
+standalone peer used by the integ test for exactly this reason.
 
 ## Site channels in the client
 

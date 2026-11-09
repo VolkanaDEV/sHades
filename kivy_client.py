@@ -3445,6 +3445,20 @@ class sHadesClientApp(MDApp):
                 dest = RNS.Destination(nid, RNS.Destination.OUT,
                                        RNS.Destination.SINGLE,
                                        "lxmf", "delivery")
+                # LXMF needs a transport PATH to the peer's delivery
+                # destination, not just their identity: without one the
+                # message is never transmitted. Ask for it and wait briefly.
+                if not RNS.Transport.has_path(dest.hash):
+                    RNS.Transport.request_path(dest.hash)
+                    for _ in range(30):
+                        if RNS.Transport.has_path(dest.hash):
+                            break
+                        time.sleep(0.2)
+                    if not RNS.Transport.has_path(dest.hash):
+                        Clock.schedule_once(lambda dt: self._set_status(
+                            "dm: no path to %s — they must be reachable"
+                            % peer_hash[:8]), 0)
+                        return
                 lxm = LXMF.LXMessage(dest, self.lxmf_delivery, text,
                                      title="sHades dm",
                                      desired_method=LXMF.LXMessage.DIRECT)
