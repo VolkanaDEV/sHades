@@ -110,6 +110,7 @@ _tokens_lock  = threading.Lock()
 _rate_windows = defaultdict(deque)  # (sender, channel) -> deque[timestamps]
 _rate_lock    = threading.Lock()
 MODERATORS    = set()             # canonical user hashes; seeded from moderators.txt at boot
+ADMIN_USERS   = set()             # canonical user hashes; seeded from admin.txt at boot
 NODE_REGISTRY = {}                # node_hash -> {address, port, last_seen}
 NODE_REGISTRY_LOCK = threading.Lock()
 NODE_ANNOUNCE_INTERVAL = 4.0      # clients re-register (ping) this often
@@ -176,7 +177,13 @@ CREATE TABLE IF NOT EXISTS user_roles (
 CREATE TABLE IF NOT EXISTS channel_overwrites (
     channel_id TEXT, role_id INTEGER, perms INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (channel_id, role_id));
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL, actor TEXT, action TEXT, target TEXT, detail TEXT);
+CREATE TABLE IF NOT EXISTS server_config (
+    key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS idx_reactions_msg ON reactions(msg_id);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, id);
 """
 
@@ -428,6 +435,18 @@ def load_moderators(path):
                     MODERATORS.add(line)
     return len(MODERATORS)
 
+def load_admins(path):
+    """admin.txt: same format as moderators.txt. ADMIN_USERS is the live
+    set; boot seeding also assigns the Admin role to every hash here."""
+    ADMIN_USERS.clear()
+    if os.path.isfile(path):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and re.match(r"^[0-9a-f]{32}$", line):
+                    ADMIN_USERS.add(line)
+    return len(ADMIN_USERS)
+
 def is_moderator(user):
     """Guild-wide moderator check: any role carrying MANAGE_MESSAGES or
     ADMIN, or the legacy MODERATORS set (moderators.txt, kept for backward
@@ -642,6 +661,20 @@ def serve_attachment_file(path, data, request_id, link_id, remote_identity, requ
 # One transaction: user placeholder, message row, attachments, members, seq bump.
 # ----------------------------------------------------------------------------------
 
+_last_post_at = {}              # user_hash -> ts of last accepted post (slowmode)
+_last_post_lock = threading.Lock()
+
+def _slow_ok(user_hash, seconds):
+    """Slowmode gate: True if the user may post now (and records the
+    post). Uses its own lock so it never deadlocks with db_lock."""
+    t = now()
+    with _last_post_lock:
+        last = _last_post_at.get(user_hash, 0.0)
+        if t - last < seconds:
+            return False
+        _last_post_at[user_hash] = t
+    return True
+
 def ingest(channel_id, author_hash, content, ts=None, attachments=None):
     dlog(f"ingest: channel={channel_id[:12]} author={author_hash[:12]} content_len={len(content or '')} attachments={len(attachments or [])}")
     if is_banned(author_hash):
@@ -653,6 +686,17 @@ def ingest(channel_id, author_hash, content, ts=None, attachments=None):
                                                       channel_id[:12]),
                 RNS.LOG_WARNING)
         return None  # no POST permission in this channel
+    # guild-wide slowmode (admin setting): one post per N seconds per user
+    slow = 0
+    try:
+        slow = int(_cfg_get("slowmode", "0") or 0)
+    except (TypeError, ValueError):
+        slow = 0
+    if slow > 0 and not _slow_ok(author_hash, slow) \
+            and not has_role_perm(author_hash, PERMS["ADMIN"]):
+        RNS.log("ingest: slowmode drop for %s" % author_hash[:12],
+                RNS.LOG_DEBUG)
+        return None
     content = (content or "").strip()
     if not content and not attachments:
         dlog(f"ingest: empty content and no attachments, rejecting")
@@ -1713,6 +1757,7 @@ def _create_channel_txn(viewer, name, kind, manifest=None):
                    (cid, name, now(), kind, manifest_json))
         db.execute("INSERT OR IGNORE INTO channel_state (channel_id, seq) VALUES (?, 0)", (cid,))
         db.commit()
+    _audit(viewer, "channel.create", cid, "%s (%s)" % (name, kind))
     return cid, None
 
 @api_route("/api/v1/channels/create")
@@ -2660,6 +2705,7 @@ def _register_mod_endpoint(path, verb, apply_fn):
         apply_fn(viewer, target, reason)
         RNS.log("moderation: %s %s %s" % (viewer[:12], verb, target[:12]),
                 RNS.LOG_NOTICE)
+        _audit(viewer, "mod.%s" % verb, target, reason)
         return {"ok": 1}
 
 _register_mod_endpoint(
@@ -2676,6 +2722,163 @@ _register_mod_endpoint(
 _register_mod_endpoint(
     "/api/v1/mod/unmute", "unmuted",
     lambda viewer, target, reason: unmute_user(target))
+
+def _audit(actor, action, target=None, detail=None):
+    """Append one row to the audit log (U8). Every privileged mutation
+    (ban/mute/delete/channel/role/config) lands here. Never raises — an
+    audit failure must not break the action that was being audited."""
+    try:
+        with db_lock:
+            db.execute("INSERT INTO audit_log (ts, actor, action, target, detail) "
+                       "VALUES (?, ?, ?, ?, ?)",
+                       (now(), actor or "-", str(action)[:64],
+                        (target or "")[:128], (detail or "")[:400]))
+            db.commit()
+    except Exception as e:
+        RNS.log("audit write failed: %s" % e, RNS.LOG_ERROR)
+
+def _cfg_get(key, default=None):
+    with db_lock:
+        row = db.execute("SELECT value FROM server_config WHERE key=?",
+                         (key,)).fetchone()
+    return row["value"] if row else default
+
+def _cfg_set(key, value):
+    with db_lock:
+        db.execute("INSERT INTO server_config (key, value) VALUES (?, ?) "
+                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                   (key, str(value)))
+        db.commit()
+
+def _cfg_all():
+    with db_lock:
+        rows = db.execute("SELECT key, value FROM server_config").fetchall()
+    return {r["key"]: r["value"] for r in rows}
+
+# Server settings the admin panel may change (U8). Everything else in
+# server_config is server-internal.
+SERVER_CONFIG_KEYS = {
+    "guild_name": "sHades",
+    "registration": "open",      # open | code
+    "slowmode": "0",             # seconds between posts, 0 = off
+    "motd": "",
+}
+
+def _require_admin(viewer):
+    """Admin gate for the panel endpoints (U8). ADMIN role only — the
+    legacy moderator set is NOT enough here."""
+    if not has_role_perm(viewer, PERMS["ADMIN"]):
+        return {"ok": 0, "error": "admin required", "code": 403}
+    return None
+
+@api_route("/api/v1/admin/config")
+@wrap_json_api
+def api_v1_admin_config(viewer, data, link_id):
+    """Read or change server settings. GET returns the current values;
+    a POST with {key, value} changes one. Only SERVER_CONFIG_KEYS are
+    writable — anything else is server-internal."""
+    denied = _require_admin(viewer)
+    if denied:
+        return denied
+    key = data.get("key")
+    if key is None:
+        cfg = dict(SERVER_CONFIG_KEYS)
+        cfg.update(_cfg_all())
+        cfg["guild_name"] = cfg.get("guild_name") or GUILD_NAME
+        return {"ok": 1, "config": cfg}
+    if key not in SERVER_CONFIG_KEYS:
+        return {"ok": 0, "error": "unknown config key", "code": 400}
+    if "value" not in data:
+        return {"ok": 1, "config": {key: _cfg_get(key,
+                                                  SERVER_CONFIG_KEYS[key])}}
+    value = str(data.get("value") or "")[:2000]
+    if key == "registration" and value not in ("open", "code"):
+        return {"ok": 0, "error": "registration must be 'open' or 'code'",
+                "code": 400}
+    if key == "slowmode":
+        try:
+            secs = int(value)
+        except ValueError:
+            return {"ok": 0, "error": "slowmode must be an integer", "code": 400}
+        if secs < 0 or secs > 3600:
+            return {"ok": 0, "error": "slowmode must be 0-3600", "code": 400}
+        value = str(secs)
+    old = _cfg_get(key, SERVER_CONFIG_KEYS[key])
+    _cfg_set(key, value)
+    _audit(viewer, "config.set", key, "%s -> %s" % (old, value))
+    return {"ok": 1, "config": {key: value}}
+
+@api_route("/api/v1/admin/audit")
+@wrap_json_api
+def api_v1_admin_audit(viewer, data, link_id):
+    """Recent audit-log rows, newest first."""
+    denied = _require_admin(viewer)
+    if denied:
+        return denied
+    try:
+        limit = int(data.get("limit", 100))
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(1, min(limit, 500))
+    with db_lock:
+        rows = db.execute("SELECT ts, actor, action, target, detail FROM "
+                          "audit_log ORDER BY id DESC LIMIT ?",
+                          (limit,)).fetchall()
+    return {"ok": 1, "entries": [
+        {"ts": r["ts"], "actor": r["actor"], "action": r["action"],
+         "target": r["target"], "detail": r["detail"]} for r in rows]}
+
+@api_route("/api/v1/admin/mods")
+@wrap_json_api
+def api_v1_admin_mods(viewer, data, link_id):
+    """Manage the whitelists. {op: list|add|remove|admin_add|admin_remove,
+    user: <32-hex>}. moderators.txt and admin.txt stay the source of truth
+    and are rewritten atomically; the live sets are updated to match.
+    Adding a moderator does NOT make them an admin."""
+    denied = _require_admin(viewer)
+    if denied:
+        return denied
+    op = (data.get("op") or "list").lower()
+    if op == "list":
+        return {"ok": 1, "mods": sorted(MODERATORS),
+                "admins": sorted(ADMIN_USERS)}
+    target = (data.get("user") or "").strip().lower()
+    if not re.match(r"^[0-9a-f]{32}$", target):
+        return {"ok": 0, "error": "user must be a 32-hex hash", "code": 400}
+    if op == "add":
+        MODERATORS.add(target)
+        _write_hash_file(os.path.join(STORAGE, "moderators.txt"),
+                         sorted(MODERATORS))
+        _audit(viewer, "mods.add", target)
+    elif op == "remove":
+        MODERATORS.discard(target)
+        _write_hash_file(os.path.join(STORAGE, "moderators.txt"),
+                         sorted(MODERATORS))
+        _audit(viewer, "mods.remove", target)
+    elif op == "admin_add":
+        ADMIN_USERS.add(target)
+        _write_hash_file(os.path.join(STORAGE, "admin.txt"),
+                         sorted(ADMIN_USERS))
+        _assign_role(target, _ensure_role("Admin", PERM_ALL, position=100,
+                                          color="F8a8"))
+        _audit(viewer, "admins.add", target)
+    elif op == "admin_remove":
+        ADMIN_USERS.discard(target)
+        _write_hash_file(os.path.join(STORAGE, "admin.txt"),
+                         sorted(ADMIN_USERS))
+        _audit(viewer, "admins.remove", target)
+    else:
+        return {"ok": 0, "error": "op must be list|add|remove|admin_add|"
+                                  "admin_remove", "code": 400}
+    return {"ok": 1, "mods": sorted(MODERATORS), "admins": sorted(ADMIN_USERS)}
+
+def _write_hash_file(path, hashes):
+    """Atomically rewrite a one-hash-per-line whitelist file."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        for h in hashes:
+            f.write(h + "\n")
+    os.replace(tmp, path)
 
 def _delete_channel_txn(cid, viewer):
     """Shared channel deletion (API + slash command). Returns
@@ -2709,6 +2912,7 @@ def _delete_channel_txn(cid, viewer):
         # on the destination (RNS 1.1.3 has no deregister); they now 404.
     _emit_event(cid, "channel_deleted",
                 {"channel": cid, "name": name}, guild_wide=True)
+    _audit(viewer, "channel.delete", cid, name)
     return None, name
 
 @api_route("/api/v1/channels/delete")
@@ -2811,6 +3015,7 @@ def api_v1_roles_delete(viewer, data, link_id):
         db.execute("DELETE FROM channel_overwrites WHERE role_id=?", (role_id,))
         db.execute("DELETE FROM roles WHERE role_id=?", (role_id,))
         db.commit()
+    _audit(viewer, "role.delete", None, "role_id=%s" % role_id)
     return {"ok": 1, "role_id": role_id, "name": row["name"]}
 
 @api_route("/api/v1/roles/assign")
@@ -2829,6 +3034,7 @@ def api_v1_roles_assign(viewer, data, link_id):
         db.execute("INSERT OR IGNORE INTO user_roles (user_hash, role_id) VALUES (?, ?)",
                    (target, role_id))
         db.commit()
+    _audit(viewer, "role.assign", target, "role_id=%s" % role_id)
     return {"ok": 1, "role_id": role_id, "user": target}
 
 @api_route("/api/v1/roles/unassign")
@@ -2845,6 +3051,7 @@ def api_v1_roles_unassign(viewer, data, link_id):
         db.execute("DELETE FROM user_roles WHERE user_hash=? AND role_id=?",
                    (target, role_id))
         db.commit()
+    _audit(viewer, "role.unassign", target, "role_id=%s" % role_id)
     return {"ok": 1, "role_id": role_id, "user": target}
 
 @api_route("/api/v1/channels/patch")
@@ -3045,6 +3252,8 @@ def run(argv=None):
     # Seed the moderator set from moderators.txt (boot-time source of truth).
     # Without this, MODERATORS stays empty and ban/mod paths never authorize.
     load_moderators(os.path.join(STORAGE, "moderators.txt"))
+    # Admin whitelist (same format) — also drives the Admin role.
+    load_admins(os.path.join(STORAGE, "admin.txt"))
     # Role seeding (U5): admin.txt -> Admin role, moderators.txt -> Moderator.
     load_role_seeds(STORAGE)
 

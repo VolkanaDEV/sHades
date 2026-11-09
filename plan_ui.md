@@ -5,7 +5,7 @@ transport as the rest of the API: **JSON over RNS Link requests** on
 `nomadnetwork.node`. HTML, HTTP and IP-socket APIs remain anti-patterns; the
 guild never becomes a web server.
 
-Status: U1-U7 are DONE (icons; receipts/reactions/search; context menus +
+Status: U1-U8 are DONE (icons; receipts/reactions/search; context menus +
 mod endpoints + channel deletion). U4-U8 are designed here, not built.
 
 ## U0 — foundations that already exist
@@ -196,20 +196,45 @@ not covered by integ; verify manually on two machines.
   path to each other) and the guild's RNS config needs
   `enable_transport = yes` so it can relay announces between clients.
 
-## U8 — server config panel (admin only)
+## U8 — server config panel (DONE, admin-only)
 
-Server: `admin.txt` → ADMIN; panel endpoints gated by `has_perm(ADMIN)`:
-`/api/v1/admin/config {name?}`, `/api/v1/admin/mods list|add|remove`
-(rewrites moderators.txt), `/api/v1/admin/audit` (see below), registration
-policy (U6), default slowmode. **Audit log:** `audit_log` table (ts, actor,
-action, target, detail) written by ban/mute/delete/channel/role mutations;
-viewable in the panel and as a Micron `/page/sHades/audit.mu` for NomadNet
-users.
+- server: `audit_log` (id, ts, actor, action, target, detail) and
+  `server_config` (key, value) tables; `_audit()` writes a row for every
+  privileged mutation (mod.banned/muted/unbanned/unmuted, channel.create,
+  channel.delete, role.assign/unassign/delete, config.set, mods.*/admins.*)
+  and NEVER raises — a failed audit must not break the audited action.
+- `_require_admin()` gates the panel endpoints on the ADMIN role only (a
+  moderator is not enough); `_cfg_get/_cfg_set/_cfg_all` back the settings.
+- endpoints: `/api/v1/admin/config` (read all / read one / write one,
+  only SERVER_CONFIG_KEYS writable: guild_name, registration open|code,
+  slowmode 0-3600, motd), `/api/v1/admin/audit` (newest first, limit<=500),
+  `/api/v1/admin/mods` ({op: list|add|remove|admin_add|admin_remove}).
+  The whitelists stay file-backed: moderators.txt and admin.txt are
+  rewritten atomically; admin_add also grants the Admin role; adding a
+  moderator does NOT make someone an admin.
+- slowmode is enforced in ingest (one post per N seconds per user, admins
+  exempt) with its own lock so it never deadlocks against db_lock.
+- client: guild-header context menu gains "server settings" (only when
+  whoami says is_admin); the panel has three tabs — config (edit+save),
+  moderators (list/add/remove mod+admin), audit (recent rows).
+  `i_am_admin`/`my_roles` are initialised in __init__ (an unset flag would
+  raise AttributeError in the menu builder for non-admins).
+- Tests: `tests/test_admin.py` (41 checks: admin gating incl. moderator
+  denied, config read/write/validation, audit rows + newest-first, audited
+  mutations, whitelist file round-trip, admin_add granting the role,
+  slowmode window/per-user/admin-exemption) + an integ section over the
+  mesh.
 
-Client: "server settings" behind the guild-header menu (admin only — menu
-entry hidden unless the guild says `you_are_admin` in `/api/v1/presence` or a
-new `/api/v1/whoami`): server name, moderator management, audit viewer,
-channel create/delete/rename, role editor, policy toggles.
+## U6b — join gate (optional, NOT DONE)
+
+Guild-side `invites` table (code, uses, expiry) + registration policy
+setting (`open` | `code`, already writable via `/api/v1/admin/config`);
+the first identified link presents `/api/v1/join {code}` to register.
+Default stays open, so the gate is opt-in.
+
+Remaining U8 niceties not yet done: the audit log as a Micron page
+(`/page/sHades/audit.mu`) for NomadNet users, and role colors on
+usernames / a full channel-overwrite editor in the panel.
 
 ## Build order
 

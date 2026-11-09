@@ -245,6 +245,33 @@ between them routes — a hub with `enable_transport = yes` relays announces
 and answers path requests; a leaf-only node cannot. `tests/dm_peer.py` is a
 standalone peer used by the integ test for exactly this reason.
 
+## Admin panel and audit log (U8)
+
+Admin-only (the **Admin** role — a moderator is not enough). Right-click the
+guild header -> "server settings" opens the panel (the entry only appears
+when `/api/v1/whoami` says `is_admin`; the server enforces it regardless).
+
+Server endpoints (all JSON over RNS, admin-gated):
+
+| endpoint | purpose |
+|---|---|
+| `/api/v1/admin/config` | read all settings, or read/write one (`{key, value}`) |
+| `/api/v1/admin/audit` | recent audit rows, newest first (`{limit}`) |
+| `/api/v1/admin/mods` | `{op: list\|add\|remove\|admin_add\|admin_remove, user}` |
+
+Writable settings: `guild_name`, `registration` (`open`/`code`), `slowmode`
+(seconds, 0 = off, admins exempt), `motd`. Unknown keys are rejected.
+
+The whitelists stay file-backed: `moderators.txt` and `admin.txt` are
+rewritten atomically, and `admin_add` also grants the Admin role. Adding a
+moderator does **not** make someone an admin.
+
+**Audit log** (`audit_log` table): every privileged mutation is recorded
+with actor, action, target and detail — bans/mutes/unbans, channel
+create/delete, role assign/unassign/delete, config changes and whitelist
+edits. Reads are admin-only; the writer never raises (a failed audit must
+not break the action it was recording).
+
 ## Site channels in the client
 
 The client learns each channel's kind from `/api/v1/channels/list` and routes by

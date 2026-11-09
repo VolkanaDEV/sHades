@@ -46,10 +46,14 @@ def main():
                 "    enabled = yes\n    listen_ip = 127.0.0.1\n    listen_port = 42421\n")
     os.makedirs(os.path.join(c_store, "rns-client"), exist_ok=True)
     with open(os.path.join(c_store, "rns-client", "config"), "w") as f:
+        # Two interfaces: the guild hub (API + LXMF) and the DM peer, which
+        # the client dials DIRECTLY (no hub in the DM path -> deterministic).
         f.write("[reticulum]\n  enable_transport = no\n  share_instance = no\n\n"
                 "[interfaces]\n"
                 "  [[TCP Client Interface]]\n    type = TCPClientInterface\n"
-                "    enabled = yes\n    target_host = 127.0.0.1\n    target_port = 42421\n")
+                "    enabled = yes\n    target_host = 127.0.0.1\n    target_port = 42421\n"
+                "  [[TCP Client Interface DM]]\n    type = TCPClientInterface\n"
+                "    enabled = yes\n    target_host = 127.0.0.1\n    target_port = 42422\n")
 
     # ---- create the test client identity BEFORE the guild boots ----
     # so we can pre-seed moderators.txt with this client's delivery hash.
@@ -692,28 +696,35 @@ def main():
         main_router.announce(main_delivery.hash)
         time.sleep(1.5)
 
-        # peer config: its own TCP client interface onto the same server
+        # peer: its own process + RNS instance, listening so the client can
+        # dial it DIRECTLY (a hub-mediated path is racy: the hub may
+        # rebroadcast the client's announce before the peer exists).
         peer_cfg = os.path.join(c_store, "rns-peer")
         os.makedirs(peer_cfg, exist_ok=True)
-        with open(os.path.join(peer_cfg, "config"), "w") as f:
-            f.write("[reticulum]\n  enable_transport = no\n  share_instance = no\n\n"
-                    "[interfaces]\n"
-                    "  [[TCP Client Interface]]\n    type = TCPClientInterface\n"
-                    "    enabled = yes\n    target_host = 127.0.0.1\n"
-                    "    target_port = 42421\n")
+        peer_out_path = os.path.join(base, "dm_peer.log")
         peer = subprocess.Popen(
             ["/usr/bin/python3", os.path.join(RETI_DIR, "tests", "dm_peer.py"),
-             peer_cfg, hexstr(main_delivery.hash), "mesh hello u7"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+             peer_cfg, hexstr(main_delivery.hash), "mesh hello u7", "42422"],
+            stdout=open(peer_out_path, "w"), stderr=subprocess.STDOUT, text=True)
+        # re-announce while the peer comes up, so it hears the destination
+        deadline = time.time() + 60
+        while peer.poll() is None and time.time() < deadline:
+            main_router.announce(main_delivery.hash)
+            time.sleep(2.0)
         try:
-            out = peer.communicate(timeout=120)[0] or ""
+            peer.communicate(timeout=120)
         except subprocess.TimeoutExpired:
             peer.kill()
-            out = peer.communicate()[0] or ""
+            peer.communicate()
+        out = ""
+        try:
+            out = open(peer_out_path).read()
+        except OSError:
+            pass
         got_it = dm_rx["event"].wait(5)
         check("direct lxmf dm delivered over the mesh",
               got_it and dm_rx["text"] == "mesh hello u7",
-              "peer=%r rx=%r" % (out.strip()[-200:], dm_rx.get("text")))
+              "peer=%r rx=%r" % (out.strip()[-600:], dm_rx.get("text")))
         # the exact client-side persistence path: append in, load back
         peer_hash = hexstr(victim_dest.hash)
         dms.append_dm(dms.dm_history_path(c_store, peer_hash), "in", dm_rx["text"])
@@ -721,6 +732,35 @@ def main():
         check("dm history persisted client-local",
               len(rows) == 1 and rows[0]["dir"] == "in"
               and rows[0]["text"] == "mesh hello u7", rows)
+
+        # ---- U8: admin panel + audit log over the mesh ----
+        r = japi("/api/v1/admin/config", {})
+        check("v1 admin/config over the mesh", r.get("ok") == 1
+              and "registration" in r.get("config", {}), r)
+        r = japi("/api/v1/admin/config", {"key": "guild_name",
+                                          "value": "IntegGuild"})
+        check("v1 admin writes a config value", r.get("ok") == 1, r)
+        r = japi("/api/v1/admin/config", {"key": "guild_name"})
+        check("v1 admin config read-back",
+              r.get("config", {}).get("guild_name") == "IntegGuild", r)
+        r = japi("/api/v1/admin/config", {"key": "bogus", "value": "x"})
+        check("v1 admin rejects an unknown config key", r.get("code") == 400, r)
+        r = japi("/api/v1/admin/audit", {"limit": 50})
+        check("v1 admin/audit over the mesh", r.get("ok") == 1, r)
+        check("v1 audit records the config change",
+              any(e.get("action") == "config.set" for e in r.get("entries", [])),
+              r.get("entries", [])[:3])
+        r = japi("/api/v1/admin/mods", {"op": "list"})
+        check("v1 admin/mods list over the mesh", r.get("ok") == 1, r)
+        # the whitelist round-trips to moderators.txt
+        r = japi("/api/v1/admin/mods", {"op": "add", "user": victim_hash})
+        check("v1 admin adds a moderator", r.get("ok") == 1
+              and victim_hash in r.get("mods", []), r)
+        check("v1 admin add does not promote to admin",
+              victim_hash not in r.get("admins", []), r)
+        r = japi("/api/v1/admin/mods", {"op": "remove", "user": victim_hash})
+        check("v1 admin removes the moderator",
+              victim_hash not in r.get("mods", []), r)
 
         # ---- rate limit (kept last: it exhausts the sender window) ----
         codes = []

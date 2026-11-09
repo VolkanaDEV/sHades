@@ -512,6 +512,24 @@ class GuildAPI:
         return self._request_json("/api/v1/roles/unassign",
                                   {"role_id": role_id, "user": user})
 
+    # ---- admin panel (U8) ----
+    def admin_config(self, key=None, value=None):
+        data = {}
+        if key is not None:
+            data["key"] = key
+        if value is not None:
+            data["value"] = value
+        return self._request_json("/api/v1/admin/config", data)
+
+    def admin_audit(self, limit=100):
+        return self._request_json("/api/v1/admin/audit", {"limit": limit})
+
+    def admin_mods(self, op="list", user=None):
+        data = {"op": op}
+        if user:
+            data["user"] = user
+        return self._request_json("/api/v1/admin/mods", data)
+
     def fetch_file(self, path):
         """Fetch raw bytes from a /file/... request handler on the guild."""
         dlog(f"fetch_file: requesting {path}")
@@ -984,12 +1002,17 @@ class ContextMenuOverlay(FloatLayout):
 
 
 class CtxHeaderLabel(ContextMenuMixin, Label):
-    """Guild header: right-click/long-press offers the invite share-link."""
+    """Guild header: right-click/long-press offers the invite share-link
+    and (for admins) the server settings panel."""
 
     def build_context_menu(self):
         app = App.get_running_app()
-        return [("copy invite link", True,
-                 lambda: app and app._copy_invite())]
+        actions = [("copy invite link", True,
+                    lambda: app and app._copy_invite())]
+        if app and getattr(app, "i_am_admin", False):
+            actions.append(("server settings", True,
+                            lambda: app and app._open_admin_panel()))
+        return actions
 
 
 class ClickableLabel(ContextMenuMixin, ButtonBehavior, Label):
@@ -1849,6 +1872,15 @@ class sHadesClientApp(MDApp):
         # context menu state + moderator flag (from /api/v1/whoami)
         self._ctx_menu = None
         self.i_am_moderator = False
+        # U5/U8: admin flag + role list, filled from /api/v1/whoami
+        self.i_am_admin = False
+        self.my_roles = []
+        self.PERM_VIEW = 1
+        self.PERM_POST = 2
+        self.PERM_MANAGE_MESSAGES = 4
+        self.PERM_MANAGE_CHANNEL = 8
+        self.PERM_MANAGE_ROLES = 16
+        self.PERM_ADMIN = 32
         # client-muted channels (persisted; suppresses unread badges only)
         self._muted_channels = set()
         try:
@@ -1903,6 +1935,7 @@ class sHadesClientApp(MDApp):
         self._dm_popup_peer = None
         self._dm_popup_grid = None
         self._dm_popup_input = None
+        self._admin_popup = None
 
     def _select_random_banners(self):
         """Pick random banner images from media/ folder on startup.
@@ -3502,6 +3535,172 @@ class sHadesClientApp(MDApp):
                                                 % (nick, content[:60])), 0)
         except Exception as e:
             print("dm delivery error:", repr(e))
+
+    # -- admin panel (U8) --------------------------------------------------
+    def _open_admin_panel(self):
+        """Server settings panel: config values, moderator whitelist and
+        the audit log. Admin-only (the server enforces it regardless —
+        this panel just avoids showing admins a broken screen)."""
+        if not self.guild_api or not getattr(self, "i_am_admin", False):
+            return
+        box = BoxLayout(orientation="vertical", spacing=4, padding=6)
+        tabs = BoxLayout(size_hint_y=None, height=32, spacing=4)
+        box.add_widget(tabs)
+        scroll = ScrollView(size_hint=(1, 1))
+        grid = GridLayout(cols=1, size_hint_y=None, spacing=3, padding=[2, 2])
+        grid.bind(minimum_height=grid.setter("height"))
+        scroll.add_widget(grid)
+        box.add_widget(scroll)
+        close = Button(text="close", size_hint_y=None, height=28)
+        box.add_widget(close)
+        popup = Popup(title="server settings", content=box, size_hint=(0.8, 0.8))
+        self._admin_popup = popup
+        close.bind(on_press=lambda inst: popup.dismiss())
+
+        def set_status(txt):
+            Clock.schedule_once(lambda dt: self._set_status(txt), 0)
+
+        def load_config():
+            try:
+                res = self.guild_api.admin_config()
+            except Exception as e:
+                set_status("config: %r" % e)
+                return
+            if not res.get("ok"):
+                set_status("config: %s" % res.get("error", "failed"))
+                return
+            cfg = res.get("config", {})
+            for key, val in sorted(cfg.items()):
+                row = BoxLayout(size_hint_y=None, height=dp(32), spacing=4)
+                row.add_widget(Label(text=key, size_hint_x=0.35,
+                                     halign="left", valign="middle",
+                                     font_size=sp(12)))
+                entry = TextInput(text=str(val), multiline=False,
+                                  size_hint_x=0.45)
+                row.add_widget(entry)
+                save = Button(text="save", size_hint_x=None, width=60,
+                              font_size=sp(11))
+                row.add_widget(save)
+
+                def do_save(k=key, e=entry):
+                    try:
+                        r = self.guild_api.admin_config(k, e.text)
+                    except Exception as ex:
+                        set_status("config: %r" % ex)
+                        return
+                    if r.get("ok"):
+                        set_status("%s saved" % k)
+                        Clock.schedule_once(lambda dt: refresh(), 0)
+                    else:
+                        set_status("%s: %s" % (k, r.get("error")))
+                save.bind(on_press=lambda inst, k=key, e=entry: do_save(k, e))
+                grid.add_widget(row)
+
+        def load_mods():
+            try:
+                res = self.guild_api.admin_mods("list")
+            except Exception as e:
+                set_status("mods: %r" % e)
+                return
+            if not res.get("ok"):
+                set_status("mods: %s" % res.get("error", "failed"))
+                return
+            mods = res.get("mods") or []
+            admins = res.get("admins") or []
+            grid.add_widget(Label(
+                text="moderators (%d)  admins (%d)" % (len(mods), len(admins)),
+                size_hint_y=None, height=dp(22), font_size=sp(12),
+                color=(0.85, 0.87, 0.9, 1), halign="left", valign="middle"))
+            row = BoxLayout(size_hint_y=None, height=dp(32), spacing=4)
+            entry = TextInput(hint_text="user hash (32 hex)",
+                              multiline=False, size_hint_x=0.6)
+            row.add_widget(entry)
+            addm = Button(text="add mod", size_hint_x=None, width=80,
+                          font_size=sp(11))
+            row.add_widget(addm)
+            adda = Button(text="add admin", size_hint_x=None, width=90,
+                          font_size=sp(11))
+            row.add_widget(adda)
+            grid.add_widget(row)
+
+            def do_op(op, target_hash=None):
+                h = (target_hash or (entry.text or "")).strip().lower()
+                if not h:
+                    return
+                try:
+                    r = self.guild_api.admin_mods(op, h)
+                except Exception as ex:
+                    set_status("mods: %r" % ex)
+                    return
+                if r.get("ok"):
+                    entry.text = ""
+                    set_status("%s %s" % (op, h[:12]))
+                    Clock.schedule_once(lambda dt: refresh(), 0)
+                else:
+                    set_status("%s: %s" % (op, r.get("error")))
+            addm.bind(on_press=lambda inst: do_op("add"))
+            adda.bind(on_press=lambda inst: do_op("admin_add"))
+            for h in sorted(set(mods) | set(admins)):
+                kind = ("admin" if h in admins else "mod")
+                r = BoxLayout(size_hint_y=None, height=dp(26), spacing=4)
+                r.add_widget(Label(text="%s %s" % (kind, h[:16]),
+                                   size_hint_x=0.7, halign="left",
+                                   valign="middle", font_size=sp(11)))
+                rm = Button(text="remove", size_hint_x=None, width=70,
+                            font_size=sp(10))
+                rm.bind(on_press=lambda inst, hh=h, kk=kind: do_op(
+                    "admin_remove" if kk == "admin" else "remove", hh))
+                r.add_widget(rm)
+                grid.add_widget(r)
+
+        def load_audit():
+            try:
+                res = self.guild_api.admin_audit(50)
+            except Exception as e:
+                set_status("audit: %r" % e)
+                return
+            if not res.get("ok"):
+                set_status("audit: %s" % res.get("error", "failed"))
+                return
+            entries = res.get("entries") or []
+            grid.add_widget(Label(
+                text="audit log (%d recent)" % len(entries),
+                size_hint_y=None, height=dp(22), font_size=sp(12),
+                color=(0.85, 0.87, 0.9, 1), halign="left", valign="middle"))
+            for e in entries:
+                grid.add_widget(Label(
+                    text="%s  %s  %s" % (e.get("action", ""),
+                                         (e.get("target") or "")[:16],
+                                         (e.get("detail") or "")[:40]),
+                    size_hint_y=None, height=dp(22), font_size=sp(11),
+                    color=(0.8, 0.82, 0.86, 1), halign="left",
+                    valign="middle"))
+
+            views = [("config", load_config), ("moderators", load_mods),
+                     ("audit", load_audit)]
+            current = [0]
+
+            def show(idx):
+                current[0] = idx
+                for i, btn in enumerate(tab_buttons):
+                    btn.background_color = (0.36, 0.41, 0.59, 1) \
+                        if i == idx else (0.24, 0.26, 0.3, 1)
+                grid.clear_widgets()
+                views[idx][1]()
+
+            def refresh():
+                """Reload the tab that is currently open."""
+                show(current[0])
+
+            tab_buttons = []
+            for i, (title, _) in enumerate(views):
+                btn = Button(text=title, background_color=(0.24, 0.26, 0.3, 1),
+                             font_size=sp(12))
+                btn.bind(on_press=lambda inst, idx=i: show(idx))
+                tabs.add_widget(btn)
+                tab_buttons.append(btn)
+            show(0)
+        popup.open()
 
     def _update_channel_badges(self):
         """Push unread counts onto the sidebar buttons (UI thread)."""
