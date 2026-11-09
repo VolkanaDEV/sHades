@@ -36,6 +36,8 @@ try:
     from kivy.uix.floatlayout import FloatLayout
     from kivy.uix.label import Label
     from kivy.uix.image import Image, AsyncImage
+    from kivy.uix.scrollview import ScrollView
+    from kivy.uix.gridlayout import GridLayout
     from kivy.uix.screenmanager import ScreenManager, Screen
     from kivy.core.window import Window
     from kivy.clock import Clock
@@ -73,22 +75,24 @@ from RNS.vendor import umsgpack as msgpack
 import micron
 import invite
 import dms
+import ui_geom
 from micron import (micron_parse, micron_page_bg, micron_media_target,
                     micron_hex3, runs_to_markup, MICRON_MEDIA_EXTS)
 
 # ---------------------------------------------------------------------------
-# Theme (Discord-like dark palette)
+# Theme (Dark Vintage: warm amber primary, cool teal accent for pop)
 # ---------------------------------------------------------------------------
-BG        = "#23272A"   # app background
-SIDEBAR   = "#2F3136"   # channel / member sidebar
-SIDEBAR_D = "#292B2F"
-PANEL     = "#36393F"   # chat area
-INPUT_BG  = "#40444B"   # input bar
-TEXT      = "#DCDDDE"   # primary text
-TEXT_MUTED= "#8E9297"   # secondary text
-LINK      = "#00A2E8"   # links / embeds
-ACCENT    = "#5865F2"   # accent / unread divider
-AVATAR_BG = "#7289DA"
+BG        = "#0A0A0A"   # app background - near black
+SIDEBAR   = "#0E0E0E"   # channel / member sidebar
+SIDEBAR_D = "#080808"
+PANEL     = "#121212"   # chat area
+INPUT_BG  = "#161616"   # input bar
+TEXT      = "#DF993A"   # primary text - vintage amber
+TEXT_MUTED= "#B8862D"   # secondary text - aged amber
+LINK      = "#DF993A"   # links / embeds - amber
+ACCENT    = "#00BFA6"   # accent - vibrant teal (complementary pop)
+AVATAR_BG = "#00BFA6"   # teal highlight for avatars
+BTN_TEXT  = "#0A0A0A"   # button text - near black (for amber buttons)
 
 # Attachment storage styles:
 #   server   - file is stored on the guild; bytes re-fetched via /file/attachments
@@ -104,20 +108,21 @@ ATT_PLACEHOLDER_TEXT = "[loading image…]"
 # headless callers install it on a bare App so KV's app.theme_colors[...]
 # expressions resolve (see THEME_KEYS order for the config screen's c_<key> ids).
 DEFAULT_THEME_COLORS = {
-    "bg_main": (0.14, 0.16, 0.19, 1),      # screens / root background
-    "panel": (0.21, 0.23, 0.27, 1),        # center chat area
-    "panel_darker": (0.25, 0.27, 0.31, 1),  # input bar / dropdowns
-    "bg_sidebar": (0.18, 0.2, 0.23, 1),    # side window backgrounds
-    "sidebar_ctrl": (0.24, 0.26, 0.3, 1),  # sidebar buttons / slim bars
-    "topbar": (0.42, 0.48, 1.0, 1),        # top bar / primary actions
-    "primary": (0.42, 0.48, 1.0, 1),       # primary buttons
-    "accent": (1.0, 0.6, 0.0, 1),          # accent / destructive
-    "text": (1, 1, 1, 1),                  # body text
-    "text_muted": (0.7, 0.73, 0.77, 1),    # secondary text
-    "text_dim": (0.6, 0.63, 0.67, 1),      # dimmer secondary text
-    "input_bg": (0.22, 0.24, 0.28, 1),     # text field fill
-    "input_bg_focus": (0.25, 0.27, 0.31, 1),
-    "msg_own": (0.2, 0.22, 0.25, 1),       # own-message bubble / embeds
+    "bg_main": (0.04, 0.04, 0.04, 1),      # screens / root background - near black
+    "panel": (0.07, 0.07, 0.07, 1),        # center chat area
+    "panel_darker": (0.09, 0.09, 0.09, 1),  # input bar / dropdowns
+    "bg_sidebar": (0.05, 0.05, 0.05, 1),   # side window backgrounds
+    "sidebar_ctrl": (0.08, 0.08, 0.08, 1), # sidebar buttons / slim bars
+    "topbar": (0.04, 0.04, 0.04, 1),       # top bar background - near black
+    "primary": (0.87, 0.60, 0.23, 1),      # primary buttons - vintage amber #DF993A
+    "accent": (0.0, 0.75, 0.65, 1),        # accent / destructive - vibrant teal #00BFA6
+    "text": (0.87, 0.60, 0.23, 1),         # body text - vintage amber
+    "text_muted": (0.72, 0.53, 0.18, 1),   # secondary text - aged amber #B8862D
+    "text_dim": (0.60, 0.44, 0.15, 1),     # dimmer secondary text
+    "input_bg": (0.09, 0.09, 0.09, 1),     # text field fill
+    "input_bg_focus": (0.11, 0.11, 0.11, 1),
+    "msg_own": (0.07, 0.07, 0.07, 1),      # own-message bubble / embeds
+    "btn_text": (0.04, 0.04, 0.04, 1),     # button text - near black (for amber buttons)
 }
 
 THEME_KEYS = (
@@ -617,6 +622,64 @@ IMAGE_CACHE = ImageCache()
 # ---------------------------------------------------------------------------
 # Widgets
 # ---------------------------------------------------------------------------
+class ContextMenuMixin:
+    """Right-click (desktop) / long-press (touch) context menu, Discord-style.
+
+    Subclasses implement `build_context_menu()` returning a list of
+    (label, enabled, callable). Right-click opens immediately; a 0.5 s hold
+    opens it on touch (mouse left-press never does). One code path, two
+    gestures; the menu itself is the app's Window-level overlay.
+
+    NOTE: this class must be defined BEFORE the widgets that inherit from
+    it (MessageRow, ChannelButton, ...). A base class is evaluated at class
+    -definition time, so a mixin defined further down the file makes the
+    module fail to import with NameError."""
+
+    LONG_PRESS_S = 0.5
+
+    def build_context_menu(self):
+        return []
+
+    def _open_ctx_menu(self, window_pos):
+        app = App.get_running_app()
+        if app is not None:
+            app.open_context_menu(self.build_context_menu(), window_pos)
+
+    def on_touch_down(self, touch):
+        if touch.grab_current is self:
+            return super().on_touch_down(touch)
+        if getattr(touch, "button", None) == "right":
+            # desktop right-click: menu instead of the left-press action
+            self._open_ctx_menu(self.to_window(touch.x, touch.y))
+            return True
+        if "button" not in getattr(touch, "profile", []) or \
+                touch.profile == []:
+            # real touch (finger): long-press opens the menu
+            touch.ud["shades_ctx_pos"] = self.to_window(touch.x, touch.y)
+            touch.ud["shades_ctx_fired"] = False
+            touch.grab(self)
+            self._ctx_clock = Clock.schedule_once(
+                lambda dt: self._ctx_fire(touch), self.LONG_PRESS_S)
+        return super().on_touch_down(touch)
+
+    def _ctx_fire(self, touch):
+        touch.ud["shades_ctx_fired"] = True
+        self._open_ctx_menu(touch.ud.get("shades_ctx_pos")
+                            or self.to_window(*self.center))
+
+    def on_touch_up(self, touch):
+        clock = getattr(self, "_ctx_clock", None)
+        if clock:
+            clock.cancel()
+            self._ctx_clock = None
+        if touch.ud.get("shades_ctx_fired"):
+            # the long-press fired: swallow the corresponding up
+            touch.ud["shades_ctx_fired"] = False
+            touch.ungrab(self)
+            return True
+        return super().on_touch_up(touch)
+
+
 if KIVY:
     class PfpImage(Image):
         """Circular-ish avatar placeholder with fallback color."""
@@ -918,59 +981,6 @@ if KIVY:
             pass
 
 
-class ContextMenuMixin:
-    """Right-click (desktop) / long-press (touch) context menu, Discord-style.
-
-    Subclasses implement `build_context_menu()` returning a list of
-    (label, enabled, callable). Right-click opens immediately; a 0.5 s hold
-    opens it on touch (mouse left-press never does). One code path, two
-    gestures; the menu itself is the app's Window-level overlay."""
-
-    LONG_PRESS_S = 0.5
-
-    def build_context_menu(self):
-        return []
-
-    def _open_ctx_menu(self, window_pos):
-        app = App.get_running_app()
-        if app is not None:
-            app.open_context_menu(self.build_context_menu(), window_pos)
-
-    def on_touch_down(self, touch):
-        if touch.grab_current is self:
-            return super().on_touch_down(touch)
-        if getattr(touch, "button", None) == "right":
-            # desktop right-click: menu instead of the left-press action
-            self._open_ctx_menu(self.to_window(touch.x, touch.y))
-            return True
-        if "button" not in getattr(touch, "profile", []) or \
-                touch.profile == []:
-            # real touch (finger): long-press opens the menu
-            touch.ud["shades_ctx_pos"] = self.to_window(touch.x, touch.y)
-            touch.ud["shades_ctx_fired"] = False
-            touch.grab(self)
-            self._ctx_clock = Clock.schedule_once(
-                lambda dt: self._ctx_fire(touch), self.LONG_PRESS_S)
-        return super().on_touch_down(touch)
-
-    def _ctx_fire(self, touch):
-        touch.ud["shades_ctx_fired"] = True
-        self._open_ctx_menu(touch.ud.get("shades_ctx_pos")
-                            or self.to_window(*self.center))
-
-    def on_touch_up(self, touch):
-        clock = getattr(self, "_ctx_clock", None)
-        if clock:
-            clock.cancel()
-            self._ctx_clock = None
-        if touch.ud.get("shades_ctx_fired"):
-            # the long-press fired: swallow the corresponding up
-            touch.ud["shades_ctx_fired"] = False
-            touch.ungrab(self)
-            return True
-        return super().on_touch_up(touch)
-
-
 class ContextMenuOverlay(FloatLayout):
     """Full-screen overlay hosting one context menu; a tap anywhere outside
     the menu dismisses it, a tap on an item acts then dismisses. Parented to
@@ -1103,10 +1113,13 @@ if KIVY:
     class MicronSep(Widget):
         """A thin micron separator line."""
 
-        def __init__(self, color=(0.35, 0.37, 0.42, 1), **kw):
+        def __init__(self, color=None, **kw):
             super().__init__(**kw)
             self.size_hint_y = None
             self.height = dp(2)
+            app = App.get_running_app()
+            if color is None:
+                color = app.theme_colors.get('text_dim', (0.35, 0.37, 0.42, 1)) if app else (0.35, 0.37, 0.42, 1)
             with self.canvas:
                 Color(*color)
                 self._rect = Rectangle(pos=self.pos, size=self.size)
@@ -1121,12 +1134,16 @@ if KIVY:
         glyphs for ☰/⌕/⚙ — they render as boxes with X's — so the icons are
         drawn, not typed. Geometry lives in ui_geom.py (Kivy-free, unit
         tested); this class only emits the instructions."""
-        color = ListProperty([1, 1, 1, 1])
+        color = ListProperty([])
 
         def __init__(self, **kw):
             super().__init__(**kw)
             self.size_hint = (None, None)
             self.size = (dp(40), dp(40))
+            # Default to theme text color if available
+            if not self.color:
+                app = App.get_running_app()
+                self.color = app.theme_colors.get('text', (1, 1, 1, 1)) if app else (1, 1, 1, 1)
             self.bind(pos=self._redraw, size=self._redraw, color=self._redraw)
             Clock.schedule_once(lambda dt: self._redraw(), 0)
 
@@ -1181,8 +1198,10 @@ if KIVY:
             self.size_hint_y = None
             self.padding = [dp(8), dp(8), dp(8), dp(8)]
             self.bind(minimum_height=lambda w, h: setattr(w, "height", h))
+            app = App.get_running_app()
+            term_text_color = app.theme_colors.get('text_muted', (0.85, 0.88, 0.9, 1)) if app else (0.85, 0.88, 0.9, 1)
             self.output = Label(markup=False, halign="left",
-                                color=(0.85, 0.88, 0.9, 1),
+                                color=term_text_color,
                                 font_size=sp(13))
             self.output.size_hint_y = None
             self.output.bind(width=lambda inst, w: setattr(
@@ -1216,7 +1235,7 @@ KV = r"""
             pos: root.crop_cx - root.crop_r, root.crop_cy - root.crop_r
             size: root.crop_r * 2, root.crop_r * 2
         Color:
-            rgba: 1, 1, 1, 1
+            rgba: app.theme_colors['text']
         Line:
             circle: root.crop_cx, root.crop_cy, root.crop_r
             width: 2
@@ -1239,7 +1258,7 @@ KV = r"""
     spacing: dp(8)
     canvas.before:
         Color:
-            rgba: (0.2, 0.22, 0.25, 1) if root.is_own else (0, 0, 0, 0)
+            rgba: app.theme_colors['msg_own'] if root.is_own else (0, 0, 0, 0)
         RoundedRectangle:
             pos: self.pos
             size: self.size
@@ -1264,7 +1283,7 @@ KV = r"""
             ClickableLabel:
                 text: root.username
                 target_hash: root.author_hash
-                color: (1, 1, 1, 1) if root.is_own else (0.9, 0.9, 0.9, 1)
+                color: app.theme_colors['text'] if root.is_own else app.theme_colors['text_muted']
                 bold: True
                 font_size: sp(13)
                 text_size: self.width, None
@@ -1275,7 +1294,7 @@ KV = r"""
                 on_press: app.open_profile(root.author_hash, root.username)
             Label:
                 text: root.ts
-                color: (0.6, 0.63, 0.67, 1)
+                color: app.theme_colors['text_dim']
                 font_size: sp(11)
                 text_size: self.width, None
                 size_hint_x: None
@@ -1286,7 +1305,7 @@ KV = r"""
             id: content_lbl
             text: root.content_markup
             markup: True
-            color: (1, 1, 1, 1)
+            color: app.theme_colors['text']
             font_size: sp(14)
             text_size: self.width, None
             size_hint_y: None
@@ -1306,7 +1325,7 @@ KV = r"""
     spacing: dp(4)
     Label:
         text: root.channel_name
-        color: (1, 1, 1, 0.85)
+        color: app.theme_colors['text_muted']
         font_size: sp(13)
         halign: 'left'
         valign: 'middle'
@@ -1328,7 +1347,7 @@ KV = r"""
     ClickableLabel:
         text: root.username
         target_hash: root.author_hash
-        color: (1, 1, 1, 0.9)
+        color: app.theme_colors['text_muted']
         font_size: sp(13)
         halign: 'left'
         valign: 'middle'
@@ -1343,7 +1362,7 @@ KV = r"""
         spacing: dp(20)
         canvas.before:
             Color:
-                rgba: 0.14, 0.16, 0.19, 1
+                rgba: app.theme_colors['bg_main']
             Rectangle:
                 pos: self.pos
                 size: self.size
@@ -1360,12 +1379,12 @@ KV = r"""
             text: 'sHades'
             font_size: sp(40)
             bold: True
-            color: 1, 1, 1, 1
+            color: app.theme_colors['text']
             size_hint_y: None
             height: dp(60)
         Label:
             text: 'Connect to a guild'
-            color: 0.7, 0.73, 0.77, 1
+            color: app.theme_colors['text_dim']
             font_size: sp(16)
             size_hint_y: None
             height: dp(30)
@@ -1380,9 +1399,9 @@ KV = r"""
                 multiline: False
                 size_hint_y: None
                 height: dp(44)
-                background_color: 0.22, 0.24, 0.28, 1
-                foreground_color: 1, 1, 1, 1
-                cursor_color: 1, 1, 1, 1
+                background_color: app.theme_colors['input_bg']
+                foreground_color: app.theme_colors['text']
+                cursor_color: app.theme_colors['text']
                 on_focus: app._invite_prefill(hub_address, node_hash)
                 on_text_validate: app._invite_prefill(hub_address, node_hash)
             TextInput:
@@ -1391,12 +1410,12 @@ KV = r"""
                 multiline: False
                 size_hint_y: None
                 height: dp(44)
-                background_color: 0.18, 0.2, 0.23, 1
-                foreground_color: 1, 1, 1, 1
-                cursor_color: 1, 1, 1, 1
+                background_color: app.theme_colors['input_bg']
+                foreground_color: app.theme_colors['text']
+                cursor_color: app.theme_colors['text']
             Label:
                 text: 'Guild hashes (leave blank to auto-discover from hub announce)'
-                color: 0.7, 0.73, 0.77, 1
+                color: app.theme_colors['text_dim']
                 font_size: sp(12)
                 size_hint_y: None
                 height: dp(20)
@@ -1409,29 +1428,29 @@ KV = r"""
                 multiline: False
                 size_hint_y: None
                 height: dp(40)
-                background_color: 0.18, 0.2, 0.23, 1
-                foreground_color: 1, 1, 1, 1
-                cursor_color: 1, 1, 1, 1
+                background_color: app.theme_colors['input_bg']
+                foreground_color: app.theme_colors['text']
+                cursor_color: app.theme_colors['text']
             TextInput:
                 id: delivery_hash
                 hint_text: 'Guild delivery_hash (32 hex, optional)'
                 multiline: False
                 size_hint_y: None
                 height: dp(40)
-                background_color: 0.18, 0.2, 0.23, 1
-                foreground_color: 1, 1, 1, 1
-                cursor_color: 1, 1, 1, 1
+                background_color: app.theme_colors['input_bg']
+                foreground_color: app.theme_colors['text']
+                cursor_color: app.theme_colors['text']
         Button:
             text: 'Connect'
             size_hint_y: None
             height: dp(50)
-            background_color: 0.36, 0.41, 0.59, 1
-            color: 1, 1, 1, 1
+            background_color: app.theme_colors['primary']
+            color: app.theme_colors['btn_text']
             on_press:app.connect_to_guild(hub_address.text,username.text,node_hash.text,delivery_hash.text)
         Label:
             id: status
             text: ''
-            color: 1, 0.4, 0.4, 1
+            color: app.theme_colors['accent']
             font_size: sp(13)
             size_hint_y: None
             height: dp(30)
@@ -1443,7 +1462,7 @@ KV = r"""
         spacing: dp(15)
         canvas.before:
             Color:
-                rgba: 0.14, 0.16, 0.19, 1
+                rgba: app.theme_colors['bg_main']
             Rectangle:
                 pos: self.pos
                 size: self.size
@@ -1451,7 +1470,7 @@ KV = r"""
             text: 'Profile'
             font_size: sp(32)
             bold: True
-            color: 1, 1, 1, 1
+            color: app.theme_colors['text']
             size_hint_y: None
             height: dp(50)
         BoxLayout:
@@ -1475,7 +1494,7 @@ KV = r"""
                         pos: self.center_x - dp(75), self.center_y - dp(75)
                         size: dp(150), dp(150)
                     Color:
-                        rgba: 1, 1, 1, 1
+                        rgba: app.theme_colors['text']
                     Line:
                         circle: self.center_x, self.center_y, 75
                         width: 2
@@ -1485,7 +1504,7 @@ KV = r"""
             text: root.target_username
             font_size: sp(20)
             bold: True
-            color: 1, 1, 1, 1
+            color: app.theme_colors['text']
             size_hint_y: None
             height: dp(30)
             halign: 'center'
@@ -1496,13 +1515,13 @@ KV = r"""
             multiline: False
             size_hint_y: None
             height: dp(40)
-            background_color: 0.22, 0.24, 0.28, 1
-            foreground_color: 1, 1, 1, 1
-            cursor_color: 1, 1, 1, 1
+            background_color: app.theme_colors['input_bg']
+            foreground_color: app.theme_colors['text']
+            cursor_color: app.theme_colors['text']
         Label:
             text: 'Node hash: ' + root.target_hash
             font_size: sp(11)
-            color: 0.7, 0.73, 0.77, 1
+            color: app.theme_colors['text_dim']
             size_hint_y: None
             height: dp(20)
             halign: 'center'
@@ -1511,7 +1530,7 @@ KV = r"""
         Label:
             text: 'Delivery: ' + root.target_username
             font_size: sp(11)
-            color: 0.7, 0.73, 0.77, 1
+            color: app.theme_colors['text_dim']
             size_hint_y: None
             height: dp(20)
             halign: 'center'
@@ -1525,22 +1544,22 @@ KV = r"""
                 text: 'Change Avatar'
                 size_hint_x: None
                 width: dp(140)
-                background_color: 0.36, 0.41, 0.59, 1
-                color: 1, 1, 1, 1
+                background_color: app.theme_colors['primary']
+                color: app.theme_colors['btn_text']
                 on_press: app.open_file_chooser(avatar=True)
             Button:
                 text: 'Save Username'
                 size_hint_x: None
                 width: dp(140)
-                background_color: 0.36, 0.41, 0.59, 1
-                color: 1, 1, 1, 1
+                background_color: app.theme_colors['primary']
+                color: app.theme_colors['btn_text']
                 on_press: app.save_profile()
             Button:
                 text: 'Back'
                 size_hint_x: None
                 width: dp(100)
-                background_color: 0.5, 0.53, 0.59, 1
-                color: 1, 1, 1, 1
+                background_color: app.theme_colors['sidebar_ctrl']
+                color: app.theme_colors['text']
                 on_press: app.root.current = 'main'
 
 <MainScreen>:
@@ -1548,7 +1567,7 @@ KV = r"""
         orientation: 'vertical'
         canvas.before:
             Color:
-                rgba: 0.14, 0.16, 0.19, 1
+                rgba: app.theme_colors['bg_main']
             Rectangle:
                 pos: self.pos
                 size: self.size
@@ -1564,7 +1583,7 @@ KV = r"""
                 orientation: 'vertical'
                 canvas.before:
                     Color:
-                        rgba: 0.18, 0.2, 0.23, 1
+                        rgba: app.theme_colors['bg_sidebar']
                     Rectangle:
                         pos: self.pos
                         size: self.size
@@ -1582,8 +1601,8 @@ KV = r"""
                     text: 'channels \u25bc' if root.left_open else 'channels \u25b6'
                     size_hint_y: None
                     height: dp(34)
-                    background_color: 0.24, 0.26, 0.3, 1
-                    color: 1, 1, 1, 0.9
+                    background_color: app.theme_colors['sidebar_ctrl']
+                    color: app.theme_colors['text_muted']
                     on_press: root.toggle_left()
                 ScrollView:
                     do_scroll_x: False
@@ -1601,7 +1620,7 @@ KV = r"""
                 size_hint_x: 1
                 canvas.before:
                     Color:
-                        rgba: 0.21, 0.23, 0.27, 1
+                        rgba: app.theme_colors['panel']
                     Rectangle:
                         pos: self.pos
                         size: self.size
@@ -1613,7 +1632,7 @@ KV = r"""
                     Label:
                         id: channel_header
                         text: '#general'
-                        color: 1, 1, 1, 1
+                        color: app.theme_colors['text']
                         bold: True
                         font_size: sp(16)
                         halign: 'left'
@@ -1633,12 +1652,12 @@ KV = r"""
                         padding: [dp(6), dp(6)]
                 BoxLayout:
                     size_hint_y: None
-                    height: dp(56)
-                    padding: [dp(8), dp(6)]
-                    spacing: dp(8)
+                    height: dp(28)
+                    padding: [dp(4), dp(3)]
+                    spacing: dp(4)
                     canvas.before:
                         Color:
-                            rgba: 0.25, 0.27, 0.31, 1
+                            rgba: app.theme_colors['panel_darker']
                         Rectangle:
                             pos: self.pos
                             size: self.size
@@ -1646,25 +1665,25 @@ KV = r"""
                         id: msg_input
                         hint_text: 'Message...'
                         multiline: False
-                        background_color: 0.18, 0.2, 0.23, 1
-                        foreground_color: 1, 1, 1, 1
-                        cursor_color: 1, 1, 1, 1
+                        background_color: app.theme_colors['input_bg']
+                        foreground_color: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
                         on_text_validate: app.send_message()
                     Button:
                         id: send_btn
                         text: 'Send'
                         size_hint_x: None
-                        width: dp(70)
-                        background_color: 0.36, 0.41, 0.59, 1
-                        color: 1, 1, 1, 1
+                        width: dp(47)
+                        background_color: app.theme_colors['primary']
+                        color: app.theme_colors['btn_text']
                         on_press: app.send_message()
                     Button:
                         id: attach_btn
-                        text: 'Attach'
+                        text: '+'
                         size_hint_x: None
-                        width: dp(70)
-                        background_color: 0.45, 0.5, 0.59, 1
-                        color: 1, 1, 1, 1
+                        width: dp(28)
+                        background_color: app.theme_colors['primary']
+                        color: app.theme_colors['btn_text']
                         on_press: app.open_file_chooser(avatar=False)
 
             # ---------------- right: members (collapsable) ----------------
@@ -1675,7 +1694,7 @@ KV = r"""
                 orientation: 'vertical'
                 canvas.before:
                     Color:
-                        rgba: 0.18, 0.2, 0.23, 1
+                        rgba: app.theme_colors['bg_sidebar']
                     Rectangle:
                         pos: self.pos
                         size: self.size
@@ -1686,7 +1705,7 @@ KV = r"""
                     padding: [dp(8), 0]
                     Label:
                         text: 'Members'
-                        color: 1, 1, 1, 1
+                        color: app.theme_colors['text']
                         bold: True
                         font_size: sp(14)
                         halign: 'left'
@@ -1696,8 +1715,8 @@ KV = r"""
                     text: 'members \u25bc' if root.right_open else 'members \u25b6'
                     size_hint_y: None
                     height: dp(34)
-                    background_color: 0.24, 0.26, 0.3, 1
-                    color: 1, 1, 1, 0.9
+                    background_color: app.theme_colors['sidebar_ctrl']
+                    color: app.theme_colors['text_muted']
                     on_press: root.toggle_right()
                 ScrollView:
                     do_scroll_x: False
@@ -3792,9 +3811,11 @@ class sHadesClientApp(MDApp):
 
             def show(idx):
                 current[0] = idx
+                app = App.get_running_app()
+                active_bg = app.theme_colors['primary'] if app else (0.36, 0.41, 0.59, 1)
+                inactive_bg = app.theme_colors['sidebar_ctrl'] if app else (0.24, 0.26, 0.3, 1)
                 for i, btn in enumerate(tab_buttons):
-                    btn.background_color = (0.36, 0.41, 0.59, 1) \
-                        if i == idx else (0.24, 0.26, 0.3, 1)
+                    btn.background_color = active_bg if i == idx else inactive_bg
                 grid.clear_widgets()
                 views[idx][1]()
 
@@ -3804,7 +3825,9 @@ class sHadesClientApp(MDApp):
 
             tab_buttons = []
             for i, (title, _) in enumerate(views):
-                btn = Button(text=title, background_color=(0.24, 0.26, 0.3, 1),
+                app = App.get_running_app()
+                inactive_bg = app.theme_colors['sidebar_ctrl'] if app else (0.24, 0.26, 0.3, 1)
+                btn = Button(text=title, background_color=inactive_bg,
                              font_size=sp(12))
                 btn.bind(on_press=lambda inst, idx=i: show(idx))
                 tabs.add_widget(btn)
@@ -3816,9 +3839,10 @@ class sHadesClientApp(MDApp):
         """Join-code prompt (U6b): shown when the guild's registration
         policy is 'code' and this client has not joined yet."""
         box = BoxLayout(orientation="vertical", spacing=4, padding=6)
+        app = App.get_running_app()
         box.add_widget(Label(text="This guild requires an invite code.",
                              size_hint_y=None, height=24,
-                             color=(1, 1, 1, 1), font_size=sp(13)))
+                             color=app.theme_colors['text'] if app else (1, 1, 1, 1), font_size=sp(13)))
         entry = TextInput(hint_text="invite code", multiline=False)
         box.add_widget(entry)
         row = BoxLayout(size_hint_y=None, height=34, spacing=4)
@@ -3828,7 +3852,7 @@ class sHadesClientApp(MDApp):
         row.add_widget(cancel)
         box.add_widget(row)
         status = Label(text="", size_hint_y=None, height=22,
-                       color=(0.8, 0.82, 0.86, 1), font_size=sp(11))
+                       color=app.theme_colors['text_muted'] if app else (0.8, 0.82, 0.86, 1), font_size=sp(11))
         box.add_widget(status)
         popup = Popup(title="join", content=box, size_hint=(0.7, 0.4))
         self._join_popup = popup
@@ -4624,9 +4648,10 @@ class sHadesClientApp(MDApp):
                      "*.mp4", "*.mp3", ".pdf", ".txt"]
         )
         style_box = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        app = App.get_running_app()
         style_box.add_widget(
             Label(text="Store:", size_hint_x=None, width=dp(50),
-                  color=(1, 1, 1, 1), font_size=sp(12),
+                  color=app.theme_colors['text'] if app else (1, 1, 1, 1), font_size=sp(12),
                   halign="left", valign="middle"))
         btn_server = Button(text="Server-stored", size_hint_x=None, width=dp(130))
         btn_ephem = Button(text="Ephemeral (P2P)", size_hint_x=None, width=dp(130))
@@ -4634,8 +4659,10 @@ class sHadesClientApp(MDApp):
 
         def pick(s):
             selected["style"] = s
-            btn_server.background_color = (0.42, 0.48, 1.0, 1) if s == ATT_SERVER else (0.25, 0.27, 0.31, 1)
-            btn_ephem.background_color = (0.42, 0.48, 1.0, 1) if s == ATT_EPHEMERAL else (0.25, 0.27, 0.31, 1)
+            active_bg = app.theme_colors['primary'] if app else (0.42, 0.48, 1.0, 1)
+            inactive_bg = app.theme_colors['panel_darker'] if app else (0.25, 0.27, 0.31, 1)
+            btn_server.background_color = active_bg if s == ATT_SERVER else inactive_bg
+            btn_ephem.background_color = active_bg if s == ATT_EPHEMERAL else inactive_bg
 
         btn_server.bind(on_press=lambda *_: pick(ATT_SERVER))
         btn_ephem.bind(on_press=lambda *_: pick(ATT_EPHEMERAL))
@@ -4644,9 +4671,11 @@ class sHadesClientApp(MDApp):
         style_box.add_widget(btn_ephem)
 
         btn_ok = Button(text="OK — Send", size_hint_y=None, height=dp(44),
-                        background_color=(0.42, 0.48, 1.0, 1), color=(1, 1, 1, 1))
+                        background_color=app.theme_colors['primary'] if app else (0.42, 0.48, 1.0, 1),
+                        color=app.theme_colors['text'] if app else (1, 1, 1, 1))
         btn_cancel = Button(text="Cancel", size_hint_y=None, height=dp(44),
-                            background_color=(0.25, 0.27, 0.31, 1), color=(1, 1, 1, 1))
+                            background_color=app.theme_colors['panel_darker'] if app else (0.25, 0.27, 0.31, 1),
+                            color=app.theme_colors['text'] if app else (1, 1, 1, 1))
         btn_box = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
         btn_box.add_widget(btn_ok)
         btn_box.add_widget(btn_cancel)
@@ -4654,7 +4683,7 @@ class sHadesClientApp(MDApp):
         content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
         content.add_widget(Label(text="Attach a file — choose how it is stored:",
                                  size_hint_y=None, height=dp(24),
-                                 color=(1, 1, 1, 1), font_size=sp(12)))
+                                 color=app.theme_colors['text'] if app else (1, 1, 1, 1), font_size=sp(12)))
         content.add_widget(chooser)
         content.add_widget(style_box)
         content.add_widget(btn_box)
@@ -4931,8 +4960,8 @@ class sHadesClientApp(MDApp):
         content.add_widget(scroll)
 
         close_btn = Button(text="Close", size_hint_y=None, height=dp(40),
-                           background_color=(0.5, 0.53, 0.59, 1),
-                           color=(1, 1, 1, 1))
+                           background_color=app.theme_colors['sidebar_ctrl'] if app else (0.5, 0.53, 0.59, 1),
+                           color=app.theme_colors['text'] if app else (1, 1, 1, 1))
         content.add_widget(close_btn)
 
         popup = Popup(title="Profile: %s" % (username or target_hash[:12]),
@@ -5031,10 +5060,12 @@ class sHadesClientApp(MDApp):
             height=dp(44),
             spacing=dp(10),
         )
-        save_btn = Button(text="Save PFP", background_color=(0.36, 0.41, 0.59, 1),
-                          color=(1, 1, 1, 1))
-        cancel_btn = Button(text="Cancel", background_color=(0.5, 0.53, 0.59, 1),
-                            color=(1, 1, 1, 1))
+        save_btn = Button(text="Save PFP",
+                          background_color=self.theme_colors['primary'],
+                          color=self.theme_colors['btn_text'])
+        cancel_btn = Button(text="Cancel",
+                            background_color=self.theme_colors['sidebar_ctrl'],
+                            color=self.theme_colors['text_muted'])
         btn_box.add_widget(save_btn)
         btn_box.add_widget(cancel_btn)
 
