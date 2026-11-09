@@ -2583,11 +2583,12 @@ class sHadesClientApp(MDApp):
             # Write an RNS config that routes to the guild. If a hub address was
             # provided, use a TCPClientInterface to reach it directly;
             # otherwise use AutoInterface for LAN multicast discovery.
+            self.client_port = 29222
             cfgfile = os.path.join(storage, "config")
             if not os.path.exists(cfgfile) or self._config_needs_update(cfgfile):
                 with open(cfgfile, "w") as f:
                     f.write("[reticulum]\n"
-                            "  enable_transport = no\n"
+                            "  enable_transport = yes\n"
                             "  share_instance = no\n\n"
                             "[interfaces]\n")
                     if self.hub_address:
@@ -2601,15 +2602,14 @@ class sHadesClientApp(MDApp):
                                 "    type = AutoInterface\n"
                                 "    enabled = yes\n")
 
-                    f.write("  [[TCPServerInterface]]\\n"
-                            "    type = TCPServerInterface\\n"
-                            "    enabled = yes\\n"
-                            "    listen_ip = 0.0.0.0\\n"
-                            "    listen_port = %d\\n" % 29222)
+                    f.write("  [[TCPServerInterface]]\n"
+                            "    type = TCPServerInterface\n"
+                            "    enabled = yes\n"
+                            "    listen_ip = 0.0.0.0\n"
+                            "    listen_port = %d\n" % self.client_port)
 
             reticulum = RNS.Reticulum(configdir=storage)
             self.reticulum = reticulum
-            self.client_port = 29222
         except Exception as e:
             print("init reticulum error:", repr(e))
             self._set_status("connect failed: %s" % e)
