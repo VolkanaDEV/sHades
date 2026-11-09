@@ -182,6 +182,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
     ts REAL, actor TEXT, action TEXT, target TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS server_config (
     key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS invites (
+    code TEXT PRIMARY KEY, label TEXT, created_at REAL, expires_at REAL,
+    max_uses INTEGER NOT NULL DEFAULT 0, uses INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT);
+CREATE TABLE IF NOT EXISTS guild_joins (
+    user_hash TEXT PRIMARY KEY, joined_at REAL, code TEXT);
 CREATE INDEX IF NOT EXISTS idx_reactions_msg ON reactions(msg_id);
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, id);
@@ -1448,6 +1454,11 @@ def api_delete(viewer, data):
 def api_register(viewer, data):
     username = (data.get("username") or "").strip()
     profile_node = (data.get("profile_node") or "").strip()
+    # join gate (U6b): with the 'code' policy a member must present a
+    # valid invite code (/api/v1/join) before they can claim a username.
+    # Existing members (already registered) are never locked out.
+    if _registration_policy() == "code" and not _has_joined(viewer):
+        return api_error("join code required", 403)
     if not re.match(r"^[A-Za-z0-9_\-\. ]{2,32}$", username):
         return api_error("invalid username", 400)
     if profile_node and not re.match(r"^[0-9a-fA-F]{32}$", profile_node):
@@ -2879,6 +2890,128 @@ def _write_hash_file(path, hashes):
         for h in hashes:
             f.write(h + "\n")
     os.replace(tmp, path)
+
+def _registration_policy():
+    """'open' (default) or 'code' — whether a new member needs an invite
+    code to register."""
+    return (_cfg_get("registration", "open") or "open").strip().lower()
+
+def _has_joined(user_hash):
+    """True if this user is already in the guild for gate purposes: either
+    they joined with a code, or they already registered a username (so
+    turning the gate on never locks existing members out)."""
+    if not user_hash:
+        return False
+    with db_lock:
+        if db.execute("SELECT 1 FROM guild_joins WHERE user_hash=?",
+                      (user_hash,)).fetchone():
+            return True
+        row = db.execute("SELECT username FROM users WHERE dest_hash=?",
+                         (user_hash,)).fetchone()
+    return bool(row and row["username"])
+
+def _new_invite_code():
+    """Short unambiguous code (Crockford-ish base32, no I/O/0/1)."""
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    raw = os.urandom(8)
+    return "".join(alphabet[b % len(alphabet)] for b in raw)
+
+@api_route("/api/v1/join")
+@wrap_json_api
+def api_v1_join(viewer, data, link_id):
+    """Join gate (U6b). GET (no code) reports the state; POST {code} tries
+    to join with an invite code. The policy is the `registration` server
+    setting: 'open' (default — everybody may register) or 'code' (a valid
+    invite code is required to register)."""
+    policy = _registration_policy()
+    if policy not in ("open", "code"):
+        policy = "open"
+    required = (policy == "code")
+    joined = _has_joined(viewer)
+    code = (data.get("code") or "").strip().upper()
+    if not code:
+        return {"ok": 1, "required": required, "joined": joined,
+                "policy": policy}
+    if not required:
+        # open guild: joining is implicit, but still record it so the state
+        # is consistent if the policy is tightened later
+        with db_lock:
+            db.execute("INSERT OR IGNORE INTO guild_joins (user_hash, joined_at, "
+                       "code) VALUES (?, ?, ?)", (viewer, now(), ""))
+            db.commit()
+        return {"ok": 1, "required": False, "joined": True, "policy": policy}
+    if not re.match(r"^[A-Z0-9]{6,16}$", code):
+        return {"ok": 0, "error": "invalid code", "code": 400}
+    with db_lock:
+        row = db.execute("SELECT * FROM invites WHERE code=?", (code,)).fetchone()
+        if not row:
+            return {"ok": 0, "error": "invalid code", "code": 403}
+        if row["expires_at"] and now() > row["expires_at"]:
+            return {"ok": 0, "error": "code expired", "code": 403}
+        if row["max_uses"] and row["uses"] >= row["max_uses"]:
+            return {"ok": 0, "error": "code exhausted", "code": 403}
+        db.execute("UPDATE invites SET uses = uses + 1 WHERE code=?", (code,))
+        db.execute("INSERT OR IGNORE INTO guild_joins (user_hash, joined_at, "
+                   "code) VALUES (?, ?, ?)", (viewer, now(), code))
+        db.commit()
+    _audit(viewer, "join", None, "code=%s" % code)
+    return {"ok": 1, "required": True, "joined": True, "policy": policy}
+
+@api_route("/api/v1/invites")
+@wrap_json_api
+def api_v1_invites(viewer, data, link_id):
+    """Invite codes (admin only). {op: list|create|revoke, code?, label?,
+    max_uses?, expires_in?} — max_uses 0 means unlimited, expires_in 0
+    means never expires."""
+    denied = _require_admin(viewer)
+    if denied:
+        return denied
+    op = (data.get("op") or "list").lower()
+    if op == "list":
+        with db_lock:
+            rows = db.execute("SELECT * FROM invites ORDER BY created_at DESC"
+                              ).fetchall()
+        return {"ok": 1, "invites": [
+            {"code": r["code"], "label": r["label"], "created_at": r["created_at"],
+             "expires_at": r["expires_at"], "max_uses": r["max_uses"],
+             "uses": r["uses"], "created_by": r["created_by"]} for r in rows]}
+    if op == "create":
+        try:
+            max_uses = int(data.get("max_uses", 0))
+            expires_in = int(data.get("expires_in", 0))
+        except (TypeError, ValueError):
+            return {"ok": 0, "error": "max_uses/expires_in must be integers",
+                    "code": 400}
+        if max_uses < 0 or max_uses > 10000:
+            return {"ok": 0, "error": "max_uses must be 0-10000", "code": 400}
+        if expires_in < 0 or expires_in > 60 * 60 * 24 * 30:
+            return {"ok": 0, "error": "expires_in must be 0-2592000", "code": 400}
+        label = str(data.get("label") or "")[:64]
+        code = _new_invite_code()
+        with db_lock:
+            if db.execute("SELECT 1 FROM invites WHERE code=?", (code,)).fetchone():
+                code = _new_invite_code()
+            expires_at = (now() + expires_in) if expires_in else 0
+            db.execute("INSERT INTO invites (code, label, created_at, "
+                       "expires_at, max_uses, uses, created_by) "
+                       "VALUES (?, ?, ?, ?, ?, 0, ?)",
+                       (code, label, now(), expires_at, max_uses, viewer))
+            db.commit()
+        _audit(viewer, "invite.create", code, label)
+        return {"ok": 1, "code": code, "label": label, "max_uses": max_uses,
+                "expires_at": expires_at}
+    if op == "revoke":
+        code = (data.get("code") or "").strip().upper()
+        if not re.match(r"^[A-Z0-9]{6,16}$", code):
+            return {"ok": 0, "error": "invalid code", "code": 400}
+        with db_lock:
+            cur = db.execute("DELETE FROM invites WHERE code=?", (code,))
+            db.commit()
+        if not cur.rowcount:
+            return {"ok": 0, "error": "unknown code", "code": 404}
+        _audit(viewer, "invite.revoke", code)
+        return {"ok": 1, "code": code}
+    return {"ok": 0, "error": "op must be list|create|revoke", "code": 400}
 
 def _delete_channel_txn(cid, viewer):
     """Shared channel deletion (API + slash command). Returns

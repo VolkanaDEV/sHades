@@ -530,6 +530,27 @@ class GuildAPI:
             data["user"] = user
         return self._request_json("/api/v1/admin/mods", data)
 
+    # ---- join gate (U6b) ----
+    def join(self, code=None):
+        """Join status (no code) or join with an invite code."""
+        data = {}
+        if code:
+            data["code"] = code
+        return self._request_json("/api/v1/join", data)
+
+    def invites(self, op="list", code=None, label=None, max_uses=None,
+                expires_in=None):
+        data = {"op": op}
+        if code:
+            data["code"] = code
+        if label is not None:
+            data["label"] = label
+        if max_uses is not None:
+            data["max_uses"] = max_uses
+        if expires_in is not None:
+            data["expires_in"] = expires_in
+        return self._request_json("/api/v1/invites", data)
+
     def fetch_file(self, path):
         """Fetch raw bytes from a /file/... request handler on the guild."""
         dlog(f"fetch_file: requesting {path}")
@@ -2489,6 +2510,8 @@ class sHadesClientApp(MDApp):
             Clock.schedule_once(lambda dt: self._start_streamer(), 0)
             Clock.schedule_once(lambda dt: self._refresh_channels_from_guild(), 1.0)
             Clock.schedule_once(lambda dt: self._fetch_whoami(), 1.2)
+            # join gate (U6b): if the guild requires an invite code, prompt
+            Clock.schedule_once(lambda dt: self._check_join_gate(), 1.6)
         except Exception as e:
             print("connect guild error:", repr(e))
             err_msg = "connect failed: %s" % e
@@ -3676,8 +3699,95 @@ class sHadesClientApp(MDApp):
                     color=(0.8, 0.82, 0.86, 1), halign="left",
                     valign="middle"))
 
+            def load_invites():
+                """Invite codes (U6b) — create, list, revoke."""
+                try:
+                    res = self.guild_api.invites("list")
+                except Exception as e:
+                    set_status("invites: %r" % e)
+                    return
+                if not res.get("ok"):
+                    set_status("invites: %s" % res.get("error", "failed"))
+                    return
+                grid.add_widget(Label(
+                    text="invite codes (%d)" % len(res.get("invites") or []),
+                    size_hint_y=None, height=dp(22), font_size=sp(12),
+                    color=(0.85, 0.87, 0.9, 1), halign="left",
+                    valign="middle"))
+                row = BoxLayout(size_hint_y=None, height=dp(32), spacing=4)
+                label_in = TextInput(hint_text="label (optional)",
+                                     multiline=False, size_hint_x=0.45)
+                row.add_widget(label_in)
+                uses_in = TextInput(hint_text="max uses", multiline=False,
+                                    size_hint_x=0.2)
+                row.add_widget(uses_in)
+                exp_in = TextInput(hint_text="expires in s", multiline=False,
+                                   size_hint_x=0.2)
+                row.add_widget(exp_in)
+                mk = Button(text="create", size_hint_x=None, width=70,
+                            font_size=sp(11))
+                row.add_widget(mk)
+                grid.add_widget(row)
+
+                def num(txt, default=0):
+                    try:
+                        return int((txt or "").strip() or default)
+                    except ValueError:
+                        return default
+
+                def do_create():
+                    def work():
+                        try:
+                            r = self.guild_api.invites(
+                                "create", label=(label_in.text or "").strip(),
+                                max_uses=num(uses_in.text),
+                                expires_in=num(exp_in.text))
+                        except Exception as ex:
+                            set_status("invites: %r" % ex)
+                            return
+                        if r.get("ok"):
+                            set_status("invite %s created" % r.get("code"))
+                            Clock.schedule_once(lambda dt: refresh(), 0)
+                        else:
+                            set_status("invites: %s" % r.get("error"))
+                    threading.Thread(target=work, daemon=True).start()
+                mk.bind(on_press=lambda inst: do_create())
+
+                for inv in res.get("invites") or []:
+                    ir = BoxLayout(size_hint_y=None, height=dp(26), spacing=4)
+                    expires = inv.get("expires_at") or 0
+                    exp_txt = "never" if not expires else time.strftime(
+                        "%Y-%m-%d %H:%M", time.localtime(expires))
+                    ir.add_widget(Label(
+                        text="%s  %s  uses %s/%s  exp %s" % (
+                            inv.get("code", ""), inv.get("label") or "-",
+                            inv.get("uses", 0),
+                            inv.get("max_uses") or "*", exp_txt),
+                        size_hint_x=0.8, halign="left", valign="middle",
+                        font_size=sp(10)))
+                    rm = Button(text="revoke", size_hint_x=None, width=70,
+                                font_size=sp(10))
+
+                    def do_revoke(code=inv.get("code")):
+                        def work():
+                            try:
+                                r = self.guild_api.invites("revoke",
+                                                           code=code)
+                            except Exception as ex:
+                                set_status("invites: %r" % ex)
+                                return
+                            if r.get("ok"):
+                                set_status("revoked %s" % code)
+                                Clock.schedule_once(lambda dt: refresh(), 0)
+                            else:
+                                set_status("revoke: %s" % r.get("error"))
+                        threading.Thread(target=work, daemon=True).start()
+                    rm.bind(on_press=lambda inst: do_revoke())
+                    ir.add_widget(rm)
+                    grid.add_widget(ir)
+
             views = [("config", load_config), ("moderators", load_mods),
-                     ("audit", load_audit)]
+                     ("audit", load_audit), ("invites", load_invites)]
             current = [0]
 
             def show(idx):
@@ -3701,6 +3811,74 @@ class sHadesClientApp(MDApp):
                 tab_buttons.append(btn)
             show(0)
         popup.open()
+
+    def _open_join_prompt(self, on_done=None):
+        """Join-code prompt (U6b): shown when the guild's registration
+        policy is 'code' and this client has not joined yet."""
+        box = BoxLayout(orientation="vertical", spacing=4, padding=6)
+        box.add_widget(Label(text="This guild requires an invite code.",
+                             size_hint_y=None, height=24,
+                             color=(1, 1, 1, 1), font_size=sp(13)))
+        entry = TextInput(hint_text="invite code", multiline=False)
+        box.add_widget(entry)
+        row = BoxLayout(size_hint_y=None, height=34, spacing=4)
+        submit = Button(text="join")
+        row.add_widget(submit)
+        cancel = Button(text="cancel")
+        row.add_widget(cancel)
+        box.add_widget(row)
+        status = Label(text="", size_hint_y=None, height=22,
+                       color=(0.8, 0.82, 0.86, 1), font_size=sp(11))
+        box.add_widget(status)
+        popup = Popup(title="join", content=box, size_hint=(0.7, 0.4))
+        self._join_popup = popup
+
+        def do_submit():
+            code = (entry.text or "").strip().upper()
+            if not code:
+                return
+
+            def work():
+                try:
+                    res = self.guild_api.join(code)
+                except Exception as e:
+                    msg = "join failed: %r" % e
+                    Clock.schedule_once(lambda dt: setattr(status, "text", msg), 0)
+                    return
+                if res.get("ok") and res.get("joined"):
+                    Clock.schedule_once(lambda dt: setattr(status, "text",
+                                                          "joined"), 0)
+                    Clock.schedule_once(lambda dt: popup.dismiss(), 0.3)
+                    if on_done:
+                        Clock.schedule_once(lambda dt: on_done(True), 0.4)
+                else:
+                    err = res.get("error", "invalid code")
+                    Clock.schedule_once(lambda dt: setattr(status, "text", err),
+                                        0)
+            threading.Thread(target=work, daemon=True).start()
+
+        submit.bind(on_press=lambda inst: do_submit())
+        entry.bind(on_text_validate=lambda inst: do_submit())
+        cancel.bind(on_press=lambda inst: popup.dismiss())
+        popup.open()
+
+    def _check_join_gate(self):
+        """Ask the guild whether this client may register. Returns True if
+        registration is allowed right now; otherwise prompts for a code."""
+        if not self.guild_api:
+            return True
+
+        def work():
+            try:
+                res = self.guild_api.join()
+            except Exception:
+                return
+            if not res.get("ok"):
+                return
+            if not res.get("required") or res.get("joined"):
+                return
+            Clock.schedule_once(lambda dt: self._open_join_prompt(), 0)
+        threading.Thread(target=work, daemon=True).start()
 
     def _update_channel_badges(self):
         """Push unread counts onto the sidebar buttons (UI thread)."""

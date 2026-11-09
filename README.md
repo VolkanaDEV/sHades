@@ -272,6 +272,26 @@ create/delete, role assign/unassign/delete, config changes and whitelist
 edits. Reads are admin-only; the writer never raises (a failed audit must
 not break the action it was recording).
 
+## Join gate (U6b)
+
+Opt-in, off by default. The `registration` server setting (`open` | `code`)
+decides whether a new member needs an invite code to register. Set it in
+the admin panel's config tab.
+
+- `/api/v1/join` — no code: reports `{required, joined, policy}`; with a
+  code: tries to join. Codes are 8 characters from an unambiguous alphabet
+  (no I/O/0/1), case-insensitive.
+- `/api/v1/invites` (admin only) — `{op: list|create|revoke, code?, label?,
+  max_uses?, expires_in?}`. `max_uses` 0 = unlimited, `expires_in` 0 =
+  never expires.
+- `/api/register` is refused with "join code required" while the policy is
+  `code` and the caller has not joined. **Existing members are never locked
+  out**: a user who already registered a username counts as joined, so
+  turning the gate on never locks the current roster out.
+
+Client: on connect the client asks `/api/v1/join`; if a code is required
+and it has not joined, a join-code prompt opens.
+
 ## Site channels in the client
 
 The client learns each channel's kind from `/api/v1/channels/list` and routes by

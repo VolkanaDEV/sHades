@@ -5,7 +5,7 @@ transport as the rest of the API: **JSON over RNS Link requests** on
 `nomadnetwork.node`. HTML, HTTP and IP-socket APIs remain anti-patterns; the
 guild never becomes a web server.
 
-Status: U1-U8 are DONE (icons; receipts/reactions/search; context menus +
+Status: U1-U8 + U6b are DONE (icons; receipts/reactions/search; context menus +
 mod endpoints + channel deletion). U4-U8 are designed here, not built.
 
 ## U0 — foundations that already exist
@@ -225,16 +225,28 @@ not covered by integ; verify manually on two machines.
   slowmode window/per-user/admin-exemption) + an integ section over the
   mesh.
 
-## U6b — join gate (optional, NOT DONE)
+## U6b — join gate (DONE, opt-in)
 
-Guild-side `invites` table (code, uses, expiry) + registration policy
-setting (`open` | `code`, already writable via `/api/v1/admin/config`);
-the first identified link presents `/api/v1/join {code}` to register.
-Default stays open, so the gate is opt-in.
-
-Remaining U8 niceties not yet done: the audit log as a Micron page
-(`/page/sHades/audit.mu`) for NomadNet users, and role colors on
-usernames / a full channel-overwrite editor in the panel.
+- tables: `invites(code PK, label, created_at, expires_at, max_uses, uses,
+  created_by)` and `guild_joins(user_hash PK, joined_at, code)`.
+- policy = the `registration` server setting: `open` (default) or `code`.
+  `_registration_policy()` reads it; `_has_joined(user_hash)` treats a user
+  with a guild_joins row OR an existing registered username as joined, so
+  turning the gate on NEVER locks the current roster out.
+- endpoints: `/api/v1/join` (no code -> {required, joined, policy}; with a
+  code -> validates format/expiry/uses, bumps the counter and records the
+  join) and `/api/v1/invites` (admin only: list|create|revoke, max_uses
+  0 = unlimited, expires_in 0 = never).
+- enforcement: `/api/register` returns "join code required" while the
+  policy is `code` and the caller has not joined.
+- client: `_check_join_gate()` runs ~1.6 s after connect; if a code is
+  required it opens `_open_join_prompt` (popup with code entry). The admin
+  panel gains an "invites" tab (create with label/max-uses/expiry, list,
+  revoke).
+- Tests: `tests/test_join.py` (30 checks: open-by-default, policy flip,
+  admin gating on invites, invalid/expired/exhausted/revoked codes, use
+  counter, existing-member exemption, register gate, audit rows) + an
+  integ section over the mesh.
 
 ## Build order
 

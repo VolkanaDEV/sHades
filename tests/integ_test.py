@@ -762,6 +762,31 @@ def main():
         check("v1 admin removes the moderator",
               victim_hash not in r.get("mods", []), r)
 
+        # ---- U6b: join gate + invite codes over the mesh ----
+        r = japi("/api/v1/join", {})
+        check("v1 join status over the mesh", r.get("ok") == 1
+              and r.get("policy") == "open", r)
+        r = japi("/api/v1/invites", {"op": "create", "label": "integ",
+                                     "max_uses": 2})
+        check("v1 invite create over the mesh", r.get("ok") == 1
+              and len(r.get("code", "")) == 8, r)
+        invite_code = r.get("code")
+        r = japi("/api/v1/admin/config", {"key": "registration",
+                                          "value": "code"})
+        check("v1 admin switches the join policy to code", r.get("ok") == 1, r)
+        r = japi("/api/v1/join", {})
+        check("v1 join status flips to required", r.get("required") is True, r)
+        r = japi("/api/v1/join", {"code": "NOPE1234"})
+        check("v1 join with a bad code is refused", r.get("ok") == 0, r)
+        r = japi("/api/v1/join", {"code": invite_code})
+        check("v1 join with a valid code succeeds",
+              r.get("ok") == 1 and r.get("joined") is True, r)
+        r = japi("/api/v1/invites", {"op": "revoke", "code": invite_code})
+        check("v1 invite revoke over the mesh", r.get("ok") == 1, r)
+        r = japi("/api/v1/admin/config", {"key": "registration",
+                                          "value": "open"})
+        check("v1 admin restores the open policy", r.get("ok") == 1, r)
+
         # ---- rate limit (kept last: it exhausts the sender window) ----
         codes = []
         for i in range(14):
