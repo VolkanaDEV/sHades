@@ -597,140 +597,201 @@
 
 <ConnectScreen>:
     BoxLayout:
-        orientation: 'vertical'
-        padding: dp(40)
-        spacing: dp(20)
+        orientation: 'horizontal'
         canvas.before:
             Color:
                 rgba: app.theme_colors['bg_main']
             Rectangle:
                 pos: self.pos
                 size: self.size
-        Image:
-            id: banner_config
-            source: app.banner_config_path or ''
-            size_hint_y: None
-            height: dp(200)
-            size_hint_x: None
-            width: dp(400)
-            allow_stretch: False
-            keep_ratio: True
-        Label:
-            text: 'sHades'
-            font_size: sp(40)
-            bold: True
-            color: app.theme_colors['text']
-            size_hint_y: None
-            height: dp(60)
-        Label:
-            text: 'Connect to a guild'
-            color: app.theme_colors['text_muted']
-            size_hint_y: None
-            height: dp(30)
+
+        # ---------------- left: saved servers ----------------
         BoxLayout:
+            id: server_sidebar
+            size_hint_x: None
+            width: dp(200)
             orientation: 'vertical'
-            spacing: dp(10)
-            size_hint_y: None
-            height: dp(340)
-            MDTextField:
-                id: hub_address
-                hint_text: 'Hub address (ip:port, e.g. 192.168.1.50:29221)'
-                multiline: False
-                size_hint_y: None
-                height: dp(44)
-                fill_color_normal: app.theme_colors['input_bg']
-                fill_color_focus: app.theme_colors['input_bg_focus']
-                text_color_normal: app.theme_colors['text']
-                text_color_focus: app.theme_colors['text']
-                cursor_color: app.theme_colors['text']
+            canvas.before:
+                Color:
+                    rgba: app.theme_colors['bg_sidebar']
+                Rectangle:
+                    pos: self.pos
+                    size: self.size
             Label:
-                text: 'Hub address (ip:port) of the guild hub to connect to'
-                color: app.theme_colors['text_muted']
-                size_hint_y: None
-                height: dp(16)
-                halign: 'left'
-                valign: 'middle'
-                text_size: self.width, None
-                font_size: sp(11)
-            MDTextField:
-                id: username
-                hint_text: 'Your username'
-                multiline: False
-                size_hint_y: None
-                height: dp(44)
-                fill_color_normal: app.theme_colors['input_bg']
-                fill_color_focus: app.theme_colors['input_bg_focus']
-                text_color_normal: app.theme_colors['text']
-                text_color_focus: app.theme_colors['text']
-                cursor_color: app.theme_colors['text']
-            Label:
-                text: 'Your display name in the guild'
-                color: app.theme_colors['text_muted']
-                size_hint_y: None
-                height: dp(16)
-                halign: 'left'
-                valign: 'middle'
-                text_size: self.width, None
-                font_size: sp(11)
-            Label:
-                text: 'Guild hashes (leave blank to auto-discover from hub announce)'
-                color: app.theme_colors['text_muted']
-                size_hint_y: None
-                height: dp(20)
-                halign: 'left'
-                valign: 'middle'
-                text_size: self.width, None
-                font_size: sp(11)
-            MDTextField:
-                id: node_hash
-                hint_text: 'Guild node_hash (32 hex, optional)'
-                multiline: False
+                text: 'Saved Servers'
+                color: app.theme_colors['text']
+                bold: True
+                font_size: sp(16)
                 size_hint_y: None
                 height: dp(40)
-                fill_color_normal: app.theme_colors['input_bg']
-                fill_color_focus: app.theme_colors['input_bg_focus']
-                text_color_normal: app.theme_colors['text']
-                text_color_focus: app.theme_colors['text']
-                cursor_color: app.theme_colors['text']
-            Label:
-                text: 'Node hash of the guild (32 hex, optional)'
-                color: app.theme_colors['text_muted']
-                size_hint_y: None
-                height: dp(16)
+                padding: [dp(12), 0]
                 halign: 'left'
                 valign: 'middle'
                 text_size: self.width, None
-                font_size: sp(11)
-            MDTextField:
-                id: delivery_hash
-                hint_text: 'Guild delivery_hash (32 hex, optional)'
-                multiline: False
-                size_hint_y: None
-                height: dp(40)
-                fill_color_normal: app.theme_colors['input_bg']
-                fill_color_focus: app.theme_colors['input_bg_focus']
-                text_color_normal: app.theme_colors['text']
-                text_color_focus: app.theme_colors['text']
-                cursor_color: app.theme_colors['text']
-            Label:
-                text: 'Delivery hash of the guild (32 hex, optional)'
-                color: app.theme_colors['text_muted']
-                size_hint_y: None
-                height: dp(16)
-                halign: 'left'
-                valign: 'middle'
-                text_size: self.width, None
-                font_size: sp(11)
+            ScrollView:
+                do_scroll_x: False
+                GridLayout:
+                    id: server_grid
+                    cols: 1
+                    size_hint_y: None
+                    height: self.minimum_height
+                    spacing: dp(4)
+                    padding: [dp(8), dp(8)]
+            # Add server button at bottom
             MDButton:
                 style: 'filled'
                 size_hint_y: None
-                height: dp(50)
+                height: dp(44)
                 theme_bg_color: 'Custom'
                 md_bg_color: app.theme_colors['primary']
-                on_press: app.connect_to_guild(hub_address.text, username.text, node_hash.text, delivery_hash.text)
+                on_press: app._open_add_server_popup()
                 MDButtonText:
-                    text: 'Connect'
+                    text: '+ Add Server'
                     text_color: app.theme_colors['btn_text']
+
+        # ---------------- right: connect form ----------------
+        BoxLayout:
+            orientation: 'vertical'
+            padding: dp(40)
+            spacing: dp(20)
+            size_hint_x: 1
+            Image:
+                id: banner_config
+                source: app.banner_config_path or ''
+                size_hint_y: None
+                height: dp(200)
+                size_hint_x: None
+                width: dp(400)
+                allow_stretch: False
+                keep_ratio: True
+                padding: dp(40)
+                spacing: dp(20)
+                size_hint_x: 1
+                Image:
+                    id: banner_config
+                    source: app.banner_config_path or ''
+                    size_hint_y: None
+                    height: dp(200)
+                    size_hint_x: None
+                    width: dp(400)
+                    allow_stretch: False
+                    keep_ratio: True
+                Label:
+                    text: 'sHades'
+                    font_size: sp(40)
+                    bold: True
+                    color: app.theme_colors['text']
+                    size_hint_y: None
+                    height: dp(60)
+                Label:
+                    text: 'Connect to a guild'
+                    color: app.theme_colors['text_muted']
+                    size_hint_y: None
+                    height: dp(30)
+                BoxLayout:
+                    orientation: 'vertical'
+                    spacing: dp(10)
+                    size_hint_y: None
+                    height: dp(340)
+                    MDTextField:
+                        id: hub_address
+                        hint_text: 'Hub address (ip:port, e.g. 192.168.1.50:29221)'
+                        multiline: False
+                        size_hint_y: None
+                        height: dp(44)
+                        fill_color_normal: app.theme_colors['input_bg']
+                        fill_color_focus: app.theme_colors['input_bg_focus']
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
+                    Label:
+                        text: 'Hub address (ip:port) of the guild hub to connect to'
+                        color: app.theme_colors['text_muted']
+                        size_hint_y: None
+                        height: dp(16)
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.width, None
+                        font_size: sp(11)
+                    MDTextField:
+                        id: username
+                        hint_text: 'Your username'
+                        multiline: False
+                        size_hint_y: None
+                        height: dp(44)
+                        fill_color_normal: app.theme_colors['input_bg']
+                        fill_color_focus: app.theme_colors['input_bg_focus']
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
+                    Label:
+                        text: 'Your display name in the guild'
+                        color: app.theme_colors['text_muted']
+                        size_hint_y: None
+                        height: dp(16)
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.width, None
+                        font_size: sp(11)
+                    Label:
+                        text: 'Guild hashes (leave blank to auto-discover from hub announce)'
+                        color: app.theme_colors['text_muted']
+                        size_hint_y: None
+                        height: dp(20)
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.width, None
+                        font_size: sp(11)
+                    MDTextField:
+                        id: node_hash
+                        hint_text: 'Guild node_hash (32 hex, optional)'
+                        multiline: False
+                        size_hint_y: None
+                        height: dp(40)
+                        fill_color_normal: app.theme_colors['input_bg']
+                        fill_color_focus: app.theme_colors['input_bg_focus']
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
+                    Label:
+                        text: 'Node hash of the guild (32 hex, optional)'
+                        color: app.theme_colors['text_muted']
+                        size_hint_y: None
+                        height: dp(16)
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.width, None
+                        font_size: sp(11)
+                    MDTextField:
+                        id: delivery_hash
+                        hint_text: 'Guild delivery_hash (32 hex, optional)'
+                        multiline: False
+                        size_hint_y: None
+                        height: dp(40)
+                        fill_color_normal: app.theme_colors['input_bg']
+                        fill_color_focus: app.theme_colors['input_bg_focus']
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
+                    Label:
+                        text: 'Delivery hash of the guild (32 hex, optional)'
+                        color: app.theme_colors['text_muted']
+                        size_hint_y: None
+                        height: dp(16)
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.width, None
+                        font_size: sp(11)
+                    MDButton:
+                        style: 'filled'
+                        size_hint_y: None
+                        height: dp(50)
+                        theme_bg_color: 'Custom'
+                        md_bg_color: app.theme_colors['primary']
+                        on_press: app.connect_to_guild(hub_address.text, username.text, node_hash.text, delivery_hash.text)
+                        MDButtonText:
+                            text: 'Connect'
+                            text_color: app.theme_colors['btn_text']
         Label:
             id: status
             text: ''

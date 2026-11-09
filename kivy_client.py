@@ -2107,6 +2107,9 @@ class sHadesClientApp(MDApp):
         return sm
 
     def on_start(self):
+        # Populate saved servers on ConnectScreen immediately
+        self._refresh_connect_server_sidebar()
+
         # Try to resume a saved session
         sess = self._load_session()
         if sess:
@@ -2463,6 +2466,50 @@ class sHadesClientApp(MDApp):
             btn.bind(on_press=lambda inst, i=idx: self._select_server(i))
             btn.bind(size=lambda inst, val: setattr(inst, 'text_size', (inst.width, None)))
             grid.add_widget(btn)
+
+    def _refresh_connect_server_sidebar(self):
+        """Populate the server grid on ConnectScreen with server buttons."""
+        try:
+            connect = self.root.get_screen("connect")
+            grid = connect.ids.server_grid
+        except Exception:
+            return
+        grid.clear_widgets()
+        for idx, s in enumerate(self._servers):
+            display_name = s.get("display_name", s.get("host", "Server"))
+            host = s.get("host", "")
+            btn = Button(
+                text=display_name[:20],
+                size_hint_y=None,
+                height=dp(52),
+                font_size=sp(11),
+                background_color=self.theme_colors['primary'] if idx == self._active_server_idx else self.theme_colors['sidebar_ctrl'],
+                color=self.theme_colors['btn_text'] if idx == self._active_server_idx else self.theme_colors['text'],
+                halign='left',
+                valign='middle',
+            )
+            # Sub-label with host:port
+            btn.bind(on_press=lambda inst, i=idx: self._select_connect_server(i))
+            btn.bind(size=lambda inst, val: setattr(inst, 'text_size', (inst.width, None)))
+            grid.add_widget(btn)
+
+    def _select_connect_server(self, idx):
+        """Select a server from ConnectScreen and prefill the form."""
+        if idx >= len(self._servers):
+            return
+        self._active_server_idx = idx
+        s = self._servers[idx]
+        self._refresh_connect_server_sidebar()
+        # Prefill the connect form
+        try:
+            connect = self.root.get_screen("connect")
+            connect.ids.hub_address.text = s.get("hub_address", "")
+            connect.ids.username.text = s.get("username", "user")
+            connect.ids.node_hash.text = s.get("node_hash", "")
+            connect.ids.delivery_hash.text = s.get("delivery_hash", "")
+        except Exception:
+            pass
+        self._set_status("Selected %s" % s.get("display_name", "server"))
 
     def _select_server(self, idx):
         """Switch to a different server."""
