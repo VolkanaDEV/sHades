@@ -50,6 +50,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # pycairo builds from source when no wheel matches the resolver's
+      # choice, and the sdist meson build needs the system cairo headers.
+      # Without libcairo2-dev + pkg-config this job dies at pip install
+      # (github run 42715864910, "Dependency cairo not found").
+      - name: Install system cairo headers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libcairo2-dev pkg-config
       - name: Install client deps
         run: python -m pip install --disable-pip-version-check "kivy[base]==2.3.1" "kivymd==2.0.0" pillow rns==1.1.3 lxmf==0.9.4 msgpack
       - name: Import smoke test
