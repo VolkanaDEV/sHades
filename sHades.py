@@ -2173,8 +2173,12 @@ def api_v1_site_get(viewer, data, link_id):
     if not rel:
         return {"ok": 0, "error": "invalid resource path", "code": 400}
     fpath = os.path.join(_site_root(), cid, rel)
-    # traversal guard: the resolved file must stay inside this site's dir
-    if os.path.realpath(fpath) != os.path.join(os.path.realpath(_site_root()), cid, rel):
+    # traversal guard: the resolved file must stay inside this site's dir.
+    # realpath BOTH sides: rel may carry forward slashes (client-supplied),
+    # and on Windows realpath normalizes to backslashes while a raw join
+    # does not, so the un-normalized comparison could never pass there.
+    if os.path.realpath(fpath) != os.path.realpath(
+            os.path.join(os.path.realpath(_site_root()), cid, rel)):
         return {"ok": 0, "error": "invalid resource path", "code": 400}
     offset, length = _chunk_params(data)
     total, chunk = _read_slice(fpath, offset, length)
