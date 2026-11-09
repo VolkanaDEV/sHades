@@ -2222,8 +2222,21 @@ class sHadesClientApp(MDApp):
     def _add_server(self, hub_address, username, node_hash="", delivery_hash="", display_name=None, avatar_path=None):
         """Add or update a server in the list."""
         inv = invite.parse_invite(hub_address)
-        host = inv.get("host") or hub_address
-        port = inv.get("port")
+        if inv:
+            host = inv.get("host") or hub_address
+            port = inv.get("port")
+        else:
+            # Plain ip:port format (no shades:// prefix)
+            if ":" in hub_address:
+                host_part, _, port_part = hub_address.rpartition(":")
+                host = host_part.strip()
+                try:
+                    port = int(port_part.strip()) if port_part.strip().isdigit() else None
+                except ValueError:
+                    port = None
+            else:
+                host = hub_address
+                port = None
         # Generate a display name from host if not provided
         if not display_name:
             display_name = host.split(":")[0] if ":" in host else host
