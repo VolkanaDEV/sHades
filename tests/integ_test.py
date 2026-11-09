@@ -71,7 +71,7 @@ def main():
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
     proc = subprocess.Popen(
-        ["/usr/bin/python3", GUILD_PY, "--storage", g_store,
+        [sys.executable, GUILD_PY, "--storage", g_store,
          "--rns-configdir", os.path.join(g_store, "rns-guild"),
          "--announce-delay", "2",
          # --listen must match the TCPServerInterface written above: without it
@@ -703,7 +703,7 @@ def main():
         os.makedirs(peer_cfg, exist_ok=True)
         peer_out_path = os.path.join(base, "dm_peer.log")
         peer = subprocess.Popen(
-            ["/usr/bin/python3", os.path.join(RETI_DIR, "tests", "dm_peer.py"),
+            [sys.executable, os.path.join(RETI_DIR, "tests", "dm_peer.py"),
              peer_cfg, hexstr(main_delivery.hash), "mesh hello u7", "42422"],
             stdout=open(peer_out_path, "w"), stderr=subprocess.STDOUT, text=True)
         # re-announce while the peer comes up, so it hears the destination

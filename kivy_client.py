@@ -59,6 +59,35 @@ except Exception as _e:  # pragma: no cover - Kivy missing at import time
     KIVY = False
     _KIVY_IMPORT_ERROR = _e
 
+    # Minimal stubs so module-scope class definitions (below) can evaluate
+    # when Kivy is absent. Each name gets its own distinct stub class:
+    # the client stacks several of them in the same bases tuple, and two
+    # occurrences of one class make that definition a TypeError. They are
+    # import-only: instantiating one raises, so nothing silently pretends
+    # to be a widget. Client test suites that need real widgets already
+    # SKIP on their own via kc.KIVY.
+    def _make_kivy_stub(name):
+        class _Stub(object):
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError(
+                    "Kivy stub class %s instantiated; Kivy is not "
+                    "available (%r)" % (name, _KIVY_IMPORT_ERROR))
+        _Stub.__name__ = name
+        return _Stub
+
+    FloatLayout = _make_kivy_stub("FloatLayout")
+    BoxLayout = _make_kivy_stub("BoxLayout")
+    Label = _make_kivy_stub("Label")
+    ButtonBehavior = _make_kivy_stub("ButtonBehavior")
+    App = _make_kivy_stub("App")
+    MDApp = _make_kivy_stub("MDApp")
+
+    def _stub_property(*args, **kwargs):
+        return None
+
+    StringProperty = ObjectProperty = NumericProperty = _stub_property
+    BooleanProperty = DictProperty = ListProperty = _stub_property
+
 # KivyMD imports (only available if Kivy is present)
 if KIVY:
     try:
