@@ -1575,6 +1575,38 @@ KV = r"""
             orientation: 'horizontal'
             size_hint_y: 1
 
+            # ---------------- far-left: servers (guild list) ---------------
+            BoxLayout:
+                id: server_sidebar
+                size_hint_x: None
+                width: dp(64)
+                orientation: 'vertical'
+                canvas.before:
+                    Color:
+                        rgba: app.theme_colors['bg_sidebar']
+                    Rectangle:
+                        pos: self.pos
+                        size: self.size
+                ScrollView:
+                    do_scroll_x: False
+                    GridLayout:
+                        id: server_grid
+                        cols: 1
+                        size_hint_y: None
+                        height: self.minimum_height
+                        spacing: dp(4)
+                        padding: [dp(4), dp(8)]
+                # Add server button at bottom
+                Button:
+                    id: add_server_btn
+                    text: '+'
+                    size_hint_y: None
+                    height: dp(48)
+                    font_size: sp(24)
+                    background_color: app.theme_colors['primary']
+                    color: app.theme_colors['btn_text']
+                    on_press: app._open_add_server_popup()
+
             # ---------------- left: channels (collapsable) ----------------
             BoxLayout:
                 id: left_sidebar
@@ -1969,6 +2001,13 @@ class sHadesClientApp(MDApp):
         # in _connect_after_rns (degrades gracefully if LXMF is missing).
         self._friends_path = os.path.join(_app_data_dir(), "friends.json")
         self._friends = dms.load_friends(self._friends_path)
+
+        # Server/guild list (client-local; each entry has hub_address, node_hash,
+        # delivery_hash, username, display_name, avatar_path). Only one server
+        # is active at a time; channel list inherits from the active server.
+        self._servers_path = os.path.join(_app_data_dir(), "servers.json")
+        self._servers = self._load_servers()
+        self._active_server_idx = 0 if self._servers else -1
         self.lxmf_router = None
         self.lxmf_delivery = None
         self._dm_popup = None
@@ -2077,6 +2116,12 @@ class sHadesClientApp(MDApp):
             self.hub_address = sess.get("hub_address")
             self.hub_host = sess.get("hub_host")
             self.hub_port = sess.get("hub_port")
+            # Try to match the session to a saved server
+            if self.hub_host and self.hub_port:
+                for idx, s in enumerate(self._servers):
+                    if s.get("host") == self.hub_host and s.get("port") == self.hub_port:
+                        self._active_server_idx = idx
+                        break
             self._open_main()
             Clock.schedule_once(lambda dt: self._init_reticulum(), 0.5)
             # Re-render persisted history (embeds survive close/re-open) once
@@ -2089,6 +2134,7 @@ class sHadesClientApp(MDApp):
         try:
             self.root.current = "main"
             self._refresh_channels_ui()
+            self._refresh_server_sidebar()
         except Exception as e:
             print("open main error:", repr(e))
 
@@ -2151,6 +2197,76 @@ class sHadesClientApp(MDApp):
                 return json.load(f)
         except Exception:
             return None
+
+    # -- server/guild list persistence ---------------------------------------
+    def _load_servers(self):
+        try:
+            with open(self._servers_path) as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            pass
+        return []
+
+    def _save_servers(self):
+        try:
+            os.makedirs(_app_data_dir(), exist_ok=True)
+            tmp = self._servers_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self._servers, f, indent=2)
+            os.replace(tmp, self._servers_path)
+        except Exception as e:
+            print("save servers failed:", repr(e))
+
+    def _add_server(self, hub_address, username, node_hash="", delivery_hash="", display_name=None, avatar_path=None):
+        """Add or update a server in the list."""
+        inv = invite.parse_invite(hub_address)
+        host = inv.get("host") or hub_address
+        port = inv.get("port")
+        # Generate a display name from host if not provided
+        if not display_name:
+            display_name = host.split(":")[0] if ":" in host else host
+        entry = {
+            "hub_address": hub_address,
+            "host": host,
+            "port": port,
+            "node_hash": node_hash,
+            "delivery_hash": delivery_hash,
+            "username": username,
+            "display_name": display_name,
+            "avatar_path": avatar_path,
+        }
+        # Check if server already exists (by host+port)
+        for i, s in enumerate(self._servers):
+            if s.get("host") == host and s.get("port") == port:
+                self._servers[i] = entry
+                self._active_server_idx = i
+                self._save_servers()
+                return i
+        self._servers.append(entry)
+        self._active_server_idx = len(self._servers) - 1
+        self._save_servers()
+        return self._active_server_idx
+
+    def _remove_server(self, idx):
+        if 0 <= idx < len(self._servers):
+            self._servers.pop(idx)
+            if self._active_server_idx >= len(self._servers):
+                self._active_server_idx = len(self._servers) - 1
+            self._save_servers()
+
+    def _set_active_server(self, idx):
+        if 0 <= idx < len(self._servers):
+            self._active_server_idx = idx
+            s = self._servers[idx]
+            self.hub_address = s.get("hub_address")
+            self.hub_host = s.get("host")
+            self.hub_port = s.get("port")
+            self.node_hash = s.get("node_hash")
+            self.delivery_hash = s.get("delivery_hash")
+            self.username = s.get("username", "user")
+            self._save_session()
 
     # -- message history persistence (so embeds survive close/re-open) -----
     def _history_path(self):
@@ -2291,6 +2407,9 @@ class sHadesClientApp(MDApp):
             self._set_status("Invalid delivery_hash (need 32 hex)")
             return
 
+        # Add/update server in the list
+        self._add_server(hub_address, username, node_hash, delivery_hash)
+
         self.hub_address = hub_address
         self.hub_host = host
         self.hub_port = port
@@ -2306,6 +2425,117 @@ class sHadesClientApp(MDApp):
             Clock.schedule_once(lambda dt: self._connect_after_rns(), 0)
         else:
             Clock.schedule_once(lambda dt: self._init_reticulum(), 0)
+
+    # -- server sidebar ------------------------------------------------------
+    def _refresh_server_sidebar(self):
+        """Populate the server grid with server buttons."""
+        try:
+            main = self.root.get_screen("main")
+            grid = main.ids.server_grid
+        except Exception:
+            return
+        grid.clear_widgets()
+        for idx, s in enumerate(self._servers):
+            display_name = s.get("display_name", s.get("host", "Server"))
+            btn = Button(
+                text=display_name[:12],  # truncate long names
+                size_hint_y=None,
+                height=dp(48),
+                font_size=sp(10),
+                background_color=self.theme_colors['primary'] if idx == self._active_server_idx else self.theme_colors['sidebar_ctrl'],
+                color=self.theme_colors['btn_text'] if idx == self._active_server_idx else self.theme_colors['text'],
+                halign='center',
+                valign='middle',
+            )
+            btn.bind(on_press=lambda inst, i=idx: self._select_server(i))
+            btn.bind(size=lambda inst, val: setattr(inst, 'text_size', (inst.width, None)))
+            grid.add_widget(btn)
+
+    def _select_server(self, idx):
+        """Switch to a different server."""
+        if idx == self._active_server_idx:
+            return
+        self._set_active_server(idx)
+        self._refresh_server_sidebar()
+        self._refresh_channels_ui()
+        # Reconnect to the new server
+        if self.reticulum is not None:
+            Clock.schedule_once(lambda dt: self._connect_after_rns(), 0)
+        else:
+            Clock.schedule_once(lambda dt: self._init_reticulum(), 0)
+        self._set_status("Switching to %s..." % self._servers[idx].get("display_name", "server"))
+
+    def _open_add_server_popup(self):
+        """Popup to add a new server (guild)."""
+        from kivy.uix.popup import Popup
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.textinput import TextInput
+        from kivy.uix.label import Label
+        from kivy.uix.button import Button
+        from kivy.metrics import dp, sp
+
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
+        box.add_widget(Label(text="Add Server", font_size=sp(18), size_hint_y=None, height=dp(30), color=self.theme_colors['text']))
+
+        hub_in = TextInput(hint_text="Hub address (ip:port or shades://...)", multiline=False, size_hint_y=None, height=dp(40),
+                           background_color=self.theme_colors['input_bg'], foreground_color=self.theme_colors['text'], cursor_color=self.theme_colors['text'])
+        box.add_widget(hub_in)
+
+        user_in = TextInput(hint_text="Username", multiline=False, size_hint_y=None, height=dp(40),
+                            background_color=self.theme_colors['input_bg'], foreground_color=self.theme_colors['text'], cursor_color=self.theme_colors['text'])
+        user_in.text = self.username
+        box.add_widget(user_in)
+
+        node_in = TextInput(hint_text="Node hash (32 hex, optional)", multiline=False, size_hint_y=None, height=dp(40),
+                            background_color=self.theme_colors['input_bg'], foreground_color=self.theme_colors['text'], cursor_color=self.theme_colors['text'])
+        box.add_widget(node_in)
+
+        delivery_in = TextInput(hint_text="Delivery hash (32 hex, optional)", multiline=False, size_hint_y=None, height=dp(40),
+                                background_color=self.theme_colors['input_bg'], foreground_color=self.theme_colors['text'], cursor_color=self.theme_colors['text'])
+        box.add_widget(delivery_in)
+
+        name_in = TextInput(hint_text="Display name (optional)", multiline=False, size_hint_y=None, height=dp(40),
+                            background_color=self.theme_colors['input_bg'], foreground_color=self.theme_colors['text'], cursor_color=self.theme_colors['text'])
+        box.add_widget(name_in)
+
+        status = Label(text="", size_hint_y=None, height=dp(20), color=self.theme_colors['accent'], font_size=sp(11))
+        box.add_widget(status)
+
+        btn_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        def do_add(*_):
+            hub = (hub_in.text or "").strip()
+            user = (user_in.text or "").strip() or "user"
+            node = (node_in.text or "").strip().lower()
+            delivery = (delivery_in.text or "").strip().lower()
+            name = (name_in.text or "").strip() or None
+            if not hub:
+                status.text = "Hub address required"
+                return
+            if ":" not in hub and not hub.startswith("shades://"):
+                status.text = "Hub must be ip:port or shades://..."
+                return
+            if node and not re.fullmatch(r"[0-9a-f]{32}", node):
+                status.text = "Invalid node hash"
+                return
+            if delivery and not re.fullmatch(r"[0-9a-f]{32}", delivery):
+                status.text = "Invalid delivery hash"
+                return
+            self._add_server(hub, user, node, delivery, name)
+            self._refresh_server_sidebar()
+            popup.dismiss()
+            # Connect to the new server
+            self.connect_to_guild(hub, user, node, delivery)
+
+        add_btn = Button(text="Add & Connect", background_color=self.theme_colors['primary'], color=self.theme_colors['btn_text'])
+        add_btn.bind(on_press=do_add)
+        cancel_btn = Button(text="Cancel", background_color=self.theme_colors['sidebar_ctrl'], color=self.theme_colors['text'])
+        cancel_btn.bind(on_press=lambda *_: popup.dismiss())
+        btn_row.add_widget(add_btn)
+        btn_row.add_widget(cancel_btn)
+        box.add_widget(btn_row)
+
+        popup = Popup(title="", content=box, size_hint=(0.8, 0.75), auto_dismiss=False)
+        popup.open()
 
     def _init_reticulum(self):
         """Main thread only: create RNS instance (signal handlers), then
