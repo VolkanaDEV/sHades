@@ -2,10 +2,15 @@
 #:import sp kivy.metrics.sp
 #:import get_color_from_hex kivy.utils.get_color_from_hex
 #:import MDApp kivymd.app.MDApp
+#:import scaled ui_scale.scaled
 
-# Theme colors (Dark Blue theme)
-# primary: #6B7AFF (blue), accent: #FF9800 (orange), background: #0E0E11
-# primary_light: #A8B2FF, primary_dark: #3A4AFF
+# Every button in the client is drawn a third shorter than the height it
+# would otherwise get (40dp -> 26.67dp, and so on). The factor lives in
+# ui_scale.py so the KV layout and the Python-built popups stay in sync.
+# This is the default; buttons with an explicit height below scale their
+# own height the same way.
+<MDButton>:
+    height: scaled(dp(40))
 
 <PFPEditorWidget>:
     canvas.after:
@@ -15,7 +20,7 @@
             pos: root.crop_cx - root.crop_r, root.crop_cy - root.crop_r
             size: root.crop_r * 2, root.crop_r * 2
         Color:
-            rgba: 1, 1, 1, 1
+            rgba: app.theme_colors['text']
         Line:
             circle: root.crop_cx, root.crop_cy, root.crop_r
             width: 2
@@ -62,7 +67,7 @@
             ClickableLabel:
                 text: root.username
                 target_hash: root.author_hash
-                color: (1, 1, 1, 1) if root.is_own else (0.9, 0.9, 0.9, 1)
+                color: app.theme_colors['text'] if root.is_own else app.theme_colors['text_muted']
                 bold: True
                 font_size: sp(13)
                 text_size: self.width, None
@@ -96,7 +101,7 @@
             id: content_lbl
             text: root.content_markup
             markup: True
-            color: (1, 1, 1, 1)
+            color: app.theme_colors['text']
             font_size: sp(14)
             text_size: self.width, None
             size_hint_y: None
@@ -120,7 +125,7 @@
         height: dp(20)
         Label:
             text: root.channel_name
-            color: (1, 1, 1, 0.85)
+            color: app.theme_colors['text_muted']
             font_size: sp(13)
             halign: 'left'
             valign: 'middle'
@@ -129,7 +134,7 @@
         Label:
             id: badge
             text: str(root.badge) if root.badge else ''
-            color: (1, 1, 1, 1)
+            color: app.theme_colors['text']
             bold: True
             font_size: sp(12)
             size_hint_x: None
@@ -210,7 +215,7 @@
     ClickableLabel:
         text: root.username
         target_hash: root.author_hash
-        color: (1, 1, 1, 0.9)
+        color: app.theme_colors['text_muted']
         font_size: sp(13)
         halign: 'left'
         valign: 'middle'
@@ -241,7 +246,7 @@
             text: 'Profile'
             font_size: sp(32)
             bold: True
-            color: 1, 1, 1, 1
+            color: app.theme_colors['text']
             size_hint_y: None
             height: dp(50)
         BoxLayout:
@@ -265,7 +270,7 @@
                         pos: self.center_x - dp(75), self.center_y - dp(75)
                         size: dp(150), dp(150)
                     Color:
-                        rgba: 1, 1, 1, 1
+                        rgba: app.theme_colors['text']
                     Line:
                         circle: self.center_x, self.center_y, 75
                         width: 2
@@ -275,7 +280,7 @@
             text: root.target_username
             font_size: sp(20)
             bold: True
-            color: 1, 1, 1, 1
+            color: app.theme_colors['text']
             size_hint_y: None
             height: dp(30)
             halign: 'center'
@@ -288,9 +293,9 @@
             height: dp(56)
             fill_color_normal: app.theme_colors['input_bg']
             fill_color_focus: app.theme_colors['input_bg_focus']
-            text_color_normal: 1, 1, 1, 1
-            text_color_focus: 1, 1, 1, 1
-            cursor_color: 1, 1, 1, 1
+            text_color_normal: app.theme_colors['text']
+            text_color_focus: app.theme_colors['text']
+            cursor_color: app.theme_colors['text']
         Label:
             text: 'Node hash: ' + root.target_hash
             font_size: sp(11)
@@ -322,6 +327,7 @@
                 on_press: app.open_file_chooser(avatar=True)
                 MDButtonText:
                     text: 'Change Avatar'
+                    text_color: app.theme_colors['btn_text']
             MDButton:
                 style: 'filled'
                 size_hint_x: None
@@ -331,6 +337,7 @@
                 on_press: app.save_profile()
                 MDButtonText:
                     text: 'Save Username'
+                    text_color: app.theme_colors['btn_text']
             MDButton:
                 style: 'outlined'
                 size_hint_x: None
@@ -338,6 +345,7 @@
                 on_press: app.root.current = 'main'
                 MDButtonText:
                     text: 'Back'
+                    text_color: app.theme_colors['text']
 
 <MainScreen>:
     BoxLayout:
@@ -362,10 +370,11 @@
                     size: self.size
             HamburgerIcon:
                 on_press: root.toggle_left()
+                color: app.theme_colors['text']
             CtxHeaderLabel:
                 id: channel_header
                 text: '#' + (root._current_channel or 'general')
-                color: 1, 1, 1, 1
+                color: app.theme_colors['text']
                 bold: True
                 font_size: sp(16)
                 size_hint_x: 1
@@ -374,11 +383,48 @@
                 text_size: self.width, None
             SearchIcon:
                 on_press: app.open_search()
+                color: app.theme_colors['text']
             GearIcon:
                 on_press: app.open_profile(app.my_hash or '', app.username or '')
+                color: app.theme_colors['text']
         BoxLayout:
             orientation: 'horizontal'
             size_hint_y: 1
+
+            # ---------------- far-left: servers (guild list) ---------------
+            BoxLayout:
+                id: server_sidebar
+                size_hint_x: None
+                width: dp(64)
+                orientation: 'vertical'
+                canvas.before:
+                    Color:
+                        rgba: app.theme_colors['bg_sidebar']
+                    Rectangle:
+                        pos: self.pos
+                        size: self.size
+                ScrollView:
+                    do_scroll_x: False
+                    GridLayout:
+                        id: server_grid
+                        cols: 1
+                        size_hint_y: None
+                        height: self.minimum_height
+                        spacing: dp(4)
+                        padding: [dp(4), dp(8)]
+                # Add server button at bottom
+                MDButton:
+                    id: add_server_btn
+                    style: 'filled'
+                    size_hint_y: None
+                    height: dp(48)
+                    theme_bg_color: 'Custom'
+                    md_bg_color: app.theme_colors['primary']
+                    on_press: app._open_add_server_popup()
+                    MDButtonText:
+                        text: '+'
+                        text_color: app.theme_colors['btn_text']
+                        font_size: sp(24)
 
             # ---------------- left: channels (collapsable) ----------------
             BoxLayout:
@@ -465,9 +511,9 @@
                         padding: [dp(6), dp(6)]
                 BoxLayout:
                     size_hint_y: None
-                    height: dp(48)
-                    padding: [dp(8), dp(2)]
-                    spacing: dp(8)
+                    height: dp(24)
+                    padding: [dp(4), dp(1)]
+                    spacing: dp(4)
                     canvas.before:
                         Color:
                             rgba: app.theme_colors['panel_darker']
@@ -482,36 +528,38 @@
                         size_hint_x: 1
                         size_hint_y: None
                         height: self.minimum_height
-                        min_height: dp(40)
-                        max_height: dp(160)
-                        radius: [dp(12), dp(12), dp(12), dp(12)]
+                        min_height: dp(20)
+                        max_height: dp(80)
+                        radius: [dp(6), dp(6), dp(6), dp(6)]
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: 1, 1, 1, 1
-                        text_color_focus: 1, 1, 1, 1
-                        cursor_color: 1, 1, 1, 1
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
                         on_text_validate: app.send_message()
                     MDButton:
                         style: 'filled'
                         size_hint_x: None
-                        width: dp(70)
+                        width: dp(40)
                         theme_bg_color: 'Custom'
                         md_bg_color: app.theme_colors['primary']
                         on_press: app.send_message()
                         MDButtonText:
                             text: 'Send'
+                            text_color: app.theme_colors['btn_text']
                     Widget:
                         size_hint_x: None
-                        width: dp(8)
+                        width: dp(3)
                     MDButton:
                         style: 'filled'
                         size_hint_x: None
-                        width: dp(70)
+                        width: dp(24)
                         theme_bg_color: 'Custom'
-                        md_bg_color: app.theme_colors['accent']
+                        md_bg_color: app.theme_colors['primary']
                         on_press: app.open_attach_dialog()
                         MDButtonText:
-                            text: 'Attach'
+                            text: '+'
+                            text_color: app.theme_colors['btn_text']
 
             SlimButton:
                 text: '>'
@@ -571,7 +619,7 @@
             text: 'sHades'
             font_size: sp(40)
             bold: True
-            color: 1, 1, 1, 1
+            color: app.theme_colors['text']
             size_hint_y: None
             height: dp(60)
         Label:
@@ -592,9 +640,9 @@
                 height: dp(44)
                 fill_color_normal: app.theme_colors['input_bg']
                 fill_color_focus: app.theme_colors['input_bg_focus']
-                text_color_normal: 1, 1, 1, 1
-                text_color_focus: 1, 1, 1, 1
-                cursor_color: 1, 1, 1, 1
+                text_color_normal: app.theme_colors['text']
+                text_color_focus: app.theme_colors['text']
+                cursor_color: app.theme_colors['text']
             Label:
                 text: 'Hub address (ip:port) of the guild hub to connect to'
                 color: app.theme_colors['text_muted']
@@ -612,9 +660,9 @@
                 height: dp(44)
                 fill_color_normal: app.theme_colors['input_bg']
                 fill_color_focus: app.theme_colors['input_bg_focus']
-                text_color_normal: 1, 1, 1, 1
-                text_color_focus: 1, 1, 1, 1
-                cursor_color: 1, 1, 1, 1
+                text_color_normal: app.theme_colors['text']
+                text_color_focus: app.theme_colors['text']
+                cursor_color: app.theme_colors['text']
             Label:
                 text: 'Your display name in the guild'
                 color: app.theme_colors['text_muted']
@@ -632,6 +680,7 @@
                 halign: 'left'
                 valign: 'middle'
                 text_size: self.width, None
+                font_size: sp(11)
             MDTextField:
                 id: node_hash
                 hint_text: 'Guild node_hash (32 hex, optional)'
@@ -640,9 +689,9 @@
                 height: dp(40)
                 fill_color_normal: app.theme_colors['input_bg']
                 fill_color_focus: app.theme_colors['input_bg_focus']
-                text_color_normal: 1, 1, 1, 1
-                text_color_focus: 1, 1, 1, 1
-                cursor_color: 1, 1, 1, 1
+                text_color_normal: app.theme_colors['text']
+                text_color_focus: app.theme_colors['text']
+                cursor_color: app.theme_colors['text']
             Label:
                 text: 'Node hash of the guild (32 hex, optional)'
                 color: app.theme_colors['text_muted']
@@ -660,9 +709,9 @@
                 height: dp(40)
                 fill_color_normal: app.theme_colors['input_bg']
                 fill_color_focus: app.theme_colors['input_bg_focus']
-                text_color_normal: 1, 1, 1, 1
-                text_color_focus: 1, 1, 1, 1
-                cursor_color: 1, 1, 1, 1
+                text_color_normal: app.theme_colors['text']
+                text_color_focus: app.theme_colors['text']
+                cursor_color: app.theme_colors['text']
             Label:
                 text: 'Delivery hash of the guild (32 hex, optional)'
                 color: app.theme_colors['text_muted']
@@ -681,10 +730,11 @@
                 on_press: app.connect_to_guild(hub_address.text, username.text, node_hash.text, delivery_hash.text)
                 MDButtonText:
                     text: 'Connect'
+                    text_color: app.theme_colors['btn_text']
         Label:
             id: status
             text: ''
-            color: 1, 0.4, 0.4, 1
+            color: app.theme_colors['accent']
             font_size: sp(13)
             size_hint_y: None
             height: dp(30)
@@ -750,9 +800,9 @@
                         size_hint_x: 0.66
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: 1, 1, 1, 1
-                        text_color_focus: 1, 1, 1, 1
-                        cursor_color: 1, 1, 1, 1
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
                 BoxLayout:
                     size_hint_y: None
                     height: dp(44)
@@ -768,9 +818,9 @@
                         size_hint_x: 0.66
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: 1, 1, 1, 1
-                        text_color_focus: 1, 1, 1, 1
-                        cursor_color: 1, 1, 1, 1
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
                 BoxLayout:
                     size_hint_y: None
                     height: dp(44)
@@ -786,9 +836,9 @@
                         size_hint_x: 0.66
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: 1, 1, 1, 1
-                        text_color_focus: 1, 1, 1, 1
-                        cursor_color: 1, 1, 1, 1
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
                 BoxLayout:
                     size_hint_y: None
                     height: dp(44)
@@ -804,9 +854,9 @@
                         size_hint_x: 0.66
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: 1, 1, 1, 1
-                        text_color_focus: 1, 1, 1, 1
-                        cursor_color: 1, 1, 1, 1
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
                 BoxLayout:
                     size_hint_y: None
                     height: dp(44)
@@ -822,9 +872,9 @@
                         size_hint_x: 0.66
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: 1, 1, 1, 1
-                        text_color_focus: 1, 1, 1, 1
-                        cursor_color: 1, 1, 1, 1
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
                 BoxLayout:
                     size_hint_y: None
                     height: dp(44)
@@ -840,9 +890,9 @@
                         size_hint_x: 0.66
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: 1, 1, 1, 1
-                        text_color_focus: 1, 1, 1, 1
-                        cursor_color: 1, 1, 1, 1
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
                 BoxLayout:
                     size_hint_y: None
                     height: dp(44)
@@ -858,9 +908,9 @@
                         size_hint_x: 0.66
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: 1, 1, 1, 1
-                        text_color_focus: 1, 1, 1, 1
-                        cursor_color: 1, 1, 1, 1
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
                 BoxLayout:
                     size_hint_y: None
                     height: dp(44)
@@ -876,9 +926,9 @@
                         size_hint_x: 0.66
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: 1, 1, 1, 1
-                        text_color_focus: 1, 1, 1, 1
-                        cursor_color: 1, 1, 1, 1
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
                 BoxLayout:
                     size_hint_y: None
                     height: dp(44)
@@ -894,9 +944,9 @@
                         size_hint_x: 0.66
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: 1, 1, 1, 1
-                        text_color_focus: 1, 1, 1, 1
-                        cursor_color: 1, 1, 1, 1
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
                 BoxLayout:
                     size_hint_y: None
                     height: dp(44)
@@ -912,9 +962,9 @@
                         size_hint_x: 0.66
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: 1, 1, 1, 1
-                        text_color_focus: 1, 1, 1, 1
-                        cursor_color: 1, 1, 1, 1
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
                 BoxLayout:
                     size_hint_y: None
                     height: dp(44)
@@ -930,9 +980,9 @@
                         size_hint_x: 0.66
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: 1, 1, 1, 1
-                        text_color_focus: 1, 1, 1, 1
-                        cursor_color: 1, 1, 1, 1
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
                 BoxLayout:
                     size_hint_y: None
                     height: dp(44)
@@ -948,9 +998,9 @@
                         size_hint_x: 0.66
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: 1, 1, 1, 1
-                        text_color_focus: 1, 1, 1, 1
-                        cursor_color: 1, 1, 1, 1
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
                 BoxLayout:
                     size_hint_y: None
                     height: dp(44)
@@ -966,9 +1016,9 @@
                         size_hint_x: 0.66
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: 1, 1, 1, 1
-                        text_color_focus: 1, 1, 1, 1
-                        cursor_color: 1, 1, 1, 1
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
                 BoxLayout:
                     size_hint_y: None
                     height: dp(44)
@@ -984,9 +1034,9 @@
                         size_hint_x: 0.66
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: 1, 1, 1, 1
-                        text_color_focus: 1, 1, 1, 1
-                        cursor_color: 1, 1, 1, 1
+                        text_color_normal: app.theme_colors['text']
+                        text_color_focus: app.theme_colors['text']
+                        cursor_color: app.theme_colors['text']
         Label:
             id: config_status
             text: ''
@@ -1005,13 +1055,16 @@
                 on_press: root.save_config()
                 MDButtonText:
                     text: 'Save'
+                    text_color: app.theme_colors['btn_text']
             MDButton:
                 style: 'outlined'
                 on_press: root.reset_config()
                 MDButtonText:
                     text: 'Reset'
+                    text_color: app.theme_colors['text']
             MDButton:
                 style: 'outlined'
                 on_press: app.root.current = 'main'
                 MDButtonText:
                     text: 'Back'
+                    text_color: app.theme_colors['text']

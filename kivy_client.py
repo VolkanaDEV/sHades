@@ -2771,6 +2771,7 @@ class sHadesClientApp(MDApp):
         self.root.current = "main"
         # load channels (placeholder: general + anything discovered)
         self._refresh_channels_ui()
+        self._refresh_server_sidebar()
         # Ensure self is in member list
         if self.my_hash and self.username:
             self._record_member(self.my_hash, self.username)
