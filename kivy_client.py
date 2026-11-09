@@ -72,6 +72,7 @@ import RNS
 from RNS.vendor import umsgpack as msgpack
 import micron
 import invite
+import dms
 from micron import (micron_parse, micron_page_bg, micron_media_target,
                     micron_hex3, runs_to_markup, MICRON_MEDIA_EXTS)
 
@@ -841,6 +842,17 @@ if KIVY:
                                     self.msg_id, self.content or "")))
                 actions.append(("delete", True,
                                 lambda: app and app._delete_message(self.msg_id)))
+            uh = self.author_hash or ""
+            if app and uh and uh != app.my_hash and hasattr(app, "_friends"):
+                actions.append(("message", app.lxmf_router is not None,
+                                lambda: app and app._open_dm_popup(
+                                    uh, self.username or "")))
+                label = ("remove friend" if app._friends
+                         and dms.is_friend(app._friends, uh)
+                         else "add friend")
+                actions.append((label, True,
+                                lambda: app and app._toggle_friend(
+                                    uh, self.username or "")))
             return actions
 
         def __init__(self, **kwargs):
@@ -1685,6 +1697,14 @@ if KIVY:
                 ("mention @%s" % name, bool(name),
                  lambda: app and app._mention(name)),
             ]
+            if app and uh and uh != app.my_hash:
+                actions.append(("message", app.lxmf_router is not None,
+                                lambda: app and app._open_dm_popup(uh, name)))
+                label = ("remove friend" if app._friends
+                         and dms.is_friend(app._friends, uh)
+                         else "add friend")
+                actions.append((label, True,
+                                lambda: app and app._toggle_friend(uh, name)))
             if app and app.i_am_moderator and uh and uh != app.my_hash:
                 actions.append(("mute user", True,
                                 lambda: app and app._mod_action("mod_mute", uh, name)))
@@ -1871,6 +1891,18 @@ class sHadesClientApp(MDApp):
         # Avatar pfp paths (set by _save_pfp_crop)
         self.my_avatar_orig = None
         self.my_avatar_small = None
+
+        # Friends roster + DM state (U7, client-local; the guild never sees
+        # either). DM transport is a direct LXMRouter exchange, initialised
+        # in _connect_after_rns (degrades gracefully if LXMF is missing).
+        self._friends_path = os.path.join(_app_data_dir(), "friends.json")
+        self._friends = dms.load_friends(self._friends_path)
+        self.lxmf_router = None
+        self.lxmf_delivery = None
+        self._dm_popup = None
+        self._dm_popup_peer = None
+        self._dm_popup_grid = None
+        self._dm_popup_input = None
 
     def _select_random_banners(self):
         """Pick random banner images from media/ folder on startup.
@@ -2319,6 +2351,27 @@ class sHadesClientApp(MDApp):
                 self.client_identity, RNS.Destination.OUT,
                 RNS.Destination.SINGLE, "lxmf", "delivery")
             self.my_hash = hexstr(self.client_dest.hash)
+
+            # Direct client-to-client DM transport (U7): a real LXMRouter on
+            # our identity. Inbound DMs arrive at our lxmf.delivery destination
+            # (nothing else ever does — guild chat rides the API link), so the
+            # delivery callback IS the DM inbox. Failure to init just
+            # disables DMs; chat keeps working.
+            try:
+                import LXMF
+                self.lxmf_router = LXMF.LXMRouter(
+                    identity=self.client_identity,
+                    storagepath=os.path.join(_app_data_dir(), "lxmf"))
+                self.lxmf_delivery = self.lxmf_router.register_delivery_identity(
+                    self.client_identity,
+                    display_name=(self.username or "sHades"))
+                self.lxmf_router.register_delivery_callback(self._on_dm_delivery)
+                # announce now so friends can hear our lxmf.delivery
+                self.lxmf_router.announce(self.lxmf_delivery.hash)
+            except Exception as e:
+                print("LXMF router init failed (DMs disabled):", repr(e))
+                self.lxmf_router = None
+                self.lxmf_delivery = None
 
             # Discover guild node_hash via RNS announce if not provided.
             # The hub announces nomadnetwork.node over the TCPClientInterface
@@ -3287,6 +3340,155 @@ class sHadesClientApp(MDApp):
         refresh()
         popup.open()
 
+    # -- friends + DMs (U7, client-local) -----------------------------------
+    def _toggle_friend(self, user_hash, username):
+        """Add or remove a friend; persists friends.json and refreshes the
+        sidebar. The guild is not involved."""
+        if not user_hash or user_hash == self.my_hash:
+            return
+        if dms.is_friend(self._friends, user_hash):
+            self._friends = dms.remove_friend(self._friends, user_hash)
+            self._set_status("removed friend @%s" % (username or user_hash[:8]))
+        else:
+            self._friends = dms.add_friend(self._friends, user_hash, username)
+            self._set_status("added friend @%s" % (username or user_hash[:8]))
+        dms.save_friends(self._friends_path, self._friends)
+        self._refresh_members_ui(getattr(self.root.get_screen("main"),
+                                         "_current_channel", "general")
+                                 if self.root else "general")
+
+    def _open_dm_popup(self, peer_hash, nickname):
+        """DM thread popup: local history + direct LXMF send. History is
+        client-local (dms/<hash>.json); the guild relays nothing."""
+        if not peer_hash or peer_hash == self.my_hash:
+            return
+        box = BoxLayout(orientation="vertical", spacing=4, padding=4)
+        title = Label(text="dm: @%s" % (nickname or peer_hash[:8]),
+                      size_hint_y=None, height=22)
+        box.add_widget(title)
+        scroll = ScrollView(size_hint=(1, 1))
+        grid = GridLayout(cols=1, size_hint_y=None, spacing=2, padding=[2, 2])
+        grid.bind(minimum_height=grid.setter("height"))
+        scroll.add_widget(grid)
+        box.add_widget(scroll)
+        row = BoxLayout(size_hint_y=None, height=36, spacing=4)
+        text_in = TextInput(hint_text="message (direct lxmf)",
+                            multiline=False)
+        row.add_widget(text_in)
+        send = Button(text="send", size_hint_x=None, width=70)
+        row.add_widget(send)
+        box.add_widget(row)
+        close = Button(text="close", size_hint_y=None, height=28)
+        box.add_widget(close)
+        popup = Popup(title="dm", content=box, size_hint=(0.7, 0.7))
+        self._dm_popup = popup
+        self._dm_popup_peer = peer_hash
+        self._dm_popup_grid = grid
+        self._dm_popup_input = text_in
+
+        def do_send():
+            text = (text_in.text or "").strip()
+            if not text:
+                return
+            text_in.text = ""
+            self._send_dm(peer_hash, text)
+        send.bind(on_press=lambda inst: do_send())
+        text_in.bind(on_text_validate=lambda inst: do_send())
+        close.bind(on_press=lambda inst: popup.dismiss())
+        self._refresh_dm_popup()
+        popup.open()
+
+    def _refresh_dm_popup(self):
+        """Re-render the open DM thread from local history."""
+        grid = self._dm_popup_grid
+        peer = self._dm_popup_peer
+        if not grid or not peer:
+            return
+        grid.clear_widgets()
+        try:
+            rows = dms.load_dm_history(dms.dm_history_path(_app_data_dir(),
+                                                           peer))
+        except ValueError:
+            rows = []
+        for r in rows:
+            who = "me" if r["dir"] == "out" else "them"
+            grid.add_widget(Label(
+                text="%s: %s" % (who, r["text"][:200]),
+                size_hint_y=None, height=dp(24),
+                color=(0.85, 0.87, 0.9, 1) if r["dir"] == "out"
+                else (1, 1, 1, 1),
+                font_size=sp(12), halign="left", valign="middle"))
+        if not rows:
+            grid.add_widget(Label(text="no messages yet",
+                                  size_hint_y=None, height=dp(24),
+                                  color=(0.6, 0.63, 0.68, 1),
+                                  font_size=sp(12)))
+
+    def _send_dm(self, peer_hash, text):
+        """Direct client-to-client LXMF send (U7). The guild is not a party."""
+        if not self.lxmf_router or not self.lxmf_delivery:
+            self._set_status("dm unavailable (lxmf router offline)")
+            return
+        text = (text or "").strip()
+        if not text:
+            return
+
+        def work():
+            try:
+                import LXMF
+                nid = RNS.Identity.recall(bytes.fromhex(peer_hash))
+                if nid is None:
+                    Clock.schedule_once(lambda dt: self._set_status(
+                        "dm: identity unknown for %s — they must be "
+                        "online/announced" % peer_hash[:8]), 0)
+                    return
+                dest = RNS.Destination(nid, RNS.Destination.OUT,
+                                       RNS.Destination.SINGLE,
+                                       "lxmf", "delivery")
+                lxm = LXMF.LXMessage(dest, self.lxmf_delivery, text,
+                                     title="sHades dm",
+                                     desired_method=LXMF.LXMessage.DIRECT)
+                self.lxmf_router.handle_outbound(lxm)
+            except Exception as e:
+                err = repr(e)
+                Clock.schedule_once(lambda dt: self._set_status(
+                    "dm send failed: %s" % err), 0)
+                return
+            try:
+                dms.append_dm(dms.dm_history_path(_app_data_dir(), peer_hash),
+                              "out", text)
+            except ValueError:
+                pass
+            Clock.schedule_once(lambda dt: self._refresh_dm_popup(), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_dm_delivery(self, lxm):
+        """LXMF delivery callback: everything arriving at our lxmf.delivery
+        destination is a direct DM (guild chat never uses this path)."""
+        try:
+            src = hexstr(lxm.source_hash)
+            content = lxm.content
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", "replace")
+            content = (content or "").strip()
+            if not content:
+                return
+            try:
+                dms.append_dm(dms.dm_history_path(_app_data_dir(), src),
+                              "in", content)
+            except ValueError:
+                return
+            nick = next((f["nickname"] for f in self._friends
+                         if f["user_hash"] == src), None) or ("user-" + src[:6])
+            if self._dm_popup_peer == src:
+                Clock.schedule_once(lambda dt: self._refresh_dm_popup(), 0)
+            else:
+                Clock.schedule_once(
+                    lambda dt: self._set_status("dm from @%s: %s"
+                                                % (nick, content[:60])), 0)
+        except Exception as e:
+            print("dm delivery error:", repr(e))
+
     def _update_channel_badges(self):
         """Push unread counts onto the sidebar buttons (UI thread)."""
         try:
@@ -3843,6 +4045,26 @@ class sHadesClientApp(MDApp):
             main = self.root.get_screen("main")
             grid = main.ids.member_grid
             grid.clear_widgets()
+            # Friends first (U7): local roster, online state best-effort from
+            # the guild presence map (a friend away from the guild shows gray).
+            if self._friends:
+                grid.add_widget(Label(
+                    text="friends (%d)" % len(self._friends),
+                    size_hint_y=None, height=dp(22), color=(1, 0.85, 0.5, 1),
+                    font_size=sp(12), bold=True))
+                for f in self._friends:
+                    online = f["user_hash"] in self._active_users
+                    grid.add_widget(MemberRow(
+                        username=f.get("nickname") or
+                        ("user-" + f["user_hash"][:6]),
+                        avatar_source="",
+                        author_hash=f["user_hash"],
+                        presence_color=[0.2, 0.8, 0.2, 1] if online
+                        else [0.5, 0.5, 0.5, 1],
+                    ))
+                grid.add_widget(Label(
+                    text="members", size_hint_y=None, height=dp(22),
+                    color=(0.7, 0.73, 0.77, 1), font_size=sp(12), bold=True))
             if self._presence_ok:
                 for user_hash, info in sorted(
                         self._active_users.items(),
@@ -4696,6 +4918,14 @@ class sHadesClientApp(MDApp):
             except Exception:
                 pass
         self._term_sessions.clear()
+        # shut the LXMF router so its announce/delivery threads don't leak
+        if self.lxmf_router is not None:
+            try:
+                self.lxmf_router.exit_handler()   # LXMF's own teardown hook
+            except Exception:
+                pass
+            self.lxmf_router = None
+            self.lxmf_delivery = None
 
 
 # ---------------------------------------------------------------------------

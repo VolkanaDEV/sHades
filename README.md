@@ -214,6 +214,20 @@ address field, node hash into the node-hash field. Explicitly typed hash
 fields win over the invite's. Parsing lives in `invite.py` (Kivy-free,
 stdlib only) and is covered by `tests/test_invite.py`.
 
+## Friends + DMs (U7, client-local)
+
+Right-click a member (or message author) -> "add friend" builds a local
+roster (`friends.json` in the app data dir — the guild never sees it).
+Friends head the member sidebar with their own section; online state is
+best-effort from the guild presence map. "message" on the same menu opens
+the DM thread: a popup backed by a real `LXMRouter` on the client identity
+(direct client-to-client LXMF, `lxmf/delivery` — the guild is not a party,
+and chat keeps working even if it's down). Threads persist client-local as
+`dms/<user_hash>.json` (200-message cap). Inbound DMs arrive at the
+client's own lxmf.delivery destination and surface as a status line or
+refresh an open thread. Everything lives in `dms.py` (Kivy-free) and is
+covered by `tests/test_dms.py`.
+
 ## Site channels in the client
 
 The client learns each channel's kind from `/api/v1/channels/list` and routes by

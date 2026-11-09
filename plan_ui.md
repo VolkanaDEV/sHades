@@ -138,14 +138,38 @@ address). Two layers:
    expiry) + registration policy setting (`open` | `code`); first identified
    link presents `/api/v1/join {code}` to register. Default stays open.
 
-## U7 — friends + DMs (client-local)
+## U7 — friends + DMs (DONE, client-local)
 
-DMs are plain LXMF client-to-client today; the guild stays out. Friends =
-client-side roster in app data (`friends.json`: user_hash, nickname, note).
-Right-click user → add friend; friends section above the member list; opening
-a friend opens an LXMF DM conversation view (direct LXMRouter exchange,
-existing client router). Presence for friends comes from the guild presence
-payload when the friend is online there (best-effort).
+- roster: `dms.py` (Kivy-free, stdlib) loads/saves `friends.json`
+  (add dedupes by hash and re-nicknames, remove filters, junk entries are
+  filtered on load, corrupt file -> []). Hash validation: 32-hex only.
+- DM transport: the client NOW RUNS A REAL LXMRouter (U7 addition — the
+  client previously had no LXMF inbound path at all):
+  `LXMRouter(identity=client_identity, storagepath=appdata/lxmf)` +
+  `register_delivery_identity` + `register_delivery_callback` +
+  immediate `announce(delivery.hash)` so friends can hear us. Inbound DMs =
+  everything arriving at our lxmf.delivery destination (guild chat never
+  uses that path — it rides the API link). Router init failure just
+  disables DMs; `on_stop` tears the router down via `exit_handler()`.
+- send: `RNS.Identity.recall(peer_hash)` -> their lxmf.delivery dest ->
+  `LXMessage(dest, our_delivery, text, title="sHades dm", DIRECT)` through
+  `router.handle_outbound` on a worker thread. Unknown identity (peer never
+  announced) -> clear status message, no history row.
+- history: `dms/<user_hash>.json`, {ts, dir in|out, text[:4000]}, 200-row
+  cap, atomic tmp+rename writes.
+- UI: friends section heads the member sidebar (gold header, green dot when
+  the friend is in the guild presence map, gray otherwise); "message" and
+  "add/remove friend" items on both the member-row and message-row context
+  menus; DM popup = thread + input, refreshes live when a DM lands while
+  it's open, status line otherwise.
+- deferred-lambda gotcha (caught by flake8): an `except ... as e` name is
+  DELETED when the block exits — never reference `e` inside a
+  Clock.schedule_once lambda scheduled from that block; bind it first.
+
+Tests: `tests/test_dms.py` (11: roster dedupe/rename/remove/validation,
+persistence + corruption, junk filtering; DM history append/cap/validate/
+corrupt recovery). The LXMF wire path itself needs two live clients —
+not covered by integ; verify manually on two machines.
 
 ## U8 — server config panel (admin only)
 
