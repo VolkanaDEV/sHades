@@ -2470,7 +2470,30 @@ class sHadesClientApp(MDApp):
             return
         self._set_active_server(idx)
         self._refresh_server_sidebar()
-        self._refresh_channels_ui()
+        # Clear all channel/chat state for the new server
+        self._channels.clear()
+        self._channel_kinds.clear()
+        self._channel_unread.clear()
+        self._msg_widgets.clear()
+        self._older.clear()
+        self._seq = 0
+        self._last_ts = 0.0
+        self._stream_cid = None
+        self._stream_cursor = None
+        self._site_stack.clear()
+        self._site_current = None
+        self._site_theme.clear()
+        self._term_sessions.clear()
+        self._term_page = None
+        # Clear UI
+        try:
+            main = self.root.get_screen("main")
+            main.ids.channel_grid.clear_widgets()
+            main.ids.message_grid.clear_widgets()
+            main.ids.channel_header.text = "#general"
+        except Exception:
+            pass
+        self._channels_added = False
         # Reconnect to the new server
         if self.reticulum is not None:
             Clock.schedule_once(lambda dt: self._connect_after_rns(), 0)
@@ -2684,6 +2707,13 @@ class sHadesClientApp(MDApp):
                 self.lxmf_router.register_delivery_callback(self._on_dm_delivery)
                 # announce now so friends can hear our lxmf.delivery
                 self.lxmf_router.announce(self.lxmf_delivery.hash)
+            except ValueError as e:
+                if "signal only works in the main thread" in str(e):
+                    print("LXMF router init failed: must run on main thread (DMs disabled)")
+                else:
+                    print("LXMF router init failed (DMs disabled):", repr(e))
+                self.lxmf_router = None
+                self.lxmf_delivery = None
             except Exception as e:
                 print("LXMF router init failed (DMs disabled):", repr(e))
                 self.lxmf_router = None
