@@ -92,6 +92,8 @@ class StubApp:
         self._members = {}
         self._msg_widgets = {}
         self._pending_attachment = None
+        self._channel_kinds = {}
+        self.theme_colors = dict(kivy_client.DEFAULT_THEME_COLORS)
         self.status = []
         # real implementations, bound to this stub
         self._render_message = functools.partial(
@@ -108,6 +110,13 @@ class StubApp:
             kivy_client.sHadesClientApp._add_loading_placeholder, self)
         self._remove_placeholder = functools.partial(
             kivy_client.sHadesClientApp._remove_placeholder, self)
+        # _render_message() ends by calling this to draw the reaction summary
+        # line; without it the stub raises AttributeError on every render.
+        self._set_row_reactions = functools.partial(
+            kivy_client.sHadesClientApp._set_row_reactions, self)
+        # send_message() checks the channel kind before posting.
+        self._channel_kind = functools.partial(
+            kivy_client.sHadesClientApp._channel_kind, self)
 
     def _set_status(self, text):
         self.status.append(text)

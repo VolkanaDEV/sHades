@@ -20,5 +20,12 @@ lxmf/
 # NomadNet runtime
 .nomadnetwork/
 
+# Build artifacts
+build/
+dist/
+bin/
+.buildozer/
+*.spec.bak
+
 # OS
 .DS_Store

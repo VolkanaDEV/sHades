@@ -78,6 +78,7 @@ class StubApp:
         self.my_avatar_orig = None
         self.my_avatar_small = None
         self._msg_widgets = {}
+        self.theme_colors = dict(kivy_client.DEFAULT_THEME_COLORS)
         # real crop implementation, bound to this stub
         self._save_pfp_crop = functools.partial(
             kivy_client.sHadesClientApp._save_pfp_crop, self)
@@ -134,7 +135,24 @@ def main():
     from kivy.lang import Builder
     from kivy.uix.popup import Popup
 
-    Builder.load_string(kc.KV)
+    # The KV rules live in kv_md.kv (the app loads that file; there is no
+    # inline KV string any more). PFPEditorWidget is defined there.
+    Builder.load_file(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "kv_md.kv"))
+
+    # KV rules read app.theme_colors[...], which Kivy resolves through
+    # App.get_running_app(); the KV proxy also calls app.bind(). With no app
+    # running, building any themed widget raises
+    # "'NoneType' object has no attribute 'bind'". sHadesClientApp is an MDApp
+    # (KivyMD widgets refuse to build under a plain kivy.app.App), constructs
+    # without RNS, and we pin the palette for determinism.
+    class _ThemeApp(kc.sHadesClientApp):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.theme_colors = dict(kc.DEFAULT_THEME_COLORS)
+
+    _ThemeApp()
 
     tmp = tempfile.mkdtemp(prefix="shades_pfp_test_")
     kc._app_data_dir = lambda: tmp

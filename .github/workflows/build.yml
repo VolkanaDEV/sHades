@@ -36,10 +36,17 @@ jobs:
           sudo apt-get install -y -qq libmtdev1 xvfb
       - name: Lint
         run: |
-          python -m py_compile main.py kivy_client.py setup_sHades.py sHades.py
-          python -m flake8 main.py kivy_client.py setup_sHades.py sHades.py
+          python -m py_compile main.py kivy_client.py setup_sHades.py sHades.py ui_scale.py applet_bridge.py
+          python -m flake8 main.py kivy_client.py setup_sHades.py sHades.py ui_scale.py applet_bridge.py
       - name: Import smoke test (headless)
         run: xvfb-run -a env KIVY_GL_BACKEND=mock python -c "import kivy_client; app = kivy_client.sHadesClientApp(); app.build(); print('client builds OK')"
+      - name: Test suite
+        run: |
+          for t in tests/test_*.py; do
+            echo "::group::$t"
+            xvfb-run -a env KIVY_GL_BACKEND=mock python "$t" || { echo "::error::$t failed"; exit 1; }
+            echo "::endgroup::"
+          done
 
   build-linux:
     name: build Linux (PyInstaller onefile)
@@ -69,8 +76,11 @@ jobs:
             --hidden-import=LXMF \
             --hidden-import=RNS.vendor \
             --hidden-import=RNS.vendor.umsgpack \
+            --hidden-import=ui_scale \
             --collect-all=RNS \
             --collect-all=LXMF \
+            --add-data "kv_md.kv:." \
+            --add-data "media:media" \
             --distpath dist/linux
       - name: Publish artifact
         uses: actions/upload-artifact@v4
@@ -96,7 +106,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt "pyinstaller>=6.0,<7.0"
       - name: Build onefile binary
-        run: pyinstaller --onefile --name sHades-client.exe kivy_client.py --hidden-import=RNS --hidden-import=LXMF --hidden-import=RNS.vendor --hidden-import=RNS.vendor.umsgpack --collect-all=RNS --collect-all=LXMF --distpath dist/windows
+        run: pyinstaller --onefile --name sHades-client.exe kivy_client.py --hidden-import=RNS --hidden-import=LXMF --hidden-import=RNS.vendor --hidden-import=RNS.vendor.umsgpack --hidden-import=ui_scale --collect-all=RNS --collect-all=LXMF --add-data "kv_md.kv;." --add-data "media;media" --distpath dist/windows
       - name: Publish artifact
         uses: actions/upload-artifact@v4
         with:

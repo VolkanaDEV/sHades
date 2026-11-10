@@ -21,6 +21,14 @@ try:
     HAVE_WASMTIME = True
 except ImportError:  # pragma: no cover - CI installs wasmtime; keep import safe
     HAVE_WASMTIME = False
+except OSError as e:
+    # The wasmtime wheel is pure-python but loads a native library at import
+    # time. If the wheel does not match the platform (e.g. the py3-none-any
+    # wheel, which ships only a Windows DLL), the import raises OSError, not
+    # ImportError. Treat that as "wasmtime unavailable" so the caller sees a
+    # clean refusal instead of a traceback.
+    print("wasmtime unavailable: %s" % e)
+    HAVE_WASMTIME = False
 
 
 DEFAULT_FUEL = 1_000_000
@@ -92,15 +100,20 @@ class MicronAppletBridge:
         # 1. Hash
         digest = hashlib.sha256(module_bytes).hexdigest()
         if digest != grant.sha256:
-            self.on_refused(f"hash mismatch: manifest {grant.sha256[:12]}.. != bytes {digest[:12]}..")
-            raise AppletRefused(f"module sha256 {digest[:16]}.. does not match manifest {grant.sha256[:16]}..")
+            self.on_refused(
+                f"hash mismatch: manifest {grant.sha256[:12]}.. != "
+                f"bytes {digest[:12]}..")
+            raise AppletRefused(
+                f"module sha256 {digest[:16]}.. does not match "
+                f"manifest {grant.sha256[:16]}..")
         # 2. Size
         if len(module_bytes) > grant.size_cap:
             self.on_refused(f"module too big: {len(module_bytes)} > {grant.size_cap}")
             raise AppletRefused(f"module size {len(module_bytes)} exceeds cap {grant.size_cap}")
         # 3. Imports (enumerate BEFORE instantiation; unknown = refuse)
         module = Module(self.engine, module_bytes)
-        bad = [(i.module, i.name) for i in module.imports if (i.module, i.name) not in ALLOWED_IMPORTS]
+        bad = [(i.module, i.name) for i in module.imports
+               if (i.module, i.name) not in ALLOWED_IMPORTS]
         if bad:
             self.on_refused(f"unknown import(s): {bad}")
             raise AppletRefused(f"unknown import(s) {bad}; allowlist is {sorted(ALLOWED_IMPORTS)}")

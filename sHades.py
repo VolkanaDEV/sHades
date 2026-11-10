@@ -705,7 +705,7 @@ def ingest(channel_id, author_hash, content, ts=None, attachments=None):
         return None
     content = (content or "").strip()
     if not content and not attachments:
-        dlog(f"ingest: empty content and no attachments, rejecting")
+        dlog("ingest: empty content and no attachments, rejecting")
         return None
     if len(content) > MAX_CONTENT_LEN:
         content = content[:MAX_CONTENT_LEN]

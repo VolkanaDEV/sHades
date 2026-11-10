@@ -9,20 +9,30 @@ Pins the sandbox laws from micron_applet_bridge_spec.md:
   5. linear-memory cap is enforced at instantiation;
   6. epoch deadline stops a runaway module on wall clock.
 """
-import os, sys, time, hashlib
+import os
+import sys
+import time
+import hashlib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 PASS, FAIL = [], []
 
+
 def check(name, cond, extra=""):
     (PASS if cond else FAIL).append(name)
-    print(("PASS  " if cond else "FAIL  ") + name + (("  | " + str(extra)) if extra and not cond else ""))
+    print(("PASS  " if cond else "FAIL  ") + name
+          + (("  | " + str(extra)) if extra and not cond else ""))
+
 
 try:
-    import wasmtime
+    import wasmtime  # noqa: F401  (availability probe only)
     HAVE = True
 except ImportError:
+    HAVE = False
+except OSError as e:
+    # Platform-mismatched wheel: the native lib fails to load at import.
+    print("wasmtime unavailable: %s" % e)
     HAVE = False
 
 if HAVE:
@@ -77,7 +87,8 @@ if HAVE:
         b = MicronAppletBridge(run_epoch_thread=False)
         r = b.load(ECHO, grant_for(ECHO, **SMALL)).call_run()
         check("1a echo output via render_runs", r["outputs"] == b"hello", r)
-        check("1b fuel metered (used>0, under cap)", 0 < r["fuel_used"] <= SMALL["fuel"], r.get("fuel_used"))
+        check("1b fuel metered (used>0, under cap)",
+              0 < r["fuel_used"] <= SMALL["fuel"], r.get("fuel_used"))
         check("1c not trapped", r["trapped"] is False, r)
         check("1d run returned", r["return"] == 1, r)
         b.close()
@@ -125,7 +136,7 @@ if HAVE:
         b.close()
     except AppletRefused:
         pass  # missing exports path (memory dropped) still a refusal, acceptable
-    except Exception as e:
+    except Exception:
         capped = True  # instantiation error = the expected cap enforcement
     check("5 memory cap enforced", capped, "module with 2MiB memory vs 1MiB cap")
 

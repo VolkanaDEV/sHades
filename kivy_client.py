@@ -17,7 +17,6 @@ import re
 import json
 import time
 import base64
-import math
 import hashlib
 import threading
 import random
@@ -26,6 +25,8 @@ import mimetypes
 from PIL import Image as PILImage
 from PIL import ImageDraw as PILImageDraw
 from PIL import ImageChops as PILImageChops
+
+from ui_scale import scaled
 
 # ---------------------------------------------------------------------------
 # Kivy (guarded so the module can be imported for linting without Kivy present)
@@ -49,7 +50,6 @@ try:
     from kivy.uix.filechooser import FileChooserListView
     from kivy.uix.popup import Popup
     from kivy.uix.button import Button
-    from kivy.uix.togglebutton import ToggleButton
     from kivy.uix.textinput import TextInput
     from kivy.uix.widget import Widget
     from kivy.graphics import Color, Ellipse, Line, Rectangle
@@ -101,12 +101,11 @@ else:
 
 import RNS
 from RNS.vendor import umsgpack as msgpack
-import micron
 import invite
 import dms
 import ui_geom
 from micron import (micron_parse, micron_page_bg, micron_media_target,
-                    micron_hex3, runs_to_markup, MICRON_MEDIA_EXTS)
+                    runs_to_markup)
 
 # ---------------------------------------------------------------------------
 # Theme (Dark Vintage: warm amber primary, cool teal accent for pop)
@@ -141,7 +140,7 @@ DEFAULT_THEME_COLORS = {
     "panel": (0.07, 0.07, 0.07, 1),        # center chat area
     "panel_darker": (0.09, 0.09, 0.09, 1),  # input bar / dropdowns
     "bg_sidebar": (0.05, 0.05, 0.05, 1),   # side window backgrounds
-    "sidebar_ctrl": (0.08, 0.08, 0.08, 1), # sidebar buttons / slim bars
+    "sidebar_ctrl": (0.08, 0.08, 0.08, 1),  # sidebar buttons / slim bars
     "topbar": (0.04, 0.04, 0.04, 1),       # top bar background - near black
     "primary": (0.87, 0.60, 0.23, 1),      # primary buttons - vintage amber #DF993A
     "accent": (0.0, 0.75, 0.65, 1),        # accent / destructive - vibrant teal #00BFA6
@@ -198,6 +197,21 @@ def _app_data_dir():
         return app_storage_path()
     except Exception:
         return os.path.join(os.path.expanduser("~"), ".sHades_client")
+
+
+def _app_dir():
+    """Directory holding the app's bundled resources (kv_md.kv, media/).
+
+    Works from a source checkout and from a PyInstaller bundle, where data
+    files are unpacked into sys._MEIPASS. Builder.load_file() and the media
+    lookup both resolve relative to the CURRENT WORKING DIRECTORY otherwise,
+    so a binary launched from any other directory (or a fresh install run
+    from ~) would fail to find them.
+    """
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return meipass
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 def rgba_to_hex(rgba):
@@ -478,8 +492,9 @@ class GuildAPI:
             "data_b64": base64.b64encode(text.encode("utf-8")).decode("ascii"),
         })
 
-    def term_close(self, session):
-        return self._request_json("/api/v1/term/close", {"session": session})
+    def term_close(self, session, timeout=10.0):
+        return self._request_json("/api/v1/term/close",
+                                  {"session": session}, timeout=timeout)
 
     def receipts(self, channel, msg_id=None):
         """Read watermark: mark up to msg_id, or report {last_read_id, unread}."""
@@ -617,9 +632,25 @@ class ImageCache:
     def get(self, key):
         return self._paths.get(key)
 
+    def begin_load(self, key):
+        """Claim the right to fetch `key`. False if it is already cached or
+        an in-flight fetch owns it -- that is what keeps a history of many
+        messages from one author from issuing one avatar request each."""
+        if key in self._paths or key in self._loading:
+            return False
+        self._loading.add(key)
+        return True
+
+    def end_load(self, key):
+        """Release a claim taken by begin_load. Call this even when the
+        fetch failed, or the key stays blocked forever."""
+        self._loading.discard(key)
+
     def set_bytes(self, key, data, ext="png"):
         try:
-            fpath = os.path.join(cache_dir(), key + "." + ext)
+            # Keys are "av:<hash>"; ':' is illegal in a Windows filename,
+            # so hash the key instead of using it verbatim.
+            fpath = cached_path(key) + "." + ext
             with open(fpath, "wb") as f:
                 f.write(data)
             self._paths[key] = fpath
@@ -629,9 +660,8 @@ class ImageCache:
             return None
 
     def fetch_and_cache(self, api, path, key, ext="png"):
-        if key in self._paths or key in self._loading:
+        if not self.begin_load(key):
             return self._paths.get(key)
-        self._loading.add(key)
 
         def work():
             try:
@@ -639,7 +669,7 @@ class ImageCache:
                 if data:
                     Clock.schedule_once(lambda dt: self.set_bytes(key, data, ext))
             finally:
-                self._loading.discard(key)
+                self.end_load(key)
 
         threading.Thread(target=work, daemon=True).start()
         return None
@@ -1025,7 +1055,7 @@ class ContextMenuOverlay(FloatLayout):
                     max(dp(4), min(window_pos[1] - menu.height,
                                    Window.height - menu.height - dp(4))))
         for label, enabled, cb in actions:
-            btn = Button(text=label, size_hint_y=None, height=dp(34),
+            btn = Button(text=label, size_hint_y=None, height=scaled(dp(34)),
                          background_color=(0.18, 0.2, 0.24, 1) if enabled
                          else (0.12, 0.13, 0.15, 1),
                          color=(0.9, 0.92, 0.95, 1) if enabled
@@ -1148,7 +1178,8 @@ if KIVY:
             self.height = dp(2)
             app = App.get_running_app()
             if color is None:
-                color = app.theme_colors.get('text_dim', (0.35, 0.37, 0.42, 1)) if app else (0.35, 0.37, 0.42, 1)
+                color = app.theme_colors.get(
+                    'text_dim', (0.35, 0.37, 0.42, 1)) if app else (0.35, 0.37, 0.42, 1)
             with self.canvas:
                 Color(*color)
                 self._rect = Rectangle(pos=self.pos, size=self.size)
@@ -1228,7 +1259,8 @@ if KIVY:
             self.padding = [dp(8), dp(8), dp(8), dp(8)]
             self.bind(minimum_height=lambda w, h: setattr(w, "height", h))
             app = App.get_running_app()
-            term_text_color = app.theme_colors.get('text_muted', (0.85, 0.88, 0.9, 1)) if app else (0.85, 0.88, 0.9, 1)
+            term_text_color = app.theme_colors.get(
+                'text_muted', (0.85, 0.88, 0.9, 1)) if app else (0.85, 0.88, 0.9, 1)
             self.output = Label(markup=False, halign="left",
                                 color=term_text_color,
                                 font_size=sp(13))
@@ -1253,542 +1285,10 @@ if KIVY:
 # ---------------------------------------------------------------------------
 # KV UI
 # ---------------------------------------------------------------------------
-KV = r"""
-#:import dp kivy.metrics.dp
-
-<PFPEditorWidget>:
-    canvas.after:
-        Color:
-            rgba: 0, 0, 0, 0.4
-        Ellipse:
-            pos: root.crop_cx - root.crop_r, root.crop_cy - root.crop_r
-            size: root.crop_r * 2, root.crop_r * 2
-        Color:
-            rgba: app.theme_colors['text']
-        Line:
-            circle: root.crop_cx, root.crop_cy, root.crop_r
-            width: 2
-    PassThroughImage:
-        id: pfp_img
-        source: root.source
-        allow_stretch: False
-        keep_ratio: True
-        size_hint: None, None
-        # Re-size when the texture arrives. on_source() cannot be relied on
-        # for this: `source` is set in the constructor, i.e. before the KV rule
-        # creates pfp_img, so root.ids is still empty when it fires.
-        on_texture_size: root._size_image()
-
-<MessageRow>:
-    orientation: 'horizontal'
-    size_hint_y: None
-    height: self.minimum_height
-    padding: [dp(8), dp(6)]
-    spacing: dp(8)
-    canvas.before:
-        Color:
-            rgba: app.theme_colors['msg_own'] if root.is_own else (0, 0, 0, 0)
-        RoundedRectangle:
-            pos: self.pos
-            size: self.size
-            radius: [dp(8), dp(8), dp(8), dp(8)]
-
-    PfpImage:
-        id: pfp
-        size_hint: None, None
-        size: dp(32), dp(32)
-        source: root.avatar_source or ""
-        allow_stretch: False
-        keep_ratio: True
-
-    BoxLayout:
-        orientation: 'vertical'
-        size_hint_x: 1
-        spacing: dp(2)
-        BoxLayout:
-            orientation: 'horizontal'
-            size_hint_y: None
-            height: dp(18)
-            ClickableLabel:
-                text: root.username
-                target_hash: root.author_hash
-                color: app.theme_colors['text'] if root.is_own else app.theme_colors['text_muted']
-                bold: True
-                font_size: sp(13)
-                text_size: self.width, None
-                size_hint_x: 1
-                halign: 'left'
-                valign: 'middle'
-                shorten: True
-                on_press: app.open_profile(root.author_hash, root.username)
-            Label:
-                text: root.ts
-                color: app.theme_colors['text_dim']
-                font_size: sp(11)
-                text_size: self.width, None
-                size_hint_x: None
-                width: dp(50)
-                halign: 'right'
-                valign: 'middle'
-        Label:
-            id: content_lbl
-            text: root.content_markup
-            markup: True
-            color: app.theme_colors['text']
-            font_size: sp(14)
-            text_size: self.width, None
-            size_hint_y: None
-            height: self.texture_size[1]
-            halign: 'left'
-            valign: 'top'
-
-    Widget:
-        size_hint_x: None
-        width: dp(4)
-
-<ChannelButton>:
-    orientation: 'vertical'
-    size_hint_y: None
-    height: dp(44)
-    padding: [dp(10), 0]
-    spacing: dp(4)
-    Label:
-        text: root.channel_name
-        color: app.theme_colors['text_muted']
-        font_size: sp(13)
-        halign: 'left'
-        valign: 'middle'
-        text_size: self.width, None
-
-<MemberRow>:
-    orientation: 'horizontal'
-    size_hint_y: None
-    height: dp(36)
-    padding: [dp(8), 0]
-    spacing: dp(8)
-    PfpImage:
-        id: pfpx
-        size_hint: None, None
-        size: dp(26), dp(26)
-        source: root.avatar_source or ""
-        allow_stretch: False
-        keep_ratio: True
-    ClickableLabel:
-        text: root.username
-        target_hash: root.author_hash
-        color: app.theme_colors['text_muted']
-        font_size: sp(13)
-        halign: 'left'
-        valign: 'middle'
-        text_size: self.width, None
-        size_hint_x: 1
-        on_press: app.open_profile(root.author_hash, root.username)
-
-<ConnectScreen>:
-    BoxLayout:
-        orientation: 'vertical'
-        padding: dp(40)
-        spacing: dp(20)
-        canvas.before:
-            Color:
-                rgba: app.theme_colors['bg_main']
-            Rectangle:
-                pos: self.pos
-                size: self.size
-        Image:
-            id: banner_config
-            source: app.banner_config_path or ''
-            size_hint_y: None
-            height: dp(200)
-            size_hint_x: None
-            width: dp(400)
-            allow_stretch: False
-            keep_ratio: True
-        Label:
-            text: 'sHades'
-            font_size: sp(40)
-            bold: True
-            color: app.theme_colors['text']
-            size_hint_y: None
-            height: dp(60)
-        Label:
-            text: 'Connect to a guild'
-            color: app.theme_colors['text_dim']
-            font_size: sp(16)
-            size_hint_y: None
-            height: dp(30)
-        BoxLayout:
-            orientation: 'vertical'
-            spacing: dp(10)
-            size_hint_y: None
-            height: dp(340)
-            TextInput:
-                id: hub_address
-                hint_text: 'Hub address or invite (ip:port or shades://...)'
-                multiline: False
-                size_hint_y: None
-                height: dp(44)
-                background_color: app.theme_colors['input_bg']
-                foreground_color: app.theme_colors['text']
-                cursor_color: app.theme_colors['text']
-                on_focus: app._invite_prefill(hub_address, node_hash)
-                on_text_validate: app._invite_prefill(hub_address, node_hash)
-            TextInput:
-                id: username
-                hint_text: 'Your username'
-                multiline: False
-                size_hint_y: None
-                height: dp(44)
-                background_color: app.theme_colors['input_bg']
-                foreground_color: app.theme_colors['text']
-                cursor_color: app.theme_colors['text']
-            Label:
-                text: 'Guild hashes (leave blank to auto-discover from hub announce)'
-                color: app.theme_colors['text_dim']
-                font_size: sp(12)
-                size_hint_y: None
-                height: dp(20)
-                halign: 'left'
-                valign: 'middle'
-                text_size: self.width, None
-            TextInput:
-                id: node_hash
-                hint_text: 'Guild node_hash (32 hex, optional)'
-                multiline: False
-                size_hint_y: None
-                height: dp(40)
-                background_color: app.theme_colors['input_bg']
-                foreground_color: app.theme_colors['text']
-                cursor_color: app.theme_colors['text']
-            TextInput:
-                id: delivery_hash
-                hint_text: 'Guild delivery_hash (32 hex, optional)'
-                multiline: False
-                size_hint_y: None
-                height: dp(40)
-                background_color: app.theme_colors['input_bg']
-                foreground_color: app.theme_colors['text']
-                cursor_color: app.theme_colors['text']
-        Button:
-            text: 'Connect'
-            size_hint_y: None
-            height: dp(50)
-            background_color: app.theme_colors['primary']
-            color: app.theme_colors['btn_text']
-            on_press:app.connect_to_guild(hub_address.text,username.text,node_hash.text,delivery_hash.text)
-        Label:
-            id: status
-            text: ''
-            color: app.theme_colors['accent']
-            font_size: sp(13)
-            size_hint_y: None
-            height: dp(30)
-
-<ProfileScreen>:
-    BoxLayout:
-        orientation: 'vertical'
-        padding: dp(20)
-        spacing: dp(15)
-        canvas.before:
-            Color:
-                rgba: app.theme_colors['bg_main']
-            Rectangle:
-                pos: self.pos
-                size: self.size
-        Label:
-            text: 'Profile'
-            font_size: sp(32)
-            bold: True
-            color: app.theme_colors['text']
-            size_hint_y: None
-            height: dp(50)
-        BoxLayout:
-            orientation: 'horizontal'
-            size_hint_y: None
-            height: dp(200)
-            spacing: dp(10)
-            Widget:
-                size_hint_x: 1
-            PfpImage:
-                id: profile_pfp
-                size_hint: None, None
-                size: dp(150), dp(150)
-                source: root.target_avatar or ''
-                allow_stretch: False
-                keep_ratio: True
-                canvas.after:
-                    Color:
-                        rgba: 0, 0, 0, 0.5
-                    Ellipse:
-                        pos: self.center_x - dp(75), self.center_y - dp(75)
-                        size: dp(150), dp(150)
-                    Color:
-                        rgba: app.theme_colors['text']
-                    Line:
-                        circle: self.center_x, self.center_y, 75
-                        width: 2
-            Widget:
-                size_hint_x: 1
-        Label:
-            text: root.target_username
-            font_size: sp(20)
-            bold: True
-            color: app.theme_colors['text']
-            size_hint_y: None
-            height: dp(30)
-            halign: 'center'
-            text_size: self.width, None
-        TextInput:
-            id: profile_username_input
-            text: root.target_username
-            multiline: False
-            size_hint_y: None
-            height: dp(40)
-            background_color: app.theme_colors['input_bg']
-            foreground_color: app.theme_colors['text']
-            cursor_color: app.theme_colors['text']
-        Label:
-            text: 'Node hash: ' + root.target_hash
-            font_size: sp(11)
-            color: app.theme_colors['text_dim']
-            size_hint_y: None
-            height: dp(20)
-            halign: 'center'
-            text_size: self.width, None
-            shorten: True
-        Label:
-            text: 'Delivery: ' + root.target_username
-            font_size: sp(11)
-            color: app.theme_colors['text_dim']
-            size_hint_y: None
-            height: dp(20)
-            halign: 'center'
-            text_size: self.width, None
-            shorten: True
-        BoxLayout:
-            size_hint_y: None
-            height: dp(50)
-            spacing: dp(10)
-            Button:
-                text: 'Change Avatar'
-                size_hint_x: None
-                width: dp(140)
-                background_color: app.theme_colors['primary']
-                color: app.theme_colors['btn_text']
-                on_press: app.open_file_chooser(avatar=True)
-            Button:
-                text: 'Save Username'
-                size_hint_x: None
-                width: dp(140)
-                background_color: app.theme_colors['primary']
-                color: app.theme_colors['btn_text']
-                on_press: app.save_profile()
-            Button:
-                text: 'Back'
-                size_hint_x: None
-                width: dp(100)
-                background_color: app.theme_colors['sidebar_ctrl']
-                color: app.theme_colors['text']
-                on_press: app.root.current = 'main'
-
-<MainScreen>:
-    BoxLayout:
-        orientation: 'vertical'
-        canvas.before:
-            Color:
-                rgba: app.theme_colors['bg_main']
-            Rectangle:
-                pos: self.pos
-                size: self.size
-        BoxLayout:
-            orientation: 'horizontal'
-            size_hint_y: 1
-
-            # ---------------- far-left: servers (guild list) ---------------
-            BoxLayout:
-                id: server_sidebar
-                size_hint_x: None
-                width: dp(64)
-                orientation: 'vertical'
-                canvas.before:
-                    Color:
-                        rgba: app.theme_colors['bg_sidebar']
-                    Rectangle:
-                        pos: self.pos
-                        size: self.size
-                ScrollView:
-                    do_scroll_x: False
-                    GridLayout:
-                        id: server_grid
-                        cols: 1
-                        size_hint_y: None
-                        height: self.minimum_height
-                        spacing: dp(4)
-                        padding: [dp(4), dp(8)]
-                # Add server button at bottom
-                Button:
-                    id: add_server_btn
-                    text: '+'
-                    size_hint_y: None
-                    height: dp(48)
-                    font_size: sp(24)
-                    background_color: app.theme_colors['primary']
-                    color: app.theme_colors['btn_text']
-                    on_press: app._open_add_server_popup()
-
-            # ---------------- left: channels (collapsable) ----------------
-            BoxLayout:
-                id: left_sidebar
-                size_hint_x: None
-                width: dp(220) if root.left_open else dp(0)
-                orientation: 'vertical'
-                canvas.before:
-                    Color:
-                        rgba: app.theme_colors['bg_sidebar']
-                    Rectangle:
-                        pos: self.pos
-                        size: self.size
-                Image:
-                    id: banner_channel
-                    source: app.banner_channel_path or ''
-                    size_hint_y: None
-                    height: dp(160)
-                    size_hint_x: None
-                    width: dp(200)
-                    allow_stretch: False
-                    keep_ratio: True
-                    pos_hint: {'center_x': 0.5}
-                Button:
-                    text: 'channels \u25bc' if root.left_open else 'channels \u25b6'
-                    size_hint_y: None
-                    height: dp(34)
-                    background_color: app.theme_colors['sidebar_ctrl']
-                    color: app.theme_colors['text_muted']
-                    on_press: root.toggle_left()
-                ScrollView:
-                    do_scroll_x: False
-                    GridLayout:
-                        id: channel_grid
-                        cols: 1
-                        size_hint_y: None
-                        height: self.minimum_height
-                        spacing: dp(2)
-                        padding: [dp(6), dp(6)]
-
-            # ---------------- center: chat ----------------
-            BoxLayout:
-                orientation: 'vertical'
-                size_hint_x: 1
-                canvas.before:
-                    Color:
-                        rgba: app.theme_colors['panel']
-                    Rectangle:
-                        pos: self.pos
-                        size: self.size
-                BoxLayout:
-                    orientation: 'vertical'
-                    size_hint_y: None
-                    height: dp(40)
-                    padding: [dp(10), 0]
-                    Label:
-                        id: channel_header
-                        text: '#general'
-                        color: app.theme_colors['text']
-                        bold: True
-                        font_size: sp(16)
-                        halign: 'left'
-                        valign: 'middle'
-                        text_size: self.width, None
-                ScrollView:
-                    id: scroll
-                    do_scroll_x: False
-                    bar_width: dp(6)
-                    size_hint_y: 1
-                    GridLayout:
-                        id: message_grid
-                        cols: 1
-                        size_hint_y: None
-                        height: self.minimum_height
-                        spacing: dp(2)
-                        padding: [dp(6), dp(6)]
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(28)
-                    padding: [dp(4), dp(3)]
-                    spacing: dp(4)
-                    canvas.before:
-                        Color:
-                            rgba: app.theme_colors['panel_darker']
-                        Rectangle:
-                            pos: self.pos
-                            size: self.size
-                    TextInput:
-                        id: msg_input
-                        hint_text: 'Message...'
-                        multiline: False
-                        background_color: app.theme_colors['input_bg']
-                        foreground_color: app.theme_colors['text']
-                        cursor_color: app.theme_colors['text']
-                        on_text_validate: app.send_message()
-                    Button:
-                        id: send_btn
-                        text: 'Send'
-                        size_hint_x: None
-                        width: dp(47)
-                        background_color: app.theme_colors['primary']
-                        color: app.theme_colors['btn_text']
-                        on_press: app.send_message()
-                    Button:
-                        id: attach_btn
-                        text: '+'
-                        size_hint_x: None
-                        width: dp(28)
-                        background_color: app.theme_colors['primary']
-                        color: app.theme_colors['btn_text']
-                        on_press: app.open_file_chooser(avatar=False)
-
-            # ---------------- right: members (collapsable) ----------------
-            BoxLayout:
-                id: right_sidebar
-                size_hint_x: None
-                width: dp(200) if root.right_open else dp(0)
-                orientation: 'vertical'
-                canvas.before:
-                    Color:
-                        rgba: app.theme_colors['bg_sidebar']
-                    Rectangle:
-                        pos: self.pos
-                        size: self.size
-                BoxLayout:
-                    orientation: 'vertical'
-                    size_hint_y: None
-                    height: dp(40)
-                    padding: [dp(8), 0]
-                    Label:
-                        text: 'Members'
-                        color: app.theme_colors['text']
-                        bold: True
-                        font_size: sp(14)
-                        halign: 'left'
-                        valign: 'middle'
-                        text_size: self.width, None
-                Button:
-                    text: 'members \u25bc' if root.right_open else 'members \u25b6'
-                    size_hint_y: None
-                    height: dp(34)
-                    background_color: app.theme_colors['sidebar_ctrl']
-                    color: app.theme_colors['text_muted']
-                    on_press: root.toggle_right()
-                ScrollView:
-                    do_scroll_x: False
-                    GridLayout:
-                        id: member_grid
-                        cols: 1
-                        size_hint_y: None
-                        height: self.minimum_height
-                        spacing: dp(2)
-                        padding: [dp(6), dp(6)]
-"""
+# The KV rules live in kv_md.kv (loaded in build()). They used to be
+# duplicated here as an inline KV string; keeping two copies meant edits
+# landed in one file and not the other, which broke the app. Do not
+# re-add an inline copy — edit kv_md.kv only.
 
 
 
@@ -2048,9 +1548,7 @@ class sHadesClientApp(MDApp):
     def _select_random_banners(self):
         """Pick random banner images from media/ folder on startup.
         One for the connect screen, one for the channel header."""
-        media_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "media"
-        )
+        media_dir = os.path.join(_app_dir(), "media")
         if not os.path.isdir(media_dir):
             return
         images = [
@@ -2124,7 +1622,7 @@ class sHadesClientApp(MDApp):
         from kivymd.uix.textfield import MDTextField  # noqa: F401
         from kivymd.uix.appbar import MDTopAppBar  # noqa: F401
         from kivy.lang import Builder
-        Builder.load_file("kv_md.kv")
+        Builder.load_file(os.path.join(_app_dir(), "kv_md.kv"))
         sm = ScreenManager()
         sm.add_widget(ConnectScreen(name="connect"))
         sm.add_widget(MainScreen(name="main"))
@@ -2136,9 +1634,6 @@ class sHadesClientApp(MDApp):
         return sm
 
     def on_start(self):
-        # Populate saved servers on ConnectScreen immediately
-        self._refresh_connect_server_sidebar()
-
         # Try to resume a saved session
         sess = self._load_session()
         if sess:
@@ -2251,7 +1746,8 @@ class sHadesClientApp(MDApp):
         except Exception as e:
             print("save servers failed:", repr(e))
 
-    def _add_server(self, hub_address, username, node_hash="", delivery_hash="", display_name=None, avatar_path=None):
+    def _add_server(self, hub_address, username, node_hash="",
+                    delivery_hash="", display_name=None, avatar_path=None):
         """Add or update a server in the list."""
         inv = invite.parse_invite(hub_address)
         if inv:
@@ -2269,6 +1765,11 @@ class sHadesClientApp(MDApp):
             else:
                 host = hub_address
                 port = None
+        # Remember whether the caller named this server explicitly. When it
+        # did not, the auto-derived host fallback must not overwrite a
+        # display name the user already set (connect_to_guild() re-adds the
+        # server without one).
+        explicit_name = bool(display_name)
         # Generate a display name from host if not provided
         if not display_name:
             display_name = host.split(":")[0] if ":" in host else host
@@ -2285,6 +1786,10 @@ class sHadesClientApp(MDApp):
         # Check if server already exists (by host+port)
         for i, s in enumerate(self._servers):
             if s.get("host") == host and s.get("port") == port:
+                if not explicit_name and s.get("display_name"):
+                    entry["display_name"] = s["display_name"]
+                if avatar_path is None and s.get("avatar_path"):
+                    entry["avatar_path"] = s["avatar_path"]
                 self._servers[i] = entry
                 self._active_server_idx = i
                 self._save_servers()
@@ -2485,60 +1990,22 @@ class sHadesClientApp(MDApp):
             btn = Button(
                 text=display_name[:12],  # truncate long names
                 size_hint_y=None,
-                height=dp(48),
+                height=scaled(dp(48)),
                 font_size=sp(10),
-                background_color=self.theme_colors['primary'] if idx == self._active_server_idx else self.theme_colors['sidebar_ctrl'],
-                color=self.theme_colors['btn_text'] if idx == self._active_server_idx else self.theme_colors['text'],
+                background_color=(
+                    self.theme_colors['primary']
+                    if idx == self._active_server_idx
+                    else self.theme_colors['sidebar_ctrl']),
+                color=(
+                    self.theme_colors['btn_text']
+                    if idx == self._active_server_idx
+                    else self.theme_colors['text']),
                 halign='center',
                 valign='middle',
             )
             btn.bind(on_press=lambda inst, i=idx: self._select_server(i))
             btn.bind(size=lambda inst, val: setattr(inst, 'text_size', (inst.width, None)))
             grid.add_widget(btn)
-
-    def _refresh_connect_server_sidebar(self):
-        """Populate the server grid on ConnectScreen with server buttons."""
-        try:
-            connect = self.root.get_screen("connect")
-            grid = connect.ids.server_grid
-        except Exception:
-            return
-        grid.clear_widgets()
-        for idx, s in enumerate(self._servers):
-            display_name = s.get("display_name", s.get("host", "Server"))
-            host = s.get("host", "")
-            btn = Button(
-                text=display_name[:20],
-                size_hint_y=None,
-                height=dp(52),
-                font_size=sp(11),
-                background_color=self.theme_colors['primary'] if idx == self._active_server_idx else self.theme_colors['sidebar_ctrl'],
-                color=self.theme_colors['btn_text'] if idx == self._active_server_idx else self.theme_colors['text'],
-                halign='left',
-                valign='middle',
-            )
-            # Sub-label with host:port
-            btn.bind(on_press=lambda inst, i=idx: self._select_connect_server(i))
-            btn.bind(size=lambda inst, val: setattr(inst, 'text_size', (inst.width, None)))
-            grid.add_widget(btn)
-
-    def _select_connect_server(self, idx):
-        """Select a server from ConnectScreen and prefill the form."""
-        if idx >= len(self._servers):
-            return
-        self._active_server_idx = idx
-        s = self._servers[idx]
-        self._refresh_connect_server_sidebar()
-        # Prefill the connect form
-        try:
-            connect = self.root.get_screen("connect")
-            connect.ids.hub_address.text = s.get("hub_address", "")
-            connect.ids.username.text = s.get("username", "user")
-            connect.ids.node_hash.text = s.get("node_hash", "")
-            connect.ids.delivery_hash.text = s.get("delivery_hash", "")
-        except Exception:
-            pass
-        self._set_status("Selected %s" % s.get("display_name", "server"))
 
     def _select_server(self, idx):
         """Switch to a different server."""
@@ -2587,33 +2054,51 @@ class sHadesClientApp(MDApp):
         from kivy.metrics import dp, sp
 
         box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
-        box.add_widget(Label(text="Add Server", font_size=sp(18), size_hint_y=None, height=dp(30), color=self.theme_colors['text']))
+        box.add_widget(Label(text="Add Server", font_size=sp(18), size_hint_y=None,
+                       height=dp(30), color=self.theme_colors['text']))
 
-        hub_in = TextInput(hint_text="Hub address (ip:port or shades://...)", multiline=False, size_hint_y=None, height=dp(40),
-                           background_color=self.theme_colors['input_bg'], foreground_color=self.theme_colors['text'], cursor_color=self.theme_colors['text'])
+        hub_in = TextInput(hint_text="Hub address (ip:port or shades://...)",
+                           multiline=False, size_hint_y=None, height=dp(40),
+                           background_color=self.theme_colors['input_bg'],
+                           foreground_color=self.theme_colors['text'],
+                           cursor_color=self.theme_colors['text'])
         box.add_widget(hub_in)
 
-        user_in = TextInput(hint_text="Username", multiline=False, size_hint_y=None, height=dp(40),
-                            background_color=self.theme_colors['input_bg'], foreground_color=self.theme_colors['text'], cursor_color=self.theme_colors['text'])
+        user_in = TextInput(hint_text="Username",
+                            multiline=False, size_hint_y=None, height=dp(40),
+                            background_color=self.theme_colors['input_bg'],
+                            foreground_color=self.theme_colors['text'],
+                            cursor_color=self.theme_colors['text'])
         user_in.text = self.username
         box.add_widget(user_in)
 
-        node_in = TextInput(hint_text="Node hash (32 hex, optional)", multiline=False, size_hint_y=None, height=dp(40),
-                            background_color=self.theme_colors['input_bg'], foreground_color=self.theme_colors['text'], cursor_color=self.theme_colors['text'])
+        node_in = TextInput(hint_text="Node hash (32 hex, optional)",
+                            multiline=False, size_hint_y=None, height=dp(40),
+                            background_color=self.theme_colors['input_bg'],
+                            foreground_color=self.theme_colors['text'],
+                            cursor_color=self.theme_colors['text'])
         box.add_widget(node_in)
 
-        delivery_in = TextInput(hint_text="Delivery hash (32 hex, optional)", multiline=False, size_hint_y=None, height=dp(40),
-                                background_color=self.theme_colors['input_bg'], foreground_color=self.theme_colors['text'], cursor_color=self.theme_colors['text'])
+        delivery_in = TextInput(hint_text="Delivery hash (32 hex, optional)",
+                                multiline=False, size_hint_y=None, height=dp(40),
+                                background_color=self.theme_colors['input_bg'],
+                                foreground_color=self.theme_colors['text'],
+                                cursor_color=self.theme_colors['text'])
         box.add_widget(delivery_in)
 
-        name_in = TextInput(hint_text="Display name (optional)", multiline=False, size_hint_y=None, height=dp(40),
-                            background_color=self.theme_colors['input_bg'], foreground_color=self.theme_colors['text'], cursor_color=self.theme_colors['text'])
+        name_in = TextInput(hint_text="Display name (optional)",
+                            multiline=False, size_hint_y=None, height=dp(40),
+                            background_color=self.theme_colors['input_bg'],
+                            foreground_color=self.theme_colors['text'],
+                            cursor_color=self.theme_colors['text'])
         box.add_widget(name_in)
 
-        status = Label(text="", size_hint_y=None, height=dp(20), color=self.theme_colors['accent'], font_size=sp(11))
+        status = Label(text="", size_hint_y=None, height=dp(
+            20), color=self.theme_colors['accent'], font_size=sp(11))
         box.add_widget(status)
 
         btn_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+
         def do_add(*_):
             hub = (hub_in.text or "").strip()
             user = (user_in.text or "").strip() or "user"
@@ -2638,9 +2123,21 @@ class sHadesClientApp(MDApp):
             # Connect to the new server
             self.connect_to_guild(hub, user, node, delivery)
 
-        add_btn = Button(text="Add & Connect", background_color=self.theme_colors['primary'], color=self.theme_colors['btn_text'])
+        add_btn = Button(
+            text="Add & Connect",
+            size_hint_y=None,
+            height=scaled(dp(44)),
+            pos_hint={"center_y": 0.5},
+            background_color=self.theme_colors['primary'],
+            color=self.theme_colors['btn_text'])
         add_btn.bind(on_press=do_add)
-        cancel_btn = Button(text="Cancel", background_color=self.theme_colors['sidebar_ctrl'], color=self.theme_colors['text'])
+        cancel_btn = Button(
+            text="Cancel",
+            size_hint_y=None,
+            height=scaled(dp(44)),
+            pos_hint={"center_y": 0.5},
+            background_color=self.theme_colors['sidebar_ctrl'],
+            color=self.theme_colors['text'])
         cancel_btn.bind(on_press=lambda *_: popup.dismiss())
         btn_row.add_widget(add_btn)
         btn_row.add_widget(cancel_btn)
@@ -3164,6 +2661,7 @@ class sHadesClientApp(MDApp):
             return
         # Network call must not block the main thread — run it in background,
         # schedule UI updates via Clock.schedule_once.
+
         def work():
             cid = self._channel_cid(channel)
             res = self.guild_api.messages(cid, since_id=since_id, since_ts=since_ts,
@@ -3233,9 +2731,6 @@ class sHadesClientApp(MDApp):
                 except Exception as e:
                     print("render messages error:", e)
             Clock.schedule_once(apply, 0)
-
-            for u in updates:
-                self._apply_update(u)
         threading.Thread(target=work, daemon=True).start()
 
     def _on_scroll_y(self, value):
@@ -3279,14 +2774,17 @@ class sHadesClientApp(MDApp):
             path = IMAGE_CACHE.get(key)
             if path:
                 avatar_source = path
-            elif author and key not in IMAGE_CACHE._loading:
+            elif author and IMAGE_CACHE.begin_load(key):
                 # fetch avatar — deduplicate in-flight requests (never for
                 # empty authors: system rows like command notices)
                 def _do_av(a=author, k=key):
-                    res = self.guild_api.avatar_get(a)
-                    if res.get("ok") and res.get("avatar"):
-                        IMAGE_CACHE.set_bytes(k, res["avatar"], "png")
-                        Clock.schedule_once(lambda dt: self._refresh_avatar(k), 0)
+                    try:
+                        res = self.guild_api.avatar_get(a)
+                        if res.get("ok") and res.get("avatar"):
+                            IMAGE_CACHE.set_bytes(k, res["avatar"], "png")
+                            Clock.schedule_once(lambda dt: self._refresh_avatar(k), 0)
+                    finally:
+                        IMAGE_CACHE.end_load(k)
                 threading.Thread(target=_do_av, daemon=True).start()
 
         row = MessageRow(
@@ -3386,6 +2884,7 @@ class sHadesClientApp(MDApp):
     def _toggle_reaction(self, msg_id, emoji):
         if not self.guild_api:
             return
+
         def work():
             try:
                 self.guild_api.react(msg_id, emoji)
@@ -3406,14 +2905,16 @@ class sHadesClientApp(MDApp):
 
     def _open_reaction_popup(self, msg_id):
         try:
-            main = self.root.get_screen("main")
+            self.root.get_screen("main")
         except Exception:
             return
         box = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(10))
         line = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint_y=None,
                          height=dp(40))
         for emoji in self.REACTION_PRESETS:
-            btn = Button(text=":%s" % emoji, size_hint_x=None, width=dp(70))
+            btn = Button(text=":%s" % emoji, size_hint_x=None, width=dp(70),
+                         size_hint_y=None, height=scaled(dp(40)),
+                         pos_hint={"center_y": 0.5})
             btn.bind(on_press=lambda inst, m=msg_id, em=emoji:
                      (self._toggle_reaction(m, em), popup.dismiss()))
             line.add_widget(btn)
@@ -3441,11 +2942,13 @@ class sHadesClientApp(MDApp):
             q = (query.text or "").strip()
             if len(q) < 2:
                 return
+
             def work():
                 try:
                     res = self.guild_api.search(q)
                 except Exception as e:
                     res = {"ok": 0, "error": repr(e)}
+
                 def apply(dt):
                     if not res.get("ok"):
                         results.text = "[i]search failed: %s[/i]" % res.get("error", "")
@@ -3463,7 +2966,7 @@ class sHadesClientApp(MDApp):
                 Clock.schedule_once(apply, 0)
             threading.Thread(target=work, daemon=True).start()
         query.bind(on_text_validate=run_search)
-        btn = Button(text="search", size_hint_y=None, height=dp(36))
+        btn = Button(text="search", size_hint_y=None, height=scaled(dp(36)))
         btn.bind(on_press=run_search)
         box.add_widget(query)
         box.add_widget(btn)
@@ -3474,8 +2977,13 @@ class sHadesClientApp(MDApp):
 
     def _add_attachment_embed(self, row, name, blob):
         """Render one attachment: images inline, everything else as a label."""
-        print(f"[TRACE] _add_attachment_embed: name={name} blob_size={len(blob)} ext={os.path.splitext(name)[1].lower()}", flush=True)
-        dlog(f"_add_attachment_embed: name={name} blob_size={len(blob)} ext={os.path.splitext(name)[1].lower()}")
+        print(
+            f"[TRACE] _add_attachment_embed: name={name} "
+            f"blob_size={len(blob)} ext={os.path.splitext(name)[1].lower()}",
+            flush=True)
+        dlog(
+            f"_add_attachment_embed: name={name} "
+            f"blob_size={len(blob)} ext={os.path.splitext(name)[1].lower()}")
         ext = os.path.splitext(name)[1].lower()
         if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
             import tempfile
@@ -3523,13 +3031,16 @@ class sHadesClientApp(MDApp):
         the embed back on the UI thread. A loading placeholder is shown until
         the image has been received.
         """
-        print(f"[TRACE] _fetch_attachment: msg_id={msg_id} name={att.get('name')!r} path={att.get('path')!r}", flush=True)
-        dlog(f"_fetch_attachment: msg_id={msg_id} name={att.get('name')!r} path={att.get('path')!r}")
+        print(
+            f"[TRACE] _fetch_attachment: msg_id={msg_id} "
+            f"name={att.get('name')!r} path={att.get('path')!r}", flush=True)
+        dlog(
+            f"_fetch_attachment: msg_id={msg_id} name={att.get('name')!r} path={att.get('path')!r}")
         name = att.get("name") or ""
         path = att.get("path") or ""
         if not path:
-            print(f"[TRACE] _fetch_attachment: no path, skipping", flush=True)
-            dlog(f"_fetch_attachment: no path, skipping")
+            print("[TRACE] _fetch_attachment: no path, skipping", flush=True)
+            dlog("_fetch_attachment: no path, skipping")
             return
 
         self._add_loading_placeholder(row)
@@ -3542,12 +3053,15 @@ class sHadesClientApp(MDApp):
             except Exception:
                 blob = None
             if not blob:
-                print(f"[TRACE] _fetch_attachment.work: fetch returned empty for {path}", flush=True)
+                print(
+                    f"[TRACE] _fetch_attachment.work: fetch returned empty for {path}", flush=True)
                 dlog(f"_fetch_attachment.work: fetch returned empty for {path}")
                 Clock.schedule_once(
                     lambda dt: self._remove_placeholder(row), 0)
                 return
-            print(f"[TRACE] _fetch_attachment.work: received {len(blob)} bytes for {path}", flush=True)
+            print(
+                f"[TRACE] _fetch_attachment.work: received {len(blob)} bytes "
+                f"for {path}", flush=True)
             dlog(f"_fetch_attachment.work: received {len(blob)} bytes for {path}")
 
             def apply(dt):
@@ -3634,11 +3148,13 @@ class sHadesClientApp(MDApp):
         with every channel and records each one's kind (chat/site/term)."""
         if not self.guild_api:
             return
+
         def work():
             res = self.guild_api.channels_list()
             if not res.get("ok"):
                 return
             chans = res.get("channels") or []
+
             def apply(dt):
                 for c in chans:
                     if not isinstance(c, dict):
@@ -3664,6 +3180,7 @@ class sHadesClientApp(MDApp):
         """Fetch our own identity/role view (gates moderator menu items)."""
         if not self.guild_api:
             return
+
         def work():
             try:
                 res = self.guild_api.whoami()
@@ -3700,66 +3217,109 @@ class sHadesClientApp(MDApp):
         row = BoxLayout(size_hint_y=None, height=30, spacing=4)
         name_in = TextInput(hint_text="new role name", multiline=False)
         row.add_widget(name_in)
-        create_btn = Button(text="create", size_hint_x=None, width=70)
+        create_btn = Button(text="create", size_hint_x=None, width=70,
+                            size_hint_y=None, height=scaled(30),
+                            font_size=sp(14), pos_hint={"center_y": 0.5})
         row.add_widget(create_btn)
         box.add_widget(row)
-        close = Button(text="close", size_hint_y=None, height=28)
+        close = Button(text="close", size_hint_y=None, height=scaled(28))
         box.add_widget(close)
         popup = Popup(title="roles", content=box, size_hint=(0.7, 0.6))
         self._popup = popup
 
+        # load_gen guards against out-of-order responses: toggling two roles
+        # quickly starts two overlapping fetches, and without this the
+        # slower one appends its rows on top of the faster one's.
+        load_gen = [0]
+
         def refresh():
+            """Reload the role list.
+
+            The guild call blocks on the RNS link for up to the request
+            timeout, so it runs on a worker thread; the widget rebuild
+            happens back on the main thread.
+            """
             grid.clear_widgets()
+            load_gen[0] += 1
+            gen = load_gen[0]
 
             def add_role(r, member):
                 def toggle(btn):
-                    try:
-                        if member:
-                            res = self.guild_api.roles_unassign(r["role_id"],
-                                                                target_hash)
+                    def work():
+                        try:
+                            if member:
+                                res = self.guild_api.roles_unassign(
+                                    r["role_id"], target_hash)
+                            else:
+                                res = self.guild_api.roles_assign(
+                                    r["role_id"], target_hash)
+                        except Exception as e:
+                            # Bind the message to a plain local: Python unbinds
+                            # `e` when the except block exits, so a lambda
+                            # closing over it would raise NameError later.
+                            err = "roles: %r" % e
+                            Clock.schedule_once(
+                                lambda dt: self._show_notice(err), 0)
+                            return
+                        if res.get("ok"):
+                            Clock.schedule_once(lambda dt: refresh(), 0)
                         else:
-                            res = self.guild_api.roles_assign(r["role_id"],
-                                                              target_hash)
-                    except Exception as e:
-                        self._show_notice("roles: %r" % e)
-                        return
-                    if res.get("ok"):
-                        Clock.schedule_once(lambda dt: refresh(), 0)
-                    else:
-                        self._show_notice("roles: %s" %
-                                            res.get("error", "failed"))
+                            Clock.schedule_once(
+                                lambda dt: self._show_notice(
+                                    "roles: %s" % res.get("error", "failed")), 0)
+                    threading.Thread(target=work, daemon=True).start()
                 mark = "[x] " if member else "[  ] "
-                btn = Button(text=mark + r["name"], size_hint_y=None, height=24,
+                btn = Button(text=mark + r["name"], size_hint_y=None,
+                             height=scaled(24), font_size=sp(13),
                              background_color=(0.2, 0.2, 0.25, 1))
                 btn.bind(on_press=toggle)
                 grid.add_widget(btn)
-            try:
-                res = self.guild_api.roles_list()
-            except Exception as e:
-                self._show_notice("roles: %r" % e)
-                return
-            if not res.get("ok"):
-                self._show_notice("roles: %s" % res.get("error", "failed"))
-                return
-            members = set()
-            for r in res.get("roles", []):
-                members = set(r.get("members") or [])
-                add_role(r, target_hash in members)
+
+            def work():
+                try:
+                    res = self.guild_api.roles_list()
+                except Exception as e:
+                    err = "roles: %r" % e
+                    Clock.schedule_once(
+                        lambda dt: self._show_notice(err), 0)
+                    return
+
+                def apply(dt):
+                    if gen != load_gen[0]:
+                        return  # a newer refresh superseded this response
+                    if not res.get("ok"):
+                        self._show_notice(
+                            "roles: %s" % res.get("error", "failed"))
+                        return
+                    members = set()
+                    for r in res.get("roles", []):
+                        members = set(r.get("members") or [])
+                        add_role(r, target_hash in members)
+                Clock.schedule_once(apply, 0)
+            threading.Thread(target=work, daemon=True).start()
 
         def on_create():
             name = name_in.text.strip()
             if not name:
                 return
-            try:
-                res = self.guild_api.roles_create(name)
-            except Exception as e:
-                self._show_notice("roles: %r" % e)
-                return
-            if res.get("ok"):
-                name_in.text = ""
-                Clock.schedule_once(lambda dt: refresh(), 0)
-            else:
-                self._show_notice("roles: %s" % res.get("error", "failed"))
+
+            def work():
+                try:
+                    res = self.guild_api.roles_create(name)
+                except Exception as e:
+                    err = "roles: %r" % e
+                    Clock.schedule_once(
+                        lambda dt: self._show_notice(err), 0)
+                    return
+                if res.get("ok"):
+                    Clock.schedule_once(
+                        lambda dt: setattr(name_in, "text", ""), 0)
+                    Clock.schedule_once(lambda dt: refresh(), 0)
+                else:
+                    Clock.schedule_once(
+                        lambda dt: self._show_notice(
+                            "roles: %s" % res.get("error", "failed")), 0)
+            threading.Thread(target=work, daemon=True).start()
         create_btn.bind(on_press=lambda inst: on_create())
         close.bind(on_press=lambda inst: popup.dismiss())
         refresh()
@@ -3800,10 +3360,12 @@ class sHadesClientApp(MDApp):
         text_in = TextInput(hint_text="message (direct lxmf)",
                             multiline=False)
         row.add_widget(text_in)
-        send = Button(text="send", size_hint_x=None, width=70)
+        send = Button(text="send", size_hint_x=None, width=70,
+                      size_hint_y=None, height=scaled(36),
+                      font_size=sp(14), pos_hint={"center_y": 0.5})
         row.add_widget(send)
         box.add_widget(row)
-        close = Button(text="close", size_hint_y=None, height=28)
+        close = Button(text="close", size_hint_y=None, height=scaled(28))
         box.add_widget(close)
         popup = Popup(title="dm", content=box, size_hint=(0.7, 0.7))
         self._dm_popup = popup
@@ -3943,7 +3505,7 @@ class sHadesClientApp(MDApp):
         grid.bind(minimum_height=grid.setter("height"))
         scroll.add_widget(grid)
         box.add_widget(scroll)
-        close = Button(text="close", size_hint_y=None, height=28)
+        close = Button(text="close", size_hint_y=None, height=scaled(28))
         box.add_widget(close)
         popup = Popup(title="server settings", content=box, size_hint=(0.8, 0.8))
         self._admin_popup = popup
@@ -3952,129 +3514,157 @@ class sHadesClientApp(MDApp):
         def set_status(txt):
             Clock.schedule_once(lambda dt: self._set_status(txt), 0)
 
-        def load_config():
-            try:
-                res = self.guild_api.admin_config()
-            except Exception as e:
-                set_status("config: %r" % e)
-                return
-            if not res.get("ok"):
-                set_status("config: %s" % res.get("error", "failed"))
-                return
-            cfg = res.get("config", {})
-            for key, val in sorted(cfg.items()):
-                row = BoxLayout(size_hint_y=None, height=dp(32), spacing=4)
-                row.add_widget(Label(text=key, size_hint_x=0.35,
-                                     halign="left", valign="middle",
-                                     font_size=sp(12)))
-                entry = TextInput(text=str(val), multiline=False,
-                                  size_hint_x=0.45)
-                row.add_widget(entry)
-                save = Button(text="save", size_hint_x=None, width=60,
-                              font_size=sp(11))
-                row.add_widget(save)
+        # Every tab fetches from the guild. Those calls block on the RNS
+        # link for up to the request timeout (10s), so they must NOT run on
+        # the main thread — an unresponsive guild would freeze the whole UI.
+        # Each loader therefore fetches on a background thread and builds
+        # its widgets back on the main thread via Clock.schedule_once.
+        #
+        # load_gen guards against out-of-order responses: switching tabs
+        # quickly would otherwise let a slow earlier response append its
+        # rows to a grid the newer response already cleared.
+        load_gen = [0]
 
-                def do_save(k=key, e=entry):
-                    try:
-                        r = self.guild_api.admin_config(k, e.text)
-                    except Exception as ex:
-                        set_status("config: %r" % ex)
-                        return
-                    if r.get("ok"):
-                        set_status("%s saved" % k)
-                        Clock.schedule_once(lambda dt: refresh(), 0)
-                    else:
-                        set_status("%s: %s" % (k, r.get("error")))
-                save.bind(on_press=lambda inst, k=key, e=entry: do_save(k, e))
-                grid.add_widget(row)
+        def fetch(view_fn, on_ok):
+            """Run view_fn() on a worker thread; call on_ok(res) on the
+            main thread with the result."""
+            gen = load_gen[0]
+
+            def work():
+                try:
+                    res = view_fn()
+                except Exception as e:
+                    set_status("%r" % e)
+                    return
+                if gen != load_gen[0]:
+                    return  # a newer tab superseded this response
+                Clock.schedule_once(lambda dt: on_ok(res), 0)
+            threading.Thread(target=work, daemon=True).start()
+
+        def load_config():
+            def render(res):
+                if not res.get("ok"):
+                    set_status("config: %s" % res.get("error", "failed"))
+                    return
+                cfg = res.get("config", {})
+                for key, val in sorted(cfg.items()):
+                    row = BoxLayout(size_hint_y=None, height=dp(32), spacing=4)
+                    row.add_widget(Label(text=key, size_hint_x=0.35,
+                                         halign="left", valign="middle",
+                                         font_size=sp(12)))
+                    entry = TextInput(text=str(val), multiline=False,
+                                      size_hint_x=0.45)
+                    row.add_widget(entry)
+                    save = Button(text="save", size_hint_x=None, width=60,
+                                  size_hint_y=None, height=scaled(dp(32)),
+                                  font_size=sp(11), pos_hint={"center_y": 0.5})
+                    row.add_widget(save)
+
+                    def do_save(k=key, e=entry):
+                        # Read the widget on the main thread; the worker
+                        # must not touch widget state.
+                        val = e.text
+
+                        def save_work():
+                            try:
+                                r = self.guild_api.admin_config(k, val)
+                            except Exception as ex:
+                                set_status("config: %r" % ex)
+                                return
+                            if r.get("ok"):
+                                set_status("%s saved" % k)
+                                Clock.schedule_once(lambda dt: refresh(), 0)
+                            else:
+                                set_status("config: %s" % r.get("error"))
+                        threading.Thread(target=save_work, daemon=True).start()
+                    save.bind(on_press=lambda inst, k=key, e=entry: do_save(k, e))
+                    grid.add_widget(row)
+            fetch(self.guild_api.admin_config, render)
 
         def load_mods():
-            try:
-                res = self.guild_api.admin_mods("list")
-            except Exception as e:
-                set_status("mods: %r" % e)
-                return
-            if not res.get("ok"):
-                set_status("mods: %s" % res.get("error", "failed"))
-                return
-            mods = res.get("mods") or []
-            admins = res.get("admins") or []
-            grid.add_widget(Label(
-                text="moderators (%d)  admins (%d)" % (len(mods), len(admins)),
-                size_hint_y=None, height=dp(22), font_size=sp(12),
-                color=(0.85, 0.87, 0.9, 1), halign="left", valign="middle"))
-            row = BoxLayout(size_hint_y=None, height=dp(32), spacing=4)
-            entry = TextInput(hint_text="user hash (32 hex)",
-                              multiline=False, size_hint_x=0.6)
-            row.add_widget(entry)
-            addm = Button(text="add mod", size_hint_x=None, width=80,
-                          font_size=sp(11))
-            row.add_widget(addm)
-            adda = Button(text="add admin", size_hint_x=None, width=90,
-                          font_size=sp(11))
-            row.add_widget(adda)
-            grid.add_widget(row)
+            def render(res):
+                if not res.get("ok"):
+                    set_status("mods: %s" % res.get("error", "failed"))
+                    return
+                mods = res.get("mods") or []
+                admins = res.get("admins") or []
+                grid.add_widget(Label(
+                    text="moderators (%d)  admins (%d)" % (len(mods), len(admins)),
+                    size_hint_y=None, height=dp(22), font_size=sp(12),
+                    color=(0.85, 0.87, 0.9, 1), halign="left", valign="middle"))
+                row = BoxLayout(size_hint_y=None, height=dp(32), spacing=4)
+                entry = TextInput(hint_text="user hash (32 hex)",
+                                  multiline=False, size_hint_x=0.6)
+                row.add_widget(entry)
+                addm = Button(text="add mod", size_hint_x=None, width=80,
+                              size_hint_y=None, height=scaled(dp(32)),
+                              font_size=sp(11), pos_hint={"center_y": 0.5})
+                row.add_widget(addm)
+                adda = Button(text="add admin", size_hint_x=None, width=90,
+                              size_hint_y=None, height=scaled(dp(32)),
+                              font_size=sp(11), pos_hint={"center_y": 0.5})
+                row.add_widget(adda)
+                grid.add_widget(row)
 
-            def do_op(op, target_hash=None):
-                h = (target_hash or (entry.text or "")).strip().lower()
-                if not h:
-                    return
-                try:
-                    r = self.guild_api.admin_mods(op, h)
-                except Exception as ex:
-                    set_status("mods: %r" % ex)
-                    return
-                if r.get("ok"):
-                    entry.text = ""
-                    set_status("%s %s" % (op, h[:12]))
-                    Clock.schedule_once(lambda dt: refresh(), 0)
-                else:
-                    set_status("%s: %s" % (op, r.get("error")))
-            addm.bind(on_press=lambda inst: do_op("add"))
-            adda.bind(on_press=lambda inst: do_op("admin_add"))
-            for h in sorted(set(mods) | set(admins)):
-                kind = ("admin" if h in admins else "mod")
-                r = BoxLayout(size_hint_y=None, height=dp(26), spacing=4)
-                r.add_widget(Label(text="%s %s" % (kind, h[:16]),
-                                   size_hint_x=0.7, halign="left",
-                                   valign="middle", font_size=sp(11)))
-                rm = Button(text="remove", size_hint_x=None, width=70,
-                            font_size=sp(10))
-                rm.bind(on_press=lambda inst, hh=h, kk=kind: do_op(
-                    "admin_remove" if kk == "admin" else "remove", hh))
-                r.add_widget(rm)
-                grid.add_widget(r)
+                def do_op(op, target_hash=None):
+                    h = (target_hash or (entry.text or "")).strip().lower()
+                    if not h:
+                        return
+
+                    def op_work():
+                        try:
+                            r = self.guild_api.admin_mods(op, h)
+                        except Exception as ex:
+                            set_status("mods: %r" % ex)
+                            return
+                        if r.get("ok"):
+                            Clock.schedule_once(
+                                lambda dt: setattr(entry, "text", ""), 0)
+                            set_status("%s %s" % (op, h[:12]))
+                            Clock.schedule_once(lambda dt: refresh(), 0)
+                        else:
+                            set_status("mods: %s" % r.get("error"))
+                    threading.Thread(target=op_work, daemon=True).start()
+                addm.bind(on_press=lambda inst: do_op("add"))
+                adda.bind(on_press=lambda inst: do_op("admin_add"))
+                for h in sorted(set(mods) | set(admins)):
+                    kind = ("admin" if h in admins else "mod")
+                    r = BoxLayout(size_hint_y=None, height=dp(26), spacing=4)
+                    r.add_widget(Label(text="%s %s" % (kind, h[:16]),
+                                       size_hint_x=0.7, halign="left",
+                                       valign="middle", font_size=sp(11)))
+                    rm = Button(text="remove", size_hint_x=None, width=70,
+                                size_hint_y=None, height=scaled(dp(26)),
+                                font_size=sp(10), pos_hint={"center_y": 0.5})
+                    rm.bind(on_press=lambda inst, hh=h, kk=kind: do_op(
+                        "admin_remove" if kk == "admin" else "remove", hh))
+                    r.add_widget(rm)
+                    grid.add_widget(r)
+            fetch(lambda: self.guild_api.admin_mods("list"), render)
 
         def load_audit():
-            try:
-                res = self.guild_api.admin_audit(50)
-            except Exception as e:
-                set_status("audit: %r" % e)
-                return
-            if not res.get("ok"):
-                set_status("audit: %s" % res.get("error", "failed"))
-                return
-            entries = res.get("entries") or []
-            grid.add_widget(Label(
-                text="audit log (%d recent)" % len(entries),
-                size_hint_y=None, height=dp(22), font_size=sp(12),
-                color=(0.85, 0.87, 0.9, 1), halign="left", valign="middle"))
-            for e in entries:
-                grid.add_widget(Label(
-                    text="%s  %s  %s" % (e.get("action", ""),
-                                         (e.get("target") or "")[:16],
-                                         (e.get("detail") or "")[:40]),
-                    size_hint_y=None, height=dp(22), font_size=sp(11),
-                    color=(0.8, 0.82, 0.86, 1), halign="left",
-                    valign="middle"))
-
-            def load_invites():
-                """Invite codes (U6b) — create, list, revoke."""
-                try:
-                    res = self.guild_api.invites("list")
-                except Exception as e:
-                    set_status("invites: %r" % e)
+            def render(res):
+                if not res.get("ok"):
+                    set_status("audit: %s" % res.get("error", "failed"))
                     return
+                entries = res.get("entries") or []
+                grid.add_widget(Label(
+                    text="audit log (%d recent)" % len(entries),
+                    size_hint_y=None, height=dp(22), font_size=sp(12),
+                    color=(0.85, 0.87, 0.9, 1), halign="left", valign="middle"))
+                for e in entries:
+                    grid.add_widget(Label(
+                        text="%s  %s  %s" % (e.get("action", ""),
+                                             (e.get("target") or "")[:16],
+                                             (e.get("detail") or "")[:40]),
+                        size_hint_y=None, height=dp(22), font_size=sp(11),
+                        color=(0.8, 0.82, 0.86, 1), halign="left",
+                        valign="middle"))
+            fetch(lambda: self.guild_api.admin_audit(50), render)
+
+        def load_invites():
+            """Invite codes (U6b) — create, list, revoke."""
+            def render(res):
                 if not res.get("ok"):
                     set_status("invites: %s" % res.get("error", "failed"))
                     return
@@ -4094,7 +3684,8 @@ class sHadesClientApp(MDApp):
                                    size_hint_x=0.2)
                 row.add_widget(exp_in)
                 mk = Button(text="create", size_hint_x=None, width=70,
-                            font_size=sp(11))
+                            size_hint_y=None, height=scaled(dp(32)),
+                            font_size=sp(11), pos_hint={"center_y": 0.5})
                 row.add_widget(mk)
                 grid.add_widget(row)
 
@@ -4105,12 +3696,18 @@ class sHadesClientApp(MDApp):
                         return default
 
                 def do_create():
+                    # Read the widgets on the main thread; the worker must
+                    # not touch widget state.
+                    label = (label_in.text or "").strip()
+                    max_uses = num(uses_in.text)
+                    expires_in = num(exp_in.text)
+
                     def work():
                         try:
                             r = self.guild_api.invites(
-                                "create", label=(label_in.text or "").strip(),
-                                max_uses=num(uses_in.text),
-                                expires_in=num(exp_in.text))
+                                "create", label=label,
+                                max_uses=max_uses,
+                                expires_in=expires_in)
                         except Exception as ex:
                             set_status("invites: %r" % ex)
                             return
@@ -4135,7 +3732,8 @@ class sHadesClientApp(MDApp):
                         size_hint_x=0.8, halign="left", valign="middle",
                         font_size=sp(10)))
                     rm = Button(text="revoke", size_hint_x=None, width=70,
-                                font_size=sp(10))
+                                size_hint_y=None, height=scaled(dp(26)),
+                                font_size=sp(10), pos_hint={"center_y": 0.5})
 
                     def do_revoke(code=inv.get("code")):
                         def work():
@@ -4154,35 +3752,40 @@ class sHadesClientApp(MDApp):
                     rm.bind(on_press=lambda inst: do_revoke())
                     ir.add_widget(rm)
                     grid.add_widget(ir)
+            fetch(lambda: self.guild_api.invites("list"), render)
 
-            views = [("config", load_config), ("moderators", load_mods),
-                     ("audit", load_audit), ("invites", load_invites)]
-            current = [0]
+        views = [("config", load_config), ("moderators", load_mods),
+                 ("audit", load_audit), ("invites", load_invites)]
+        current = [0]
 
-            def show(idx):
-                current[0] = idx
-                app = App.get_running_app()
-                active_bg = app.theme_colors['primary'] if app else (0.36, 0.41, 0.59, 1)
-                inactive_bg = app.theme_colors['sidebar_ctrl'] if app else (0.24, 0.26, 0.3, 1)
-                for i, btn in enumerate(tab_buttons):
-                    btn.background_color = active_bg if i == idx else inactive_bg
-                grid.clear_widgets()
-                views[idx][1]()
+        def show(idx):
+            current[0] = idx
+            # Invalidate any in-flight load from the previous tab so a slow
+            # response cannot append its rows to the newly-cleared grid.
+            load_gen[0] += 1
+            app = App.get_running_app()
+            active_bg = app.theme_colors['primary'] if app else (0.36, 0.41, 0.59, 1)
+            inactive_bg = app.theme_colors['sidebar_ctrl'] if app else (0.24, 0.26, 0.3, 1)
+            for i, btn in enumerate(tab_buttons):
+                btn.background_color = active_bg if i == idx else inactive_bg
+            grid.clear_widgets()
+            views[idx][1]()
 
-            def refresh():
-                """Reload the tab that is currently open."""
-                show(current[0])
+        def refresh():
+            """Reload the tab that is currently open."""
+            show(current[0])
 
-            tab_buttons = []
-            for i, (title, _) in enumerate(views):
-                app = App.get_running_app()
-                inactive_bg = app.theme_colors['sidebar_ctrl'] if app else (0.24, 0.26, 0.3, 1)
-                btn = Button(text=title, background_color=inactive_bg,
-                             font_size=sp(12))
-                btn.bind(on_press=lambda inst, idx=i: show(idx))
-                tabs.add_widget(btn)
-                tab_buttons.append(btn)
-            show(0)
+        tab_buttons = []
+        for i, (title, _) in enumerate(views):
+            app = App.get_running_app()
+            inactive_bg = app.theme_colors['sidebar_ctrl'] if app else (0.24, 0.26, 0.3, 1)
+            btn = Button(text=title, background_color=inactive_bg,
+                         size_hint_y=None, height=scaled(32),
+                         font_size=sp(12), pos_hint={"center_y": 0.5})
+            btn.bind(on_press=lambda inst, idx=i: show(idx))
+            tabs.add_widget(btn)
+            tab_buttons.append(btn)
+        show(0)
         popup.open()
 
     def _open_join_prompt(self, on_done=None):
@@ -4190,19 +3793,25 @@ class sHadesClientApp(MDApp):
         policy is 'code' and this client has not joined yet."""
         box = BoxLayout(orientation="vertical", spacing=4, padding=6)
         app = App.get_running_app()
-        box.add_widget(Label(text="This guild requires an invite code.",
-                             size_hint_y=None, height=24,
-                             color=app.theme_colors['text'] if app else (1, 1, 1, 1), font_size=sp(13)))
+        box.add_widget(Label(
+            text="This guild requires an invite code.",
+            size_hint_y=None, height=24,
+            color=app.theme_colors['text'] if app else (1, 1, 1, 1),
+            font_size=sp(13)))
         entry = TextInput(hint_text="invite code", multiline=False)
         box.add_widget(entry)
         row = BoxLayout(size_hint_y=None, height=34, spacing=4)
-        submit = Button(text="join")
+        submit = Button(text="join", size_hint_y=None, height=scaled(34),
+                        pos_hint={"center_y": 0.5})
         row.add_widget(submit)
-        cancel = Button(text="cancel")
+        cancel = Button(text="cancel", size_hint_y=None, height=scaled(34),
+                        pos_hint={"center_y": 0.5})
         row.add_widget(cancel)
         box.add_widget(row)
-        status = Label(text="", size_hint_y=None, height=22,
-                       color=app.theme_colors['text_muted'] if app else (0.8, 0.82, 0.86, 1), font_size=sp(11))
+        status = Label(
+            text="", size_hint_y=None, height=22,
+            color=app.theme_colors['text_muted'] if app else (0.8, 0.82, 0.86, 1),
+            font_size=sp(11))
         box.add_widget(status)
         popup = Popup(title="join", content=box, size_hint=(0.7, 0.4))
         self._join_popup = popup
@@ -4220,8 +3829,8 @@ class sHadesClientApp(MDApp):
                     Clock.schedule_once(lambda dt: setattr(status, "text", msg), 0)
                     return
                 if res.get("ok") and res.get("joined"):
-                    Clock.schedule_once(lambda dt: setattr(status, "text",
-                                                          "joined"), 0)
+                    Clock.schedule_once(
+                        lambda dt: setattr(status, "text", "joined"), 0)
                     Clock.schedule_once(lambda dt: popup.dismiss(), 0.3)
                     if on_done:
                         Clock.schedule_once(lambda dt: on_done(True), 0.4)
@@ -4285,7 +3894,7 @@ class sHadesClientApp(MDApp):
     def _reply_quote(self, username, content):
         """Quote a message into the input bar: '> name: line' per line."""
         lines = (content or "").split("\n")[:3]
-        quote = "\n".join("> %s: %s" % (username, l[:120]) for l in lines)
+        quote = "\n".join("> %s: %s" % (username, ln[:120]) for ln in lines)
         try:
             main = self.root.get_screen("main")
             inp = main.ids.msg_input
@@ -4321,6 +3930,7 @@ class sHadesClientApp(MDApp):
     def _delete_channel(self, name, cid):
         if not self.guild_api:
             return
+
         def work():
             try:
                 res = self.guild_api.channels_delete(cid)
@@ -4336,6 +3946,7 @@ class sHadesClientApp(MDApp):
         """Run a moderation call (mute/ban/...) off the UI thread."""
         if not self.guild_api:
             return
+
         def work():
             try:
                 res = getattr(self.guild_api, method)(user_hash)
@@ -4351,6 +3962,7 @@ class sHadesClientApp(MDApp):
     def _delete_message(self, msg_id):
         if not self.guild_api:
             return
+
         def work():
             try:
                 res = self.guild_api.delete(msg_id)
@@ -4378,6 +3990,7 @@ class sHadesClientApp(MDApp):
             new = (ti.text or "").strip()
             if not new or not self.guild_api:
                 return
+
             def work():
                 try:
                     self.guild_api.edit(msg_id, new)
@@ -4385,9 +3998,11 @@ class sHadesClientApp(MDApp):
                     print("edit failed:", repr(e))
             threading.Thread(target=work, daemon=True).start()
             popup_holder["p"].dismiss()
-        save_btn = Button(text="save")
+        save_btn = Button(text="save", size_hint_y=None, height=scaled(dp(40)),
+                          pos_hint={"center_y": 0.5})
         save_btn.bind(on_press=save)
-        cancel_btn = Button(text="cancel")
+        cancel_btn = Button(text="cancel", size_hint_y=None,
+                            height=scaled(dp(40)), pos_hint={"center_y": 0.5})
         cancel_btn.bind(on_press=lambda *a: popup_holder["p"].dismiss())
         row.add_widget(save_btn)
         row.add_widget(cancel_btn)
@@ -4429,6 +4044,7 @@ class sHadesClientApp(MDApp):
             return
         if not self.guild_api:
             return
+
         def work():
             try:
                 res = self.guild_api.command(text)
@@ -4451,12 +4067,12 @@ class sHadesClientApp(MDApp):
             main = self.root.get_screen("main")
             name = getattr(main, "_current_channel", "general")
             cid = self._channel_cid(name)
-            inp = main.ids.msg_input
         except Exception as e:
             print("raw send failed:", repr(e))
             return
         if not text.strip() or not self.guild_api:
             return
+
         def work():
             res = self.guild_api.post(cid, text)
             if not res.get("ok"):
@@ -4533,6 +4149,7 @@ class sHadesClientApp(MDApp):
             grid.add_widget(self._micron_label("[i]loading site…[/i]"))
         except Exception as e:
             print("site open error:", repr(e))
+
         def work():
             manifest = {}
             try:
@@ -4562,6 +4179,7 @@ class sHadesClientApp(MDApp):
             print("term open error:", repr(e))
         if self._term_sessions.get(cid):
             return   # session survives channel switches until idle expiry
+
         def work():
             try:
                 res = self.guild_api.term_open(cid)
@@ -4585,6 +4203,7 @@ class sHadesClientApp(MDApp):
             return
         if self._term_page:
             self._term_page.append("> " + text + "\n")
+
         def work():
             try:
                 res = self.guild_api.term_data(sid, text + "\n")
@@ -4606,6 +4225,7 @@ class sHadesClientApp(MDApp):
         self._site_current = (cid, path)
         if not self.guild_api:
             return
+
         def work():
             text, err = None, "unknown"
             try:
@@ -4713,6 +4333,7 @@ class sHadesClientApp(MDApp):
         emb = MessageEmbed()
         emb.source = ""    # placeholder box until the bytes arrive
         container.add_widget(emb)
+
         def work():
             blob = None
             try:
@@ -4765,6 +4386,7 @@ class sHadesClientApp(MDApp):
         """Download a media target to the local attachments dir."""
         name = target.rsplit("/", 1)[-1] or "media"
         self._set_status("downloading %s…" % name)
+
         def work():
             blob = None
             try:
@@ -4951,7 +4573,9 @@ class sHadesClientApp(MDApp):
     # -- attachments: server-stored vs ephemeral (P2P) -------------------
     def _add_loading_placeholder(self, row):
         """Show a loading placeholder in the row's embed container."""
-        print(f"[TRACE] _add_loading_placeholder: row={row.msg_id[:12] if row.msg_id else '?'}", flush=True)
+        print(
+            f"[TRACE] _add_loading_placeholder: "
+            f"row={row.msg_id[:12] if row.msg_id else '?'}", flush=True)
         dlog(f"_add_loading_placeholder: row={row.msg_id[:12] if row.msg_id else '?'}")
         lbl = Label(
             text=ATT_PLACEHOLDER_TEXT,
@@ -4968,7 +4592,9 @@ class sHadesClientApp(MDApp):
         """Remove the loading placeholder from the row's embed container."""
         lbl = getattr(row, "_loading_placeholder", None)
         if lbl is not None:
-            print(f"[TRACE] _remove_placeholder: row={row.msg_id[:12] if row.msg_id else '?'}", flush=True)
+            print(
+                f"[TRACE] _remove_placeholder: "
+                f"row={row.msg_id[:12] if row.msg_id else '?'}", flush=True)
             dlog(f"_remove_placeholder: row={row.msg_id[:12] if row.msg_id else '?'}")
             try:
                 row.ids.embed_container.remove_widget(lbl)
@@ -5003,8 +4629,12 @@ class sHadesClientApp(MDApp):
             Label(text="Store:", size_hint_x=None, width=dp(50),
                   color=app.theme_colors['text'] if app else (1, 1, 1, 1), font_size=sp(12),
                   halign="left", valign="middle"))
-        btn_server = Button(text="Server-stored", size_hint_x=None, width=dp(130))
-        btn_ephem = Button(text="Ephemeral (P2P)", size_hint_x=None, width=dp(130))
+        btn_server = Button(text="Server-stored", size_hint_x=None,
+                            width=dp(130), size_hint_y=None,
+                            height=scaled(dp(44)), pos_hint={"center_y": 0.5})
+        btn_ephem = Button(text="Ephemeral (P2P)", size_hint_x=None,
+                           width=dp(130), size_hint_y=None,
+                           height=scaled(dp(44)), pos_hint={"center_y": 0.5})
         selected = {"style": ATT_SERVER}
 
         def pick(s):
@@ -5020,20 +4650,26 @@ class sHadesClientApp(MDApp):
         style_box.add_widget(btn_server)
         style_box.add_widget(btn_ephem)
 
-        btn_ok = Button(text="OK — Send", size_hint_y=None, height=dp(44),
-                        background_color=app.theme_colors['primary'] if app else (0.42, 0.48, 1.0, 1),
+        btn_ok = Button(text="OK — Send", size_hint_y=None,
+                        height=scaled(dp(44)),
+                        background_color=app.theme_colors['primary'] if app else (
+                            0.42, 0.48, 1.0, 1),
                         color=app.theme_colors['text'] if app else (1, 1, 1, 1))
-        btn_cancel = Button(text="Cancel", size_hint_y=None, height=dp(44),
-                            background_color=app.theme_colors['panel_darker'] if app else (0.25, 0.27, 0.31, 1),
+        btn_cancel = Button(text="Cancel", size_hint_y=None,
+                            height=scaled(dp(44)),
+                            background_color=app.theme_colors['panel_darker'] if app else (
+                                0.25, 0.27, 0.31, 1),
                             color=app.theme_colors['text'] if app else (1, 1, 1, 1))
         btn_box = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
         btn_box.add_widget(btn_ok)
         btn_box.add_widget(btn_cancel)
 
         content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
-        content.add_widget(Label(text="Attach a file — choose how it is stored:",
-                                 size_hint_y=None, height=dp(24),
-                                 color=app.theme_colors['text'] if app else (1, 1, 1, 1), font_size=sp(12)))
+        content.add_widget(Label(
+            text="Attach a file — choose how it is stored:",
+            size_hint_y=None, height=dp(24),
+            color=app.theme_colors['text'] if app else (1, 1, 1, 1),
+            font_size=sp(12)))
         content.add_widget(chooser)
         content.add_widget(style_box)
         content.add_widget(btn_box)
@@ -5067,7 +4703,8 @@ class sHadesClientApp(MDApp):
         # Client-side size check so the user gets a clear message instead of
         # a silent server rejection. Matches server MAX_ATTACHMENT_SZ (32 MB).
         if len(blob) > 32 * 1024 * 1024:
-            self._set_status("attach failed: file too large (%d MB, max 32 MB)" % (len(blob) / 1024 / 1024))
+            self._set_status("attach failed: file too large (%d MB, max 32 MB)" %
+                             (len(blob) / 1024 / 1024))
             return
         self._send_with_attachment(text, name, mime, blob, style)
 
@@ -5077,8 +4714,13 @@ class sHadesClientApp(MDApp):
         The wire format is always a [name, mime, blob] triple; the chosen
         style only affects how the client persists/re-fetches the attachment.
         """
-        print(f"[TRACE] _send_with_attachment: name={name} mime={mime} size={len(blob)} style={style} text_len={len(text or '')}", flush=True)
-        dlog(f"_send_with_attachment: name={name} mime={mime} size={len(blob)} style={style} text_len={len(text or '')}")
+        print(
+            f"[TRACE] _send_with_attachment: name={name} mime={mime} "
+            f"size={len(blob)} style={style} text_len={len(text or '')}",
+            flush=True)
+        dlog(
+            f"_send_with_attachment: name={name} mime={mime} "
+            f"size={len(blob)} style={style} text_len={len(text or '')}")
         if not self.guild_api:
             self._set_status("Not connected to guild")
             return
@@ -5107,8 +4749,14 @@ class sHadesClientApp(MDApp):
             if res is None or not res.get("ok"):
                 legacy = self.guild_api.post(cid, text, attachments=[[name, mime, blob]])
                 res = legacy if (res is None or not res.get("ok")) else res
-            print(f"[TRACE] _send_with_attachment.work: post response ok={res.get('ok')} msg_id={res.get('msg_id')} attachment={res.get('attachment')}", flush=True)
-            dlog(f"_send_with_attachment.work: post response ok={res.get('ok')} msg_id={res.get('msg_id')} attachment={res.get('attachment')}")
+            print(
+                f"[TRACE] _send_with_attachment.work: post response "
+                f"ok={res.get('ok')} msg_id={res.get('msg_id')} "
+                f"attachment={res.get('attachment')}", flush=True)
+            dlog(
+                f"_send_with_attachment.work: post response "
+                f"ok={res.get('ok')} msg_id={res.get('msg_id')} "
+                f"attachment={res.get('attachment')}")
             if not res.get("ok"):
                 Clock.schedule_once(
                     lambda dt: self._set_status("send failed: %s" % res.get("error", "unknown")), 0)
@@ -5159,96 +4807,115 @@ class sHadesClientApp(MDApp):
         info = self._active_users.get((target_hash or "").lower())
         lookup_hash = (info or {}).get("node_hash") or target_hash
 
-        # Look up node's address via guild
-        try:
-            res = self.guild_api.lookup_node(lookup_hash)
-            if not res.get("ok"):
-                self._set_status("Node not found: %s" % res.get("error", "unknown"))
-                return
-            address = res.get("address")
-            port = res.get("port")
-            identity_hash = res.get("identity_hash")
-        except Exception as e:
-            self._set_status("Lookup failed: %s" % e)
-            return
-
-        if not address or not port:
-            self._set_status("No address for node: %s" % lookup_hash)
-            return
-
-        # Connect to remote node via RNS.Link and request profile page
-        try:
-            nh = bytes.fromhex(lookup_hash)
-            nid = RNS.Identity.recall(nh)
-            if nid is None:
-                # Try with identity_hash from lookup
-                nid = RNS.Identity(bytes.fromhex(identity_hash)) if identity_hash else None
-            if nid is None:
-                self._set_status("RNS does not know identity for %s" % target_hash)
-                return
-            nd = RNS.Destination(nid, RNS.Destination.OUT,
-                                 RNS.Destination.SINGLE, "nomadnetwork", "node")
-            link = RNS.Link(nd)
-            for _ in range(200):
-                if link.status == RNS.Link.ACTIVE:
-                    break
-                time.sleep(0.1)
-            if link.status != RNS.Link.ACTIVE:
-                self._set_status("Link to %s never active" % target_hash[:12])
-                return
-
-            # Request profile page
-            req_path = "/page/profile/%s" % target_hash
-            receipt = link.request(req_path, data={})
-            if isinstance(receipt, bool):
-                if not receipt:
-                    self._set_status("Profile request failed")
+        # Everything below blocks on RNS: the guild lookup, the link setup
+        # (up to 20s waiting for ACTIVE), and the page fetch. Run it on a
+        # worker thread and hop back to the main thread for the status text
+        # and the popup, so opening a profile never freezes the UI.
+        def work():
+            # Look up node's address via guild
+            try:
+                res = self.guild_api.lookup_node(lookup_hash)
+                if not res.get("ok"):
+                    Clock.schedule_once(lambda dt: self._set_status(
+                        "Node not found: %s" % res.get("error", "unknown")), 0)
                     return
-                receipt = link.request(req_path, data={})
-            deadline = time.time() + 10
-            while (hasattr(receipt, "response")
-                   and receipt.response is None
-                   and time.time() < deadline):
-                time.sleep(0.1)
-            if not hasattr(receipt, "response") or receipt.response is None:
-                self._set_status("Profile request timed out")
+                address = res.get("address")
+                port = res.get("port")
+                identity_hash = res.get("identity_hash")
+            except Exception as e:
+                err = "Lookup failed: %s" % e
+                Clock.schedule_once(
+                    lambda dt: self._set_status(err), 0)
                 return
 
-            profile_text = receipt.response.decode("utf-8", errors="replace")
+            if not address or not port:
+                Clock.schedule_once(lambda dt: self._set_status(
+                    "No address for node: %s" % lookup_hash), 0)
+                return
 
-            # Fetch any images referenced in the profile page (![alt](/file/name))
-            image_paths = {}  # filename -> local temp path
-            import re as _re
-            for m in _re.finditer(r"!\[([^\]]*)\]\(/file/([^)]+)\)", profile_text):
-                filename = m.group(2)
-                try:
-                    file_req_path = "/file/%s" % filename
-                    file_receipt = link.request(file_req_path, data={})
-                    if isinstance(file_receipt, bool):
-                        if not file_receipt:
-                            continue
+            # Connect to remote node via RNS.Link and request profile page
+            try:
+                nh = bytes.fromhex(lookup_hash)
+                nid = RNS.Identity.recall(nh)
+                if nid is None:
+                    # Try with identity_hash from lookup
+                    nid = RNS.Identity(bytes.fromhex(identity_hash)) if identity_hash else None
+                if nid is None:
+                    Clock.schedule_once(lambda dt: self._set_status(
+                        "RNS does not know identity for %s" % target_hash), 0)
+                    return
+                nd = RNS.Destination(nid, RNS.Destination.OUT,
+                                     RNS.Destination.SINGLE, "nomadnetwork", "node")
+                link = RNS.Link(nd)
+                for _ in range(200):
+                    if link.status == RNS.Link.ACTIVE:
+                        break
+                    time.sleep(0.1)
+                if link.status != RNS.Link.ACTIVE:
+                    Clock.schedule_once(lambda dt: self._set_status(
+                        "Link to %s never active" % target_hash[:12]), 0)
+                    return
+
+                # Request profile page
+                req_path = "/page/profile/%s" % target_hash
+                receipt = link.request(req_path, data={})
+                if isinstance(receipt, bool):
+                    if not receipt:
+                        Clock.schedule_once(
+                            lambda dt: self._set_status("Profile request failed"), 0)
+                        return
+                    receipt = link.request(req_path, data={})
+                deadline = time.time() + 10
+                while (hasattr(receipt, "response")
+                       and receipt.response is None
+                       and time.time() < deadline):
+                    time.sleep(0.1)
+                if not hasattr(receipt, "response") or receipt.response is None:
+                    Clock.schedule_once(
+                        lambda dt: self._set_status("Profile request timed out"), 0)
+                    return
+
+                profile_text = receipt.response.decode("utf-8", errors="replace")
+
+                # Fetch any images referenced in the profile page
+                # (![alt](/file/name))
+                image_paths = {}  # filename -> local temp path
+                import re as _re
+                for m in _re.finditer(r"!\[([^\]]*)\]\(/file/([^)]+)\)", profile_text):
+                    filename = m.group(2)
+                    try:
+                        file_req_path = "/file/%s" % filename
                         file_receipt = link.request(file_req_path, data={})
-                    deadline = time.time() + 10
-                    while (hasattr(file_receipt, "response")
-                           and file_receipt.response is None
-                           and time.time() < deadline):
-                        time.sleep(0.1)
-                    if hasattr(file_receipt, "response") and file_receipt.response is not None:
-                        # Save to temp file
-                        import tempfile as _tempfile
-                        tmp = _tempfile.NamedTemporaryFile(
-                            suffix=".png", delete=False, dir=_app_data_dir())
-                        tmp.write(file_receipt.response)
-                        tmp.close()
-                        image_paths[filename] = tmp.name
-                except Exception:
-                    pass
+                        if isinstance(file_receipt, bool):
+                            if not file_receipt:
+                                continue
+                            file_receipt = link.request(file_req_path, data={})
+                        deadline = time.time() + 10
+                        while (hasattr(file_receipt, "response")
+                               and file_receipt.response is None
+                               and time.time() < deadline):
+                            time.sleep(0.1)
+                        if (hasattr(file_receipt, "response")
+                                and file_receipt.response is not None):
+                            # Save to temp file
+                            import tempfile as _tempfile
+                            tmp = _tempfile.NamedTemporaryFile(
+                                suffix=".png", delete=False, dir=_app_data_dir())
+                            tmp.write(file_receipt.response)
+                            tmp.close()
+                            image_paths[filename] = tmp.name
+                    except Exception:
+                        pass
 
-            self._show_profile_popup(target_hash, username, profile_text, image_paths)
+                Clock.schedule_once(lambda dt: self._show_profile_popup(
+                    target_hash, username, profile_text, image_paths), 0)
 
-        except Exception as e:
-            print("Profile fetch error:", repr(e))
-            self._set_status("Profile fetch failed: %s" % e)
+            except Exception as e:
+                print("Profile fetch error:", repr(e))
+                err = "Profile fetch failed: %s" % e
+                Clock.schedule_once(
+                    lambda dt: self._set_status(err), 0)
+        threading.Thread(target=work, daemon=True).start()
 
     def _show_own_profile(self):
         """Show own profile locally."""
@@ -5309,9 +4976,9 @@ class sHadesClientApp(MDApp):
         scroll.add_widget(label)
         content.add_widget(scroll)
 
-        close_btn = Button(text="Close", size_hint_y=None, height=dp(40),
-                           background_color=app.theme_colors['sidebar_ctrl'] if app else (0.5, 0.53, 0.59, 1),
-                           color=app.theme_colors['text'] if app else (1, 1, 1, 1))
+        close_btn = Button(text="Close", size_hint_y=None, height=scaled(dp(40)),
+                           background_color=self.theme_colors['sidebar_ctrl'],
+                           color=self.theme_colors['text'])
         content.add_widget(close_btn)
 
         popup = Popup(title="Profile: %s" % (username or target_hash[:12]),
@@ -5411,9 +5078,13 @@ class sHadesClientApp(MDApp):
             spacing=dp(10),
         )
         save_btn = Button(text="Save PFP",
+                          size_hint_y=None, height=scaled(dp(44)),
+                          pos_hint={"center_y": 0.5},
                           background_color=self.theme_colors['primary'],
                           color=self.theme_colors['btn_text'])
         cancel_btn = Button(text="Cancel",
+                            size_hint_y=None, height=scaled(dp(44)),
+                            pos_hint={"center_y": 0.5},
                             background_color=self.theme_colors['sidebar_ctrl'],
                             color=self.theme_colors['text_muted'])
         btn_box.add_widget(save_btn)
@@ -5582,18 +5253,24 @@ class sHadesClientApp(MDApp):
             shutil.copy(path, orig_path)
             shutil.copy(path, small_path)
 
-        # Upload 256x256 version to guild as avatar
-        try:
-            with open(small_path, "rb") as f:
-                blob = f.read()
-            res = self.guild_api.avatar_upload(blob)
-        except Exception:
-            res = None
+        # Upload 256x256 version to guild as avatar. avatar_upload() blocks
+        # on the RNS link, so do it on a worker thread; the local files are
+        # saved either way and applied to the UI on the main thread.
+        def upload_work():
+            try:
+                with open(small_path, "rb") as f:
+                    blob = f.read()
+                res = self.guild_api.avatar_upload(blob)
+            except Exception:
+                res = None
 
-        if res and res.get("ok"):
-            self._set_status("Avatar updated")
-        else:
-            self._set_status("avatar upload failed")
+            def apply_upload(dt):
+                if res and res.get("ok"):
+                    self._set_status("Avatar updated")
+                else:
+                    self._set_status("avatar upload failed")
+            Clock.schedule_once(apply_upload, 0)
+        threading.Thread(target=upload_work, daemon=True).start()
 
         # Always store paths locally regardless of guild API result —
         # the files are saved to disk even if guild upload fails.
@@ -5638,17 +5315,26 @@ class sHadesClientApp(MDApp):
         except Exception as e:
             self._set_status("avatar upload failed: %s" % e)
             return
-        try:
-            res = self.guild_api.avatar_upload(blob)
-        except Exception:
-            res = None
-        if res and res.get("ok"):
-            self._set_status("Avatar updated")
-            self.profile_screen.target_avatar = path
-            if hasattr(self, "profile_screen"):
-                self.profile_screen.ids.profile_pfp.source = path
-        else:
-            self._set_status("avatar upload failed")
+
+        # avatar_upload() blocks on the RNS link — keep it off the main thread.
+        def work():
+            try:
+                res = self.guild_api.avatar_upload(blob)
+            except Exception:
+                res = None
+
+            def apply(dt):
+                if res and res.get("ok"):
+                    self._set_status("Avatar updated")
+                    try:
+                        self.profile_screen.target_avatar = path
+                        self.profile_screen.ids.profile_pfp.source = path
+                    except Exception:
+                        pass
+                else:
+                    self._set_status("avatar upload failed")
+            Clock.schedule_once(apply, 0)
+        threading.Thread(target=work, daemon=True).start()
 
     def save_profile(self):
         """Save username to the guild."""
@@ -5657,16 +5343,30 @@ class sHadesClientApp(MDApp):
             new_name = (inp.text or "").strip() or "user"
         except Exception:
             return
-        try:
-            res = self.guild_api.register(new_name, "")
+
+        # register() blocks on the RNS link — keep it off the main thread.
+        def work():
+            try:
+                res = self.guild_api.register(new_name, "")
+            except Exception as e:
+                err = "save failed: %s" % e
+                Clock.schedule_once(
+                    lambda dt: self._set_status(err), 0)
+                return
             if res.get("ok"):
-                self.username = new_name
-                self.profile_screen.target_username = new_name
-                self._set_status("Profile saved")
+                def apply(dt):
+                    self.username = new_name
+                    try:
+                        self.profile_screen.target_username = new_name
+                    except Exception:
+                        pass
+                    self._set_status("Profile saved")
+                Clock.schedule_once(apply, 0)
             else:
-                self._set_status("save failed: %s" % res.get("error", "unknown"))
-        except Exception as e:
-            self._set_status("save failed: %s" % e)
+                Clock.schedule_once(
+                    lambda dt: self._set_status(
+                        "save failed: %s" % res.get("error", "unknown")), 0)
+        threading.Thread(target=work, daemon=True).start()
 
     # -- ui helpers ------------------------------------------------------
     def _set_status(self, text):
@@ -5683,12 +5383,24 @@ class sHadesClientApp(MDApp):
         self._stream_stop.set()
         self._announce_stop.set()
         self._presence_stop.set()
-        # close any open console sessions so they don't idle out server-side
-        for sid in list(self._term_sessions.values()):
-            try:
-                self.guild_api.term_close(sid)
-            except Exception:
-                pass
+        # close any open console sessions so they don't idle out server-side.
+        # Each term_close() blocks on the RNS link for up to the request
+        # timeout, so doing them inline freezes shutdown for N * timeout
+        # seconds. Close them on a background thread with a short timeout
+        # instead — the sessions are server-side garbage-collected anyway.
+        sessions = list(self._term_sessions.values())
+        if sessions:
+            api = self.guild_api
+            if api is not None:
+                def close_all():
+                    for sid in sessions:
+                        try:
+                            api.term_close(sid, timeout=1.5)
+                        except Exception:
+                            pass
+                t = threading.Thread(target=close_all, daemon=True)
+                t.start()
+                t.join(2.0)
         self._term_sessions.clear()
         # shut the LXMF router so its announce/delivery threads don't leak
         if self.lxmf_router is not None:

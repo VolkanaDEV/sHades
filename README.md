@@ -323,6 +323,8 @@ shows a placeholder until terminal sessions land. Site rendering (`micron.py` +
 
     sHades.py              the guild server (single file)
     setup_sHades.py        fresh-hub / join-existing-hub setup script
+    applet_bridge.py       micron applet sandbox (wasmtime, fuel/epoch/memory
+                           capped) — see micron_applet_bridge_spec.md
     tests/integ_test.py    end-to-end verification (mesh)
     tests/test_moderation.py moderation unit tests
     tests/test_presence.py presence / ping-expiry unit tests
