@@ -79,6 +79,7 @@ jobs:
             --hidden-import=ui_scale \
             --collect-all=RNS \
             --collect-all=LXMF \
+            --collect-all=wasmtime \
             --add-data "kv_md.kv:." \
             --add-data "media:media" \
             --distpath dist/linux
@@ -106,7 +107,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt "pyinstaller>=6.0,<7.0"
       - name: Build onefile binary
-        run: pyinstaller --onefile --name sHades-client.exe kivy_client.py --hidden-import=RNS --hidden-import=LXMF --hidden-import=RNS.vendor --hidden-import=RNS.vendor.umsgpack --hidden-import=ui_scale --collect-all=RNS --collect-all=LXMF --add-data "kv_md.kv;." --add-data "media;media" --distpath dist/windows
+        # --collect-all=wasmtime: the package ships a raw data DLL (wasmtime
+        # layout: wasmtime/win32-x86_64/_wasmtime.dll) that plain analysis
+        # never bundles; local mirror of this exact command produced an exe
+        # with ZERO wasmtime entries in Analysis/EXE TOCs. Without it the
+        # frozen client silently drops the micron applet bridge.
+        run: pyinstaller --onefile --name sHades-client.exe kivy_client.py --hidden-import=RNS --hidden-import=LXMF --hidden-import=RNS.vendor --hidden-import=RNS.vendor.umsgpack --hidden-import=ui_scale --collect-all=RNS --collect-all=LXMF --collect-all=wasmtime --add-data "kv_md.kv;." --add-data "media;media" --distpath dist/windows
       - name: Publish artifact
         uses: actions/upload-artifact@v4
         with:
