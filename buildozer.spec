@@ -19,7 +19,11 @@ orientation = portrait
 fullscreen = 0
 android.permissions = INTERNET,ACCESS_NETWORK_STATE,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
 android.api = 33
-android.minapi = 24
+# minapi must equal ndk_api: p4a (develop) refuses --minsdk != the API the
+# dist was compiled against ("You must pass --allow-minsdk-ndkapi-mismatch",
+# github run 42926045356). The wasmtime android wheel is android_26_<abi>
+# anyway (see comment above), so 26 is the floor for both.
+android.minapi = 26
 android.ndk_api = 26
 android.archs = arm64-v8a
 android.accept_sdk_license = True
