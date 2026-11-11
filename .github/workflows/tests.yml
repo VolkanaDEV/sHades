@@ -70,7 +70,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq xvfb libmtdev1
       - name: Import smoke test
-        run: python -c "import kivy_client; assert kivy_client.KIVY and kivy_client.KIVYMD, 'client import requires kivy+kivymd'"
+        # Same display law as the suites: importing kivy_client initializes
+        # the kivy window manager and the sdl2 provider needs a display
+        # (github run 42926045160: "Couldn't connect to X server", exit 102).
+        run: xvfb-run -a python -c "import kivy_client; assert kivy_client.KIVY and kivy_client.KIVYMD, 'client import requires kivy+kivymd'"
       - name: Run client suites under a virtual display
         run: |
           xvfb-run -a python tests/test_attachments.py
