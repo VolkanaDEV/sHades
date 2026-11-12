@@ -163,6 +163,29 @@ DEBUG = False  # set via --debug CLI arg; enables verbose attachment/ingest logg
 
 
 # ---------------------------------------------------------------------------
+# Default community hub
+# ---------------------------------------------------------------------------
+# The official sHades community hub runs on this VPS. A fresh install (no
+# saved session) connects here automatically instead of making the user
+# type a server address on the connect screen.
+#
+#   199.231.189.136:29221 -> sHades guild server (TCP interface)
+#   199.231.189.136:4242  -> rsReticulum community hub (transport node)
+#
+# The guild server is the one clients speak the sHades API to, so that is
+# what the client points at. The rsReticulum instance on 4242 is a
+# transport node that relays for other peers on the mesh.
+DEFAULT_HUB_HOST = "199.231.189.136"
+DEFAULT_HUB_PORT = 29221
+DEFAULT_HUB_ADDRESS = "%s:%d" % (DEFAULT_HUB_HOST, DEFAULT_HUB_PORT)
+
+# The guild's nomadnetwork.node hash. Left blank on purpose: the client
+# discovers it from the guild's announce, which is what keeps working if
+# the guild is ever rebuilt with a fresh identity.
+DEFAULT_GUILD_NODE_HASH = ""
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def hexstr(b):
@@ -1428,11 +1451,22 @@ class sHadesClientApp(MDApp):
         self.theme_cls.primary_palette = "Blue"
         self.theme_cls.accent_palette = "Orange"
         self.node_hash = None
+        # The GUILD's nomadnetwork.node hash. Distinct from self.node_hash,
+        # which is later reused for THIS client's own node destination.
+        self.guild_node_hash = None
         self.delivery_hash = None
         self.client_identity = None
         self.client_dest = None
         self.username = "user"
         self.my_hash = None
+        # Which guild we are pointed at. These are plain attributes (not
+        # properties), so they MUST be initialised here: on a fresh install
+        # no session has been loaded yet and any read of them before the
+        # first connect would raise AttributeError. Seeded with the default
+        # community hub so a fresh install already has a valid target.
+        self.hub_address = DEFAULT_HUB_ADDRESS
+        self.hub_host = DEFAULT_HUB_HOST
+        self.hub_port = DEFAULT_HUB_PORT
         self._poll_thread = None
         self._poll_stop = threading.Event()
         self._seq = 0
@@ -1636,8 +1670,9 @@ class sHadesClientApp(MDApp):
     def on_start(self):
         # Try to resume a saved session
         sess = self._load_session()
-        if sess:
-            self.node_hash = sess.get("node_hash")
+        if sess and sess.get("hub_address"):
+            self.guild_node_hash = sess.get("node_hash")
+            self.node_hash = self.guild_node_hash
             self.delivery_hash = sess.get("delivery_hash")
             self.username = sess.get("username", "user")
             self.hub_address = sess.get("hub_address")
@@ -1655,6 +1690,68 @@ class sHadesClientApp(MDApp):
             # the guild API is up; server-stored attachments re-fetch with a
             # loading placeholder until their bytes arrive.
             Clock.schedule_once(self._load_history_ui, 2.0)
+        else:
+            # Fresh install: connect to the default community hub without
+            # making the user type a server address. The connect screen stays
+            # up (showing progress) and is used as the fallback if the
+            # default hub is unreachable, so a fresh install is never locked
+            # out of the app.
+            self._auto_connect_default_hub()
+
+    def _auto_connect_default_hub(self):
+        """Connect to the default community hub on a fresh install.
+
+        Leaves the user on the connect screen while the attempt runs. If the
+        hub cannot be reached, the status line explains why and the user can
+        enter a different server -- the default is a convenience, never a
+        hard lock-in.
+        """
+        self._set_status("Connecting to default hub %s..." % DEFAULT_HUB_ADDRESS)
+        try:
+            self.root.current = "connect"
+        except Exception:
+            pass
+        # Give the connect screen a moment to render its status line before
+        # the (blocking) RNS work starts on a worker thread.
+        Clock.schedule_once(lambda dt: self._connect_default_hub(), 0.2)
+
+    def _connect_default_hub(self):
+        """Start the connect flow against the default hub.
+
+        Runs on the MAIN thread (it is invoked from a Clock callback):
+        _init_reticulum() constructs RNS.Reticulum(), which installs signal
+        handlers and is only legal on the main thread. The blocking link
+        attempt is moved to a worker by _init_reticulum() itself.
+        """
+        try:
+            username = (self.username or "").strip() or "user"
+            self.hub_address = DEFAULT_HUB_ADDRESS
+            self.hub_host = DEFAULT_HUB_HOST
+            self.hub_port = DEFAULT_HUB_PORT
+            self.username = username
+            self.guild_node_hash = DEFAULT_GUILD_NODE_HASH or None
+            self.node_hash = self.guild_node_hash
+            self.delivery_hash = None
+            # Add the default hub to the server list so it shows up in the
+            # server sidebar and can be switched to later.
+            self._add_server(DEFAULT_HUB_ADDRESS, username,
+                             DEFAULT_GUILD_NODE_HASH or "")
+            self._save_session()
+            self._init_reticulum()
+        except Exception as e:
+            print("default hub connect error:", repr(e))
+            err = "Could not reach default hub %s: %s" % (DEFAULT_HUB_ADDRESS, e)
+            Clock.schedule_once(lambda dt: self._set_status(err), 0)
+            Clock.schedule_once(lambda dt: self._return_to_connect_screen(err), 0)
+
+    def _return_to_connect_screen(self, message=""):
+        """Fall back to the connect screen after a failed auto-connect."""
+        try:
+            self.root.current = "connect"
+        except Exception:
+            pass
+        if message:
+            self._set_status(message)
 
     def _open_main(self):
         """Switch to the main chat screen."""
@@ -1707,7 +1804,13 @@ class sHadesClientApp(MDApp):
             tmp = path + ".tmp"
             with open(tmp, "w") as f:
                 json.dump({
-                    "node_hash": self.node_hash,
+                    # The GUILD's node hash, not our own. self.node_hash is
+                    # reused later for this client's own nomadnetwork.node
+                    # destination (see _connect_after_rns), so saving it here
+                    # would persist OUR hash and the next resume would look
+                    # up the wrong identity. guild_node_hash is the value
+                    # that actually identifies the guild.
+                    "node_hash": self.guild_node_hash,
                     "delivery_hash": self.delivery_hash,
                     "username": self.username,
                     "hub_address": self.hub_address,
@@ -1813,7 +1916,8 @@ class sHadesClientApp(MDApp):
             self.hub_address = s.get("hub_address")
             self.hub_host = s.get("host")
             self.hub_port = s.get("port")
-            self.node_hash = s.get("node_hash")
+            self.guild_node_hash = s.get("node_hash")
+            self.node_hash = self.guild_node_hash
             self.delivery_hash = s.get("delivery_hash")
             self.username = s.get("username", "user")
             self._save_session()
@@ -1964,7 +2068,8 @@ class sHadesClientApp(MDApp):
         self.hub_host = host
         self.hub_port = port
         self.username = username
-        self.node_hash = node_hash or None
+        self.guild_node_hash = node_hash or None
+        self.node_hash = self.guild_node_hash
         self.delivery_hash = delivery_hash or None
         self._set_status("Connecting...")
         self._save_session()
@@ -2228,9 +2333,12 @@ class sHadesClientApp(MDApp):
             # process the outbound packet". See _init_reticulum.
             if "enable_transport = yes" in content:
                 return True
-            if self.hub_address:
+            # Both the host AND the port must be known before the stored
+            # config can be compared -- a session can be missing either one,
+            # and "%d" % None raises TypeError.
+            if self.hub_address and self.hub_host and self.hub_port:
                 return ("target_host = %s" % self.hub_host) not in content or \
-                       ("target_port = %d" % self.hub_port) not in content
+                       ("target_port = %d" % int(self.hub_port)) not in content
             return "AutoInterface" not in content
         except Exception:
             return True
@@ -2349,22 +2457,23 @@ class sHadesClientApp(MDApp):
             # Discover guild node_hash via RNS announce if not provided.
             # The hub announces nomadnetwork.node over the TCPClientInterface
             # we just connected through; we capture the hash from the announce.
-            if not self.node_hash:
-                self.node_hash = self._discover_node_hash(reticulum)
-                if not self.node_hash:
+            if not self.guild_node_hash:
+                self.guild_node_hash = self._discover_node_hash(reticulum)
+                if not self.guild_node_hash:
                     raise RuntimeError(
                         "Could not discover guild node_hash from hub announces. "
                         "Ask the hub admin for its node_hash and try again.")
-                print(f"Discovered guild node_hash via announce: {self.node_hash}")
+                print(f"Discovered guild node_hash via announce: {self.guild_node_hash}")
 
             # Validate that RNS knows this identity (from hearing its announce)
-            nh = bytes.fromhex(self.node_hash)
+            self.node_hash = self.guild_node_hash
+            nh = bytes.fromhex(self.guild_node_hash)
             nid = RNS.Identity.recall(nh)
             if nid is None:
                 raise RuntimeError(
                     "RNS does not know identity for node_hash %s — "
-                    "the guild's announce was not heard yet. Try again." % self.node_hash)
-            print(f"RNS recalled identity for node_hash {self.node_hash}")
+                    "the guild's announce was not heard yet. Try again." % self.guild_node_hash)
+            print(f"RNS recalled identity for node_hash {self.guild_node_hash}")
 
             # link to guild node — retry up to 3 times
             link = None
@@ -2436,6 +2545,11 @@ class sHadesClientApp(MDApp):
             err_msg = "connect failed: %s" % e
             Clock.schedule_once(
                 lambda dt: self._set_status(err_msg), 0)
+            # Go back to the connect screen so the user can retry or point
+            # the client at a different guild. Without this a failed resume
+            # leaves the user stranded on an empty main screen.
+            Clock.schedule_once(
+                lambda dt: self._return_to_connect_screen(err_msg), 0)
 
     def _switch_main(self):
         self.root.current = "main"

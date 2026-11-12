@@ -81,6 +81,7 @@ jobs:
           xvfb-run -a python tests/test_embed_layout.py
           xvfb-run -a python tests/test_pfp_crop.py
           xvfb-run -a python tests/test_fullscreen_parent.py
+          xvfb-run -a python tests/test_default_hub.py
 
   integ-test:
     name: integration mesh (ubuntu)
