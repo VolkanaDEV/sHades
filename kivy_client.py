@@ -2160,8 +2160,16 @@ class sHadesClientApp(MDApp):
             cfgfile = os.path.join(storage, "config")
             if not os.path.exists(cfgfile) or self._config_needs_update(cfgfile):
                 with open(cfgfile, "w") as f:
+                    # enable_transport = no: the client is a leaf endpoint, not
+                    # a transport node. With transport enabled, RNS treats us
+                    # as a router and rebroadcasts the guild's announces; the
+                    # per-interface announce rate limiter then queues those
+                    # rebroadcasts instead of sending them, and every queued
+                    # one makes RNS log "No interfaces could process the
+                    # outbound packet". The guild announces itself every 10s
+                    # already, so the client gains nothing by forwarding it.
                     f.write("[reticulum]\n"
-                            "  enable_transport = yes\n"
+                            "  enable_transport = no\n"
                             "  share_instance = no\n\n"
                             "[interfaces]\n")
                     if self.hub_address:
@@ -2175,11 +2183,27 @@ class sHadesClientApp(MDApp):
                                 "    type = AutoInterface\n"
                                 "    enabled = yes\n")
 
+                    # ingress_control = no: the client is a leaf that talks to
+                    # exactly one guild. RNS's ingress limiter holds announces
+                    # for destinations it does not know yet, and the guild's
+                    # nomadnetwork.node announce is exactly such a destination
+                    # until the client discovers it -- so the limiter can
+                    # swallow the very announce discovery is waiting for,
+                    # making the connect fail intermittently. We only ever
+                    # talk to the one hub we were pointed at, so there is no
+                    # announce flood to defend against.
+                    f.write("    ingress_control = no\n")
+
                     f.write("  [[TCPServerInterface]]\n"
                             "    type = TCPServerInterface\n"
                             "    enabled = yes\n"
                             "    listen_ip = 0.0.0.0\n"
                             "    listen_port = %d\n" % self.client_port)
+                    # Same reasoning as the client interface above: other
+                    # clients' lxmf.delivery announces arrive here as
+                    # unknown destinations and would otherwise be held by
+                    # the ingress limiter.
+                    f.write("    ingress_control = no\n")
 
             reticulum = RNS.Reticulum(configdir=storage)
             self.reticulum = reticulum
@@ -2187,6 +2211,10 @@ class sHadesClientApp(MDApp):
             print("init reticulum error:", repr(e))
             self._set_status("connect failed: %s" % e)
             return
+        # Identity and the LXMRouter must be built on the MAIN thread --
+        # see _init_identity_and_lxmf. Only the blocking link work below
+        # moves to a worker.
+        self._init_identity_and_lxmf()
         threading.Thread(target=self._connect_after_rns, daemon=True).start()
 
     def _config_needs_update(self, cfgfile):
@@ -2194,6 +2222,12 @@ class sHadesClientApp(MDApp):
         try:
             with open(cfgfile) as f:
                 content = f.read()
+            # Configs written by older builds used enable_transport = yes.
+            # Rewrite those: running as a transport node makes RNS queue the
+            # guild's rebroadcast announces and log "No interfaces could
+            # process the outbound packet". See _init_reticulum.
+            if "enable_transport = yes" in content:
+                return True
             if self.hub_address:
                 return ("target_host = %s" % self.hub_host) not in content or \
                        ("target_port = %d" % self.hub_port) not in content
@@ -2240,12 +2274,24 @@ class sHadesClientApp(MDApp):
 
         return None
 
-    def _connect_after_rns(self):
-        """Background thread: identity, destinations, link to guild node."""
-        try:
-            reticulum = self.reticulum
+    def _init_identity_and_lxmf(self):
+        """Main thread only: build the client identity, the lxmf.delivery
+        destination and the LXMRouter.
 
-            # identity
+        LXMRouter's constructor installs SIGINT/SIGTERM handlers through
+        signal.signal(), and Python only allows signal.signal() on the
+        main thread of the main interpreter. Building the router from a
+        worker thread raised
+        ValueError('signal only works in main thread of the main
+        interpreter'), which the old code swallowed -- so DMs were
+        permanently dead and every run printed a scary error.
+
+        Called once per identity; switching servers keeps the same
+        identity and router (both are client-local, not per-guild).
+        """
+        if self.client_identity is not None:
+            return
+        try:
             storage = os.path.join(_app_data_dir(), "rns")
             ipath = os.path.join(storage, "identity")
             if os.path.exists(ipath):
@@ -2280,17 +2326,25 @@ class sHadesClientApp(MDApp):
                 self.lxmf_router.register_delivery_callback(self._on_dm_delivery)
                 # announce now so friends can hear our lxmf.delivery
                 self.lxmf_router.announce(self.lxmf_delivery.hash)
-            except ValueError as e:
-                if "signal only works in the main thread" in str(e):
-                    print("LXMF router init failed: must run on main thread (DMs disabled)")
-                else:
-                    print("LXMF router init failed (DMs disabled):", repr(e))
-                self.lxmf_router = None
-                self.lxmf_delivery = None
             except Exception as e:
                 print("LXMF router init failed (DMs disabled):", repr(e))
                 self.lxmf_router = None
                 self.lxmf_delivery = None
+        except Exception as e:
+            print("identity init error:", repr(e))
+            self.client_identity = None
+            self.client_dest = None
+            self.my_hash = None
+
+    def _connect_after_rns(self):
+        """Background thread: link to guild node.
+
+        The identity and the LXMRouter are already built (on the main
+        thread, by _init_identity_and_lxmf); only the blocking link
+        establishment happens here.
+        """
+        try:
+            reticulum = self.reticulum
 
             # Discover guild node_hash via RNS announce if not provided.
             # The hub announces nomadnetwork.node over the TCPClientInterface
