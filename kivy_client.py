@@ -107,21 +107,6 @@ import ui_geom
 from micron import (micron_parse, micron_page_bg, micron_media_target,
                     runs_to_markup)
 
-# ---------------------------------------------------------------------------
-# Theme (Dark Vintage: warm amber primary, cool teal accent for pop)
-# ---------------------------------------------------------------------------
-BG        = "#0A0A0A"   # app background - near black
-SIDEBAR   = "#0E0E0E"   # channel / member sidebar
-SIDEBAR_D = "#080808"
-PANEL     = "#121212"   # chat area
-INPUT_BG  = "#161616"   # input bar
-TEXT      = "#DF993A"   # primary text - vintage amber
-TEXT_MUTED= "#B8862D"   # secondary text - aged amber
-LINK      = "#DF993A"   # links / embeds - amber
-ACCENT    = "#00BFA6"   # accent - vibrant teal (complementary pop)
-AVATAR_BG = "#00BFA6"   # teal highlight for avatars
-BTN_TEXT  = "#0A0A0A"   # button text - near black (for amber buttons)
-
 # Attachment storage styles:
 #   server   - file is stored on the guild; bytes re-fetched via /file/attachments
 #              path (survives restart, shown with a loading placeholder until received).
@@ -134,7 +119,8 @@ ATT_PLACEHOLDER_TEXT = "[loading image…]"
 # Default UI palette — the single source of truth for theme colors. The app
 # seeds theme_colors from this, the config screen's Reset restores it, and
 # headless callers install it on a bare App so KV's app.theme_colors[...]
-# expressions resolve (see THEME_KEYS order for the config screen's c_<key> ids).
+# expressions resolve (THEME_KEYS + THEME_LABELS drive the config screen's
+# generated colour rows).
 DEFAULT_THEME_COLORS = {
     "bg_main": (0.04, 0.04, 0.04, 1),      # screens / root background - near black
     "panel": (0.07, 0.07, 0.07, 1),        # center chat area
@@ -146,18 +132,51 @@ DEFAULT_THEME_COLORS = {
     "accent": (0.0, 0.75, 0.65, 1),        # accent / destructive - vibrant teal #00BFA6
     "text": (0.87, 0.60, 0.23, 1),         # body text - vintage amber
     "text_muted": (0.72, 0.53, 0.18, 1),   # secondary text - aged amber #B8862D
-    "text_dim": (0.60, 0.44, 0.15, 1),     # dimmer secondary text
+    # #B08C46 -- the old #997026 measured 4.19:1 on the chat surface and
+    # 3.90:1 on the focused input fill, both below the 4.5:1 WCAG AA
+    # threshold for body text. This value measures 5.96:1 / 5.54:1.
+    "text_dim": (0.690, 0.549, 0.275, 1),   # dimmer secondary text
     "input_bg": (0.09, 0.09, 0.09, 1),     # text field fill
     "input_bg_focus": (0.11, 0.11, 0.11, 1),
-    "msg_own": (0.07, 0.07, 0.07, 1),      # own-message bubble / embeds
+    # #1E1E1E -- msg_own used to equal the panel colour exactly, so the
+    # own-message bubble was invisible against the chat surface.
+    "msg_own": (0.118, 0.118, 0.118, 1),   # own-message bubble / embeds
     "btn_text": (0.04, 0.04, 0.04, 1),     # button text - near black (for amber buttons)
+    # #646464 -- first value that clears 3:1 against all three dark
+    # surfaces (3.35 / 3.26 / 3.17), so input outlines are actually
+    # visible. Without a border token, inputs read as flat rectangles.
+    "border": (0.392, 0.392, 0.392, 1),    # input outlines, focus rings
+    "border_subtle": (0.227, 0.227, 0.227, 1),  # dividers, scrollbar trough
 }
 
 THEME_KEYS = (
     "bg_main", "panel", "panel_darker", "bg_sidebar", "sidebar_ctrl",
     "topbar", "primary", "accent", "text", "text_muted", "text_dim",
-    "input_bg", "input_bg_focus", "msg_own",
+    "input_bg", "input_bg_focus", "msg_own", "btn_text", "border",
+    "border_subtle",
 )
+
+# Human-readable label for each THEME_KEYS entry, rendered by the config
+# screen's generated colour rows (ConfigScreen._ensure_color_rows).
+THEME_LABELS = {
+    "bg_main": "Background",
+    "panel": "Chat area",
+    "panel_darker": "Input bar",
+    "bg_sidebar": "Side windows",
+    "sidebar_ctrl": "Side window controls",
+    "topbar": "Top bar",
+    "primary": "Primary button",
+    "accent": "Accent",
+    "text": "Body text",
+    "text_muted": "Muted text",
+    "text_dim": "Dim text",
+    "input_bg": "Input fill",
+    "input_bg_focus": "Input fill (focused)",
+    "msg_own": "Own message bubble",
+    "btn_text": "Button text",
+    "border": "Borders / outlines",
+    "border_subtle": "Dividers",
+}
 
 DEBUG = False  # set via --debug CLI arg; enables verbose attachment/ingest logging
 
@@ -192,6 +211,24 @@ def hexstr(b):
     if isinstance(b, str):
         return b
     return RNS.hexrep(b, delimit=False)
+
+
+def default_username(user_hash):
+    """A unique fallback display name for a user who has not chosen one.
+
+    The guild derives unregistered users' names the same way (see
+    sHades.get_username): "user-" + the first 6 hex chars of the
+    lxmf.delivery hash, which is the guild's canonical user key. Using
+    the identical convention here means a fresh client and the guild
+    agree on the name, and no two clients can collide on it.
+
+    A literal "user" would be taken by the first person to save it --
+    the guild rejects a duplicate with 409 "username taken" -- and the
+    name is UNIQUE across the whole guild, so it stays taken forever.
+    """
+    if not user_hash:
+        return "user"
+    return "user-" + str(user_hash)[:6]
 
 
 def now():
@@ -1320,13 +1357,38 @@ if KIVY:
 # ---------------------------------------------------------------------------
 if KIVY:
     class ConnectScreen(Screen):
-        pass
+        """Connect screen. The optional guild-hash fields live behind a
+        disclosure so the screen fits a small window without pushing the
+        Connect button off-screen."""
+
+        def toggle_advanced(self):
+            """Show/hide the optional node/delivery hash fields."""
+            try:
+                box = self.ids["advanced_box"]
+                label = self.ids["advanced_label"]
+            except Exception:
+                return
+            open_ = box.opacity > 0
+            if open_:
+                box.height = 0
+                box.opacity = 0
+                label.text = "Advanced: guild hashes"
+            else:
+                # minimum_height on the horizontal box is the tallest
+                # child row; the two 44px fields sit in a 420px column so
+                # the open height is 44 + 44 + spacing.
+                box.height = box.minimum_height or dp(98)
+                box.opacity = 1
+                label.text = "Advanced: guild hashes (hide)"
 
     class ProfileScreen(Screen):
         """Profile view: avatar, username, identity hashes, edit controls."""
         target_hash = StringProperty("")
         target_username = StringProperty("")
         target_avatar = StringProperty("")
+        # The user's lxmf.delivery destination hash. Distinct from
+        # target_hash (the user hash the guild keys members by).
+        target_delivery = StringProperty("")
 
     class MemberRow(ContextMenuMixin, BoxLayout):
         username = StringProperty("")
@@ -1374,22 +1436,82 @@ if KIVY:
             self.right_open = not self.right_open
 
     class ConfigScreen(Screen):
-        """Config screen: unified UI theme colors, persisted to ui_config.json."""
+        """Config screen: unified UI theme colors, persisted to ui_config.json.
 
-        def on_pre_enter(self):
-            """Prefill the color fields from the current theme when shown."""
+        The colour rows are generated in Python from THEME_KEYS
+        (_ensure_color_rows) instead of hand-written KV blocks, so adding a
+        token to DEFAULT_THEME_COLORS/THEME_KEYS cannot drift from the UI.
+        """
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            # Field for each THEME_KEYS entry, filled by _ensure_color_rows.
+            # Widgets added from Python are NOT registered in KV ids, so the
+            # old c_<key> id convention is replaced by this dict.
+            self._color_fields = {}
+            self._color_labels = []
+
+        def _ensure_color_rows(self):
+            """Build one Label+MDTextField row per THEME_KEYS entry (once)."""
+            if self._color_fields:
+                return
+            try:
+                grid = self.ids["theme_rows"]
+            except Exception:
+                return
+            from kivymd.uix.textfield import MDTextField
             from kivy.app import App as _App
             app = _App.get_running_app()
             for key in THEME_KEYS:
-                try:
-                    self.ids["c_" + key].text = rgba_to_hex(
-                        app.theme_colors.get(key, (1, 1, 1, 1)))
-                except Exception:
-                    pass
+                row = BoxLayout(size_hint_y=None, height=dp(44),
+                                padding=[0, dp(2)])
+                lbl = Label(text=THEME_LABELS.get(key, key),
+                            size_hint_x=0.34)
+                fld = MDTextField(text="", mode="filled",
+                                  size_hint_x=0.66)
+                row.add_widget(lbl)
+                row.add_widget(fld)
+                self._color_fields[key] = fld
+                self._color_labels.append(lbl)
+                grid.add_widget(row)
+            if app is not None:
+                app.bind(theme_colors=self._apply_row_colors)
+                self._apply_row_colors(app, app.theme_colors)
+
+        def _apply_row_colors(self, app, colors):
+            """Re-tint the generated rows after a theme change."""
+            text = colors.get("text", (1, 1, 1, 1))
+            for lbl in self._color_labels:
+                lbl.color = text
+            for fld in self._color_fields.values():
+                fld.fill_color_normal = colors.get(
+                    "input_bg", (0.09, 0.09, 0.09, 1))
+                fld.fill_color_focus = colors.get(
+                    "input_bg_focus", (0.11, 0.11, 0.11, 1))
+                fld.text_color_normal = text
+                fld.text_color_focus = text
+                fld.cursor_color = text
+
+        def on_pre_enter(self):
+            """Build the rows (first entry) and prefill from the theme."""
+            self._ensure_color_rows()
+            self._prefill_fields()
             try:
                 self.ids["config_status"].text = ""
             except Exception:
                 pass
+
+        def _prefill_fields(self):
+            from kivy.app import App as _App
+            app = _App.get_running_app()
+            if app is None:
+                return
+            for key, fld in self._color_fields.items():
+                try:
+                    fld.text = rgba_to_hex(
+                        app.theme_colors.get(key, (1, 1, 1, 1)))
+                except Exception:
+                    pass
 
         def save_config(self):
             """Parse the hex fields, apply the theme and persist it."""
@@ -1401,12 +1523,11 @@ if KIVY:
             except Exception:
                 status = None
             for key in THEME_KEYS:
-                try:
-                    text = self.ids["c_" + key].text
-                except Exception:
+                fld = self._color_fields.get(key)
+                if fld is None:
                     continue
                 try:
-                    app.theme_colors[key] = hex_to_rgba(text)
+                    app.theme_colors[key] = hex_to_rgba(fld.text)
                 except Exception as e:
                     if status:
                         status.text = "Invalid color for %s: %s" % (key, e)
@@ -1424,6 +1545,9 @@ if KIVY:
             app = _App.get_running_app()
             app.theme_colors = dict(DEFAULT_THEME_COLORS)
             app._save_ui_config()
+            # Reflect the restored theme in the fields immediately, not just
+            # on the next entry into the screen.
+            self._prefill_fields()
             try:
                 self.ids["config_status"].text = "Theme reset to defaults."
             except Exception:
@@ -1457,6 +1581,10 @@ class sHadesClientApp(MDApp):
         self.delivery_hash = None
         self.client_identity = None
         self.client_dest = None
+        # Provisional display name; replaced with a unique
+        # "user-<hash6>" once the client identity exists (see
+        # _init_identity_and_lxmf). Until then no guild call can be
+        # made anyway -- every API call needs an identified link.
         self.username = "user"
         self.my_hash = None
         # Which guild we are pointed at. These are plain attributes (not
@@ -1674,7 +1802,11 @@ class sHadesClientApp(MDApp):
             self.guild_node_hash = sess.get("node_hash")
             self.node_hash = self.guild_node_hash
             self.delivery_hash = sess.get("delivery_hash")
-            self.username = sess.get("username", "user")
+            # A session written by an older build may hold the literal
+            # "user". Treat that as "no name chosen" so it is upgraded
+            # to the unique default once the identity is built.
+            saved_username = sess.get("username", "") or ""
+            self.username = ("" if saved_username == "user" else saved_username)
             self.hub_address = sess.get("hub_address")
             self.hub_host = sess.get("hub_host")
             self.hub_port = sess.get("hub_port")
@@ -1919,7 +2051,8 @@ class sHadesClientApp(MDApp):
             self.guild_node_hash = s.get("node_hash")
             self.node_hash = self.guild_node_hash
             self.delivery_hash = s.get("delivery_hash")
-            self.username = s.get("username", "user")
+            saved_username = s.get("username", "") or ""
+            self.username = ("" if saved_username == "user" else saved_username)
             self._save_session()
 
     # -- message history persistence (so embeds survive close/re-open) -----
@@ -2067,7 +2200,10 @@ class sHadesClientApp(MDApp):
         self.hub_address = hub_address
         self.hub_host = host
         self.hub_port = port
-        self.username = username
+        # An empty username means "no name chosen yet" -- the unique
+        # default is assigned once the client identity exists. A literal
+        # "user" would be taken by the first client to save it.
+        self.username = ("" if username == "user" else (username or ""))
         self.guild_node_hash = node_hash or None
         self.node_hash = self.guild_node_hash
         self.delivery_hash = delivery_hash or None
@@ -2417,6 +2553,13 @@ class sHadesClientApp(MDApp):
                 self.client_identity, RNS.Destination.OUT,
                 RNS.Destination.SINGLE, "lxmf", "delivery")
             self.my_hash = hexstr(self.client_dest.hash)
+            # Now that the lxmf.delivery hash exists, adopt the same
+            # unique fallback name the guild would assign. A client that
+            # has never chosen a username must not sit on the literal
+            # "user": the first one to save it takes it for good and
+            # every later client gets 409 "username taken".
+            if self.username in ("", "user", None):
+                self.username = default_username(self.my_hash)
 
             # Direct client-to-client DM transport (U7): a real LXMRouter on
             # our identity. Inbound DMs arrive at our lxmf.delivery destination
@@ -5094,6 +5237,9 @@ class sHadesClientApp(MDApp):
             return
         self.profile_screen.target_hash = self.my_hash or ""
         self.profile_screen.target_username = self.username or "user"
+        delivery = getattr(self, "lxmf_delivery", None)
+        self.profile_screen.target_delivery = (
+            hexstr(delivery.hash) if delivery is not None else "")
         # Show saved circular pfp if we have one, otherwise blank
         self.profile_screen.target_avatar = getattr(
             self, "my_avatar_small", ""
@@ -5508,7 +5654,14 @@ class sHadesClientApp(MDApp):
         """Save username to the guild."""
         try:
             inp = self.root.get_screen("profile").ids.profile_username_input
-            new_name = (inp.text or "").strip() or "user"
+            new_name = (inp.text or "").strip()
+            # An empty field means "keep the current name". Falling back
+            # to the literal "user" would try to claim a name that the
+            # first client to save it took for good (the guild answers
+            # 409 "username taken"). The unique default is the right
+            # fallback, and it matches what the guild already shows.
+            if not new_name:
+                new_name = self.username or default_username(self.my_hash)
         except Exception:
             return
 

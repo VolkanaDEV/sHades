@@ -4,14 +4,15 @@
 #:import MDApp kivymd.app.MDApp
 #:import scaled ui_scale.scaled
 
-# Every button in the client is drawn a third shorter than the height it
-# would otherwise get (40dp -> 26.67dp, and so on). The factor lives in
-# ui_scale.py so the KV layout and the Python-built popups stay in sync.
+# Button heights are written literally as dp(N) so they read at their
+# nominal size. They used to be scaled by 2/3, which drew a 40dp button
+# as 26.67dp and the smallest as 21px -- below the 48dp touch target.
+# The shared factor lives in ui_scale.py (currently 1.0) so the KV layout
+# and the Python-built popups stay in sync.
 #
 # This class rule only covers MDButtons that do NOT set a height of their
-# own -- a widget's own property always wins over a class rule. So every
-# explicit height below is written as scaled(dp(N)), and the Python popups
-# do the same. Never give a button a bare dp(N) height.
+# own -- a widget's own property always wins over a class rule, so every
+# explicit height below carries the factor too.
 <MDButton>:
     height: scaled(dp(40))
 
@@ -70,7 +71,9 @@
             ClickableLabel:
                 text: root.username
                 target_hash: root.author_hash
-                color: app.theme_colors['text'] if root.is_own else app.theme_colors['text_muted']
+                # Other people's names are the ones you are reading -- they
+                # get the bright 'text'; your own is dimmer.
+                color: app.theme_colors['text_muted'] if root.is_own else app.theme_colors['text']
                 bold: True
                 font_size: sp(13)
                 text_size: self.width, None
@@ -182,7 +185,7 @@
         MDButton:
             style: 'filled'
             size_hint_y: None
-            height: scaled(dp(50))
+            height: scaled(dp(40))
             size_hint_x: None
             width: dp(150)
             pos_hint: {'center_x': 0.5}
@@ -194,7 +197,7 @@
         MDButton:
             style: 'outlined'
             size_hint_y: None
-            height: scaled(dp(50))
+            height: scaled(dp(40))
             size_hint_x: None
             width: dp(150)
             pos_hint: {'center_x': 0.5}
@@ -308,8 +311,11 @@
             halign: 'center'
             text_size: self.width, None
             shorten: True
+        # The lxmf.delivery hash -- previously this line rendered
+        # target_username, so the profile showed the name twice and the
+        # label claimed to be a hash that it was not.
         Label:
-            text: 'Delivery: ' + root.target_username
+            text: 'Delivery: ' + root.target_delivery
             font_size: sp(11)
             color: app.theme_colors['text_muted']
             size_hint_y: None
@@ -371,6 +377,13 @@
                 Rectangle:
                     pos: self.pos
                     size: self.size
+                # 1px hairline so the header reads as a header and not as
+                # chrome floating over the chat (topbar == bg_main).
+                Color:
+                    rgba: app.theme_colors['border_subtle']
+                Rectangle:
+                    pos: self.x, self.y
+                    size: self.width, dp(1)
             HamburgerIcon:
                 on_press: root.toggle_left()
                 color: app.theme_colors['text']
@@ -420,7 +433,7 @@
                     id: add_server_btn
                     style: 'filled'
                     size_hint_y: None
-                    height: scaled(dp(48))
+                    height: scaled(dp(40))
                     theme_bg_color: 'Custom'
                     md_bg_color: app.theme_colors['primary']
                     on_press: app._open_add_server_popup()
@@ -460,8 +473,8 @@
                     MDButton:
                         style: 'outlined'
                         size_hint_y: None
-                        height: scaled(dp(32))
-                        width: dp(36)
+                        height: scaled(dp(40))
+                        width: dp(48)
                         theme_bg_color: 'Custom'
                         md_bg_color: app.theme_colors['sidebar_ctrl']
                         on_press: app.open_config()
@@ -471,7 +484,7 @@
                 MDButton:
                     style: 'outlined'
                     size_hint_y: None
-                    height: scaled(dp(34))
+                    height: scaled(dp(40))
                     theme_bg_color: 'Custom'
                     md_bg_color: app.theme_colors['sidebar_ctrl']
                     on_press: root.toggle_left()
@@ -513,9 +526,12 @@
                         spacing: dp(2)
                         padding: [dp(6), dp(6)]
                 BoxLayout:
+                    # 48px: the bar must CONTAIN the field and the buttons.
+                    # At 24px a 35px field and 26.7px buttons overflowed
+                    # upward into the message list.
                     size_hint_y: None
-                    height: dp(24)
-                    padding: [dp(4), dp(1)]
+                    height: dp(48)
+                    padding: [dp(4), dp(4)]
                     spacing: dp(4)
                     canvas.before:
                         Color:
@@ -530,9 +546,12 @@
                         multiline: True
                         size_hint_x: 1
                         size_hint_y: None
-                        height: self.minimum_height
-                        min_height: dp(20)
-                        max_height: dp(80)
+                        # max_height caps the field at one line inside a
+                        # 48px bar; adjust_height() otherwise balloons it
+                        # to dp(56) and it overflows the bar.
+                        height: dp(40)
+                        min_height: dp(40)
+                        max_height: dp(40)
                         radius: [dp(6), dp(6), dp(6), dp(6)]
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
@@ -543,7 +562,9 @@
                     MDButton:
                         style: 'filled'
                         size_hint_x: None
-                        width: dp(40)
+                        width: dp(56)
+                        size_hint_y: None
+                        height: scaled(dp(40))
                         theme_bg_color: 'Custom'
                         md_bg_color: app.theme_colors['primary']
                         on_press: app.send_message()
@@ -556,7 +577,9 @@
                     MDButton:
                         style: 'filled'
                         size_hint_x: None
-                        width: dp(24)
+                        width: dp(48)
+                        size_hint_y: None
+                        height: scaled(dp(40))
                         theme_bg_color: 'Custom'
                         md_bg_color: app.theme_colors['primary']
                         on_press: app.open_attach_dialog()
@@ -582,12 +605,12 @@
                 MDButton:
                     style: 'outlined'
                     size_hint_y: None
-                    height: scaled(dp(34))
+                    height: scaled(dp(40))
                     theme_bg_color: 'Custom'
                     md_bg_color: app.theme_colors['sidebar_ctrl']
                     on_press: root.toggle_right()
                     MDButtonText:
-                        text: 'members \\u25bc' if root.right_open else 'members \\u25b6'
+                        text: 'members v' if root.right_open else 'members >'
                 ScrollView:
                     do_scroll_x: False
                     GridLayout:
@@ -601,139 +624,162 @@
 <ConnectScreen>:
     BoxLayout:
         orientation: 'vertical'
-        padding: dp(40)
-        spacing: dp(20)
         canvas.before:
             Color:
                 rgba: app.theme_colors['bg_main']
             Rectangle:
                 pos: self.pos
                 size: self.size
-        Image:
-            id: banner_config
-            source: app.banner_config_path or ''
-            size_hint_y: None
-            height: dp(200)
-            size_hint_x: None
-            width: dp(400)
-            allow_stretch: False
-            keep_ratio: True
-        Label:
-            text: 'sHades'
-            font_size: sp(40)
-            bold: True
-            color: app.theme_colors['text']
-            size_hint_y: None
-            height: dp(60)
-        Label:
-            text: 'Connect to a guild'
-            color: app.theme_colors['text_muted']
-            size_hint_y: None
-            height: dp(30)
-        BoxLayout:
-            orientation: 'vertical'
-            spacing: dp(10)
-            size_hint_y: None
-            height: dp(340)
-            MDTextField:
-                id: hub_address
-                hint_text: 'Hub address (ip:port, e.g. 192.168.1.50:29221)'
-                multiline: False
+        ScrollView:
+            do_scroll_x: False
+            bar_width: dp(6)
+            size_hint_y: 1
+            GridLayout:
+                cols: 1
                 size_hint_y: None
-                height: dp(44)
-                fill_color_normal: app.theme_colors['input_bg']
-                fill_color_focus: app.theme_colors['input_bg_focus']
-                text_color_normal: app.theme_colors['text']
-                text_color_focus: app.theme_colors['text']
-                cursor_color: app.theme_colors['text']
-            Label:
-                text: 'Hub address (ip:port) of the guild hub to connect to'
-                color: app.theme_colors['text_muted']
-                size_hint_y: None
-                height: dp(16)
-                halign: 'left'
-                valign: 'middle'
-                text_size: self.width, None
-                font_size: sp(11)
-            MDTextField:
-                id: username
-                hint_text: 'Your username'
-                multiline: False
-                size_hint_y: None
-                height: dp(44)
-                fill_color_normal: app.theme_colors['input_bg']
-                fill_color_focus: app.theme_colors['input_bg_focus']
-                text_color_normal: app.theme_colors['text']
-                text_color_focus: app.theme_colors['text']
-                cursor_color: app.theme_colors['text']
-            Label:
-                text: 'Your display name in the guild'
-                color: app.theme_colors['text_muted']
-                size_hint_y: None
-                height: dp(16)
-                halign: 'left'
-                valign: 'middle'
-                text_size: self.width, None
-                font_size: sp(11)
-            Label:
-                text: 'Guild hashes (leave blank to auto-discover from hub announce)'
-                color: app.theme_colors['text_muted']
-                size_hint_y: None
-                height: dp(20)
-                halign: 'left'
-                valign: 'middle'
-                text_size: self.width, None
-                font_size: sp(11)
-            MDTextField:
-                id: node_hash
-                hint_text: 'Guild node_hash (32 hex, optional)'
-                multiline: False
-                size_hint_y: None
-                height: dp(40)
-                fill_color_normal: app.theme_colors['input_bg']
-                fill_color_focus: app.theme_colors['input_bg_focus']
-                text_color_normal: app.theme_colors['text']
-                text_color_focus: app.theme_colors['text']
-                cursor_color: app.theme_colors['text']
-            Label:
-                text: 'Node hash of the guild (32 hex, optional)'
-                color: app.theme_colors['text_muted']
-                size_hint_y: None
-                height: dp(16)
-                halign: 'left'
-                valign: 'middle'
-                text_size: self.width, None
-                font_size: sp(11)
-            MDTextField:
-                id: delivery_hash
-                hint_text: 'Guild delivery_hash (32 hex, optional)'
-                multiline: False
-                size_hint_y: None
-                height: dp(40)
-                fill_color_normal: app.theme_colors['input_bg']
-                fill_color_focus: app.theme_colors['input_bg_focus']
-                text_color_normal: app.theme_colors['text']
-                text_color_focus: app.theme_colors['text']
-                cursor_color: app.theme_colors['text']
-            Label:
-                text: 'Delivery hash of the guild (32 hex, optional)'
-                color: app.theme_colors['text_muted']
-                size_hint_y: None
-                height: dp(16)
-                halign: 'left'
-                valign: 'middle'
-                text_size: self.width, None
-                font_size: sp(11)
-            MDButton:
-                style: 'filled'
-                size_hint_y: None
-                height: scaled(dp(50))
-                theme_bg_color: 'Custom'
-                md_bg_color: app.theme_colors['primary']
-                on_press: app.connect_to_guild(hub_address.text, username.text, node_hash.text, delivery_hash.text)
-                MDButtonText:
-                    text: 'Connect'
-                    text_color: app.theme_colors['btn_text']
+                height: self.minimum_height
+                padding: [dp(24), dp(24), dp(24), dp(12)]
+                spacing: dp(12)
+                # The banner is decorative and must never push the Connect
+                # button off-screen: it used to be dp(200) tall, which with
+                # the rest of the form needed 820px and clipped the top 42px
+                # of the image at a 738px window height (180px at 600px).
+                Image:
+                    id: banner_config
+                    source: app.banner_config_path or ''
+                    size_hint_y: None
+                    height: dp(120)
+                    size_hint_x: None
+                    width: dp(240)
+                    pos_hint: {'center_x': 0.5}
+                    allow_stretch: False
+                    keep_ratio: True
+                Label:
+                    text: 'sHades'
+                    font_size: sp(40)
+                    bold: True
+                    color: app.theme_colors['text']
+                    size_hint_y: None
+                    height: dp(56)
+                    halign: 'center'
+                    text_size: self.width, None
+                Label:
+                    text: 'Connect to a guild'
+                    color: app.theme_colors['text_muted']
+                    size_hint_y: None
+                    height: dp(24)
+                    halign: 'center'
+                    text_size: self.width, None
+                # Fixed-width form centred with spacers: a 44px field
+                # stretched across the whole window (1286px) is unusable.
+                Widget:
+                    size_hint_y: None
+                    height: dp(4)
+                BoxLayout:
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: dp(44)
+                    Widget:
+                        size_hint_x: 1
+                    BoxLayout:
+                        orientation: 'vertical'
+                        spacing: dp(10)
+                        size_hint_x: None
+                        width: dp(420)
+                        MDTextField:
+                            id: hub_address
+                            hint_text: 'Hub address (ip:port)'
+                            multiline: False
+                            size_hint_y: None
+                            height: dp(44)
+                            fill_color_normal: app.theme_colors['input_bg']
+                            fill_color_focus: app.theme_colors['input_bg_focus']
+                            text_color_normal: app.theme_colors['text']
+                            text_color_focus: app.theme_colors['text']
+                            cursor_color: app.theme_colors['text']
+                        MDTextField:
+                            id: username
+                            hint_text: 'Your username'
+                            multiline: False
+                            size_hint_y: None
+                            height: dp(44)
+                            fill_color_normal: app.theme_colors['input_bg']
+                            fill_color_focus: app.theme_colors['input_bg_focus']
+                            text_color_normal: app.theme_colors['text']
+                            text_color_focus: app.theme_colors['text']
+                            cursor_color: app.theme_colors['text']
+                        # The guild hashes are optional -- auto-discovery from
+                        # the hub's announce covers them -- so they are behind
+                        # a disclosure instead of four more always-visible
+                        # fields with four helper labels underneath.
+                        MDButton:
+                            id: advanced_toggle
+                            style: 'outlined'
+                            size_hint_y: None
+                            height: scaled(dp(40))
+                            theme_bg_color: 'Custom'
+                            md_bg_color: app.theme_colors['sidebar_ctrl']
+                            on_press: root.toggle_advanced()
+                            MDButtonText:
+                                id: advanced_label
+                                text: 'Advanced: guild hashes'
+                        MDButton:
+                            style: 'filled'
+                            size_hint_y: None
+                            height: scaled(dp(40))
+                            theme_bg_color: 'Custom'
+                            md_bg_color: app.theme_colors['primary']
+                            on_press: app.connect_to_guild(hub_address.text, username.text, node_hash.text, delivery_hash.text)
+                            MDButtonText:
+                                text: 'Connect'
+                                text_color: app.theme_colors['btn_text']
+                    Widget:
+                        size_hint_x: 1
+                # Optional hash fields, collapsed by default. They live in
+                # their own block so the disclosure can toggle its height,
+                # and share the same 420px centred measure as the main form
+                # so they do not stretch across the whole window.
+                BoxLayout:
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: 0
+                    id: advanced_box
+                    opacity: 0
+                    # Height is driven from Python (toggle_advanced):
+                    # 0 when collapsed, minimum_height when open.
+                    Widget:
+                        size_hint_x: 1
+                    BoxLayout:
+                        orientation: 'vertical'
+                        spacing: dp(10)
+                        size_hint_x: None
+                        width: dp(420)
+                        MDTextField:
+                            id: node_hash
+                            hint_text: 'Guild node_hash (32 hex, optional)'
+                            multiline: False
+                            size_hint_y: None
+                            height: dp(44)
+                            fill_color_normal: app.theme_colors['input_bg']
+                            fill_color_focus: app.theme_colors['input_bg_focus']
+                            text_color_normal: app.theme_colors['text']
+                            text_color_focus: app.theme_colors['text']
+                            cursor_color: app.theme_colors['text']
+                        MDTextField:
+                            id: delivery_hash
+                            hint_text: 'Guild delivery_hash (32 hex, optional)'
+                            multiline: False
+                            size_hint_y: None
+                            height: dp(44)
+                            fill_color_normal: app.theme_colors['input_bg']
+                            fill_color_focus: app.theme_colors['input_bg_focus']
+                            text_color_normal: app.theme_colors['text']
+                            text_color_focus: app.theme_colors['text']
+                            cursor_color: app.theme_colors['text']
+                    Widget:
+                        size_hint_x: 1
+        # The status line is OUTSIDE the scroll so a long message never
+        # scrolls the Connect button out of reach.
         Label:
             id: status
             text: ''
@@ -741,10 +787,14 @@
             font_size: sp(13)
             size_hint_y: None
             height: dp(30)
+            halign: 'center'
+            text_size: self.width, None
 
 <SlimButton@Button>:
     size_hint_x: None
-    width: dp(14)
+    # 14px was the whole touch target. The bar is drawn 14px wide but
+    # the button is 48px so it can actually be hit.
+    width: dp(48)
     size_hint_y: 1
     background_color: 0, 0, 0, 0
     color: app.theme_colors['text_muted']
@@ -775,8 +825,8 @@
             height: dp(44)
         ScrollView:
             do_scroll_x: False
-            GridLayout:
-                cols: 1
+            BoxLayout:
+                orientation: 'vertical'
                 size_hint_y: None
                 height: self.minimum_height
                 padding: dp(12)
@@ -788,258 +838,17 @@
                     color: app.theme_colors['text_muted']
                     size_hint_y: None
                     height: dp(28)
-                BoxLayout:
+                # One row per THEME_KEYS entry, generated in Python by
+                # ConfigScreen._ensure_color_rows. The previous 14
+                # hand-written KV blocks covered only 14 of the 17 keys --
+                # btn_text, border and border_subtle had no field and were
+                # silently skipped on save.
+                GridLayout:
+                    id: theme_rows
+                    cols: 1
                     size_hint_y: None
-                    height: dp(44)
-                    padding: [0, dp(2)]
-                    Label:
-                        text: 'Background'
-                        size_hint_x: 0.34
-                        color: app.theme_colors['text']
-                    MDTextField:
-                        id: c_bg_main
-                        text: ''
-                        mode: 'filled'
-                        size_hint_x: 0.66
-                        fill_color_normal: app.theme_colors['input_bg']
-                        fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: app.theme_colors['text']
-                        text_color_focus: app.theme_colors['text']
-                        cursor_color: app.theme_colors['text']
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(44)
-                    padding: [0, dp(2)]
-                    Label:
-                        text: 'Chat area'
-                        size_hint_x: 0.34
-                        color: app.theme_colors['text']
-                    MDTextField:
-                        id: c_panel
-                        text: ''
-                        mode: 'filled'
-                        size_hint_x: 0.66
-                        fill_color_normal: app.theme_colors['input_bg']
-                        fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: app.theme_colors['text']
-                        text_color_focus: app.theme_colors['text']
-                        cursor_color: app.theme_colors['text']
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(44)
-                    padding: [0, dp(2)]
-                    Label:
-                        text: 'Input bar'
-                        size_hint_x: 0.34
-                        color: app.theme_colors['text']
-                    MDTextField:
-                        id: c_panel_darker
-                        text: ''
-                        mode: 'filled'
-                        size_hint_x: 0.66
-                        fill_color_normal: app.theme_colors['input_bg']
-                        fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: app.theme_colors['text']
-                        text_color_focus: app.theme_colors['text']
-                        cursor_color: app.theme_colors['text']
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(44)
-                    padding: [0, dp(2)]
-                    Label:
-                        text: 'Side windows'
-                        size_hint_x: 0.34
-                        color: app.theme_colors['text']
-                    MDTextField:
-                        id: c_bg_sidebar
-                        text: ''
-                        mode: 'filled'
-                        size_hint_x: 0.66
-                        fill_color_normal: app.theme_colors['input_bg']
-                        fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: app.theme_colors['text']
-                        text_color_focus: app.theme_colors['text']
-                        cursor_color: app.theme_colors['text']
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(44)
-                    padding: [0, dp(2)]
-                    Label:
-                        text: 'Side window controls'
-                        size_hint_x: 0.34
-                        color: app.theme_colors['text']
-                    MDTextField:
-                        id: c_sidebar_ctrl
-                        text: ''
-                        mode: 'filled'
-                        size_hint_x: 0.66
-                        fill_color_normal: app.theme_colors['input_bg']
-                        fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: app.theme_colors['text']
-                        text_color_focus: app.theme_colors['text']
-                        cursor_color: app.theme_colors['text']
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(44)
-                    padding: [0, dp(2)]
-                    Label:
-                        text: 'Top bar'
-                        size_hint_x: 0.34
-                        color: app.theme_colors['text']
-                    MDTextField:
-                        id: c_topbar
-                        text: ''
-                        mode: 'filled'
-                        size_hint_x: 0.66
-                        fill_color_normal: app.theme_colors['input_bg']
-                        fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: app.theme_colors['text']
-                        text_color_focus: app.theme_colors['text']
-                        cursor_color: app.theme_colors['text']
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(44)
-                    padding: [0, dp(2)]
-                    Label:
-                        text: 'Primary button'
-                        size_hint_x: 0.34
-                        color: app.theme_colors['text']
-                    MDTextField:
-                        id: c_primary
-                        text: ''
-                        mode: 'filled'
-                        size_hint_x: 0.66
-                        fill_color_normal: app.theme_colors['input_bg']
-                        fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: app.theme_colors['text']
-                        text_color_focus: app.theme_colors['text']
-                        cursor_color: app.theme_colors['text']
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(44)
-                    padding: [0, dp(2)]
-                    Label:
-                        text: 'Accent'
-                        size_hint_x: 0.34
-                        color: app.theme_colors['text']
-                    MDTextField:
-                        id: c_accent
-                        text: ''
-                        mode: 'filled'
-                        size_hint_x: 0.66
-                        fill_color_normal: app.theme_colors['input_bg']
-                        fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: app.theme_colors['text']
-                        text_color_focus: app.theme_colors['text']
-                        cursor_color: app.theme_colors['text']
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(44)
-                    padding: [0, dp(2)]
-                    Label:
-                        text: 'Body text'
-                        size_hint_x: 0.34
-                        color: app.theme_colors['text']
-                    MDTextField:
-                        id: c_text
-                        text: ''
-                        mode: 'filled'
-                        size_hint_x: 0.66
-                        fill_color_normal: app.theme_colors['input_bg']
-                        fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: app.theme_colors['text']
-                        text_color_focus: app.theme_colors['text']
-                        cursor_color: app.theme_colors['text']
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(44)
-                    padding: [0, dp(2)]
-                    Label:
-                        text: 'Muted text'
-                        size_hint_x: 0.34
-                        color: app.theme_colors['text']
-                    MDTextField:
-                        id: c_text_muted
-                        text: ''
-                        mode: 'filled'
-                        size_hint_x: 0.66
-                        fill_color_normal: app.theme_colors['input_bg']
-                        fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: app.theme_colors['text']
-                        text_color_focus: app.theme_colors['text']
-                        cursor_color: app.theme_colors['text']
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(44)
-                    padding: [0, dp(2)]
-                    Label:
-                        text: 'Dim text'
-                        size_hint_x: 0.34
-                        color: app.theme_colors['text']
-                    MDTextField:
-                        id: c_text_dim
-                        text: ''
-                        mode: 'filled'
-                        size_hint_x: 0.66
-                        fill_color_normal: app.theme_colors['input_bg']
-                        fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: app.theme_colors['text']
-                        text_color_focus: app.theme_colors['text']
-                        cursor_color: app.theme_colors['text']
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(44)
-                    padding: [0, dp(2)]
-                    Label:
-                        text: 'Input fill'
-                        size_hint_x: 0.34
-                        color: app.theme_colors['text']
-                    MDTextField:
-                        id: c_input_bg
-                        text: ''
-                        mode: 'filled'
-                        size_hint_x: 0.66
-                        fill_color_normal: app.theme_colors['input_bg']
-                        fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: app.theme_colors['text']
-                        text_color_focus: app.theme_colors['text']
-                        cursor_color: app.theme_colors['text']
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(44)
-                    padding: [0, dp(2)]
-                    Label:
-                        text: 'Own message bubble'
-                        size_hint_x: 0.34
-                        color: app.theme_colors['text']
-                    MDTextField:
-                        id: c_msg_own
-                        text: ''
-                        mode: 'filled'
-                        size_hint_x: 0.66
-                        fill_color_normal: app.theme_colors['input_bg']
-                        fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: app.theme_colors['text']
-                        text_color_focus: app.theme_colors['text']
-                        cursor_color: app.theme_colors['text']
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(44)
-                    padding: [0, dp(2)]
-                    Label:
-                        text: 'Input fill (focused)'
-                        size_hint_x: 0.34
-                        color: app.theme_colors['text']
-                    MDTextField:
-                        id: c_input_bg_focus
-                        text: ''
-                        mode: 'filled'
-                        size_hint_x: 0.66
-                        fill_color_normal: app.theme_colors['input_bg']
-                        fill_color_focus: app.theme_colors['input_bg_focus']
-                        text_color_normal: app.theme_colors['text']
-                        text_color_focus: app.theme_colors['text']
-                        cursor_color: app.theme_colors['text']
+                    height: self.minimum_height
+                    spacing: dp(8)
         Label:
             id: config_status
             text: ''

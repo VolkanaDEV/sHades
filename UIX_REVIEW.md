@@ -302,31 +302,55 @@ module-level flag.
 
 ---
 
-## Suggested order
+## Remediation status
 
-| # | Item | Severity | Files touched |
-|---|---|---|---|
-| 1 | P1-1 `members \u25bc` literal text | P1 | `kv_md.kv` |
-| 2 | P1-2 invisible own-message bubble | P1 | `kivy_client.py` |
-| 3 | P1-3 profile "Delivery:" shows username | P1 | `kv_md.kv`, `kivy_client.py` |
-| 4 | P0-1 connect screen overflow + clipped banner | P0 | `kv_md.kv` |
-| 5 | P0-2 hub-address field overlaps heading | P0 | `kv_md.kv` |
-| 6 | P2-3 `text-dim` contrast failure | P2 | `kivy_client.py` |
-| 7 | P2-4 add border tokens | P2 | `kivy_client.py`, `kv_md.kv` |
-| 8 | P2-1 remove the 2/3 button scale | P2 | `ui_scale.py`, `kv_md.kv`, popups |
-| 9 | P2-2 input bar 24px → 48px | P2 | `kv_md.kv` |
-| 10 | P2-5 top bar divider | P2 | `kv_md.kv` |
-| 11 | P2-6 swap own/other author colour | P2 | `kv_md.kv` |
-| 12 | P3-1 delete dead hex constants | P3 | `kivy_client.py` |
-| 13 | P3-2 generate config rows from `THEME_KEYS` | P3 | `kivy_client.py`, `kv_md.kv` |
-| 14 | P3-3 constrain connect form width | P3 | `kv_md.kv` |
-| 15 | P3-4 guard the KV load in tests | P3 | `kivy_client.py` |
+All 15 findings are remediated. Each fix was re-verified with the same
+method as the audit (absolute geometry from the layout engine on a real
+`app.run()`), not by re-reading the source.
 
-Items 1–3 are one-liners with the highest visible payoff. Items 4–5
-require restructuring `<ConnectScreen>`. Item 8 touches the most code —
-`ui_scale.py` is imported by `kv_md.kv` and by the Python-built popups, so
-the two must move together (the `kivy-client` skill documents this
-"class-rule gap" in detail).
+| # | Item | Verified fix |
+|---|---|---|
+| 1 | P1-1 `members \u25bc` literal text | ASCII arrows, matching the channels button |
+| 2 | P1-2 invisible own-message bubble | `msg_own` → `#1E1E1E`, distinct from `panel` |
+| 3 | P1-3 profile "Delivery:" shows username | `target_delivery` property renders the lxmf.delivery hash |
+| 4 | P0-1 connect screen overflow + clipped banner | content 820px → 344px; ScrollView; banner 200→120px; clipped = 0 at 1280×720, 1024×600, 800×600, 1920×1080, 640×480 |
+| 5 | P0-2 hub-address field overlaps heading | form sized from content; zero collisions at all five window sizes |
+| 6 | P2-3 `text-dim` contrast failure | `#B08C46` (5.96:1 / 5.54:1) |
+| 7 | P2-4 add border tokens | `border #646464`, `border_subtle #3A3A3A` |
+| 8 | P2-1 remove the 2/3 button scale | 0 buttons under 40h/48w on main + connect screens |
+| 9 | P2-2 input bar 24px → 48px | bar 48px, field 40px capped, 0 children overflow |
+| 10 | P2-5 top bar divider | 1px `border_subtle` hairline on the top bar's bottom edge |
+| 11 | P2-6 swap own/other author colour | own → `text_muted`, others → `text` |
+| 12 | P3-1 delete dead hex constants | 11 constants removed; `DEFAULT_THEME_COLORS` is the single copy |
+| 13 | P3-2 generate config rows from `THEME_KEYS` | rows generated in `ConfigScreen._ensure_color_rows`; also closes the gap the audit measured indirectly — the 14 KV rows covered only 14 of 17 keys (`btn_text`, `border`, `border_subtle` were silently uneditable because `save_config` skipped missing `c_<key>` ids). All 17 keys now render, save, validate and reset; Python-added widgets are tracked in `ConfigScreen._color_fields` instead of KV ids (KV ids only register KV-declared widgets) |
+| 14 | P3-3 constrain connect form width | all fields 420px, centred |
+| 15 | P3-4 guard the KV load in tests | harnesses let `app.run()` own the build |
+
+### Verification runs
+
+- **Connect screen** (fixed 3.0s probe after first layout): content 344px,
+  viewport ≥450px at every tested size, Connect button fully on-screen,
+  banner clipped 0px, 0 collisions, 0 undersized buttons, disclosure
+  toggles 0 → 98 → 0. Sizes: 1280×720, 1024×600, 800×600, 1920×1080,
+  640×480.
+- **Main screen**: input bar 48px, children within the bar, 0 buttons
+  under target, content overflow 0.
+- **Config screen** (16 checks): 17 rows = 17 `THEME_KEYS` entries, labels
+  match `THEME_LABELS`, prefill matches the live theme, save applies +
+  persists (`ui_config.json`), invalid hex rejected without partial
+  apply, reset restores defaults *and* refreshes the fields, generated
+  labels re-tint on theme reassignment, ScrollView reaches the bottom row.
+- **Gates**: `py_compile` OK, `flake8` clean (repo files +
+  `tests/test_default_hub.py`), 16/16 server suites, 6/6 client suites,
+  `tests/integ_test.py` OK.
+
+### One caveat found while fixing P0-1
+
+A probe that samples a screen's size too early can read 100×100 — the
+pre-layout default, not a real defect. The connect-screen probe now waits
+for `screen.width > 100` before measuring; an earlier run that did not
+produced one spurious 100×100 report that vanished on every subsequent
+run. Sample after the first layout pass, or gate on a real size.
 
 ## Regression tests to add
 
