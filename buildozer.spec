@@ -7,7 +7,7 @@ package.domain = io.eldeucebag
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 source.exclude_dirs = .git, .github, tests, __pycache__, build, dist, .buildozer
-version = 0.9
+version = 0.10
 # Bump version on every android-facing fix so the installed build can be
 # verified on-device (Settings > Apps > sHades) without adb.
 # wasmtime runs the micron applet sandbox on-device (applet_bridge.py).
@@ -33,7 +33,7 @@ version = 0.9
 # SDL2-based (sdl2/sdl2_image/sdl2_ttf/sdl2_mixer + libmtdev recipes, which
 # p4a ships by default), and touch input on arm64-v8a needs minapi >= 26 +
 # ndk_api 26, exactly as pinned below. api 33 = modern Play/permission model.
-requirements = python3,kivy,kivymd==2.0.0,pillow,materialyoucolor,materialshapes,asynckivy,rns==1.1.3,cryptography,pyserial,lxmf==0.9.4,wasmtime==50.0.1,libbz2,liblzma
+requirements = python3,kivy,kivymd==2.0.0,pillow==12.2.0,materialyoucolor,materialshapes==0.3,asynckivy==0.6.4,asyncgui==0.6.3,typing-extensions==4.15.0,charset-normalizer==3.4.4,rns==1.1.3,cryptography,pyserial,lxmf==0.9.4,wasmtime==50.0.1,libbz2,liblzma
 # libbz2 + liblzma: p4a's python3 recipe marks _bz2/_lzma as OPTIONAL
 # opt_depends (pythonforandroid/recipes/python3/__init__.py: opt_depends
 # + the `if library_name in self.ctx.recipe_build_order` check) -- the
