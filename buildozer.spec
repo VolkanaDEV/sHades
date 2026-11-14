@@ -14,7 +14,13 @@ version = 0.1
 # back to the py3-none-any wheel, which carries only a Windows DLL and
 # cannot be imported. There is no armeabi-v7a (32-bit ARM) wasmtime
 # wheel, so that ABI is dropped; the applet feature is arm64-only.
-requirements = python3,kivy,rns,lxmf,wasmtime
+# kivymd + pillow are REQUIRED on this lane: kivy_client.py defines
+# sHadesClientApp(MDApp) and imports PIL unguarded at module top, so an APK
+# built without them dies in main() at import (NameError: MDApp not defined /
+# ImportError: PIL) before any widget exists -- the black screen on launch.
+# rns/lxmf/wasmtime pinned to match requirements.txt so both lanes ship
+# identical trees.
+requirements = python3,kivy,kivymd==2.0.0,pillow,rns==1.1.3,lxmf==0.9.4,wasmtime==50.0.1
 orientation = portrait
 fullscreen = 0
 android.permissions = INTERNET,ACCESS_NETWORK_STATE,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
