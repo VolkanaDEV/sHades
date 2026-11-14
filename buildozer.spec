@@ -7,7 +7,7 @@ package.domain = io.eldeucebag
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 source.exclude_dirs = .git, .github, tests, __pycache__, build, dist, .buildozer
-version = 0.2
+version = 0.3
 # Bump version on every android-facing fix so the installed build can be
 # verified on-device (Settings > Apps > sHades) without adb.
 # wasmtime runs the micron applet sandbox on-device (applet_bridge.py).
@@ -47,6 +47,16 @@ android.ndk_api = 26
 android.archs = arm64-v8a
 android.accept_sdk_license = True
 p4a.branch = develop
+# p4a.commit: pin python-for-android so the target python stays inside
+# kivy 2.3.1's supported range (3.8-3.13, kivy.org docs). p4a's python3
+# recipe moved its default to python 3.14.2 on BOTH master and develop
+# (receipt: libpython3.14.so inside the 0.2 APK; recipe source says
+# version = '3.14.2' on both branches). Kivy 2.3.1 on python 3.14 fails
+# silently at runtime -- exact black-screen symptom, no exception for the
+# crash console to catch. This commit is the last where the recipe
+# defaults to python 3.11.5 (inside the supported range); wasmtime's
+# android wheels are py3-none tags, so they survive the pin.
+p4a.commit = 2ebea90d9d7e965ef0754466abd185a41ab298aa
 
 [buildozer]
 
