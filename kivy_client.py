@@ -5313,7 +5313,6 @@ class sHadesClientApp(MDApp):
 
     def _finish_saf_result(self, payload):
         """Process a picker result on the kivy thread."""
-        request_code = payload["request_code"]
         result_code = payload["result_code"]
         intent = payload["intent"]
         on_file = payload["on_file"]
