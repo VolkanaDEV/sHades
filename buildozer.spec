@@ -7,7 +7,7 @@ package.domain = io.eldeucebag
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 source.exclude_dirs = .git, .github, tests, __pycache__, build, dist, .buildozer
-version = 0.6
+version = 0.8
 # Bump version on every android-facing fix so the installed build can be
 # verified on-device (Settings > Apps > sHades) without adb.
 # wasmtime runs the micron applet sandbox on-device (applet_bridge.py).

@@ -31,6 +31,25 @@ from ui_scale import scaled
 # ---------------------------------------------------------------------------
 # Kivy (guarded so the module can be imported for linting without Kivy present)
 # ---------------------------------------------------------------------------
+def _make_kivy_stub(name, err=None):
+    # Module-scope so BOTH guard branches can bind stub names. Each name
+    # gets its own distinct stub class (the client stacks several in the
+    # same bases tuple; two occurrences of one class make that definition
+    # a TypeError). Import-only: instantiating one raises, embedding `err`
+    # -- the real import failure -- so a phone death names its cause.
+    class _Stub(object):
+        pass
+
+    def _init_stub(*args, **kwargs):
+        raise RuntimeError(
+            "Kivy stub class %s instantiated; not available, cause=%r"
+            % (name, err))
+
+    _Stub.__name__ = name
+    _Stub.__init__ = _init_stub
+    return _Stub
+
+
 try:
     from kivy.app import App
     from kivy.uix.boxlayout import BoxLayout
@@ -60,27 +79,15 @@ except Exception as _e:  # pragma: no cover - Kivy missing at import time
     _KIVY_IMPORT_ERROR = _e
 
     # Minimal stubs so module-scope class definitions (below) can evaluate
-    # when Kivy is absent. Each name gets its own distinct stub class:
-    # the client stacks several of them in the same bases tuple, and two
-    # occurrences of one class make that definition a TypeError. They are
-    # import-only: instantiating one raises, so nothing silently pretends
-    # to be a widget. Client test suites that need real widgets already
-    # SKIP on their own via kc.KIVY.
-    def _make_kivy_stub(name):
-        class _Stub(object):
-            def __init__(self, *args, **kwargs):
-                raise RuntimeError(
-                    "Kivy stub class %s instantiated; Kivy is not "
-                    "available (%r)" % (name, _KIVY_IMPORT_ERROR))
-        _Stub.__name__ = name
-        return _Stub
-
-    FloatLayout = _make_kivy_stub("FloatLayout")
-    BoxLayout = _make_kivy_stub("BoxLayout")
-    Label = _make_kivy_stub("Label")
-    ButtonBehavior = _make_kivy_stub("ButtonBehavior")
-    App = _make_kivy_stub("App")
-    MDApp = _make_kivy_stub("MDApp")
+    # when Kivy is absent. They are import-only: instantiating one raises,
+    # so nothing silently pretends to be a widget. Client test suites that
+    # need real widgets already SKIP on their own via kc.KIVY.
+    FloatLayout = _make_kivy_stub("FloatLayout", _e)
+    BoxLayout = _make_kivy_stub("BoxLayout", _e)
+    Label = _make_kivy_stub("Label", _e)
+    ButtonBehavior = _make_kivy_stub("ButtonBehavior", _e)
+    App = _make_kivy_stub("App", _e)
+    MDApp = _make_kivy_stub("MDApp", _e)
 
     def _stub_property(*args, **kwargs):
         return None
@@ -94,8 +101,20 @@ if KIVY:
         from kivymd.app import MDApp
         KIVYMD = True
     except Exception as _e:
+        # The exception path MUST bind MDApp: the module-level
+        # `class sHadesClientApp(MDApp):` evaluates at import time, and an
+        # unbound name here was the exact cause of tay's phone crash
+        # (NameError: name 'MDApp' is not defined, kivy_client.py:1643).
+        # The stub embeds the real kivymd failure, so the death later --
+        # at app instantiation -- NAMES the cause instead of a bare
+        # NameError.
+        MDApp = _make_kivy_stub("MDApp", _e)
         KIVYMD = False
         _KIVYMD_IMPORT_ERROR = _e
+        # The tee (main.py) captures stdout from process start, so this
+        # line lands in sHades_boot.log and the on-screen crash console:
+        # it names the actual kivymd-side failure on-device.
+        print("PYTHON: kivymd import failed: %r" % (_e,), flush=True)
 else:
     KIVYMD = False
 
