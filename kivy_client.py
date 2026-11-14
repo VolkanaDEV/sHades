@@ -150,12 +150,12 @@ def _boot_hide():
     _boot_label["ref"] = None
 
 
-import RNS
-from RNS.vendor import umsgpack as msgpack
-import invite
-import dms
-import ui_geom
-from micron import (micron_parse, micron_page_bg, micron_media_target,
+import RNS  # noqa: E402  (after the guarded kivy/diagnostics block, by design)
+from RNS.vendor import umsgpack as msgpack  # noqa: E402
+import invite  # noqa: E402
+import dms  # noqa: E402
+import ui_geom  # noqa: E402
+from micron import (micron_parse, micron_page_bg, micron_media_target,  # noqa: E402
                     runs_to_markup)
 
 # Attachment storage styles:
