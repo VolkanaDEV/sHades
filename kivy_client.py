@@ -126,8 +126,9 @@ def _boot_refresh():
 
 
 def _boot_install(screen):
-    """Attach the heartbeat to the CURRENT screen (kept inside the app's
-    ScreenManager so the root stays a ScreenManager); auto-hides."""
+    """Attach the heartbeat INSIDE the screen's root layout (kept as a child
+    of the root box so the screen's structural contract -- status label as a
+    direct child of children[0], etc. -- stays intact); auto-hides."""
     from kivy.clock import Clock
 
     lbl = Label(
@@ -137,7 +138,8 @@ def _boot_install(screen):
     )
     lbl.bind(texture_size=lambda *a: setattr(
         lbl, "size", (min(lbl.texture_size[0], 420), lbl.texture_size[1])))
-    screen.add_widget(lbl)  # added last = drawn on top of the screen
+    host = screen.children[0] if screen.children else screen
+    host.add_widget(lbl)  # inside the root layout, top-left via pos_hint
     _boot_label["ref"] = lbl
     lbl.text = "\n".join(_boot_lines)
 
@@ -151,7 +153,8 @@ def _boot_reattach(screen):
         return
     if lbl.parent is not None:
         lbl.parent.remove_widget(lbl)
-    screen.add_widget(lbl)
+    host = screen.children[0] if screen.children else screen
+    host.add_widget(lbl)
     lbl.text = "\n".join(_boot_lines)
 
 
