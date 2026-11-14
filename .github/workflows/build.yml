@@ -162,6 +162,30 @@ jobs:
         # 132552679102 -- gettext 868 kB installed, autopoint still exec
         # -fail) -- so name it explicitly.
         run: sudo apt-get update -qq && sudo apt-get install -y gettext autopoint
+      - name: Prefetch p4a and un-hardcode bzlib=no
+        # p4a's python3 recipe hardcodes 'ac_cv_header_bzlib_h=no' into
+        # the cross-configure args, so the android target NEVER builds
+        # the _bz2 stdlib extension even when the libbz2 recipe is named
+        # (receipt: android job 132555356425, run 43630245037 -- the log
+        # prints 'Activating flags for libbz2' yet the configure args
+        # still carry ac_cv_header_bzlib_h=no, the probe answers
+        # '(cached) no', _bz2 lands missing, while _lzma builds fine
+        # because its probe has no such hardcode). This contradicts the
+        # recipe's own opt_depends docstring. Buildozer only clones p4a
+        # when the dir is absent (buildozer/targets/android.py
+        # `if not file_exists(p4a_dir)`), so prefetch the clone, delete
+        # the single offending line, and buildozer adopts it as-is.
+        run: |
+          P4A_DIR="$HOME/.buildozer/android/platform/python-for-android"
+          git clone -b develop --single-branch \
+            https://github.com/kivy/python-for-android.git "$P4A_DIR"
+          RECIPE="$P4A_DIR/pythonforandroid/recipes/python3/__init__.py"
+          grep -q "ac_cv_header_bzlib_h=no" "$RECIPE"
+          sed -i "/ac_cv_header_bzlib_h=no/d" "$RECIPE"
+          if grep -q "ac_cv_header_bzlib_h=no" "$RECIPE"; then
+            echo "::error::bzlib hardcode still present in python3 recipe"; exit 1
+          fi
+          echo "bzlib hardcode removed from: $RECIPE"
       - name: Build debug APK
         # p4a version selection: Recipe.version reads VERSION_<name> env
         # (pythonforandroid/recipe.py). Kivy 2.3.1 supports python 3.8-3.13
