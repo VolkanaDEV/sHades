@@ -152,6 +152,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt buildozer==1.5.0 cython
+      - name: Install gettext (autopoint needed by liblzma recipe)
+        # p4a's liblzma recipe runs `autoreconf -vif` on the xz sources;
+        # xz's configure.ac uses gettext, so autoreconf invokes autopoint.
+        # GitHub's ubuntu runner image does NOT ship autopoint ("Can't
+        # exec \"autopoint\": No such file or directory" -- android job
+        # 132549200820, v0.5 first attempt). gettext installs it.
+        run: sudo apt-get update -qq && sudo apt-get install -y gettext
       - name: Build debug APK
         # p4a version selection: Recipe.version reads VERSION_<name> env
         # (pythonforandroid/recipe.py). Kivy 2.3.1 supports python 3.8-3.13
