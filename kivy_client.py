@@ -1527,8 +1527,11 @@ if KIVY:
             return actions
 
     class MainScreen(Screen):
-        left_open = BooleanProperty(True)
-        right_open = BooleanProperty(True)
+        # Default: chat only. Both drawers closed (tay's direction: the
+        # main app screen defaults to the chat; side panels open by
+        # SWIPE, not by tap -- see on_touch_* below).
+        left_open = BooleanProperty(False)
+        right_open = BooleanProperty(False)
         _current_channel = StringProperty("general")
 
         def toggle_left(self):
@@ -1536,6 +1539,73 @@ if KIVY:
 
         def toggle_right(self):
             self.right_open = not self.right_open
+
+        # -- swipe gestures (edge bands + drawn-panel travel) ------------
+        # Kivy routes on_touch_down to parent before children, so we only
+        # CLASSIFY here (never consume): returning super()'s result lets
+        # buttons and scrolls behave normally. A drag fires at most once.
+        _SWIPE_EDGE = None   # "left_open" / "left_close" / right_*
+        _SWIPE_FIRE = False
+
+        def _swipe_plan(self, touch):
+            """Classify a new touch into a drawer gesture or None.
+
+            Left edge band (in from the screen's left) opens the channels
+            drawer on rightward travel; with that drawer open, a band just
+            inside its right border closes it on leftward travel. Mirrored
+            for the members drawer on the right side.
+            """
+            try:
+                left = self.ids["left_sidebar"]
+                right = self.ids["right_sidebar"]
+            except Exception:
+                return None
+            x, w = touch.x, self.width
+            band = dp(24)
+            if x <= band:
+                return None if self.left_open else "left_open"
+            if x >= w - band:
+                return None if self.right_open else "right_open"
+            # closing bands: inside an open drawer near its inner border
+            if self.left_open and left.width > dp(0) and \
+                    abs(x - (left.x + left.width)) <= band:
+                return "left_close"
+            if self.right_open and right.width > dp(0) and \
+                    abs(x - right.x) <= band:
+                return "right_close"
+            return None
+
+        def on_touch_down(self, touch):
+            self._SWIPE_EDGE = self._swipe_plan(touch)
+            self._SWIPE_FIRE = False
+            self._swipe_x = touch.x
+            return super().on_touch_down(touch)
+
+        def on_touch_move(self, touch):
+            if self._SWIPE_EDGE and not self._SWIPE_FIRE and \
+                    abs(touch.x - self._swipe_x) >= dp(48):
+                self._SWIPE_FIRE = True
+                opening = self._SWIPE_EDGE.endswith("_open")
+                rightward = touch.x > self._swipe_x
+                on_right = self._SWIPE_EDGE.startswith("right")
+                # open = drag toward center; close = drag away
+                if (rightward if not on_right else not rightward):
+                    if opening:
+                        setattr(self, "left_open" if not on_right
+                                else "right_open", True)
+                else:
+                    closing_left = self._SWIPE_EDGE == "left_close"
+                    closing_right = self._SWIPE_EDGE == "right_close"
+                    if closing_left:
+                        self.left_open = False
+                    elif closing_right:
+                        self.right_open = False
+            return super().on_touch_move(touch)
+
+        def on_touch_up(self, touch):
+            self._SWIPE_EDGE = None
+            self._SWIPE_FIRE = False
+            return super().on_touch_up(touch)
 
     class ConfigScreen(Screen):
         """Config screen: unified UI theme colors, persisted to ui_config.json.

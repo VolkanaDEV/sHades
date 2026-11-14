@@ -294,6 +294,8 @@
         MDTextField:
             id: profile_username_input
             text: root.target_username
+            hint_text: 'Username'
+            placeholder_text: 'Username'
             mode: 'filled'
             size_hint_y: None
             height: dp(56)
@@ -384,9 +386,6 @@
                 Rectangle:
                     pos: self.x, self.y
                     size: self.width, dp(1)
-            HamburgerIcon:
-                on_press: root.toggle_left()
-                color: app.theme_colors['text']
             CtxHeaderLabel:
                 id: channel_header
                 text: '#' + (root._current_channel or 'general')
@@ -481,15 +480,6 @@
                         MDButtonText:
                             text: 'cfg'
                             shorten: True
-                MDButton:
-                    style: 'outlined'
-                    size_hint_y: None
-                    height: scaled(dp(40))
-                    theme_bg_color: 'Custom'
-                    md_bg_color: app.theme_colors['sidebar_ctrl']
-                    on_press: root.toggle_left()
-                    MDButtonText:
-                        text: 'channels v' if root.left_open else 'channels >'
                 ScrollView:
                     do_scroll_x: False
                     GridLayout:
@@ -500,9 +490,6 @@
                         spacing: dp(2)
                         padding: [dp(6), dp(6)]
 
-            SlimButton:
-                text: '<'
-                on_press: root.toggle_left()
             # ---------------- center: chat ----------------
             BoxLayout:
                 orientation: 'vertical'
@@ -542,6 +529,7 @@
                     MDTextField:
                         id: msg_input
                         hint_text: 'Message...'
+                        placeholder_text: 'Message...'
                         mode: 'filled'
                         multiline: True
                         size_hint_x: 1
@@ -587,10 +575,7 @@
                             text: '+'
                             text_color: app.theme_colors['btn_text']
 
-            SlimButton:
-                text: '>'
-                on_press: root.toggle_right()
-            # ---------------- right: members (collapsable) ----------------
+            # right: members drawer (swipe from the right edge opens)
             BoxLayout:
                 id: right_sidebar
                 size_hint_x: None
@@ -602,15 +587,6 @@
                     Rectangle:
                         pos: self.pos
                         size: self.size
-                MDButton:
-                    style: 'outlined'
-                    size_hint_y: None
-                    height: scaled(dp(40))
-                    theme_bg_color: 'Custom'
-                    md_bg_color: app.theme_colors['sidebar_ctrl']
-                    on_press: root.toggle_right()
-                    MDButtonText:
-                        text: 'members v' if root.right_open else 'members >'
                 ScrollView:
                     do_scroll_x: False
                     GridLayout:
@@ -689,6 +665,7 @@
                         MDTextField:
                             id: hub_address
                             hint_text: 'Hub address (ip:port)'
+                            placeholder_text: 'Hub address (ip:port)'
                             multiline: False
                             size_hint_y: None
                             height: dp(44)
@@ -700,6 +677,7 @@
                         MDTextField:
                             id: username
                             hint_text: 'Your username'
+                            placeholder_text: 'Your username'
                             multiline: False
                             size_hint_y: None
                             height: dp(44)
