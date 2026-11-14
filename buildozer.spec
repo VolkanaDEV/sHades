@@ -7,7 +7,7 @@ package.domain = io.eldeucebag
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 source.exclude_dirs = .git, .github, tests, __pycache__, build, dist, .buildozer
-version = 0.4
+version = 0.5
 # Bump version on every android-facing fix so the installed build can be
 # verified on-device (Settings > Apps > sHades) without adb.
 # wasmtime runs the micron applet sandbox on-device (applet_bridge.py).
@@ -33,7 +33,16 @@ version = 0.4
 # SDL2-based (sdl2/sdl2_image/sdl2_ttf/sdl2_mixer + libmtdev recipes, which
 # p4a ships by default), and touch input on arm64-v8a needs minapi >= 26 +
 # ndk_api 26, exactly as pinned below. api 33 = modern Play/permission model.
-requirements = python3,kivy,kivymd==2.0.0,pillow,materialyoucolor,materialshapes,asynckivy,rns==1.1.3,cryptography,pyserial,lxmf==0.9.4,wasmtime==50.0.1
+requirements = python3,kivy,kivymd==2.0.0,pillow,materialyoucolor,materialshapes,asynckivy,rns==1.1.3,cryptography,pyserial,lxmf==0.9.4,wasmtime==50.0.1,libbz2,liblzma
+# libbz2 + liblzma: p4a's python3 recipe marks _bz2/_lzma as OPTIONAL
+# opt_depends (pythonforandroid/recipes/python3/__init__.py: opt_depends
+# + the `if library_name in self.ctx.recipe_build_order` check) -- the
+# extensions only get compiled when the recipes are named in the
+# requirements. Phone receipt (v0.4 crash console): ModuleNotFoundError:
+# No module named '_bz2' at kivy_client -> import RNS (RNS/Buffer.py ->
+# bz2.py -> _bz2) -- every black screen was this death at import time.
+# Naming libbz2/liblzma makes CPython compile _bz2.so/_lzma.so for the
+# android target with the right flags.
 orientation = portrait
 fullscreen = 0
 android.permissions = INTERNET,ACCESS_NETWORK_STATE,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
