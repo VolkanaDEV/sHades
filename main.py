@@ -4,13 +4,17 @@
 p4a executes this module via PyRun_SimpleFile with __name__ == "__main__".
 stdout/stderr are redirected to Android logcat (tags: python / stderr).
 
-On any failure, the traceback is:
+v0.4 diagnostics: everything the process ever prints (including Kivy's
+Logger, GL/window startup chatter, and any traceback) is TEE'd from
+process start into sHades_boot.log -- external files dir preferred
+(browsable by on-phone file managers), app-storage fallback, home
+fallback. The used path is recorded INSIDE the log. So the launch story
+survives even when rendering is a black screen and no adb exists. On any
+failure the traceback is additionally:
   1. printed to logcat, and
-  2. written to <app_storage>/sHades_launch_error.log, and
+  2. appended to the launch log, and
   3. rendered in a BARE Kivy window (amber text on dark) so the
-     phone itself shows the autopsy -- no adb required. Bare Kivy is a
-     hard APK dependency (recipe-backed), so this works whenever Python
-     itself boots, even if kivy_client/kivymd died at import.
+     phone itself shows the autopsy -- no adb required.
 
 The console self-closes after 5 minutes.
 """
@@ -20,13 +24,69 @@ import sys
 import time
 import traceback
 
+_START = time.time()
+
 
 def _log_path():
+    """Browsable launch-log path: external files dir if reachable."""
+    try:
+        from jnius import autoclass  # p4a only
+        act = autoclass("org.kivy.android.PythonActivity").mActivity
+        d = act.getExternalFilesDir(None)
+        if d is not None:
+            return os.path.join(str(d.getAbsolutePath()), "sHades_boot.log")
+    except Exception:
+        pass
     try:
         from android.storage import app_storage_path  # p4a only
-        return os.path.join(app_storage_path(), "sHades_launch_error.log")
+        return os.path.join(app_storage_path(), "sHades_boot.log")
     except Exception:
-        return os.path.join(os.path.expanduser("~"), "sHades_launch_error.log")
+        pass
+    return os.path.join(os.path.expanduser("~"), "sHades_boot.log")
+
+
+class _Tee:
+    """Write to the original stream AND the launch log; never raise."""
+
+    def __init__(self, original, logf):
+        self._original = original
+        self._logf = logf
+
+    def write(self, data):
+        try:
+            self._logf.write(data)
+            self._logf.flush()
+        except Exception:
+            pass
+        try:
+            self._original.write(data)
+            self._original.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            self._logf.flush()
+        except Exception:
+            pass
+        try:
+            self._original.flush()
+        except Exception:
+            pass
+
+
+def _install_tee():
+    """Tee stdout/stderr into the launch log from the very start."""
+    try:
+        logf = open(_log_path(), "a", encoding="utf-8", buffering=1)
+    except Exception:
+        return
+    logf.write("\n===== sHades launch %.0fs after epoch =====\n" % _START)
+    logf.write("launch log path: %s\n" % _log_path())
+    sys.stdout = _Tee(getattr(sys, "__stdout__", sys.stdout), logf)
+    sys.stderr = _Tee(getattr(sys, "__stderr__", sys.stderr), logf)
+    print("TEE installed; stdout/stderr also go to the launch log",
+          flush=True)
 
 
 def _show_on_screen(text):
@@ -78,6 +138,7 @@ def _show_on_screen(text):
 def main():
     """Entry point called from Android activity. All Python execution
     is wrapped so any import/runtime crash is visible on-device."""
+    _install_tee()
     print("PYTHON: main() starting", flush=True)
     try:
         print("PYTHON: importing kivy_client", flush=True)
@@ -91,8 +152,8 @@ def main():
         tb = traceback.format_exc()
         print(tb, flush=True)
         try:
-            with open(_log_path(), "w", encoding="utf-8") as f:
-                f.write(tb)
+            with open(_log_path(), "a", encoding="utf-8") as f:
+                f.write("\n--- TRACEBACK ---\n" + tb)
         except Exception:
             pass
         # Keep process alive so the on-screen console can be read.

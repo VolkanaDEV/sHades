@@ -100,10 +100,15 @@ else:
     KIVYMD = False
 
 # ---------------------------------------------------------------------------
-# TEMP boot diagnostics (v0.3): on-screen heartbeat overlay.
-# Prints lifecycle milestones in a plain-Kivy label so a launch failure is
-# visible in a screenshot with no adb. The overlay auto-hides 90s after the
-# window appears. Remove BOOT_DEBUG once the launch diagnosis is done.
+# TEMP boot diagnostics (v0.4): window-level heartbeat overlay + boot log.
+# v0.3 lesson: a heartbeat inside a screen's root layout is at the mercy of
+# that layout -- a vertical BoxLayout can squeeze it to nothing or push it
+# below the fold, which reads as "no heartbeat". The overlay now hangs on
+# the Kivy Window itself with an explicit pos, so no layout can move it.
+# Every milestone is ALSO appended to sHades_boot.log (external files dir
+# preferred, app-storage fallback) alongside the stdout/stderr tee that
+# main.py installs at process start, so the launch story survives even a
+# dead renderer. Remove BOOT_DEBUG once the launch diagnosis is done.
 # ---------------------------------------------------------------------------
 BOOT_DEBUG = True
 
@@ -111,11 +116,23 @@ _boot_lines = []
 _boot_label = {"ref": None}
 
 
+def _boot_file(msg):
+    """Append a milestone to the boot log file. Never raises."""
+    try:
+        from main import _log_path
+        p = _log_path()
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
+
 def _boot_mark(msg):
     """Record a boot milestone; drawn onto the overlay once it exists."""
     if not BOOT_DEBUG:
         return
     _boot_lines.append(msg)
+    _boot_file("BOOT %s" % msg)
     _boot_refresh()
 
 
@@ -125,37 +142,30 @@ def _boot_refresh():
         lbl.text = "\n".join(_boot_lines)
 
 
-def _boot_install(screen):
-    """Attach the heartbeat INSIDE the screen's root layout (kept as a child
-    of the root box so the screen's structural contract -- status label as a
-    direct child of children[0], etc. -- stays intact); auto-hides."""
+def _boot_install(screen=None):
+    """Hang the heartbeat on the Kivy Window itself (explicit pos: no
+    layout can squeeze or move it); auto-hides after 90 s."""
     from kivy.clock import Clock
 
     lbl = Label(
         text="\n".join(_boot_lines), color=(1, 0.85, 0.4, 1),
         font_size="10sp", halign="left", valign="top", markup=False,
-        size_hint=(None, None), pos_hint={"x": 0.01, "top": 0.995},
+        size_hint=(None, None),
     )
-    lbl.bind(texture_size=lambda *a: setattr(
-        lbl, "size", (min(lbl.texture_size[0], 420), lbl.texture_size[1])))
-    host = screen.children[0] if screen.children else screen
-    host.add_widget(lbl)  # inside the root layout, top-left via pos_hint
     _boot_label["ref"] = lbl
+
+    def _place(*a):
+        lbl.size = (min(max(lbl.texture_size[0], 1), 420),
+                    max(lbl.texture_size[1], 1))
+        lbl.pos = (24, Window.height - 26 - lbl.height)
+
+    lbl.bind(texture_size=_place)
+    Window.bind(size=_place)
+    Window.add_widget(lbl)
     lbl.text = "\n".join(_boot_lines)
+    _place()
 
     Clock.schedule_once(lambda dt: _boot_hide(), 90)
-
-
-def _boot_reattach(screen):
-    """Move the heartbeat onto the newly-current screen (e.g. main)."""
-    lbl = _boot_label["ref"]
-    if lbl is None:
-        return
-    if lbl.parent is not None:
-        lbl.parent.remove_widget(lbl)
-    host = screen.children[0] if screen.children else screen
-    host.add_widget(lbl)
-    lbl.text = "\n".join(_boot_lines)
 
 
 def _boot_hide():
@@ -172,6 +182,13 @@ import dms  # noqa: E402
 import ui_geom  # noqa: E402
 from micron import (micron_parse, micron_page_bg, micron_media_target,  # noqa: E402
                     runs_to_markup)
+
+# TEMP boot diagnostics: the absence of this line in sHades_boot.log
+# pins a crash INSIDE the import chain above (RNS / LXMF / micron...).
+_kv_mod = sys.modules.get("kivy")
+if BOOT_DEBUG and _kv_mod is not None:
+    _boot_file("kivy_client module imported ok (KIVY=%s KIVYMD=%s) "
+               "kivy=%s" % (KIVY, KIVYMD, _kv_mod.__version__))
 
 # Attachment storage styles:
 #   server   - file is stored on the guild; bytes re-fetched via /file/attachments
@@ -1892,8 +1909,6 @@ class sHadesClientApp(MDApp):
             self._open_main()
             if BOOT_DEBUG:
                 _boot_mark("session resumed: %s" % (self.hub_address,))
-                Clock.schedule_once(
-                    lambda dt: _boot_reattach(self.root.current), 0)
             Clock.schedule_once(lambda dt: self._init_reticulum(), 0.5)
             # Re-render persisted history (embeds survive close/re-open) once
             # the guild API is up; server-stored attachments re-fetch with a
