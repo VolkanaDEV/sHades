@@ -5111,6 +5111,9 @@ class sHadesClientApp(MDApp):
           * ephemeral (P2P) - bytes sent inline; kept locally so they survive
                              restart, but no server copy exists.
         """
+        if self._android_platform():
+            self._open_attach_dialog_android()
+            return
         from kivy.uix.boxlayout import BoxLayout
         from kivy.uix.label import Label
         from kivy.uix.button import Button
@@ -5188,6 +5191,251 @@ class sHadesClientApp(MDApp):
 
         btn_ok.bind(on_press=do_ok)
         btn_cancel.bind(on_press=lambda *_: popup.dismiss())
+        popup.open()
+
+    # ---------------- Android SAF file picking ---------------------------
+    # kivy's FileChooserListView browses the app sandbox only, which on
+    # Android contains no user files, so chooser popups showed nothing
+    # (tay's receipt). The system picker (ACTION_OPEN_DOCUMENT) needs no
+    # storage permission and returns a content:// uri read through the
+    # app's ContentResolver into a local copy, then the normal pipeline
+    # takes over (_send_attached_file / _on_file_selected).
+    _SAF_ATTACH = 0x5A17
+    _SAF_GENERIC = 0x5A18
+
+    def _android_platform(self):
+        from kivy.utils import platform
+        return platform == "android"
+
+    def _saf_copy_uri(self, uri):
+        """Copy a content:// uri into the app dir; return the local path."""
+        import mimetypes as _mt
+        from jnius import autoclass, jbyte, jarray
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        resolver = PythonActivity.mActivity.getContentResolver()
+        # display name (best effort; falls back to a mime-derived name)
+        name = None
+        try:
+            String = autoclass("java.lang.String")
+            cols = jarray(String)([String("_display_name")])
+            cur = resolver.query(uri, cols, None, None, None)
+            if cur is not None:
+                try:
+                    if cur.moveToFirst():
+                        name = cur.getString(0)
+                finally:
+                    cur.close()
+        except Exception:
+            name = None
+        if not name:
+            try:
+                mime = resolver.getType(uri)
+            except Exception:
+                mime = None
+            ext = (_mt.guess_extension(mime) if mime else None) or ""
+            name = "picked" + ext
+        name = os.path.basename(name.replace("\\", "/")) or "picked"
+        if name.startswith("."):
+            name = "picked" + name
+        out_dir = os.path.join(_app_data_dir(), "picked")
+        os.makedirs(out_dir, exist_ok=True)
+        candidate = name
+        stem, ext = os.path.splitext(candidate)
+        n = 1
+        while os.path.exists(os.path.join(out_dir, candidate)):
+            candidate = "%s (%d)%s" % (stem, n, ext)
+            n += 1
+        target = os.path.join(out_dir, candidate)
+        stream = resolver.openInputStream(uri)
+        with open(target, "wb") as out:
+            total = 0
+            while True:
+                buf = jarray(jbyte)(65536)
+                got = stream.read(buf)
+                if got <= 0:
+                    break
+                out.write(bytes(bytearray(buf[:got])))
+                total += got
+                if total > 40 * 1024 * 1024:
+                    stream.close()
+                    os.remove(target)
+                    raise OSError("picked file exceeds the 32 MB cap")
+        stream.close()
+        return target
+
+    def _saf_pick(self, request_code, on_file):
+        """Launch the system picker; on_file(local_path) fires on success."""
+        from jnius import autoclass
+        from android import activity as android_activity
+        handlers = getattr(self, "_saf_handlers", None)
+        if handlers is None:
+            handlers = {}
+            self._saf_handlers = handlers
+            android_activity.bind(on_activity_result=self._on_saf_result)
+        if request_code in handlers:
+            self._set_status("file picker already open")
+            return
+        handlers[request_code] = on_file
+        Intent = autoclass("android.content.Intent")
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        intent.setType("*/*")
+        PythonActivity.mActivity.startActivityForResult(intent, request_code)
+
+    def _on_saf_result(self, request_code, result_code, intent):
+        handlers = getattr(self, "_saf_handlers", None)
+        if not handlers:
+            return
+        on_file = handlers.pop(request_code, None)
+        if on_file is None:
+            return
+        from jnius import autoclass
+        if intent is None:
+            return
+        if result_code != autoclass("android.app.Activity").RESULT_OK:
+            return
+        uri = intent.getData()
+        if uri is None:
+            return
+        try:
+            local = self._saf_copy_uri(uri)
+        except Exception as e:
+            self._set_status("file read failed: %s" % e)
+            return
+        on_file(local)
+
+    def _open_attach_dialog_android(self):
+        """Android attach flow: system picker + storage-style selector."""
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.label import Label
+        from kivy.uix.button import Button
+        from kivy.uix.popup import Popup
+
+        main = self.root.get_screen("main")
+        text = (main.ids.msg_input.text or "").strip()
+        app = App.get_running_app()
+        state = {"style": ATT_SERVER, "path": None}
+
+        style_box = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        style_box.add_widget(
+            Label(text="Store:", size_hint_x=None, width=dp(50),
+                  color=app.theme_colors['text'] if app else (1, 1, 1, 1),
+                  font_size=sp(12), halign="left", valign="middle"))
+        btn_server = Button(text="Server-stored", size_hint_x=None,
+                            width=dp(130), size_hint_y=None,
+                            height=scaled(dp(44)), pos_hint={"center_y": 0.5})
+        btn_ephem = Button(text="Ephemeral (P2P)", size_hint_x=None,
+                           width=dp(130), size_hint_y=None,
+                           height=scaled(dp(44)), pos_hint={"center_y": 0.5})
+
+        def pick(s):
+            state["style"] = s
+            active_bg = (app.theme_colors['primary'] if app
+                         else (0.42, 0.48, 1.0, 1))
+            inactive_bg = (app.theme_colors['panel_darker'] if app
+                           else (0.25, 0.27, 0.31, 1))
+            btn_server.background_color = (active_bg if s == ATT_SERVER
+                                           else inactive_bg)
+            btn_ephem.background_color = (active_bg if s == ATT_EPHEMERAL
+                                          else inactive_bg)
+
+        btn_server.bind(on_press=lambda *_: pick(ATT_SERVER))
+        btn_ephem.bind(on_press=lambda *_: pick(ATT_EPHEMERAL))
+        pick(ATT_SERVER)
+        style_box.add_widget(btn_server)
+        style_box.add_widget(btn_ephem)
+
+        chosen = Label(text="No file picked yet", size_hint_y=None,
+                       height=dp(28),
+                       color=app.theme_colors['text'] if app else (1, 1, 1, 1),
+                       font_size=sp(12), halign="left")
+        btn_pick = Button(text="Choose file (system picker)",
+                          size_hint_y=None, height=scaled(dp(44)),
+                          background_color=(app.theme_colors['panel_darker']
+                                            if app
+                                            else (0.25, 0.27, 0.31, 1)),
+                          color=app.theme_colors['text'] if app else (1, 1, 1, 1))
+        btn_ok = Button(text="OK — Send", size_hint_y=None,
+                        height=scaled(dp(44)),
+                        background_color=(app.theme_colors['primary']
+                                          if app else (0.42, 0.48, 1.0, 1)),
+                        color=app.theme_colors['text'] if app else (1, 1, 1, 1))
+        btn_cancel = Button(text="Cancel", size_hint_y=None,
+                            height=scaled(dp(44)),
+                            background_color=(app.theme_colors['panel_darker']
+                                              if app
+                                              else (0.25, 0.27, 0.31, 1)),
+                            color=app.theme_colors['text'] if app
+                            else (1, 1, 1, 1))
+        btn_box = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        btn_box.add_widget(btn_ok)
+        btn_box.add_widget(btn_cancel)
+
+        content = BoxLayout(orientation="vertical", spacing=dp(8),
+                            padding=dp(8))
+        content.add_widget(Label(
+            text="Attach a file — choose how it is stored:",
+            size_hint_y=None, height=dp(24),
+            color=app.theme_colors['text'] if app else (1, 1, 1, 1),
+            font_size=sp(12)))
+        content.add_widget(btn_pick)
+        content.add_widget(chosen)
+        content.add_widget(style_box)
+        content.add_widget(btn_box)
+
+        popup = Popup(title="Attach file", content=content,
+                      size_hint=(0.9, 0.7), auto_dismiss=False)
+
+        def do_pick(*_):
+            def on_file(local):
+                state["path"] = local
+                chosen.text = os.path.basename(local)
+                self._set_status("picked %s — choose storage, then OK"
+                                 % chosen.text)
+            self._saf_pick(self._SAF_ATTACH, on_file)
+
+        def do_ok(*_):
+            if not state["path"]:
+                self._set_status("No file selected")
+                return
+            popup.dismiss()
+            self._send_attached_file(text, state["path"], state["style"])
+
+        btn_pick.bind(on_press=do_pick)
+        btn_ok.bind(on_press=do_ok)
+        btn_cancel.bind(on_press=lambda *_: popup.dismiss())
+        popup.open()
+
+    def _android_pick_generic(self, avatar):
+        """Android generic picker for open_file_chooser(avatar=...)."""
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.label import Label
+        from kivy.uix.button import Button
+        from kivy.uix.popup import Popup
+        app = App.get_running_app()
+        hint = Label(text="Use the system picker to choose a file.",
+                     size_hint_y=None, height=dp(32),
+                     color=app.theme_colors['text'] if app else (1, 1, 1, 1),
+                     font_size=sp(12), halign="left")
+        btn = Button(text="Choose file (system picker)",
+                     size_hint_y=None, height=scaled(dp(44)),
+                     background_color=(app.theme_colors['primary'] if app
+                                       else (0.42, 0.48, 1.0, 1)),
+                     color=app.theme_colors['text'] if app else (1, 1, 1, 1))
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        box.add_widget(hint)
+        box.add_widget(btn)
+        popup = Popup(title="Select file", content=box,
+                      size_hint=(0.9, 0.5), auto_dismiss=False)
+
+        def do_pick(*_):
+            def on_file(local):
+                popup.dismiss()
+                self._on_file_selected([local], None)
+            self._saf_pick(self._SAF_GENERIC, on_file)
+
+        btn.bind(on_press=do_pick)
         popup.open()
 
     def _send_attached_file(self, text, path, style):
@@ -5543,6 +5791,9 @@ class sHadesClientApp(MDApp):
 
     def open_file_chooser(self, avatar=False):
         """Open a file chooser popup to attach a file or select an avatar."""
+        if self._android_platform():
+            self._android_pick_generic(avatar)
+            return
         self._avatar_mode = avatar
         chooser = FileChooserListView(filters=["*.png", "*.jpg", "*.jpeg",
                                                "*.gif", "*.webp", "*.mp4",
@@ -5554,7 +5805,8 @@ class sHadesClientApp(MDApp):
         popup.open()
 
     def _on_file_selected(self, selection, popup):
-        popup.dismiss()
+        if popup is not None:
+            popup.dismiss()
         if not selection:
             return
         path = selection[0]
