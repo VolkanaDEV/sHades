@@ -176,10 +176,10 @@ jobs:
         # `if not file_exists(p4a_dir)`), so prefetch the clone, delete
         # the single offending line, and buildozer adopts it as-is.
         run: |
-          P4A_DIR="$HOME/.buildozer/android/platform/python-for-android"
+          P4A_DIR="$GITHUB_WORKSPACE/.buildozer/android/platform"
           git clone -b develop --single-branch \
-            https://github.com/kivy/python-for-android.git "$P4A_DIR"
-          RECIPE="$P4A_DIR/pythonforandroid/recipes/python3/__init__.py"
+            https://github.com/kivy/python-for-android.git "$P4A_DIR/python-for-android"
+          RECIPE="$P4A_DIR/python-for-android/pythonforandroid/recipes/python3/__init__.py"
           grep -q "ac_cv_header_bzlib_h=no" "$RECIPE"
           sed -i "/ac_cv_header_bzlib_h=no/d" "$RECIPE"
           if grep -q "ac_cv_header_bzlib_h=no" "$RECIPE"; then
