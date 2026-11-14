@@ -47,16 +47,17 @@ android.ndk_api = 26
 android.archs = arm64-v8a
 android.accept_sdk_license = True
 p4a.branch = develop
-# p4a.commit: pin python-for-android so the target python stays inside
-# kivy 2.3.1's supported range (3.8-3.13, kivy.org docs). p4a's python3
-# recipe moved its default to python 3.14.2 on BOTH master and develop
-# (receipt: libpython3.14.so inside the 0.2 APK; recipe source says
-# version = '3.14.2' on both branches). Kivy 2.3.1 on python 3.14 fails
-# silently at runtime -- exact black-screen symptom, no exception for the
-# crash console to catch. This commit is the last where the recipe
-# defaults to python 3.11.5 (inside the supported range); wasmtime's
-# android wheels are py3-none tags, so they survive the pin.
-p4a.commit = 2ebea90d9d7e965ef0754466abd185a41ab298aa
+# Target python version: selected in .github/workflows/build.yml via
+# VERSION_python3 / VERSION_hostpython3 env (p4a's Recipe.version reads
+# VERSION_<recipe-name> from the environment, pythonforandroid/recipe.py,
+# and applies version-gated recipe patches -- 3.11 gets the
+# cpython-311-ctypes-find-library patch). Kivy 2.3.1 officially supports
+# python 3.8-3.13; p4a develop's recipe default (3.14.2) is outside that
+# range and fails silently on the device: black screen, no traceback. A
+# p4a.commit pin to the last-3.11-default (2ebea90d9) was tried and is
+# REJECTED: the stale Jul-2025 toolchain fails at -luuid (_uuid stdlib
+# extension) with today's NDK, plus pip backend failures in the
+# isolated env. Modern recipes + env-selected python version is the fix.
 
 [buildozer]
 

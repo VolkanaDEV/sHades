@@ -153,6 +153,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt buildozer==1.5.0 cython
       - name: Build debug APK
+        # p4a version selection: Recipe.version reads VERSION_<name> env
+        # (pythonforandroid/recipe.py). Kivy 2.3.1 supports python 3.8-3.13
+        # while p4a develop's python3/hostpython3 recipe defaults jumped to
+        # 3.14.2 -- so the build selects 3.11.5 (recipe-patched for it)
+        # without pinning the whole toolchain to a stale commit.
+        env:
+          VERSION_python3: 3.11.5
+          VERSION_hostpython3: 3.11.5
         run: |
           buildozer android debug
       - name: Publish APK
