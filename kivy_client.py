@@ -125,8 +125,9 @@ def _boot_refresh():
         lbl.text = "\n".join(_boot_lines)
 
 
-def _boot_install(root):
-    """Attach the heartbeat to the root layout; schedule auto-hide."""
+def _boot_install(screen):
+    """Attach the heartbeat to the CURRENT screen (kept inside the app's
+    ScreenManager so the root stays a ScreenManager); auto-hides."""
     from kivy.clock import Clock
 
     lbl = Label(
@@ -136,11 +137,22 @@ def _boot_install(root):
     )
     lbl.bind(texture_size=lambda *a: setattr(
         lbl, "size", (min(lbl.texture_size[0], 420), lbl.texture_size[1])))
-    root.add_widget(lbl)
+    screen.add_widget(lbl)  # added last = drawn on top of the screen
     _boot_label["ref"] = lbl
     lbl.text = "\n".join(_boot_lines)
 
     Clock.schedule_once(lambda dt: _boot_hide(), 90)
+
+
+def _boot_reattach(screen):
+    """Move the heartbeat onto the newly-current screen (e.g. main)."""
+    lbl = _boot_label["ref"]
+    if lbl is None:
+        return
+    if lbl.parent is not None:
+        lbl.parent.remove_widget(lbl)
+    screen.add_widget(lbl)
+    lbl.text = "\n".join(_boot_lines)
 
 
 def _boot_hide():
@@ -1848,11 +1860,7 @@ class sHadesClientApp(MDApp):
         Window.bind(on_key_down=self._on_key_down)
         if BOOT_DEBUG:
             _boot_mark("screens ok: %d registered" % len(sm.screens))
-            from kivy.uix.floatlayout import FloatLayout
-            heartbeat = FloatLayout()
-            heartbeat.add_widget(sm)
-            _boot_install(heartbeat)
-            return heartbeat
+            _boot_install(sm.get_screen(sm.current))
         return sm
 
     def on_start(self):
@@ -1881,6 +1889,8 @@ class sHadesClientApp(MDApp):
             self._open_main()
             if BOOT_DEBUG:
                 _boot_mark("session resumed: %s" % (self.hub_address,))
+                Clock.schedule_once(
+                    lambda dt: _boot_reattach(self.root.current), 0)
             Clock.schedule_once(lambda dt: self._init_reticulum(), 0.5)
             # Re-render persisted history (embeds survive close/re-open) once
             # the guild API is up; server-stored attachments re-fetch with a
