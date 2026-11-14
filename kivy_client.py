@@ -5247,6 +5247,8 @@ class sHadesClientApp(MDApp):
             n += 1
         target = os.path.join(out_dir, candidate)
         stream = resolver.openInputStream(uri)
+        if stream is None:
+            raise OSError("content provider refused read (stream None)")
         with open(target, "wb") as out:
             total = 0
             while True:
@@ -5263,8 +5265,12 @@ class sHadesClientApp(MDApp):
         stream.close()
         return target
 
-    def _saf_pick(self, request_code, on_file):
-        """Launch the system picker; on_file(local_path) fires on success."""
+    def _saf_pick(self, request_code, on_file, on_fail=None):
+        """Launch the system picker; on_file(local_path) fires on success,
+        on_fail(reason) on any failure. Both run on the kivy thread --
+        the activity callback arrives on the Android UI thread and is
+        marshalled via Clock (kivy widgets must not be touched from
+        foreign threads; property dispatch there is silent-no-op)."""
         from jnius import autoclass
         from android import activity as android_activity
         handlers = getattr(self, "_saf_handlers", None)
@@ -5275,34 +5281,68 @@ class sHadesClientApp(MDApp):
         if request_code in handlers:
             self._set_status("file picker already open")
             return
-        handlers[request_code] = on_file
+        handlers[request_code] = (on_file, on_fail)
         Intent = autoclass("android.content.Intent")
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
         intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
         intent.addCategory(Intent.CATEGORY_OPENABLE)
         intent.setType("*/*")
         PythonActivity.mActivity.startActivityForResult(intent, request_code)
+        self._set_status("system picker open — choose a file there")
 
     def _on_saf_result(self, request_code, result_code, intent):
+        """Called on the ANDROID UI thread by the p4a activity bridge.
+        Never touch kivy state here: snapshot, marshal onto the kivy
+        thread, and process in _finish_saf_result."""
         handlers = getattr(self, "_saf_handlers", None)
         if not handlers:
             return
-        on_file = handlers.pop(request_code, None)
-        if on_file is None:
+        entry = handlers.pop(request_code, None)
+        if entry is None:
             return
+        from kivy.clock import Clock
+        payload = {
+            "request_code": request_code,
+            "result_code": result_code,
+            "intent": intent,
+            "on_file": entry[0],
+            "on_fail": entry[1],
+        }
+        Clock.schedule_once(
+            lambda dt: self._finish_saf_result(payload), 0)
+
+    def _finish_saf_result(self, payload):
+        """Process a picker result on the kivy thread."""
+        request_code = payload["request_code"]
+        result_code = payload["result_code"]
+        intent = payload["intent"]
+        on_file = payload["on_file"]
+        on_fail = payload["on_fail"]
+
+        def fail(reason):
+            self._set_status("pick failed: %s" % reason)
+            if on_fail:
+                on_fail(reason)
+
         from jnius import autoclass
-        if intent is None:
+        ACT = autoclass("android.app.Activity")
+        if result_code != ACT.RESULT_OK:
+            fail("picker closed without a file (code %s)" % result_code)
             return
-        if result_code != autoclass("android.app.Activity").RESULT_OK:
+        if intent is None:
+            fail("picker returned no data")
             return
         uri = intent.getData()
         if uri is None:
+            fail("picker returned no file uri")
             return
+        self._set_status("copying %s ..." % uri.toString())
         try:
             local = self._saf_copy_uri(uri)
         except Exception as e:
-            self._set_status("file read failed: %s" % e)
+            fail("read failed: %r" % e)
             return
+        self._set_status("picked %s" % os.path.basename(local))
         on_file(local)
 
     def _open_attach_dialog_android(self):
@@ -5388,12 +5428,16 @@ class sHadesClientApp(MDApp):
                       size_hint=(0.9, 0.7), auto_dismiss=False)
 
         def do_pick(*_):
+            def on_fail(reason):
+                chosen.text = reason
+                chosen.color = (1, 0.5, 0.4, 1)
+
             def on_file(local):
                 state["path"] = local
                 chosen.text = os.path.basename(local)
                 self._set_status("picked %s — choose storage, then OK"
                                  % chosen.text)
-            self._saf_pick(self._SAF_ATTACH, on_file)
+            self._saf_pick(self._SAF_ATTACH, on_file, on_fail)
 
         def do_ok(*_):
             if not state["path"]:
@@ -5430,10 +5474,13 @@ class sHadesClientApp(MDApp):
                       size_hint=(0.9, 0.5), auto_dismiss=False)
 
         def do_pick(*_):
+            def on_fail(reason):
+                hint.text = reason
+
             def on_file(local):
                 popup.dismiss()
                 self._on_file_selected([local], None)
-            self._saf_pick(self._SAF_GENERIC, on_file)
+            self._saf_pick(self._SAF_GENERIC, on_file, on_fail)
 
         btn.bind(on_press=do_pick)
         popup.open()
