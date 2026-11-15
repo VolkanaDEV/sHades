@@ -5251,23 +5251,83 @@ class sHadesClientApp(MDApp):
             candidate = "%s (%d)%s" % (stem, n, ext)
             n += 1
         target = os.path.join(out_dir, candidate)
-        stream = resolver.openInputStream(uri)
-        if stream is None:
-            raise OSError("content provider refused read (stream None)")
         if os.path.exists(target):
             os.remove(target)
-        # java-side transfer: no byte[] marshalling through jnius at all
-        fsys = autoclass("java.nio.file.FileSystems").getDefault()
-        jpath = fsys.getPath(target)
+
+        def step(what, fn):
+            """Wrap one copy hop so a failure names the hop exactly."""
+            try:
+                return fn()
+            except Exception as e:
+                dlog("saf %s failed: %r" % (what, e))
+                raise OSError("%s: %s" % (what, type(e).__name__))
+
+        stream = step("open-stream", lambda: resolver.openInputStream(uri))
+        if stream is None:
+            raise OSError("content provider refused read (stream None)")
+        transfer = None
         try:
-            autoclass("java.nio.file.Files").copy(stream, jpath)
-        finally:
+            # primary: java.nio transfer via exact-signature hops only.
+            # File(String) ctor and File.toPath() have single overloads --
+            # the varargs suspects from v0.16 (getPath/Files.copy) stay
+            # quarantined behind this one call.
+            jfile = step("jfile", lambda: autoclass("java.io.File")(target))
+            jpath = step("jtopath", lambda: jfile.toPath())
+            step("niocopy",
+                 lambda: autoclass("java.nio.file.Files").copy(stream, jpath))
+            transfer = "nio"
+        except OSError as e:
+            dlog("saf nio path failed: %s" % e)
+        if transfer is None:
+            # fallback: re-open fresh (nio may have consumed the stream),
+            # copy python-side through reflect.Array -- no jnius scalar
+            # exports anywhere, no varargs overloads.
+            try:
+                stream.close()
+            except Exception:
+                pass
+            stream2 = step("reopen-stream",
+                           lambda: resolver.openInputStream(uri))
+            try:
+                step("reflect-copy",
+                     lambda: self._reflect_copy(stream2, target))
+            finally:
+                try:
+                    stream2.close()
+                except Exception:
+                    pass
+            transfer = "reflect"
+        try:
             stream.close()
+        except Exception:
+            pass
         size = os.path.getsize(target)
         if size > 32 * 1024 * 1024:
             os.remove(target)
             raise OSError("picked file exceeds the 32 MB server cap (%d)"
                           % size)
+        dlog("saf copy done via %s: %s (%d bytes)" % (transfer, target, size))
+        return target
+
+    def _reflect_copy(self, stream, target):
+        """Python-side copy with no jbyte/jarray exports: the byte[] is
+        built via java.lang.reflect.Array.newInstance + Byte.TYPE
+        (public, documented surface), read via stream.read(buf). Slow
+        per-element conversion -- correctness fallback only."""
+        from jnius import autoclass
+        make = autoclass("java.lang.reflect.Array")
+        jbyte_cls = autoclass("java.lang.Byte").TYPE
+        buf = make.newInstance(jbyte_cls, 65536)
+        with open(target, "wb") as out:
+            total = 0
+            while True:
+                got = stream.read(buf)
+                if got <= 0:
+                    break
+                out.write(bytes(bytearray(buf[:got])))
+                total += got
+                if total > 32 * 1024 * 1024:
+                    raise OSError("picked file exceeds the 32 MB server cap")
         return target
 
     def _saf_pick(self, request_code, on_file, on_fail=None):
@@ -5346,7 +5406,7 @@ class sHadesClientApp(MDApp):
             local = self._saf_copy_uri(uri)
         except Exception as e:
             dlog("saf copy failed: %r" % e)
-            fail("E4: copy failed: %s" % type(e).__name__)
+            fail("E4: copy failed: %s" % (str(e) or type(e).__name__))
             return
         self._set_status("picked %s" % os.path.basename(local))
         on_file(local)
