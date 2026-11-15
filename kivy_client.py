@@ -6064,8 +6064,21 @@ class sHadesClientApp(MDApp):
         def do_cancel(*_):
             popup.dismiss()
 
+        def _trace_dismiss(*a):
+            # v0.19: the editor flashed-and-closed on tay's phone with no
+            # error; kivy has no caller attribution, so print the live
+            # dismiss stack: top frames name the file/line that closed it.
+            import traceback
+            fr = traceback.format_stack(limit=6)
+            dlog("editor popup dismissed; stack:\n" + "".join(fr))
+            top = fr[-2].strip() if len(fr) > 1 else "?"
+            Clock.schedule_once(
+                lambda dt: self._set_status(
+                    "editor closed by: %s" % top), 0)
+
         save_btn.bind(on_press=do_save)
         cancel_btn.bind(on_press=do_cancel)
+        popup.bind(on_dismiss=_trace_dismiss)
         popup.open()
 
     def _save_pfp_crop(self, path, crop_cx=0, crop_cy=0, crop_r=0,
@@ -6311,12 +6324,23 @@ class sHadesClientApp(MDApp):
                         self.profile_screen.target_username = new_name
                     except Exception:
                         pass
+                    # persist: restarts load the session file
+                    try:
+                        self._save_session()
+                    except Exception:
+                        pass
                     self._set_status("Profile saved: %s" % new_name)
                 Clock.schedule_once(apply, 0)
             else:
-                Clock.schedule_once(
-                    lambda dt: self._set_status(
-                        "save failed: %s" % res.get("error", "unknown")), 0)
+                def fail(dt):
+                    self._set_status(
+                        "save failed: %s" % res.get("error", "unknown"))
+                    try:
+                        inp.helper_text = (
+                            "server: %s" % str(res.get("error"))[:64])
+                    except Exception:
+                        pass
+                Clock.schedule_once(fail, 0)
         threading.Thread(target=work, daemon=True).start()
 
     # -- ui helpers ------------------------------------------------------
