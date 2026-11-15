@@ -5272,45 +5272,91 @@ class sHadesClientApp(MDApp):
                 dlog("saf %s failed: %r" % (what, e))
                 raise OSError("%s: %s" % (what, type(e).__name__))
 
-        stream = step("open-stream", lambda: resolver.openInputStream(uri))
-        if stream is None:
-            raise OSError("content provider refused read (stream None)")
-        transfer = None
+        # v0.24 PRIMARY: the file-descriptor path. tay's v0.23 receipt
+        # (224113 bytes, head=00 00 00 00 00 00 00 00) caught the
+        # java-array trap: the JVM fills ITS copy of the reflect byte
+        # array while the python wrapper keeps the original zeros, so
+        # the streamed copy had the right size and no content.
+        # ParcelFileDescriptor.detachFd() hands over the NATIVE fd int;
+        # python os.read owns it end to end and no java byte array
+        # crosses the bridge at all.
+        pfd = None
+        fd = None
         try:
-            # primary: java.nio transfer via exact-signature hops only.
-            # File(String) ctor and File.toPath() have single overloads --
-            # the varargs suspects from v0.16 (getPath/Files.copy) stay
-            # quarantined behind this one call.
-            jfile = step("jfile", lambda: autoclass("java.io.File")(target))
-            jpath = step("jtopath", lambda: jfile.toPath())
-            step("niocopy",
-                 lambda: autoclass("java.nio.file.Files").copy(stream, jpath))
-            transfer = "nio"
+            pfd = step("open-pfd", lambda: resolver.openFileDescriptor(uri, "r"))
         except OSError as e:
-            dlog("saf nio path failed: %s" % e)
-        if transfer is None:
-            # fallback: re-open fresh (nio may have consumed the stream),
-            # copy python-side through reflect.Array -- no jnius scalar
-            # exports anywhere, no varargs overloads.
+            dlog("saf pfd open failed: %s (falling back to streams)" % e)
+        if pfd is not None:
+            fd = step("detach-fd", lambda: pfd.detachFd())
+            if fd is None:
+                dlog("saf detachFd returned None")
+        if fd is not None:
+            total = 0
+            try:
+                first = os.read(fd, 8)
+                if len(first) == 8 and first == b"\x00" * 8:
+                    raise OSError("provider served zero-filled bytes "
+                                  "(fd head=00 x8)")
+                os.lseek(fd, 0, 0)
+                with open(target, "wb") as out:
+                    while True:
+                        chunk = os.read(fd, 1 << 20)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        total += len(chunk)
+                        if total > 32 * 1024 * 1024:
+                            raise OSError("picked file exceeds the 32 MB "
+                                          "server cap")
+            finally:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+            dlog("saf copy done via fd: %s (%d bytes)"
+                 % (target, total))
+            transfer = "fd"
+        else:
+            # legacy stream path (v0.15-v0.23 machinery), fallback only
+            stream = step("open-stream", lambda: resolver.openInputStream(uri))
+            if stream is None:
+                raise OSError("content provider refused read (stream None)")
+            transfer = None
+            try:
+                # primary: java.nio transfer via exact-signature hops only.
+                # File(String) ctor and File.toPath() have single overloads --
+                # the varargs suspects from v0.16 (getPath/Files.copy) stay
+                # quarantined behind this one call.
+                jfile = step("jfile", lambda: autoclass("java.io.File")(target))
+                jpath = step("jtopath", lambda: jfile.toPath())
+                step("niocopy",
+                     lambda: autoclass("java.nio.file.Files").copy(stream, jpath))
+                transfer = "nio"
+            except OSError as e:
+                dlog("saf nio path failed: %s" % e)
+            if transfer is None:
+                # fallback: re-open fresh (nio may have consumed the stream),
+                # copy python-side through reflect.Array -- no jnius scalar
+                # exports anywhere, no varargs overloads.
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+                stream2 = step("reopen-stream",
+                               lambda: resolver.openInputStream(uri))
+                try:
+                    step("reflect-copy",
+                         lambda: self._reflect_copy(stream2, target))
+                finally:
+                    try:
+                        stream2.close()
+                    except Exception:
+                        pass
+                transfer = "reflect"
             try:
                 stream.close()
             except Exception:
                 pass
-            stream2 = step("reopen-stream",
-                           lambda: resolver.openInputStream(uri))
-            try:
-                step("reflect-copy",
-                     lambda: self._reflect_copy(stream2, target))
-            finally:
-                try:
-                    stream2.close()
-                except Exception:
-                    pass
-            transfer = "reflect"
-        try:
-            stream.close()
-        except Exception:
-            pass
         size = os.path.getsize(target)
         if size > 32 * 1024 * 1024:
             os.remove(target)
