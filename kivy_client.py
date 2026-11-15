@@ -5316,8 +5316,62 @@ class sHadesClientApp(MDApp):
             os.remove(target)
             raise OSError("picked file exceeds the 32 MB server cap (%d)"
                           % size)
-        dlog("saf copy done via %s: %s (%d bytes)" % (transfer, target, size))
+        # v0.20 integrity gate: a provider stream can return zero bytes
+        # (or truncated data) and the transfer still "succeeds" -- every
+        # downstream consumer then spins or renders nothing with no
+        # error (tay's v0.19 receipt). Images are verified with the
+        # in-repo pillow dependency; a failed verify retries through
+        # the OTHER transfer once before failing with a named error.
+        if size == 0:
+            os.remove(target)
+            raise OSError("copy produced a 0-byte file via %s "
+                          "(provider stream empty)" % transfer)
+        if (os.path.splitext(target)[1].lower()
+                in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+                and not self._saf_image_ok(target)):
+            if transfer == "nio":
+                dlog("saf verify failed via nio (%d bytes); retrying "
+                     "python-side" % size)
+                try:
+                    stream2 = step("reopen-stream",
+                                   lambda: resolver.openInputStream(uri))
+                    try:
+                        self._reflect_copy(stream2, target)
+                    finally:
+                        try:
+                            stream2.close()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    os.remove(target)
+                    raise OSError("copy unreadable via %s and retry failed "
+                                  "with %s" % (transfer, type(e).__name__))
+                size = os.path.getsize(target)
+            if size == 0:
+                os.remove(target)
+                raise OSError("copy produced a 0-byte file via %s "
+                              "(provider stream empty)" % transfer)
+            if not self._saf_image_ok(target):
+                os.remove(target)
+                raise OSError("copy produced unreadable image data "
+                              "(%d bytes via %s)" % (size, transfer))
+        dlog("saf copy done via %s: %s (%d bytes, verified)"
+             % (transfer, target, size))
         return target
+
+    def _saf_image_ok(self, path):
+        """True iff the local file decodes as an image (pillow, an
+        in-repo dependency). Any exception -> False; the caller turns
+        it into a named error. Non-image extensions are not checked."""
+        try:
+            from PIL import Image
+            with Image.open(path) as im:
+                im.verify()
+            return True
+        except Exception as e:
+            dlog("saf image verify failed: %s: %s"
+                 % (type(e).__name__, e))
+            return False
 
     def _reflect_copy(self, stream, target):
         """Python-side copy with no jbyte/jarray exports: the byte[] is
@@ -5512,8 +5566,9 @@ class sHadesClientApp(MDApp):
             def on_file(local):
                 state["path"] = local
                 chosen.text = os.path.basename(local)
-                self._set_status("picked %s — choose storage, then OK"
-                                 % chosen.text)
+                self._set_status("picked %s (%d KB) — choose storage, then OK"
+                                 % (chosen.text,
+                                    os.path.getsize(local) // 1024))
             self._saf_pick(self._SAF_ATTACH, on_file, on_fail)
 
         def do_ok(*_):
@@ -6080,6 +6135,19 @@ class sHadesClientApp(MDApp):
         cancel_btn.bind(on_press=do_cancel)
         popup.bind(on_dismiss=_trace_dismiss)
         popup.open()
+
+        def _check_image(dt):
+            try:
+                pimg = editor.ids.get("pfp_img")
+            except Exception:
+                pimg = None
+            if pimg is None:
+                self._set_status("editor: no pfp_img child (kv rule "
+                                 "missing)")
+            elif not pimg.texture:
+                self._set_status("editor: image not loaded: %s"
+                                 % os.path.basename(path))
+        Clock.schedule_once(_check_image, 2.0)
 
     def _save_pfp_crop(self, path, crop_cx=0, crop_cy=0, crop_r=0,
                        image_pos=None, image_size=None):
