@@ -5344,8 +5344,11 @@ class sHadesClientApp(MDApp):
                          "magic<ext mismatch but PIL verified)"
                          % (transfer, target, size))
                     return target
-                os.remove(target)
+                # v0.23: HEAD BYTES BEFORE DELETE -- v0.22 removed the
+                # file first, so the hex receipt read nothing
+                # ('(unreadable)' on tay's flash).
                 head_hex = self._saf_head_hex(target)
+                os.remove(target)
                 if magic == "unknown":
                     raise OSError("picked image is not a decodable format "
                                   "(%d bytes, head=%s) - please pick a "
