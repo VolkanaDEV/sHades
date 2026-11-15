@@ -3548,17 +3548,27 @@ class sHadesClientApp(MDApp):
         def work():
             print(f"[TRACE] _fetch_attachment.work: fetching {path}", flush=True)
             dlog(f"_fetch_attachment.work: fetching {path}")
+            Clock.schedule_once(
+                lambda dt: self._set_status(
+                    "attachment: fetching %s ..." % name), 0)
             try:
                 blob = self.guild_api.fetch_file(path)
-            except Exception:
+            except Exception as e:
                 blob = None
+                dlog("_fetch_attachment.work: fetch raised %r" % (e,))
             if not blob:
                 print(
                     f"[TRACE] _fetch_attachment.work: fetch returned empty for {path}", flush=True)
                 dlog(f"_fetch_attachment.work: fetch returned empty for {path}")
                 Clock.schedule_once(
+                    lambda dt, m="attachment fetch failed: %s"
+                    % name: self._set_status(m), 0)
+                Clock.schedule_once(
                     lambda dt: self._remove_placeholder(row), 0)
                 return
+            Clock.schedule_once(
+                lambda dt: self._set_status(
+                    "attachment loaded (%d KB)" % (len(blob) // 1024)), 0)
             print(
                 f"[TRACE] _fetch_attachment.work: received {len(blob)} bytes "
                 f"for {path}", flush=True)
@@ -5593,37 +5603,79 @@ class sHadesClientApp(MDApp):
         cid = self._channel_cid(cid)
 
         def work():
-            print(f"[TRACE] _send_with_attachment.work: posting to channel={cid}", flush=True)
-            dlog(f"_send_with_attachment.work: posting to channel={cid}")
-            # v1 path: upload the blob once, post by reference (no re-transfer
-            # on retry). Fall back to the legacy inline msgpack post when the
-            # guild predates /api/v1.
-            res = None
             try:
-                up = self.guild_api.blobs_put(name, mime, blob)
-                if up.get("ok"):
-                    res = self.guild_api.post_v1(
-                        cid, text,
-                        attachments=[{"name": name, "mime": mime,
-                                      "blob_id": up["blob_id"]}])
-                else:
-                    print("[TRACE] blob upload failed: %s" % up.get("error"), flush=True)
+                print(f"[TRACE] _send_with_attachment.work: posting to channel={cid}", flush=True)
+                dlog(f"_send_with_attachment.work: posting to channel={cid}")
+
+                def stage(msg):
+                    Clock.schedule_once(
+                        lambda dt, m=msg: self._set_status(m), 0)
+
+                # v1 path: upload the blob once, post by reference (no re-transfer
+                # on retry). Fall back to the legacy inline msgpack post when the
+                # guild predates /api/v1.
+                res = None
+                try:
+                    stage("attachment: uploading %s (%d KB)"
+                          % (name, len(blob) // 1024))
+                    up = self.guild_api.blobs_put(name, mime, blob)
+                    if up.get("ok"):
+                        stage("attachment: blob ok, posting %s" % name)
+                        res = self.guild_api.post_v1(
+                            cid, text,
+                            attachments=[{"name": name, "mime": mime,
+                                          "blob_id": up["blob_id"]}])
+                        dlog("send.post_v1 response: %r" % (res,))
+                    else:
+                        stage("attachment: blob failed (%s), legacy ..."
+                              % up.get("error", "unknown"))
+                        print("[TRACE] blob upload failed: %s"
+                              % up.get("error"), flush=True)
+                except Exception as e:
+                    dlog("v1 blob path failed: %r" % (e,))
+                    print("[TRACE] v1 blob path failed, falling back:",
+                          repr(e), flush=True)
+                if res is None or not res.get("ok"):
+                    try:
+                        stage("attachment: posting inline %s ..." % name)
+                        legacy = self.guild_api.post(
+                            cid, text, attachments=[[name, mime, blob]])
+                        res = legacy if (res is None
+                                         or not res.get("ok")) else res
+                        dlog("send.legacy post response: %r" % (res,))
+                    except Exception as e:
+                        # pre-v0.16 bug: a raise here killed the worker
+                        # thread silently, leaving a spinner forever.
+                        dlog("legacy attachment post raised: %r" % (e,))
+                        Clock.schedule_once(
+                            lambda dt, m="attach send failed: %s: %s"
+                            % (type(e).__name__, e): self._set_status(m), 0)
+                        return
+                if res is None:
+                    Clock.schedule_once(
+                        lambda dt: self._set_status(
+                            "attach send failed: no response"), 0)
+                    return
+                print(
+                    f"[TRACE] _send_with_attachment.work: post response "
+                    f"ok={res.get('ok')} msg_id={res.get('msg_id')} "
+                    f"attachment={res.get('attachment')}", flush=True)
+                dlog(
+                    f"_send_with_attachment.work: post response "
+                    f"ok={res.get('ok')} msg_id={res.get('msg_id')} "
+                    f"attachment={res.get('attachment')}")
+                if not res.get("ok"):
+                    Clock.schedule_once(
+                        lambda dt, m="send failed: %s"
+                        % res.get("error", "unknown"): self._set_status(m), 0)
+                    return
             except Exception as e:
-                print("[TRACE] v1 blob path failed, falling back:", repr(e), flush=True)
-            if res is None or not res.get("ok"):
-                legacy = self.guild_api.post(cid, text, attachments=[[name, mime, blob]])
-                res = legacy if (res is None or not res.get("ok")) else res
-            print(
-                f"[TRACE] _send_with_attachment.work: post response "
-                f"ok={res.get('ok')} msg_id={res.get('msg_id')} "
-                f"attachment={res.get('attachment')}", flush=True)
-            dlog(
-                f"_send_with_attachment.work: post response "
-                f"ok={res.get('ok')} msg_id={res.get('msg_id')} "
-                f"attachment={res.get('attachment')}")
-            if not res.get("ok"):
+                import traceback
+                dlog("attachment send thread crashed: trace=%s"
+                     % traceback.format_exc())
                 Clock.schedule_once(
-                    lambda dt: self._set_status("send failed: %s" % res.get("error", "unknown")), 0)
+                    lambda dt, m="attachment send crashed: %s"
+                    % type(e).__name__: self._set_status(m), 0)
                 return
             msg_id = res.get("msg_id")
             # The guild may ack with stored metadata (path) => server-stored.
@@ -5907,10 +5959,10 @@ class sHadesClientApp(MDApp):
 
     def open_file_chooser(self, avatar=False):
         """Open a file chooser popup to attach a file or select an avatar."""
+        self._avatar_mode = avatar
         if self._android_platform():
             self._android_pick_generic(avatar)
             return
-        self._avatar_mode = avatar
         chooser = FileChooserListView(filters=["*.png", "*.jpg", "*.jpeg",
                                                "*.gif", "*.webp", "*.mp4",
                                                "*.mp3", "*.pdf", "*.txt"])
@@ -5926,10 +5978,17 @@ class sHadesClientApp(MDApp):
         if not selection:
             return
         path = selection[0]
-        if getattr(self, "_avatar_mode", False):
-            self._open_pfp_editor(path)
-        else:
-            self.attach_file(path)
+        try:
+            if getattr(self, "_avatar_mode", False):
+                self._set_status("opening PFP editor ...")
+                self._open_pfp_editor(path)
+            else:
+                self.attach_file(path)
+        except Exception as e:
+            import traceback
+            dlog("on_file_selected failed: %s" % traceback.format_exc())
+            self._set_status("pick routing failed: %s: %s"
+                             % (type(e).__name__, e))
 
     def _open_pfp_editor(self, path):
         """Open round-mask PFP picker popup — drag circle to position, drag outside to resize.
@@ -6219,17 +6278,31 @@ class sHadesClientApp(MDApp):
             # fallback, and it matches what the guild already shows.
             if not new_name:
                 new_name = self.username or default_username(self.my_hash)
-        except Exception:
+        except Exception as e:
+            import traceback
+            dlog("save_profile pre-register failed: %s"
+                 % traceback.format_exc())
+            self._set_status("save failed (input read): %s: %s"
+                             % (type(e).__name__, e))
             return
 
         # register() blocks on the RNS link — keep it off the main thread.
+        self._set_status("registering \"%s\" ..." % new_name)
+
         def work():
             try:
                 res = self.guild_api.register(new_name, "")
             except Exception as e:
-                err = "save failed: %s" % e
+                err = "save failed: %s: %s" % (type(e).__name__, e)
+                dlog("save_profile register raised: %s" % repr(e))
                 Clock.schedule_once(
                     lambda dt: self._set_status(err), 0)
+                return
+            dlog("save_profile register response: %r" % (res,))
+            if not isinstance(res, dict):
+                Clock.schedule_once(
+                    lambda dt: self._set_status(
+                        "save failed: bad response %r" % (res,)), 0)
                 return
             if res.get("ok"):
                 def apply(dt):
@@ -6238,7 +6311,7 @@ class sHadesClientApp(MDApp):
                         self.profile_screen.target_username = new_name
                     except Exception:
                         pass
-                    self._set_status("Profile saved")
+                    self._set_status("Profile saved: %s" % new_name)
                 Clock.schedule_once(apply, 0)
             else:
                 Clock.schedule_once(
