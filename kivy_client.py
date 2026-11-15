@@ -5341,18 +5341,19 @@ class sHadesClientApp(MDApp):
                 if magic == "unknown" and self._saf_image_ok(target):
                     # extension lied, bytes decode anyway: keep it
                     dlog("saf copy done via %s: %s (%d bytes, "
-                         "mag<ext mismatch but PIL verified)"
+                         "magic<ext mismatch but PIL verified)"
                          % (transfer, target, size))
                     return target
                 os.remove(target)
+                head_hex = self._saf_head_hex(target)
                 if magic == "unknown":
-                    raise OSError("picked image is not a decodable "
-                                  "format (%d bytes) - please pick a "
-                                  "JPEG or PNG" % size)
+                    raise OSError("picked image is not a decodable format "
+                                  "(%d bytes, head=%s) - please pick a "
+                                  "JPEG or PNG" % (size, head_hex))
                 raise OSError("picked image is %s - kivy cannot render "
                               "that format here, please pick a JPEG "
-                              "or PNG (%d bytes via %s)"
-                              % (magic.upper(), size, transfer))
+                              "or PNG (%d bytes via %s, head=%s)"
+                              % (magic.upper(), size, transfer, head_hex))
             # known-decodable magic: PIL verify is advisory here. If
             # pillow's decode stack is broken on-device, a hard gate
             # would block good files (v0.20 receipt could be either);
@@ -5364,6 +5365,17 @@ class sHadesClientApp(MDApp):
         dlog("saf copy done via %s: %s (%d bytes, verified)"
              % (transfer, target, size))
         return target
+
+    @staticmethod
+    def _saf_head_hex(path, n=8):
+        """First n bytes as space-separated hex -- names unknown content
+        in a status/error line (v0.22, tay's gallery mystery)."""
+        try:
+            with open(path, "rb") as f:
+                head = f.read(n)
+        except Exception:
+            return "(unreadable)"
+        return " ".join("%02X" % b for b in head)
 
     @staticmethod
     def _saf_magic(path):
