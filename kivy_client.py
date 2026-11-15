@@ -5208,31 +5208,36 @@ class sHadesClientApp(MDApp):
         return platform == "android"
 
     def _saf_copy_uri(self, uri):
-        """Copy a content:// uri into the app dir; return the local path."""
-        import mimetypes as _mt
-        from jnius import autoclass, jbyte, jarray
+        """Copy a content:// uri into the app dir; return the local path.
+        No python-side byte arrays: the transfer runs java-side via
+        java.nio.file.Files.copy (minapi 26), so the only jnius name
+        imported is autoclass -- the one proven to import on-device.
+        (v0.15 raised E4 ImportError importing jbyte/jarray here.)"""
+        try:
+            import mimetypes as _mt
+        except ImportError:
+            _mt = None
+        from jnius import autoclass
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
         resolver = PythonActivity.mActivity.getContentResolver()
-        # display name (best effort; falls back to a mime-derived name)
+        # display name, best effort; the jarray(String) cursor query from
+        # v0.15 needed the same suspect jnius exports as the byte transfer,
+        # so both are gone: last path segment with a mime-based fallback.
         name = None
         try:
-            String = autoclass("java.lang.String")
-            cols = jarray(String)([String("_display_name")])
-            cur = resolver.query(uri, cols, None, None, None)
-            if cur is not None:
-                try:
-                    if cur.moveToFirst():
-                        name = cur.getString(0)
-                finally:
-                    cur.close()
+            name = uri.getLastPathSegment()
         except Exception:
             name = None
+        if name:
+            name = os.path.basename(name.replace("\\", "/"))
+            if not name or "." not in name:
+                name = None
         if not name:
             try:
                 mime = resolver.getType(uri)
             except Exception:
                 mime = None
-            ext = (_mt.guess_extension(mime) if mime else None) or ""
+            ext = (_mt.guess_extension(mime) if (_mt and mime) else None) or ""
             name = "picked" + ext
         name = os.path.basename(name.replace("\\", "/")) or "picked"
         if name.startswith("."):
@@ -5249,21 +5254,20 @@ class sHadesClientApp(MDApp):
         stream = resolver.openInputStream(uri)
         if stream is None:
             raise OSError("content provider refused read (stream None)")
-        with open(target, "wb") as out:
-            total = 0
-            while True:
-                buf = jarray(jbyte)(65536)
-                got = stream.read(buf)
-                if got <= 0:
-                    break
-                out.write(bytes(bytearray(buf[:got])))
-                total += got
-                if total > 32 * 1024 * 1024:
-                    stream.close()
-                    os.remove(target)
-                    raise OSError("picked file exceeds the 32 MB server cap "
-                                  "(aborted mid-copy)")
-        stream.close()
+        if os.path.exists(target):
+            os.remove(target)
+        # java-side transfer: no byte[] marshalling through jnius at all
+        fsys = autoclass("java.nio.file.FileSystems").getDefault()
+        jpath = fsys.getPath(target)
+        try:
+            autoclass("java.nio.file.Files").copy(stream, jpath)
+        finally:
+            stream.close()
+        size = os.path.getsize(target)
+        if size > 32 * 1024 * 1024:
+            os.remove(target)
+            raise OSError("picked file exceeds the 32 MB server cap (%d)"
+                          % size)
         return target
 
     def _saf_pick(self, request_code, on_file, on_fail=None):
