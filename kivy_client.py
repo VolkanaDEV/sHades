@@ -5258,10 +5258,11 @@ class sHadesClientApp(MDApp):
                     break
                 out.write(bytes(bytearray(buf[:got])))
                 total += got
-                if total > 40 * 1024 * 1024:
+                if total > 32 * 1024 * 1024:
                     stream.close()
                     os.remove(target)
-                    raise OSError("picked file exceeds the 32 MB cap")
+                    raise OSError("picked file exceeds the 32 MB server cap "
+                                  "(aborted mid-copy)")
         stream.close()
         return target
 
@@ -5319,6 +5320,7 @@ class sHadesClientApp(MDApp):
         on_fail = payload["on_fail"]
 
         def fail(reason):
+            dlog("pick fail: %s" % reason)
             self._set_status("pick failed: %s" % reason)
             if on_fail:
                 on_fail(reason)
@@ -5326,20 +5328,21 @@ class sHadesClientApp(MDApp):
         from jnius import autoclass
         ACT = autoclass("android.app.Activity")
         if result_code != ACT.RESULT_OK:
-            fail("picker closed without a file (code %s)" % result_code)
+            fail("E1: cancelled (code %s)" % result_code)
             return
         if intent is None:
-            fail("picker returned no data")
+            fail("E2: picker returned no data")
             return
         uri = intent.getData()
         if uri is None:
-            fail("picker returned no file uri")
+            fail("E3: no file uri in result")
             return
         self._set_status("copying %s ..." % uri.toString())
         try:
             local = self._saf_copy_uri(uri)
         except Exception as e:
-            fail("read failed: %r" % e)
+            dlog("saf copy failed: %r" % e)
+            fail("E4: copy failed: %s" % type(e).__name__)
             return
         self._set_status("picked %s" % os.path.basename(local))
         on_file(local)
@@ -5386,9 +5389,10 @@ class sHadesClientApp(MDApp):
         style_box.add_widget(btn_ephem)
 
         chosen = Label(text="No file picked yet", size_hint_y=None,
-                       height=dp(28),
+                       height=dp(56),
                        color=app.theme_colors['text'] if app else (1, 1, 1, 1),
-                       font_size=sp(12), halign="left")
+                       font_size=sp(12), halign="left", valign="middle")
+        chosen.bind(width=lambda inst, w: setattr(inst, "text_size", (w, None)))
         btn_pick = Button(text="Choose file (system picker)",
                           size_hint_y=None, height=scaled(dp(44)),
                           background_color=(app.theme_colors['panel_darker']
@@ -5458,9 +5462,10 @@ class sHadesClientApp(MDApp):
         from kivy.uix.popup import Popup
         app = App.get_running_app()
         hint = Label(text="Use the system picker to choose a file.",
-                     size_hint_y=None, height=dp(32),
+                     size_hint_y=None, height=dp(48),
                      color=app.theme_colors['text'] if app else (1, 1, 1, 1),
-                     font_size=sp(12), halign="left")
+                     font_size=sp(12), halign="left", valign="middle")
+        hint.bind(width=lambda inst, w: setattr(inst, "text_size", (w, None)))
         btn = Button(text="Choose file (system picker)",
                      size_hint_y=None, height=scaled(dp(44)),
                      background_color=(app.theme_colors['primary'] if app
@@ -5475,6 +5480,7 @@ class sHadesClientApp(MDApp):
         def do_pick(*_):
             def on_fail(reason):
                 hint.text = reason
+                hint.color = (1, 0.5, 0.4, 1)
 
             def on_file(local):
                 popup.dismiss()
