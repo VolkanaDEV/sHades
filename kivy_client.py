@@ -5319,45 +5319,79 @@ class sHadesClientApp(MDApp):
         # v0.20 integrity gate: a provider stream can return zero bytes
         # (or truncated data) and the transfer still "succeeds" -- every
         # downstream consumer then spins or renders nothing with no
-        # error (tay's v0.19 receipt). Images are verified with the
-        # in-repo pillow dependency; a failed verify retries through
-        # the OTHER transfer once before failing with a named error.
+        # error (tay's v0.19 receipt). tay's v0.20 receipt answered the
+        # zero-byte branch: 203434 real bytes that pillow cannot
+        # decode. v0.21 policy: sniff the magic so the file's TRUE
+        # format names itself. A kivy-decodable magic decodes or not in
+        # the editor (texture check names it); an undecodable family
+        # (HEIC/AVIF) fails here with a message tay can act on.
         if size == 0:
             os.remove(target)
             raise OSError("copy produced a 0-byte file via %s "
                           "(provider stream empty)" % transfer)
-        if (os.path.splitext(target)[1].lower()
-                in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
-                and not self._saf_image_ok(target)):
-            if transfer == "nio":
-                dlog("saf verify failed via nio (%d bytes); retrying "
-                     "python-side" % size)
-                try:
-                    stream2 = step("reopen-stream",
-                                   lambda: resolver.openInputStream(uri))
-                    try:
-                        self._reflect_copy(stream2, target)
-                    finally:
-                        try:
-                            stream2.close()
-                        except Exception:
-                            pass
-                except Exception as e:
-                    os.remove(target)
-                    raise OSError("copy unreadable via %s and retry failed "
-                                  "with %s" % (transfer, type(e).__name__))
-                size = os.path.getsize(target)
-            if size == 0:
+        if os.path.splitext(target)[1].lower() \
+                in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
+            magic = self._saf_magic(target)
+            if magic is None:
                 os.remove(target)
-                raise OSError("copy produced a 0-byte file via %s "
-                              "(provider stream empty)" % transfer)
+                raise OSError("copy produced unreadable data "
+                              "(%d bytes via %s, unknown magic)"
+                              % (size, transfer))
+            if magic in ("heic", "avif", "unknown"):
+                if magic == "unknown" and self._saf_image_ok(target):
+                    # extension lied, bytes decode anyway: keep it
+                    dlog("saf copy done via %s: %s (%d bytes, "
+                         "mag<ext mismatch but PIL verified)"
+                         % (transfer, target, size))
+                    return target
+                os.remove(target)
+                if magic == "unknown":
+                    raise OSError("picked image is not a decodable "
+                                  "format (%d bytes) - please pick a "
+                                  "JPEG or PNG" % size)
+                raise OSError("picked image is %s - kivy cannot render "
+                              "that format here, please pick a JPEG "
+                              "or PNG (%d bytes via %s)"
+                              % (magic.upper(), size, transfer))
+            # known-decodable magic: PIL verify is advisory here. If
+            # pillow's decode stack is broken on-device, a hard gate
+            # would block good files (v0.20 receipt could be either);
+            # the editor's texture check gives the REAL verdict.
             if not self._saf_image_ok(target):
-                os.remove(target)
-                raise OSError("copy produced unreadable image data "
-                              "(%d bytes via %s)" % (size, transfer))
+                dlog("saf: PIL could not verify %s magic=%s (%d bytes); "
+                     "letting kivy attempt the render"
+                     % (target, magic, size))
         dlog("saf copy done via %s: %s (%d bytes, verified)"
              % (transfer, target, size))
         return target
+
+    @staticmethod
+    def _saf_magic(path):
+        """Sniff the file's format from its first bytes: jpeg/png/gif/
+        webp/heic/avif/pdf/unknown/None (None = unreadable)."""
+        try:
+            with open(path, "rb") as f:
+                head = f.read(16)
+        except Exception:
+            return None
+        if head[:3] == b"\xff\xd8\xff":
+            return "jpeg"
+        if head[:8] == b"\x89PNG\r\n\x1a\n":
+            return "png"
+        if head[:4] in (b"GIF8",):
+            return "gif"
+        if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+            return "webp"
+        if head[:4] == b"%PDF":
+            return "pdf"
+        if head[4:8] == b"ftyp":
+            brand = head[8:12].lower()
+            if brand.startswith(b"heic") or brand.startswith(b"mif1"):
+                return "heic"
+            if brand.startswith(b"avif") or brand.startswith(b"avis"):
+                return "avif"
+            return "heic" if brand[:2] in (b"he", b"ms") else "heic"
+        return "unknown"
 
     def _saf_image_ok(self, path):
         """True iff the local file decodes as an image (pillow, an
