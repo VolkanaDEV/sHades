@@ -1924,6 +1924,7 @@ class sHadesClientApp(MDApp):
         # link is a server-side rule, so switching channels reroutes the flow.
         self._stream_cid = None
         self._stream_cursor = None
+        self._stream_tick_event = None
         # site channels: kind per cid, the rendered page stack, the page
         # currently shown, and the active theme from the manifest
         self._channel_kinds = {}     # cid -> chat|site|term
@@ -2576,6 +2577,12 @@ class sHadesClientApp(MDApp):
         self._last_ts = 0.0
         self._stream_cid = None
         self._stream_cursor = None
+        # cancel, don't drop: a reconnect re-schedules, and two intervals
+        # would double every poll
+        ev = getattr(self, "_stream_tick_event", None)
+        if ev:
+            ev.cancel()
+        self._stream_tick_event = None
         self._site_stack.clear()
         self._site_current = None
         self._site_theme.clear()
@@ -2996,6 +3003,7 @@ class sHadesClientApp(MDApp):
             Clock.schedule_once(lambda dt: self._switch_main(), 0)
             Clock.schedule_once(lambda dt: self._start_poll(), 0)
             Clock.schedule_once(lambda dt: self._start_streamer(), 0)
+            Clock.schedule_once(lambda dt: self._start_stream_keepalive(), 0)
             Clock.schedule_once(lambda dt: self._refresh_channels_from_guild(), 1.0)
             Clock.schedule_once(lambda dt: self._fetch_whoami(), 1.2)
             # join gate (U6b): if the guild requires an invite code, prompt
@@ -3069,11 +3077,26 @@ class sHadesClientApp(MDApp):
             print("push frame failed:", repr(e))
 
     def _start_streamer(self):
-        """v0.28: subscribe ONCE per channel. The server pushes from there.
-        Only ONE subscription per link exists server-side, so pointing
-        _stream_cid at a new channel (cursor=None) re-points the push. A
-        failed subscribe leaves cursor None; the announce tick re-fires
-        this until it sticks (self-healing, not polling)."""
+        """Establish (or re-establish) the stream subscription on the link.
+
+        v0.31 truth: the server binds the channel AT SUBSCRIBE TIME and
+        replaces the binding on every call (one subscription per link,
+        api_v1_stream_subscribe) -- pointing _stream_cid alone changes
+        nothing on the wire. Callers:
+
+        - connect / guild-link attach: prime the entry channel;
+        - _switch_channel: re-point at the newly opened channel, letting
+          the server replace the binding;
+        - keepalive self-heal: after SUB_TTL_S of quiet the subscription
+          is purged server-side; the 45s keepalive sees {ok: 0, code:
+          409} and calls this again. _stream_cursor still holds the
+          watermark then, so the subscribe replays the gap from the
+          event log instead of jumping to head.
+
+        Setting the cursor here follows the same rule as upload offsets:
+        a subscribe with a kept cursor cannot lose or double-deliver
+        what the push path already rendered (render dedupes by msg_id).
+        """
         if not self.guild_api or not self._stream_cid:
             return
         try:
@@ -3087,6 +3110,63 @@ class sHadesClientApp(MDApp):
         except Exception as e:
             print("stream subscribe failed:", repr(e))
             self._stream_cursor = None
+
+    def _start_stream_keepalive(self):
+        """v0.31: keep the stream subscription alive through quiet minutes.
+
+        Receipted mechanics: SUB_TTL_S = 120 (sHades.py) drops
+        subscriptions the poll path has not touched; the push path only
+        refreshes subscriptions it is actively pushing to (sHades.py
+        _push_stream refreshes s["at"] on push), so a channel with no
+        traffic for two minutes is purged and the app goes silent until
+        restart. The poll is the designed refresh (the server's own
+        SUB_TTL comment names it); delivery stays push-only -- the tick
+        issues a zero-wait poll purely to touch the subscription and
+        self-heals a 409 by resubscribing from the watermark. The old
+        v0.28 "no polling loops" rule stands: nothing here polls for
+        content; a silent channel costs one empty request per 45s.
+        """
+        if getattr(self, "_stream_tick_event", None) is not None:
+            return
+        self._stream_tick_event = Clock.schedule_interval(
+            self._stream_tick, 45)
+
+    def _stream_tick(self, dt):
+        # the network call goes on a thread; the tick itself is instant
+        threading.Thread(target=self._stream_keepalive_once,
+                         daemon=True).start()
+
+    def _stream_keepalive_once(self):
+        api = self.guild_api
+        if not api or not self._stream_cid:
+            return
+        try:
+            res = api.stream_poll(cursor=self._stream_cursor, timeout_s=0)
+        except Exception:
+            return
+        if res.get("ok"):
+            self._stream_cursor = res.get("cursor", self._stream_cursor)
+            events = res.get("events") or []
+            if events:
+                # a quiet-channel poll can win a race with the push; the
+                # application is idempotent (render dedupes by msg_id)
+                self._apply_stream_events(events)
+        elif res.get("code") == 409:
+            # subscription expired (two quiet minutes): re-subscribe from
+            # the watermark so the TTL-eaten gap replays
+            Clock.schedule_once(lambda dt: self._start_streamer(), 0)
+
+    def _release_stream(self):
+        """Drop this link's stream subscription: switching to a push-less
+        channel kind (site/term) releases the one-subscription-per-link
+        slot instead of letting the old channel flow into the void."""
+        api = self.guild_api
+        if not api:
+            return
+        try:
+            api.stream_unsubscribe()
+        except Exception as e:
+            dlog("stream unsubscribe failed: %r" % (e,))
 
     def _resync_stream_channel(self):
         """Fetch the subscribed channel's history after a gap/reset."""
@@ -4767,20 +4847,30 @@ class sHadesClientApp(MDApp):
         self._seq = 0
         self._last_ts = 0.0
         cid = self._channel_cid(name)
+        kind = self._channel_kind(cid)
         # reroute the stream: only the visible channel flows
         self._stream_cid = cid
         self._stream_cursor = None
-        kind = self._channel_kind(cid)
-        if kind == "site":
-            self._open_site_channel(name, cid)
-            return
-        if kind == "term":
+        if kind != "chat":
+            # site/term channels carry no live push: release the stream
+            # slot (one subscription per link) so the previous channel
+            # stops flowing into a channel nobody is watching
+            self._stream_cid = None
+            threading.Thread(target=self._release_stream,
+                             daemon=True).start()
+            if kind == "site":
+                self._open_site_channel(name, cid)
+                return
             self._open_term_channel(name, cid)
             return
         self._older.setdefault(cid, {"oldest_id": None, "has_older": True,
                                      "loading": False})
         self._fetch_messages(name)
         self._refresh_members_ui(name)
+        # v0.31: re-subscribe NOW. The server binds the channel at
+        # subscribe time; setting _stream_cid alone changed nothing on
+        # the wire, and live updates died after the first switch.
+        Clock.schedule_once(lambda dt: self._start_streamer(), 0)
 
     # -- site channels (micron pages over RNS; no HTML anywhere) ---------
     def _open_site_channel(self, name, cid):
