@@ -5560,15 +5560,38 @@ class sHadesClientApp(MDApp):
         if uri is None:
             fail("E3: no file uri in result")
             return
-        self._set_status("copying %s ..." % uri.toString())
+        tail = "file"
         try:
-            local = self._saf_copy_uri(uri)
-        except Exception as e:
-            dlog("saf copy failed: %r" % e)
-            fail("E4: copy failed: %s" % (str(e) or type(e).__name__))
-            return
-        self._set_status("picked %s" % os.path.basename(local))
-        on_file(local)
+            tail = uri.getLastPathSegment() or "file"
+        except Exception:
+            pass
+        self._set_status("copying %s ..." % os.path.basename(tail))
+
+        def on_file_marshalled(local):
+            # v0.25: handlers run on the kivy thread only (thread-marshal
+            # law); the copy itself now owns a background thread so a big
+            # pick can no longer freeze the UI (tay's v0.24 stall).
+            try:
+                kb = os.path.getsize(local) // 1024
+                self._set_status("picked %s (%d KB)"
+                                 % (os.path.basename(local), kb))
+            except Exception:
+                pass
+            on_file(local)
+
+        def copy_work():
+            try:
+                local = self._saf_copy_uri(uri)
+            except Exception as e:
+                dlog("saf copy failed: %r" % e)
+                reason = "E4: copy failed: %s" % (
+                    str(e) or type(e).__name__)
+                Clock.schedule_once(lambda dt, r=reason: fail(r), 0)
+                return
+            Clock.schedule_once(
+                lambda dt: on_file_marshalled(local), 0)
+
+        threading.Thread(target=copy_work, daemon=True).start()
 
     def _open_attach_dialog_android(self):
         """Android attach flow: system picker + storage-style selector."""
@@ -6510,6 +6533,17 @@ class sHadesClientApp(MDApp):
     def _set_status(self, text):
         try:
             self.root.get_screen("connect").ids.status.text = text
+        except Exception:
+            pass
+        # v0.25: the connect screen is usually not on display. Mirror
+        # every status onto the profile screen's own line -- tay's
+        # v0.24 receipt ("name change does not actually do anything")
+        # was the register verdicts rendering on an invisible screen.
+        try:
+            ps = self.root.get_screen("profile")
+            lbl = ps.ids.get("profile_status")
+            if lbl is not None:
+                lbl.text = str(text)
         except Exception:
             pass
 
