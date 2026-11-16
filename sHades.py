@@ -2321,7 +2321,8 @@ def _resolve_v1_attachments(atts):
         else:
             return None, "attachment needs data_b64 or blob_id"
         if len(blob) > MAX_ATTACHMENT_SZ:
-            return None, "attachment too large (max 32 MB)"
+            return None, "attachment too large (max %d MB)" % (
+                MAX_ATTACHMENT_SZ // (1024 * 1024),)
         triples.append([name or "attachment.bin", mime or "application/octet-stream", blob])
     return triples, None
 

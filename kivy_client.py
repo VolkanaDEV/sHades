@@ -5570,7 +5570,7 @@ class sHadesClientApp(MDApp):
                             break
                         out.write(chunk)
                         total += len(chunk)
-                        if total > 32 * 1024 * 1024:
+                        if total > 10 * 1024 * 1024:
                             raise OSError("picked file exceeds the 32 MB "
                                           "server cap")
             finally:
@@ -5623,7 +5623,7 @@ class sHadesClientApp(MDApp):
             except Exception:
                 pass
         size = os.path.getsize(target)
-        if size > 32 * 1024 * 1024:
+        if size > 10 * 1024 * 1024:
             os.remove(target)
             raise OSError("picked file exceeds the 32 MB server cap (%d)"
                           % size)
@@ -5750,7 +5750,7 @@ class sHadesClientApp(MDApp):
                     break
                 out.write(bytes(bytearray(buf[:got])))
                 total += got
-                if total > 32 * 1024 * 1024:
+                if total > 10 * 1024 * 1024:
                     raise OSError("picked file exceeds the 32 MB server cap")
         return target
 
@@ -6013,9 +6013,9 @@ class sHadesClientApp(MDApp):
         mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
         name = path.split("/")[-1]
         # Client-side size check so the user gets a clear message instead of
-        # a silent server rejection. Matches server MAX_ATTACHMENT_SZ (32 MB).
-        if len(blob) > 32 * 1024 * 1024:
-            self._set_status("attach failed: file too large (%d MB, max 32 MB)" %
+        # a silent server rejection. Matches server MAX_ATTACHMENT_SZ (10 MB).
+        if len(blob) > 10 * 1024 * 1024:
+            self._set_status("attach failed: file too large (%d MB, max 10 MB)" %
                              (len(blob) / 1024 / 1024))
             return
         self._send_with_attachment(text, name, mime, blob, style)
@@ -6748,35 +6748,6 @@ class sHadesClientApp(MDApp):
         name = path.split("/")[-1]
         self._pending_attachment = [name, mime, blob]
         self._set_status("Attached: %s (%d bytes)" % (name, len(blob)))
-
-    def upload_avatar(self, path):
-        """Upload an avatar image to the guild."""
-        try:
-            with open(path, "rb") as f:
-                blob = f.read()
-        except Exception as e:
-            self._set_status("avatar upload failed: %s" % e)
-            return
-
-        # avatar_upload() blocks on the RNS link — keep it off the main thread.
-        def work():
-            try:
-                res = self.guild_api.avatar_upload(blob)
-            except Exception:
-                res = None
-
-            def apply(dt):
-                if res and res.get("ok"):
-                    self._set_status("Avatar updated")
-                    try:
-                        self.profile_screen.target_avatar = path
-                        self.profile_screen.ids.profile_pfp.source = path
-                    except Exception:
-                        pass
-                else:
-                    self._set_status("avatar upload failed")
-            Clock.schedule_once(apply, 0)
-        threading.Thread(target=work, daemon=True).start()
 
     def save_profile(self):
         """Save username to the guild."""
