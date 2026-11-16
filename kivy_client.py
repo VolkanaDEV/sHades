@@ -1772,8 +1772,6 @@ class sHadesClientApp(MDApp):
         self.hub_address = DEFAULT_HUB_ADDRESS
         self.hub_host = DEFAULT_HUB_HOST
         self.hub_port = DEFAULT_HUB_PORT
-        self._poll_thread = None
-        self._poll_stop = threading.Event()
         self._seq = 0
         self._last_ts = 0.0
         self._channels = OrderedDict()   # cid -> name
@@ -1794,8 +1792,6 @@ class sHadesClientApp(MDApp):
         # channel the guild should stream to us; setting it (with a None
         # cursor) makes the stream loop resubscribe — one subscription per
         # link is a server-side rule, so switching channels reroutes the flow.
-        self._stream_stop = threading.Event()
-        self._stream_thread = None
         self._stream_cid = None
         self._stream_cursor = None
         # site channels: kind per cid, the rendered page stack, the page
@@ -1831,13 +1827,11 @@ class sHadesClientApp(MDApp):
         except Exception as e:
             print("muted-channel load failed:", repr(e))
 
-        # Presence: mirror the guild's active-user list every PRESENCE_INTERVAL.
-        # _active_users maps user_hash -> {"username", "node_hash"} and is
-        # rebuilt from each /api/presence response, so a member who stops
-        # pinging drops out of the member list instead of lingering in it.
-        self._presence_stop = threading.Event()
-        self._presence_thread = None
-        self.PRESENCE_INTERVAL = 5.0
+        # Presence: members arrive as a guild-wide PUSH event on the link
+        # (server "presence" kind); _active_users maps user_hash ->
+        # {"username", "node_hash"} and is rebuilt from each pushed event,
+        # so a member who stops pinging drops out of the member list
+        # instead of lingering in it. No interval fetches.
         self._active_users = {}
         # Has the guild answered a presence request? Distinguishes "nobody is
         # online" from "this guild has no presence API" — different UI each.
@@ -2835,6 +2829,13 @@ class sHadesClientApp(MDApp):
             self.link = link
 
             self.guild_api = GuildAPI(reticulum, link)
+            # v0.28 push: stream frames arrive on this link the moment
+            # events exist. The callback is the client's entire intake;
+            # no polling loops exist anywhere in the client.
+            try:
+                link.set_packet_callback(self._on_push_frame)
+            except Exception as e:
+                print("push callback registration failed: %s" % e)
             self._save_session()
 
             # Create this client's own nomadnetwork.node destination
@@ -2866,7 +2867,6 @@ class sHadesClientApp(MDApp):
                     self.identity_hash)
                 print(f"Registered with guild: {my_host}:{self.client_port}")
                 self._start_announce()
-                self._start_presence()
             except Exception as e:
                 print(f"Node registration failed: {e}")
 
@@ -2907,100 +2907,63 @@ class sHadesClientApp(MDApp):
         self._stream_cursor = None
 
     def _start_poll(self):
-        self._poll_stop.clear()
-        self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
-        self._poll_thread.start()
+        # v0.28: no polling loops anywhere in the client. This one-shot
+        # keeps what the first poll tick did (seed the UI once); every
+        # later update arrives as a server push on the link.
+        def bootstrap(dt):
+            self._ensure_general_channel()
+            if not getattr(self, "_ui_populated", False):
+                self._ui_populated = True
+                try:
+                    main = self.root.get_screen("main")
+                    name = getattr(main, "_current_channel", "general")
+                    self._fetch_messages(name)
+                    self._refresh_members_ui(self._channel_cid(name))
+                except Exception:
+                    pass
+        Clock.schedule_once(bootstrap, 0)
 
-    def _poll_loop(self):
-        tick = 0
-        while not self._poll_stop.is_set():
-            tick += 1
-            try:
-                # periodic channel-index refresh: renames, topics, new
-                # channels and unread badges stay current (cheap JSON call)
-                if tick % 5 == 0:
-                    self._refresh_channels_from_guild()
-                main = self.root.get_screen("main")
-                cid = getattr(main, "_current_channel", "general")
-                st = self.guild_api.state(self._channel_cid(cid))
-                if st.get("ok"):
-                    self._poll_error_shown = False
-                    seq = st.get("seq", 0)
-                    last_ts = st.get("last_ts", 0.0)
-                    msg_count = len(st.get("messages", []))
-                    print("poll state ok: seq=%s last_ts=%s msgs=%s" % (seq, last_ts, msg_count))
-                    if seq != self._seq or last_ts != self._last_ts:
-                        self._seq = seq
-                        self._last_ts = last_ts
-                        self._fetch_messages(cid)
-                        self._refresh_members_ui(self._channel_cid(cid))
-                    else:
-                        # no change, but make sure UI is populated on first poll
-                        if not getattr(self, "_ui_populated", False):
-                            self._ui_populated = True
-                            self._fetch_messages(cid)
-                            self._refresh_members_ui(self._channel_cid(cid))
-                else:
-                    err = st.get("error", "unknown")
-                    self._poll_error_shown = True
-                    Clock.schedule_once(
-                        lambda dt: self._set_status("poll failed: %s" % err), 0)
-                    print("poll state failed: %s" % err)
-                Clock.schedule_once(lambda dt: self._ensure_general_channel(), 0)
-            except Exception as exc:
-                print("poll exception: %s" % repr(exc))
-                self._poll_error_shown = True
-                err_msg = "poll exception: %s" % exc
+    def _on_push_frame(self, plaintext, packet=None):
+        """v0.28 push: the guild delivers stream frames down the link the
+        moment events exist (RNS.Packet(link, bytes), context NONE, which
+        is the only traffic this callback receives). Runs on an RNS
+        thread: threadsafe updates + Clock marshalling only."""
+        try:
+            frame = msgpack.unpackb(plaintext, raw=False)
+            if not isinstance(frame, dict) or frame.get("k") != "stream":
+                return
+            if frame.get("reset"):
+                # replay window rotated past our cursor: resync
+                self._stream_cursor = None
                 Clock.schedule_once(
-                    lambda dt: self._set_status(err_msg), 0)
-            self._poll_stop.wait(3.0)
+                    lambda dt: self._resync_stream_channel(), 0)
+                return
+            events = frame.get("events") or []
+            if events:
+                self._stream_cursor = frame.get("seq", self._stream_cursor)
+                self._apply_stream_events(events)
+        except Exception as e:
+            print("push frame failed:", repr(e))
 
     def _start_streamer(self):
-        """Long-poll stream for the visible channel only (JSON API v1)."""
-        if self._stream_thread is not None and self._stream_thread.is_alive():
-            return
-        self._stream_stop.clear()
-        self._stream_thread = threading.Thread(target=self._stream_loop,
-                                               daemon=True)
-        self._stream_thread.start()
-
-    def _stream_loop(self):
-        """Subscribe to the active channel and long-poll it.
-
+        """v0.28: subscribe ONCE per channel. The server pushes from there.
         Only ONE subscription per link exists server-side, so pointing
-        _stream_cid at a new channel (cursor=None) reroutes the stream —
-        background channels get nothing until they are opened again.
-        """
-        while not self._stream_stop.is_set():
-            if not self.guild_api or not self._stream_cid:
-                self._stream_stop.wait(1.0)
-                continue
-            try:
+        _stream_cid at a new channel (cursor=None) re-points the push. A
+        failed subscribe leaves cursor None; the announce tick re-fires
+        this until it sticks (self-healing, not polling)."""
+        if not self.guild_api or not self._stream_cid:
+            return
+        try:
+            res = self.guild_api.stream_subscribe(
+                self._stream_cid, cursor=self._stream_cursor)
+            if res.get("ok"):
                 if self._stream_cursor is None:
-                    res = self.guild_api.stream_subscribe(self._stream_cid)
-                    if res.get("ok"):
-                        self._stream_cursor = res.get("seq", 0)
-                    else:
-                        self._stream_stop.wait(2.0)
-                    continue
-                res = self.guild_api.stream_poll(self._stream_cursor, timeout_s=4.0)
-                if not res.get("ok"):
-                    if res.get("error") == "not subscribed":
-                        self._stream_cursor = None
-                    self._stream_stop.wait(2.0)
-                    continue
-                if res.get("reset"):
-                    # replay window rotated past our cursor: resync
-                    self._stream_cursor = None
-                    self._resync_stream_channel()
-                    continue
-                events = res.get("events") or []
-                if events:
-                    self._stream_cursor = res.get("cursor", self._stream_cursor)
-                    self._apply_stream_events(events)
-            except Exception as e:
-                print("stream exception:", repr(e))
-                self._stream_stop.wait(2.0)
+                    self._stream_cursor = res.get("seq", 0)
+            else:
+                self._stream_cursor = None
+        except Exception as e:
+            print("stream subscribe failed:", repr(e))
+            self._stream_cursor = None
 
     def _resync_stream_channel(self):
         """Fetch the subscribed channel's history after a gap/reset."""
@@ -3082,6 +3045,11 @@ class sHadesClientApp(MDApp):
                     elif data.get("text"):
                         self._term_page.append(data["text"])
                 Clock.schedule_once(apply_term, 0)
+            elif kind == "channels_changed":
+                # v0.28: channel create/rename/topic arrive as pushes; the
+                # 3s state poller that used to notice them is deleted.
+                Clock.schedule_once(
+                    lambda dt: self._refresh_channels_from_guild(), 0)
             # "typing" events are consumed by a later phase
         if touched:
             # full refresh of the visible channel; _render_message dedupes
@@ -3112,37 +3080,19 @@ class sHadesClientApp(MDApp):
                     self.announce_port, self.identity_hash)
             except Exception as e:
                 print("announce ping failed:", repr(e))
+                continue
+            # v0.28: the announce tick is the sub's self-heal. A link drop
+            # or a server-side purge invalidates the subscription server-side;
+            # a missing cursor re-fires the one-shot subscribe (this is the
+            # presence ping's own rhythm -- NOT an extra poll).
+            if self._stream_cursor is None:
+                self._start_streamer()
 
     def _start_presence(self):
-        """Fetch active node list from guild every PRESENCE_INTERVAL seconds."""
-        if self._presence_thread is not None and self._presence_thread.is_alive():
-            self._presence_stop.set()
-        self._presence_stop.clear()
-        self._presence_thread = threading.Thread(target=self._presence_loop,
-                                                 daemon=True)
-        self._presence_thread.start()
-
-    def _presence_loop(self):
-        while not self._presence_stop.wait(self.PRESENCE_INTERVAL):
-            if not self.guild_api:
-                continue
-            try:
-                res = self.guild_api.presence()
-                if not res.get("ok"):
-                    continue
-                users = {}
-                for u in res.get("users") or []:
-                    if not isinstance(u, dict):
-                        continue
-                    uh = (u.get("user_hash") or "").lower()
-                    if uh:
-                        users[uh] = {"username": u.get("username") or "",
-                                     "node_hash": u.get("node_hash")}
-                self._active_users = users
-                self._presence_ok = True
-                Clock.schedule_once(lambda dt: self._refresh_presence_ui(), 0)
-            except Exception as e:
-                print("presence fetch failed:", repr(e))
+        """v0.28: the presence POLL was deleted. Presence now arrives as a
+        guild-wide push event on the link (server \"presence\" kind);
+        _apply_stream_events applies it. Nothing runs on an interval here."""
+        self._active_users = {}
 
     def _refresh_presence_ui(self):
         """Rebuild the member sidebar from the presence list.
@@ -6595,13 +6545,9 @@ class sHadesClientApp(MDApp):
             pass
 
     def on_stop(self):
-        # Stop every background loop: the poller, the presence ping, and the
-        # presence fetcher. Without the last one a reconnect would leak a
-        # presence thread per session.
-        self._poll_stop.set()
-        self._stream_stop.set()
+        # v0.28: push replaced the poller/streamer/presence-fetcher; only
+        # the presence ping loop remains to stop.
         self._announce_stop.set()
-        self._presence_stop.set()
         # close any open console sessions so they don't idle out server-side.
         # Each term_close() blocks on the RNS link for up to the request
         # timeout, so doing them inline freezes shutdown for N * timeout

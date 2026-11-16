@@ -233,6 +233,10 @@ def ensure_channel(name, kind="chat"):
                    (cid, name, time.time(), kind if kind in CHANNEL_KINDS else "chat"))
         db.execute("INSERT OR IGNORE INTO channel_state (channel_id, seq) VALUES (?, 0)", (cid,))
         db.commit()
+        # v0.28: a NEW channel must reach stream subscribers (the 3s state
+        # poller that used to notice renames/creates is being deleted);
+        # name changes ride the same event.
+        _emit_event(cid, "channels_changed", {"channel": name}, guild_wide=True)
     return cid
 
 def channel_name(cid):
@@ -1677,6 +1681,51 @@ def _emit_event(channel_id, kind, data, guild_wide=False):
             ring = EVENT_LOG.setdefault(cid, deque(maxlen=EVENT_LOG_MAX))
             ring.append((EVENT_SEQ, ev))
         EVENT_COND.notify_all()
+    # v0.28 push: hand each event to its subscribers directly. Runs after
+    # the cond block releases -- the sender never holds the event lock.
+    for cid in targets:
+        try:
+            _push_stream(cid)
+        except Exception as e:
+            RNS.log("stream push failed: %s" % e, RNS.LOG_ERROR)
+
+def _push_stream(cid):
+    """v0.28 push: deliver the subscribed channel's new events down the
+    link the moment they exist, instead of holding them for the client's
+    long-poll. RNS links are full duplex; RNS.Packet(link, bytes) sends a
+    raw frame over an established link and the client's packet callback
+    receives it. The poll endpoint stays for one-shot gap recovery.
+    """
+    with SUB_LOCK:
+        subs = [(lid, s["cursor"]) for lid, s in SUBSCRIPTIONS.items()
+                if s["channel"] == cid]
+    for lid, cursor in subs:
+        events, head, reset = _stream_collect(cid, cursor)
+        frame = {"k": "stream", "channel": cid, "seq": head,
+                 "reset": reset, "typing": _typing_snapshot(cid)}
+        if reset:
+            frame["events"] = []
+            out_cursor = head
+        else:
+            frame["events"] = events
+            out_cursor = events[-1]["seq"] if events else cursor
+        packed = msgpack.packb(frame, raw=False)
+        sent = False
+        for link in list(RNS.Transport.active_links):
+            if link.link_id == lid and link.status == RNS.Link.ACTIVE:
+                try:
+                    RNS.Packet(link, packed).send()
+                    sent = True
+                except Exception as e:
+                    RNS.log("stream push to link failed: %s" % e,
+                            RNS.LOG_ERROR)
+                break
+        with SUB_LOCK:
+            s = SUBSCRIPTIONS.get(lid)
+            if s and s["channel"] == cid:
+                if sent:
+                    s["cursor"] = out_cursor   # mirror the poll's advance
+                s["at"] = now()                # push keeps the sub alive
 
 def _emit_presence_if_changed(before):
     """Emit a guild-wide presence event when the online set changed."""
@@ -2409,6 +2458,8 @@ def _dispatch_command(viewer, line):
                     db.execute("UPDATE channels SET name=? WHERE id=?",
                                (new, row["id"]))
                     db.commit()
+                _emit_event(row["id"], "channels_changed",
+                            {"channel": new}, guild_wide=True)
                 out = "renamed #%s -> #%s" % (chan, new)
     elif cmd == "topic":
         chan, _, text = arg.partition(" ")
@@ -2425,6 +2476,9 @@ def _dispatch_command(viewer, line):
                 db.execute("UPDATE channels SET topic=? WHERE id=?",
                            (text or None, row["id"]))
                 db.commit()
+            _emit_event(row["id"], "channels_changed",
+                        {"channel": chan.lstrip("#").strip()},
+                        guild_wide=True)
             out = ("topic set on #%s: %s" % (chan, text)) if text \
                 else "topic cleared on #%s" % chan
     elif cmd in ("ban", "mute", "unban", "unmute"):
@@ -3210,6 +3264,8 @@ def api_v1_channels_patch(viewer, data, link_id):
             db.execute("UPDATE channels SET topic=? WHERE id=?",
                        (str(topic).strip()[:200] or None, cid))
             db.commit()
+        _emit_event(cid, "channels_changed", {"channel": channel_name(cid)},
+                    guild_wide=True)
     overwrites = data.get("overwrites")
     if overwrites is not None:
         if not isinstance(overwrites, dict):
