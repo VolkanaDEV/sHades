@@ -165,6 +165,9 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE TABLE IF NOT EXISTS attachments (
     msg_id TEXT, idx INTEGER, name TEXT, mime TEXT, size INTEGER, path TEXT,
     PRIMARY KEY (msg_id, idx));
+CREATE TABLE IF NOT EXISTS blobs (
+    id TEXT PRIMARY KEY, name TEXT, mime TEXT, size INTEGER, path TEXT,
+    ts REAL, by TEXT);
 CREATE TABLE IF NOT EXISTS banned (
     dest_hash TEXT PRIMARY KEY, reason TEXT, at REAL);
 CREATE TABLE IF NOT EXISTS muted (
@@ -2065,7 +2068,7 @@ def api_v1_blobs_put(viewer, data, link_id):
         return {"ok": 0, "error": "blob too large", "code": 413}
     name = (data.get("name") or "").strip()[:128]
     mime = (data.get("mime") or "").strip()[:64]
-    res = _blob_commit(blob, name, mime)
+    res = _blob_commit(blob, name, mime, by=viewer)
     if res is None:
         return {"ok": 0, "error": "storage failed", "code": 500}
     return res
@@ -2100,10 +2103,14 @@ def serve_blob_file(path, data, request_id, link_id, remote_identity, requested_
     return b"not found"
 
 
-def _blob_commit(blob, name, mime):
+def _blob_commit(blob, name, mime, by=None):
     """Content-address the blob, store it, register its /file/blobs handler
     and return the standard response dict. Shared by the legacy single-shot
-    put and the chunked-upload finish; None on storage failure."""
+    put and the chunked-upload finish; None on storage failure.
+
+    Storage law (tay): files live native on disk as content-addressed
+    <sha256>.<ext>; the database carries only name/mime/size/path metadata
+    (blobs table), never bytes."""
     digest = hashlib.sha256(blob).hexdigest()[:32]
     ext = safe_ext(name, mime)
     fname = f"{digest}.{ext}"
@@ -2121,6 +2128,14 @@ def _blob_commit(blob, name, mime):
         node_destination.register_request_handler(
             "/file/blobs/" + fname, serve_blob_file,
             allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
+    with db_lock:
+        db.execute(
+            "INSERT OR IGNORE INTO blobs (id, name, mime, size, path, ts, by) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (digest, name or fname,
+             EXT_MIME.get(ext, mime or "application/octet-stream"),
+             len(blob), fname, now(), by))
+        db.commit()
     return {"ok": 1, "blob_id": digest, "size": len(blob),
             "mime": EXT_MIME.get(ext, mime or "application/octet-stream"),
             "name": name or fname, "path": "/file/blobs/" + fname}
@@ -2263,7 +2278,7 @@ def api_v1_blobs_put_finish(viewer, data, link_id):
     if len(blob) != up["size"]:
         return {"ok": 0, "error": "staged bytes do not match declared size",
                 "code": 400}
-    res = _blob_commit(blob, up["name"], up["mime"])
+    res = _blob_commit(blob, up["name"], up["mime"], by=up["user"])
     try:
         os.remove(up["path"])
     except OSError:
@@ -3612,12 +3627,26 @@ def run(argv=None):
             allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
 
     # re-register v1 blobs and site resources from previous runs (one handler
-    # per file, the nomadnet Node.py register_files pattern)
+    # per file, the nomadnet Node.py register_files pattern). Also legacy
+    # /file/attachments/ files: handlers live only in RAM from store time,
+    # so a restart would otherwise strand every pre-restart attachment.
+    # Directories (e.g. the chunked-upload staging dir) are not files and
+    # get no handlers.
     bdir = os.path.join(STORAGE, "blobs")
     for fname in os.listdir(bdir):
+        if os.path.isdir(os.path.join(bdir, fname)):
+            continue
         node_destination.register_request_handler(
             "/file/blobs/" + fname, serve_blob_file,
             allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
+    adir = os.path.join(STORAGE, "attachments")
+    if os.path.isdir(adir):
+        for fname in os.listdir(adir):
+            if not re.match(r"^[0-9a-f]{32}\.[a-z0-9]{1,8}$", fname):
+                continue
+            node_destination.register_request_handler(
+                "/file/attachments/" + fname, serve_attachment_file,
+                allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
     sroot = os.path.join(STORAGE, "sites")
     for cid in os.listdir(sroot):
         cdir = os.path.join(sroot, cid)

@@ -137,6 +137,15 @@ def main():
     back = call("/api/v1/blobs/get", {"blob_id": updigest})
     check("uploaded blob round-trips byte-identical",
           base64.b64decode(back["data_b64"]) == upb, len(back.get("data_b64", "")))
+    # storage law (tay): native file on disk, DB carries path metadata only
+    rows = sHades.db.execute("SELECT id, path FROM blobs").fetchall()
+    row = next((r for r in rows if r["id"] == updigest), None)
+    # DB stores the bare filename; the response path is the URI built on it
+    check("blobs table holds path metadata for the upload",
+          row is not None
+          and row["path"] == fin.get("path", "").rsplit("/", 1)[-1]
+          and fin.get("path", "").endswith(row["path"]),
+          {"row": dict(row) if row else None})
 
     # retry-safety: rewriting the same offset cannot corrupt
     st2 = call("/api/v1/blobs/put/init", {"name": "retry.bin", "size": 8,
