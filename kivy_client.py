@@ -6390,11 +6390,18 @@ class sHadesClientApp(MDApp):
             # stalled every other request behind it (tay: "setting pfp
             # appears to block all networking"). Corners composite to the
             # theme bg and the app masks to a circle for display anyway.
+            # v0.27: 128x128 upload copy. The v0.26 256px JPEG (~15-20KB)
+            # still moved as a multi-packet resource that outran the
+            # poll's window (tay: "Poll timeout, upload failed. Happens
+            # in under 5 seconds"). A quarter of the pixel area is a
+            # 3-6 KB resource -- the avatar rides between poll packets.
+            # Display copies stay 256px local PNG.
             up_path = os.path.join(pfp_dir, "up_" + base + ".jpg")
             try:
-                up_img = PILImage.new("RGBA", (256, 256), (26, 26, 26, 255))
-                up_img.alpha_composite(crop)
-                up_img.convert("RGB").save(up_path, "JPEG", quality=85)
+                up_img = PILImage.new("RGBA", (128, 128), (26, 26, 26, 255))
+                mini = crop.resize((128, 128), PILImage.LANCZOS)
+                up_img.alpha_composite(mini)
+                up_img.convert("RGB").save(up_path, "JPEG", quality=75)
             except Exception:
                 up_path = small_path
         else:
@@ -6410,16 +6417,35 @@ class sHadesClientApp(MDApp):
             try:
                 with open(up_path, "rb") as f:
                     blob = f.read()
-                res = self.guild_api.avatar_upload(blob)
             except Exception:
-                res = None
+                blob = None
+            # v0.27: name the failure + retry once -- a fast "request
+            # failed" often means the link's queue was mid-poll; after a
+            # short drain the same small resource rides through.
+            attempt = 0
+            last = "no response"
+            if blob is None:
+                last = "unable to read upload copy"
+                attempt = 2
+            while attempt < 2:
+                try:
+                    res = self.guild_api.avatar_upload(blob)
+                    if res and res.get("ok") and not res.get("unconfirmed"):
+                        def ok(dt):
+                            self._set_status("Avatar updated (%d KB)"
+                                             % (len(blob) // 1024))
+                        Clock.schedule_once(ok, 0)
+                        return
+                    last = str((res or {}).get("error") or "no response")[:48]
+                except Exception as e:
+                    last = str(e)[:48]
+                attempt += 1
+                if attempt < 2:
+                    time.sleep(2.0)
 
-            def apply_upload(dt):
-                if res and res.get("ok"):
-                    self._set_status("Avatar updated")
-                else:
-                    self._set_status("avatar upload failed")
-            Clock.schedule_once(apply_upload, 0)
+            def fail2(dt):
+                self._set_status("avatar upload failed: %s" % last)
+            Clock.schedule_once(fail2, 0)
         threading.Thread(target=upload_work, daemon=True).start()
 
         # Always store paths locally regardless of guild API result —
