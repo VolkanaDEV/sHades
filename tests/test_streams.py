@@ -325,7 +325,7 @@ def main():
     # frame serialized the FULL message rows into a raw RNS.Packet, so
     # any real content crossed the 500-byte link MTU. The push frame is
     # now a ticket and the client delta-fetches over the resource path.
-    import msgpack as _mp
+    _mp = sHades.msgpack   # the server's own vendored coder, not pip msgpack
     sent_frames = []
 
     class _FakePacket:
@@ -365,7 +365,7 @@ def main():
     check("ticket push frames exist for the linked subscriber",
           bool(sent_frames), repr(sent_frames[:1])[:200])
     if sent_frames:
-        f = _mp.unpackb(sent_frames[-1], raw=False)
+        f = _mp.unpackb(sent_frames[-1])
         check("push frame is a ticket: bounded, no bodies, under MTU",
               f.get("k") == "stream" and f.get("ticket") is True
               and "events" not in f
