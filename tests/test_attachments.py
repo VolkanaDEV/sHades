@@ -18,6 +18,8 @@ import os
 import sys
 import time
 import functools
+import tempfile
+import base64
 
 os.environ.setdefault("KIVY_GL_BACKEND", "mock")
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -68,10 +70,39 @@ class StubGuild:
     def __init__(self, files=None):
         self.files = files or {}
         self.posted = []
+        self.uploads = []
+        self.att_calls = []
 
     def post(self, channel, content, attachments=None):
         self.posted.append((channel, content, attachments))
         return {"ok": 1, "msg_id": "sent-1"}
+
+    def post_v1(self, channel, content, attachments=None):
+        self.posted.append((channel, content, attachments))
+        return {"ok": 1, "msg_id": "sent-v1",
+                "attachments": [{"name": "notes.txt", "mime": "text/plain",
+                                 "size": 5,
+                                 "path": "/file/attachments/notes.txt"}]}
+
+    def blobs_put(self, name, mime, data):
+        # stand-in for the chunked uploader: one blob_id per call, bytes
+        # recorded so the test can prove WHERE the payload moved
+        blob_id = "bl0b" + str(len(self.uploads))
+        self.uploads.append({"blob_id": blob_id, "name": name,
+                             "mime": mime, "size": len(data),
+                             "data": bytes(data)})
+        return {"ok": 1, "blob_id": blob_id, "size": len(data),
+                "path": "/file/blobs/%s" % blob_id}
+
+    def att_get(self, path, offset=0, length=None):
+        # stand-in for the chunked reader, slicing out of the fake store:
+        # the offset echoes drive the client exactly like the wire does
+        self.att_calls.append((path, offset))
+        data = self.files.get(path) or b""
+        chunk = data[offset:offset + 100000]
+        return {"ok": 1, "path": path, "total": len(data),
+                "offset": offset, "eof": offset + len(chunk) >= len(data),
+                "data_b64": base64.b64encode(chunk).decode("ascii")}
 
     def avatar_get(self, user_hash):
         return {"ok": 0}
@@ -102,6 +133,27 @@ class StubApp:
             kivy_client.sHadesClientApp._fetch_attachment, self)
         self._add_attachment_embed = functools.partial(
             kivy_client.sHadesClientApp._add_attachment_embed, self)
+        # v0.30 rewrote _add_attachment_embed on top of the classifier and
+        # the app-storage path; bind the real static method to the stub so
+        # kind decisions match production, and route saves into a temp dir
+        # so tests never touch the real app data dir
+        self._attachment_kind = kivy_client.sHadesClientApp._attachment_kind
+        self._attach_dir = tempfile.mkdtemp(prefix="shades-attach-test-")
+        self._attachments_dir = lambda: self._attach_dir
+        self._save_attachment_blob = functools.partial(
+            kivy_client.sHadesClientApp._save_attachment_blob, self)
+        # v0.31: _fetch_attachment calls _att_get_chunked for large
+        # attachments; the stub must bind it or the real method resolves
+        # to nothing and the chunk branch dies in the fetch try/except
+        self._att_get_chunked = functools.partial(
+            kivy_client.sHadesClientApp._att_get_chunked, self)
+        # v0.30 non-image branch: tap-to-save rows bind through these two;
+        # the handler runs only on taps, but the bind itself happens at
+        # render time, so the stub must carry them
+        self._download_tap = functools.partial(
+            kivy_client.sHadesClientApp._download_tap, self)
+        self._save_and_report = functools.partial(
+            kivy_client.sHadesClientApp._save_and_report, self)
         self._record_member = functools.partial(
             kivy_client.sHadesClientApp._record_member, self)
         self._refresh_avatar = functools.partial(
@@ -206,9 +258,13 @@ def main():
           len(row3.ids.embed_container.children) == 1,
           "%d embeds in row" % len(row3.ids.embed_container.children))
 
-    # --- 4. optimistic send keeps the attachment shape --------------------
+    # --- 4. attachment send moves bytes through the chunked uploader ------
+    # (tay's v0.30 law, receipted on the MTU failure: the blob never rides
+    #  the message packet; init/chunk/finish moves it, the post carries a
+    #  blob_id reference, and the render uses the server's path metadata)
     grid4 = GridLayout(cols=1)
-    app4 = StubApp(kc, grid4)
+    app4 = StubApp(kc, grid4,
+                   files={"/file/attachments/notes.txt": b"hello"})
     app4.root.get_screen("main").ids.msg_input.text = "with file"
     app4._pending_attachment = ["notes.txt", "text/plain", b"hello"]
     kc.sHadesClientApp.send_message(app4)
@@ -219,15 +275,60 @@ def main():
             break
         time.sleep(0.05)
     posted = app4.guild_api.posted[0] if app4.guild_api.posted else None
-    check("send posts the attachment as [name, mime, blob]",
-          posted is not None and posted[2] == [["notes.txt", "text/plain",
-                                               b"hello"]],
-          posted)
+    uploaded = app4.guild_api.uploads
+    check("attachment send uploaded the bytes via blobs_put first",
+          len(uploaded) == 1 and uploaded[0]["data"] == b"hello"
+          and uploaded[0]["name"] == "notes.txt",
+          repr(uploaded))
+    check("send posts a blob_id reference, not inline bytes",
+          posted is not None and isinstance(posted[2], list) and posted[2]
+          and isinstance(posted[2][0], dict)
+          and posted[2][0].get("blob_id") == (uploaded[0]["blob_id"]
+                                              if uploaded else "?")
+          and posted[2][0].get("name") == "notes.txt",
+          repr(posted))
     Clock.tick()
     row4 = grid4.children[0]
     check("optimistically rendered message shows the attachment",
           len(row4.ids.embed_container.children) == 1,
           "%d embeds in row" % len(row4.ids.embed_container.children))
+
+    # --- 6. big attachments walk the chunked reader ----------------------
+    # (v0.31: one receipt per slice, offset-driven, not one 15s deadline
+    #  for the whole file; the full bytes land in app storage byte-equal)
+    big = b"A" * 100000 + b"B" * 100000
+    grid6 = GridLayout(cols=1)
+    app6 = StubApp(kc, grid6,
+                   files={"/file/attachments/big.txt": big})
+    m6 = {"msg_id": "m-6", "author_hash": "a1", "username": "tester",
+          "content": "big file", "ts": 0,
+          "attachments": [{"name": "big.txt", "mime": "text/plain",
+                           "size": len(big),
+                           "path": "/file/attachments/big.txt"}]}
+    kc.sHadesClientApp._render_message(app6, grid6, m6)
+    row6 = grid6.children[0]
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        Clock.tick()
+        if len(row6.ids.embed_container.children) == 1:
+            break
+        time.sleep(0.02)
+    check("large attachment walks att_get slice by slice",
+          len(app6.guild_api.att_calls) >= 2
+          and app6.guild_api.att_calls[0][1] == 0
+          and app6.guild_api.att_calls[1][1] == 100000,
+          repr(app6.guild_api.att_calls))
+    saved = None
+    if os.path.isdir(app6._attach_dir):
+        for nm in os.listdir(app6._attach_dir):
+            if "big" in nm:
+                saved = os.path.join(app6._attach_dir, nm)
+    check("chunked fetch assembles the full payload, byte-equal",
+          bool(saved) and open(saved, "rb").read() == big,
+          ("no saved file" if not saved else "mismatch"))
+    check("large attachment renders its embed",
+          len(row6.ids.embed_container.children) == 1,
+          "%d embeds in row6" % len(row6.ids.embed_container.children))
 
     print()
     print("%d passed, %d failed" % (len(PASS), len(FAIL)))

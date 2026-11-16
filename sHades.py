@@ -1738,14 +1738,21 @@ def _push_stream(cid):
                 if s["channel"] == cid]
     for lid, cursor in subs:
         events, head, reset = _stream_collect(cid, cursor)
+        # v0.31 ticket protocol: the push frame carries REFERENCES, never
+        # bodies. The frame rides a raw RNS.Packet with the 500-byte link
+        # MTU; a single serialized message row (say 400 chars of content,
+        # or any message plus attachment metadata) crossed that line and
+        # the push died with "packet size of X exceeds mtu of 500" -- the
+        # receipt is in the operator console, twice. The event log and
+        # the long-poll endpoint are untouched: they serve on the
+        # request/resource path, which chunks. The ticket says "seq is
+        # now N on this channel"; the client delta-fetches immediately.
+        # Bounded by construction: k + cid + seq + reset + a typing
+        # snapshot capped at eight identities always packs under MTU.
         frame = {"k": "stream", "channel": cid, "seq": head,
-                 "reset": reset, "typing": _typing_snapshot(cid)}
-        if reset:
-            frame["events"] = []
-            out_cursor = head
-        else:
-            frame["events"] = events
-            out_cursor = events[-1]["seq"] if events else cursor
+                 "reset": reset, "ticket": True,
+                 "typing": _typing_snapshot(cid)[:8]}
+        out_cursor = cursor
         packed = msgpack.packb(frame, raw=False)
         sent = False
         for link in list(RNS.Transport.active_links):
@@ -2090,6 +2097,31 @@ def api_v1_blobs_get(viewer, data, link_id):
             "eof": offset + len(chunk) >= total,
             "data_b64": base64.b64encode(chunk).decode("ascii")}
 
+@api_route("/api/v1/att/get")
+@wrap_json_api
+def api_v1_att_get(viewer, data, link_id):
+    """Chunked attachment read: {path, offset?, len?} -> {data_b64,
+    total, offset, eof}. The chunked-reader shape of /api/v1/blobs/get,
+    keyed by the attachment's /file/attachments/<fname> path.
+
+    Receipt: single-shot attachment fetches hold the entire payload on
+    one link receipt with a 15s deadline; a real multi-MB attachment
+    from a remote hub overruns the deadline and the embed spins with no
+    error surfaced. Stored attachments carry no blob_id in their
+    metadata (ingest copies the blob into the attachments dir), so a
+    path-keyed slice endpoint is what the receive path can use."""
+    fname = ((data.get("path") or "").rsplit("/", 1)[-1]).strip()
+    if not re.match(r"^[0-9a-f]{32}\.[a-z0-9]{1,8}$", fname):
+        return {"ok": 0, "error": "unknown path", "code": 404}
+    offset, length = _chunk_params(data)
+    total, chunk = _read_slice(
+        os.path.join(STORAGE, "attachments", fname), offset, length)
+    if total is None:
+        return {"ok": 0, "error": "attachment unreadable", "code": 404}
+    return {"ok": 1, "path": "/file/attachments/" + fname, "total": total,
+            "offset": offset, "eof": offset + len(chunk) >= total,
+            "data_b64": base64.b64encode(chunk).decode("ascii")}
+
 def serve_blob_file(path, data, request_id, link_id, remote_identity, requested_at):
     """Raw /file/blobs/<fname> handler (one per stored blob, attachments
     pattern). Path is the registration key; validate before touching disk."""
@@ -2321,7 +2353,8 @@ def _resolve_v1_attachments(atts):
         else:
             return None, "attachment needs data_b64 or blob_id"
         if len(blob) > MAX_ATTACHMENT_SZ:
-            return None, "attachment too large (max 32 MB)"
+            return None, "attachment too large (max %d MB)" % (
+                MAX_ATTACHMENT_SZ // (1024 * 1024),)
         triples.append([name or "attachment.bin", mime or "application/octet-stream", blob])
     return triples, None
 

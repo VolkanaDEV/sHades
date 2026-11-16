@@ -9,12 +9,13 @@ Covers:
   * plain Enter = send, Shift+Enter = newline logic.
 """
 import os
-os.environ.setdefault("KIVY_GL_BACKEND", "mock")
-os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-
 import sys
 import tempfile
 import shutil
+
+os.environ.setdefault("KIVY_GL_BACKEND", "mock")
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 PASS, FAIL = [], []

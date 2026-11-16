@@ -71,6 +71,7 @@ try:
     from kivy.uix.button import Button
     from kivy.uix.textinput import TextInput
     from kivy.uix.widget import Widget
+    from kivy.uix.slider import Slider
     from kivy.graphics import Color, Ellipse, Line, Rectangle
     from kivy.metrics import dp, sp
     KIVY = True
@@ -192,6 +193,109 @@ def _boot_hide():
     if lbl is not None and lbl.parent is not None:
         lbl.parent.remove_widget(lbl)
     _boot_label["ref"] = None
+
+
+class _AudioAttachRow(BoxLayout):
+    """Embedded audio attachment row (tay, v0.30): play/pause/stop,
+    download and volume controls around the sound itself, rendered inside
+    the message bubble. Playback delegates to the app's _play_audio():
+    Android MediaPlayer when on device, kivy SoundLoader on desktop
+    (desktop pause is stop-then-restart; the mixer backend has no pause)."""
+
+    def __init__(self, path="", name="", size=0, player=None, **kw):
+        super().__init__(orientation="horizontal", size_hint_y=None,
+                         height=dp(40), spacing=dp(6), **kw)
+        self._path = path
+        self._player = player
+        self._playing = False
+        self._paused = False
+        short = (name or "audio")[:28]
+        self.add_widget(Label(
+            text="[audio] %s (%d KB)" % (short, size // 1024),
+            size_hint_x=1, font_size=sp(12), color=(0.7, 0.73, 0.77, 1)))
+        self.btn_play = Button(text="play", size_hint_x=None, width=dp(56),
+                               font_size=sp(11))
+        self.btn_play.bind(on_release=self._toggle)
+        self.add_widget(self.btn_play)
+        self.btn_stop = Button(text="stop", size_hint_x=None, width=dp(48),
+                               font_size=sp(11))
+        self.btn_stop.bind(on_release=self._stop)
+        self.add_widget(self.btn_stop)
+        self.btn_save = Button(text="save", size_hint_x=None, width=dp(52),
+                               font_size=sp(11))
+        self.btn_save.bind(on_release=self._report)
+        self.add_widget(self.btn_save)
+        self.vol = Slider(min=0, max=1, value=0.8, size_hint_x=None,
+                          width=dp(80))
+        self.vol.bind(value=self._volume)
+        self.add_widget(self.vol)
+
+    def _toggle(self, w=None):
+        p = self._player
+        if not p:
+            return
+        mp = getattr(p, "_audio_media", None)
+        if self._playing and mp is not None:
+            try:
+                if hasattr(mp, "pause"):
+                    mp.pause()
+                    self._paused = True
+                else:
+                    mp.stop()
+                    p._audio_media = None
+                    self._playing = False
+            except Exception:
+                pass
+            self.btn_play.text = "play"
+        elif self._paused and mp is not None:
+            try:
+                mp.start()
+                self._playing = True
+                self._paused = False
+            except Exception:
+                pass
+            self.btn_play.text = "pause"
+        else:
+            if p._play_audio(self._path) is not None:
+                self._playing = True
+                self._paused = False
+                self.btn_play.text = "pause"
+
+    def _stop(self, w=None):
+        p = self._player
+        self._playing = False
+        self._paused = False
+        if p:
+            mp = getattr(p, "_audio_media", None)
+            if mp is not None:
+                try:
+                    mp.stop()
+                    rel = getattr(mp, "release", None)
+                    if rel:
+                        rel()
+                except Exception:
+                    pass
+                p._audio_media = None
+        self.btn_play.text = "play"
+
+    def _report(self, w=None):
+        p = self._player
+        if p:
+            p._set_status("audio in app storage: %s"
+                          % os.path.basename(self._path or "attachment"))
+
+    def _volume(self, w=None, v=0.8):
+        p = self._player
+        mp = getattr(p, "_audio_media", None) if p else None
+        if mp is None:
+            return
+        try:
+            if hasattr(mp, "setVolume"):
+                mp.setVolume(float(v), float(v))
+            elif hasattr(mp, "volume"):
+                mp.volume = float(v)
+        except Exception:
+            pass
 
 
 import RNS  # noqa: E402  (after the guarded kivy/diagnostics block, by design)
@@ -667,6 +771,16 @@ class GuildAPI:
         if length is not None:
             data["len"] = length
         return self._request_json("/api/v1/blobs/get", data)
+
+    def att_get(self, path, offset=0, length=None):
+        """Chunked attachment read (v0.31). Returns {data_b64, total,
+        offset, eof} for a /file/attachments/... path — the same slice
+        machinery as blobs_get, keyed by the path the server puts in
+        message metadata."""
+        data = {"path": path, "offset": offset}
+        if length is not None:
+            data["len"] = length
+        return self._request_json("/api/v1/att/get", data, timeout=15)
 
     def site_get(self, channel, path, offset=0, length=None):
         """Chunked site resource read (micron pages, images, media)."""
@@ -1805,7 +1919,7 @@ class sHadesClientApp(MDApp):
         self.hub_port = DEFAULT_HUB_PORT
         self._seq = 0
         self._last_ts = 0.0
-        self._channels = OrderedDict()   # cid -> name
+        self._channels = OrderedDict()   # name -> cid (filled on guild load)
         self._members = {}               # member_hash -> username
         self._msg_widgets = {}           # msg_id -> MessageRow
         self._popup = None
@@ -1820,6 +1934,7 @@ class sHadesClientApp(MDApp):
         # link is a server-side rule, so switching channels reroutes the flow.
         self._stream_cid = None
         self._stream_cursor = None
+        self._stream_tick_event = None
         # site channels: kind per cid, the rendered page stack, the page
         # currently shown, and the active theme from the manifest
         self._channel_kinds = {}     # cid -> chat|site|term
@@ -1970,6 +2085,14 @@ class sHadesClientApp(MDApp):
         """Convert a channel name to its RNS destination hash ID,
         matching the guild's ensure_channel() formula."""
         return hexstr(RNS.Identity.full_hash(b"main_guild:" + name.encode()))
+
+    def _channel_name(self, cid):
+        """Inverse of the channel map (name -> cid): the ticket push
+        (v0.31) arrives keyed by cid, the fetch path speaks names."""
+        for name, c in self._channels.items():
+            if c == cid:
+                return name
+        return None
 
     # -- lifecycle -------------------------------------------------------
     def build(self):
@@ -2472,6 +2595,12 @@ class sHadesClientApp(MDApp):
         self._last_ts = 0.0
         self._stream_cid = None
         self._stream_cursor = None
+        # cancel, don't drop: a reconnect re-schedules, and two intervals
+        # would double every poll
+        ev = getattr(self, "_stream_tick_event", None)
+        if ev:
+            ev.cancel()
+        self._stream_tick_event = None
         self._site_stack.clear()
         self._site_current = None
         self._site_theme.clear()
@@ -2892,6 +3021,7 @@ class sHadesClientApp(MDApp):
             Clock.schedule_once(lambda dt: self._switch_main(), 0)
             Clock.schedule_once(lambda dt: self._start_poll(), 0)
             Clock.schedule_once(lambda dt: self._start_streamer(), 0)
+            Clock.schedule_once(lambda dt: self._start_stream_keepalive(), 0)
             Clock.schedule_once(lambda dt: self._refresh_channels_from_guild(), 1.0)
             Clock.schedule_once(lambda dt: self._fetch_whoami(), 1.2)
             # join gate (U6b): if the guild requires an invite code, prompt
@@ -2951,25 +3081,68 @@ class sHadesClientApp(MDApp):
             frame = msgpack.unpackb(plaintext, raw=False)
             if not isinstance(frame, dict) or frame.get("k") != "stream":
                 return
-            if frame.get("reset"):
-                # replay window rotated past our cursor: resync
-                self._stream_cursor = None
-                Clock.schedule_once(
-                    lambda dt: self._resync_stream_channel(), 0)
-                return
-            events = frame.get("events") or []
-            if events:
-                self._stream_cursor = frame.get("seq", self._stream_cursor)
-                self._apply_stream_events(events)
+            self._handle_stream_frame(frame)
         except Exception as e:
             print("push frame failed:", repr(e))
 
+    def _handle_stream_frame(self, frame):
+        """v0.31: the push-receive path, split out of the raw callback so
+        frame handling is directly testable."""
+        if frame.get("reset"):
+            # replay window rotated past our cursor: resync
+            self._stream_cursor = None
+            Clock.schedule_once(
+                lambda dt: self._resync_stream_channel(), 0)
+            return
+        if frame.get("ticket"):
+            # ticket push (v0.31): the frame carries seq + refs only, so
+            # no MTU ceiling exists above it. Pull the delta now through
+            # the resource path -- the same path poll and history use --
+            # instead of receiving bodies that can overflow the packet.
+            self._stream_cursor = frame.get("seq", self._stream_cursor)
+            cid = frame.get("channel")
+            Clock.schedule_once(lambda dt: self._ticket_pull(cid), 0)
+            events = frame.get("events") or []
+            if events:                     # legacy frame: still applies
+                self._apply_stream_events(events)
+            return
+        events = frame.get("events") or []
+        if events:
+            self._stream_cursor = frame.get("seq", self._stream_cursor)
+            self._apply_stream_events(events)
+
+    def _ticket_pull(self, cid):
+        """Delta-fetch the channel a ticket pointed at. Current channel
+        refreshes in place; other subscribed channels update through the
+        same render path (unread/older state), exactly like poll events
+        did."""
+        if not cid:
+            return
+        name = self._channel_name(cid)
+        if name:
+            self._fetch_messages(name)
+
     def _start_streamer(self):
-        """v0.28: subscribe ONCE per channel. The server pushes from there.
-        Only ONE subscription per link exists server-side, so pointing
-        _stream_cid at a new channel (cursor=None) re-points the push. A
-        failed subscribe leaves cursor None; the announce tick re-fires
-        this until it sticks (self-healing, not polling)."""
+        """Establish (or re-establish) the stream subscription on the link.
+
+        v0.31 truth: the server binds the channel AT SUBSCRIBE TIME and
+        replaces the binding on every call (one subscription per link,
+        api_v1_stream_subscribe) -- pointing _stream_cid alone changes
+        nothing on the wire. Callers:
+
+        - connect / guild-link attach: prime the entry channel;
+        - _switch_channel: re-point at the newly opened channel, letting
+          the server replace the binding;
+        - keepalive self-heal: after SUB_TTL_S of quiet the subscription
+          is purged server-side; the 45s keepalive sees {ok: 0, code:
+          409} and calls this again. _stream_cursor still holds the
+          watermark then, so the subscribe replays the gap from the
+          event log instead of jumping to head.
+
+        Setting the cursor here follows the same rule as upload offsets:
+        a subscribe with a kept cursor cannot lose or double-deliver
+        what the push path already rendered (render dedupes by msg_id).
+        """
         if not self.guild_api or not self._stream_cid:
             return
         try:
@@ -2983,6 +3156,63 @@ class sHadesClientApp(MDApp):
         except Exception as e:
             print("stream subscribe failed:", repr(e))
             self._stream_cursor = None
+
+    def _start_stream_keepalive(self):
+        """v0.31: keep the stream subscription alive through quiet minutes.
+
+        Receipted mechanics: SUB_TTL_S = 120 (sHades.py) drops
+        subscriptions the poll path has not touched; the push path only
+        refreshes subscriptions it is actively pushing to (sHades.py
+        _push_stream refreshes s["at"] on push), so a channel with no
+        traffic for two minutes is purged and the app goes silent until
+        restart. The poll is the designed refresh (the server's own
+        SUB_TTL comment names it); delivery stays push-only -- the tick
+        issues a zero-wait poll purely to touch the subscription and
+        self-heals a 409 by resubscribing from the watermark. The old
+        v0.28 "no polling loops" rule stands: nothing here polls for
+        content; a silent channel costs one empty request per 45s.
+        """
+        if getattr(self, "_stream_tick_event", None) is not None:
+            return
+        self._stream_tick_event = Clock.schedule_interval(
+            self._stream_tick, 45)
+
+    def _stream_tick(self, dt):
+        # the network call goes on a thread; the tick itself is instant
+        threading.Thread(target=self._stream_keepalive_once,
+                         daemon=True).start()
+
+    def _stream_keepalive_once(self):
+        api = self.guild_api
+        if not api or not self._stream_cid:
+            return
+        try:
+            res = api.stream_poll(cursor=self._stream_cursor, timeout_s=0)
+        except Exception:
+            return
+        if res.get("ok"):
+            self._stream_cursor = res.get("cursor", self._stream_cursor)
+            events = res.get("events") or []
+            if events:
+                # a quiet-channel poll can win a race with the push; the
+                # application is idempotent (render dedupes by msg_id)
+                self._apply_stream_events(events)
+        elif res.get("code") == 409:
+            # subscription expired (two quiet minutes): re-subscribe from
+            # the watermark so the TTL-eaten gap replays
+            Clock.schedule_once(lambda dt: self._start_streamer(), 0)
+
+    def _release_stream(self):
+        """Drop this link's stream subscription: switching to a push-less
+        channel kind (site/term) releases the one-subscription-per-link
+        slot instead of letting the old channel flow into the void."""
+        api = self.guild_api
+        if not api:
+            return
+        try:
+            api.stream_unsubscribe()
+        except Exception as e:
+            dlog("stream unsubscribe failed: %r" % (e,))
 
     def _resync_stream_channel(self):
         """Fetch the subscribed channel's history after a gap/reset."""
@@ -3417,53 +3647,180 @@ class sHadesClientApp(MDApp):
         self._popup = popup
         popup.open()
 
+    ATT_MEDIA_IMAGE = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+    ATT_MEDIA_AUDIO = (".mp3", ".ogg", ".wav", ".flac", ".m4a", ".opus",
+                       ".oga", ".mp2", ".aac")
+    ATT_MEDIA_VIDEO = (".mp4", ".webm", ".mkv", ".mov", ".avi", ".ogv")
+
+    @staticmethod
+    def _attachment_kind(name, mime=None):
+        """Classify an attachment name (+optional mime) into
+        image / audio / video / file. One decision site for embeds and
+        for the player row; the send side (mimetypes) and the render side
+        share it. Video is download-only for now (v0.30): embedded video
+        playback needs ffpyplayer in the build or a native surface -- a
+        deliberate follow-up, named for tay, not smuggled in."""
+        n = (name or "").lower()
+        ext = os.path.splitext(n)[1]
+        if m := (mime or "").lower():
+            if m.startswith("image/"):
+                return "image"
+            if m.startswith("audio/") or "ogg" in m:
+                return "audio"
+            if m.startswith("video/"):
+                return "video"
+            if m in ("application/ogg",):
+                return "audio"
+        if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
+            return "image"
+        if ext in (".mp3", ".ogg", ".wav", ".flac", ".m4a", ".opus",
+                   ".oga", ".mp2", ".aac"):
+            return "audio"
+        if ext in (".mp4", ".webm", ".mkv", ".mov", ".avi", ".ogv"):
+            return "video"
+        return "file"
+
     def _add_attachment_embed(self, row, name, blob):
-        """Render one attachment: images inline, everything else as a label."""
-        print(
-            f"[TRACE] _add_attachment_embed: name={name} "
-            f"blob_size={len(blob)} ext={os.path.splitext(name)[1].lower()}",
-            flush=True)
+        """Render one attachment. tay's v0.30 spec: images render inline, or
+        audio as play/pause/stop, download, volume and the stream itself
+        embedded; video and other files present as tappable download rows
+        (embedded video playback is a named follow-up, not hidden)."""
         dlog(
             f"_add_attachment_embed: name={name} "
             f"blob_size={len(blob)} ext={os.path.splitext(name)[1].lower()}")
-        ext = os.path.splitext(name)[1].lower()
-        if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
-            import tempfile
-            tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
-            tmp.write(blob)
-            tmp.close()
-            emb = MessageEmbed(source=tmp.name, size_hint_y=None, height=dp(200))
-            row.ids.embed_container.add_widget(emb)
-        elif ext in (".mp3", ".ogg", ".wav", ".flac"):
-            row.ids.embed_container.add_widget(
-                Label(
-                    text="[audio] " + name,
-                    size_hint_y=None,
-                    height=dp(20),
-                    color=(0.7, 0.73, 0.77, 1),
-                    font_size=sp(12),
-                )
-            )
-        elif ext in (".mp4", ".webm"):
-            row.ids.embed_container.add_widget(
-                Label(
-                    text="[video] " + name,
-                    size_hint_y=None,
-                    height=dp(20),
-                    color=(0.7, 0.73, 0.77, 1),
-                    font_size=sp(12),
-                )
-            )
+        kind = self._attachment_kind(name)
+        container = row.ids.embed_container
+        path = self._save_attachment_blob(blob, name)
+        if kind == "image":
+            source = path
+            if not source:
+                import tempfile
+                tmp = tempfile.NamedTemporaryFile(suffix=os.path.splitext(name)[1] or ".png",
+                                                  delete=False)
+                tmp.write(blob)
+                tmp.close()
+                source = tmp.name
+            emb = MessageEmbed(source=source,
+                               size_hint_y=None, height=dp(200))
+            emb.bind(on_release=lambda w, n=name: self._status(
+                "%s (%d KB)" % (n, len(blob) // 1024)))
+            container.add_widget(emb)
+        elif kind == "audio":
+            container.add_widget(
+                _AudioAttachRow(path=path, name=name, size=len(blob),
+                                player=self))
         else:
-            row.ids.embed_container.add_widget(
-                Label(
-                    text="[file] " + name,
-                    size_hint_y=None,
-                    height=dp(20),
-                    color=(0.7, 0.73, 0.77, 1),
-                    font_size=sp(12),
-                )
+            # video + every other file: tappable download row
+            lbl = Label(
+                text="[file] %s -- tap to (%d KB) save" % (name, len(blob) // 1024)
+                if kind == "file" else
+                "[video] %s -- tap to (%d KB) save" % (name, len(blob) // 1024),
+                size_hint_y=None,
+                height=dp(20),
+                color=(0.7, 0.73, 0.77, 1),
+                font_size=sp(12),
+                markup=True,
             )
+            lbl.bind(on_touch_down=self._download_tap(
+                name, blob, getattr(row, "msg_id", None)))
+            container.add_widget(lbl)
+
+    def _download_tap(self, name, blob, msg_id):
+        """Touch handler for tap-to-save attachment rows: saves the bytes
+        into the app attachments dir and names where in the status line."""
+
+        def handler(widget, touch):
+            if widget.collide_point(*touch.pos) and touch.button == "left":
+                self._save_and_report(name, blob, widget)
+                return True
+            return False
+        return handler
+
+    def _save_and_report(self, name, blob, widget=None):
+        path = self._save_attachment_blob(blob, name)
+        if path:
+            self._set_status("saved %s to app storage (%d KB)"
+                             % (name, len(blob) // 1024))
+        else:
+            self._set_status("save failed for %s" % name)
+
+    def _play_audio(self, path):
+        """Play an embedded sound file (tay's v0.30 player spec):
+        android uses the platform MediaPlayer (play/pause/stop/volume
+        real); desktop builds fall back to kivy SoundLoader (load,
+        play/stop/volume with pause as best effort). One active sound
+        at a time: starting a new one stops the previous."""
+        try:
+            import platform as _pf
+            old = getattr(self, "_audio_media", None)
+            if old is not None:
+                try:
+                    old.stop()
+                    old.release()
+                except Exception:
+                    pass
+                self._audio_media = None
+            if _pf.system() == "Android":
+                from jnius import autoclass
+                MediaPlayer = autoclass("android.media.MediaPlayer")
+                mp = MediaPlayer()
+                # load from the app dir; MediaPlayer.setDataSource wants a
+                # file descriptor for sandboxed paths (no root, SAF law)
+                FileInputStream = autoclass("java.io.FileInputStream")
+                fd = FileInputStream(path).getFD()
+                mp.setDataSource(fd)
+                mp.prepare()
+                mp.start()
+                self._audio_media = mp
+            else:
+                from kivy.core.audio import SoundLoader
+                snd = SoundLoader.load(path)
+                if snd is None:
+                    self._set_status("audio format not loadable on desktop")
+                    return None
+                snd.play()
+                self._audio_media = snd
+            return self._audio_media
+        except Exception as e:
+            dlog("audio play failed: %r" % (e,))
+            self._set_status("audio play failed: %s" % str(e)[:48])
+            return None
+
+    def _att_get_chunked(self, path):
+        """Download a stored attachment in server-side slices.
+
+        Receipted mechanics (v0.31): the receive path's single-shot
+        request carries one receipt and one deadline; attachments
+        fetched with size > 128 KB walk /api/v1/att/get instead, one
+        slice per request, each with its own deadline, loop driven by
+        the server's {offset, eof} echoes the same way the upload loop
+        follows its acks. A slice failure raises with the phase named;
+        nothing here is a timer-based retry."""
+        api = self.guild_api
+        if not api:
+            raise OSError("attachment fetch: no guild link")
+        blob = b""
+        off = 0
+        for _ in range(64):          # 64 slices x slice cap >> 10 MB law
+            res = api.att_get(path, off)
+            if not res.get("ok"):
+                raise OSError("attachment slice %d failed: %s"
+                              % (off, res.get("error") or res.get("code")
+                                 or "unknown"))
+            chunk = base64.b64decode(res.get("data_b64") or "")
+            if not chunk:
+                if res.get("eof"):
+                    return blob
+                raise OSError("attachment slice %d empty" % off)
+            blob += chunk
+            off += len(chunk)
+            total = res.get("total")
+            if total is not None and off >= total:
+                return blob
+            if res.get("eof"):
+                return blob
+        raise OSError("attachment fetch exceeded 64 slices at offset %d"
+                      % off)
 
     def _fetch_attachment(self, row, msg_id, att):
         """Download an attachment blob from the guild and render it.
@@ -3493,8 +3850,18 @@ class sHadesClientApp(MDApp):
             Clock.schedule_once(
                 lambda dt: self._set_status(
                     "attachment: fetching %s ..." % name), 0)
+            # v0.31: big attachments download in server-side slices, the
+            # same chunk shape as the upload law: one receipt per slice
+            # with its own deadline instead of the whole file on a single
+            # 15s receipt that a multi-MB transfer is guaranteed to
+            # overrun (receipted: the embed spun forever, no error).
+            # Small attachments keep the single-shot path; every slice
+            # failure still surfaces by name.
             try:
-                blob = self.guild_api.fetch_file(path)
+                if int(att.get("size") or 0) > 128 * 1024:
+                    blob = self._att_get_chunked(path)
+                else:
+                    blob = self.guild_api.fetch_file(path)
             except Exception as e:
                 blob = None
                 dlog("_fetch_attachment.work: fetch raised %r" % (e,))
@@ -4572,20 +4939,30 @@ class sHadesClientApp(MDApp):
         self._seq = 0
         self._last_ts = 0.0
         cid = self._channel_cid(name)
+        kind = self._channel_kind(cid)
         # reroute the stream: only the visible channel flows
         self._stream_cid = cid
         self._stream_cursor = None
-        kind = self._channel_kind(cid)
-        if kind == "site":
-            self._open_site_channel(name, cid)
-            return
-        if kind == "term":
+        if kind != "chat":
+            # site/term channels carry no live push: release the stream
+            # slot (one subscription per link) so the previous channel
+            # stops flowing into a channel nobody is watching
+            self._stream_cid = None
+            threading.Thread(target=self._release_stream,
+                             daemon=True).start()
+            if kind == "site":
+                self._open_site_channel(name, cid)
+                return
             self._open_term_channel(name, cid)
             return
         self._older.setdefault(cid, {"oldest_id": None, "has_older": True,
                                      "loading": False})
         self._fetch_messages(name)
         self._refresh_members_ui(name)
+        # v0.31: re-subscribe NOW. The server binds the channel at
+        # subscribe time; setting _stream_cid alone changed nothing on
+        # the wire, and live updates died after the first switch.
+        Clock.schedule_once(lambda dt: self._start_streamer(), 0)
 
     # -- site channels (micron pages over RNS; no HTML anywhere) ---------
     def _open_site_channel(self, name, cid):
@@ -4959,22 +5336,45 @@ class sHadesClientApp(MDApp):
             return
         cid = self._channel_cid(cid)
         inp.text = ""
+        # Capture ONCE here (main thread): a second send during this
+        # worker's flight must not mutate what this one posts.
+        att = getattr(self, "_pending_attachment", None)
 
         def work():
-            res = self.guild_api.post(cid, text,
-                                      attachments=[self._pending_attachment]
-                                      if getattr(self, "_pending_attachment",
-                                                 None) else None)
+            atts_req = None
+            atts_render = None
+            if att:
+                name, mime, blob = att
+                # v0.30: the blob NEVER rides the message packet. Inline
+                # triples exceed the link packet budget (receipt: tay,
+                # "packet size of 515 exceeds mtu of 500") -- the chunked
+                # blob API moves every byte; the post carries a reference.
+                up = self.guild_api.blobs_put(name, mime, blob)
+                if not up.get("ok"):
+                    Clock.schedule_once(
+                        lambda dt: self._set_status(
+                            "attach upload failed (%s): %s"
+                            % (up.get("phase", "init"),
+                               up.get("error", "unknown"))[:80]), 0)
+                    return
+                atts_req = [{"blob_id": up.get("blob_id"),
+                             "name": name, "mime": mime}]
+            if atts_req:
+                res = self.guild_api.post_v1(cid, text, attachments=atts_req)
+                # the server answers with stored metadata (name, mime,
+                # size, path) and no bytes -- the optimistic render is the
+                # same shape push delivers to everyone else, so it renders
+                # lazily through _fetch_attachment just like received rows
+                atts_render = res.get("attachments") or None
+            else:
+                res = self.guild_api.post(cid, text)
             if res.get("ok"):
                 # optimistically show
                 msg_id = res.get("msg_id")
                 m = {"msg_id": msg_id, "author_hash": self.my_hash,
                      "username": self.username, "content": text,
                      "ts": now(), "channel_id": cid,
-                     # one attachment = [name, mime, blob]; the list holds
-                     # those triples, matching the guild's ingest format
-                     "attachments": [self._pending_attachment]
-                     if getattr(self, "_pending_attachment", None) else None}
+                     "attachments": atts_render}
                 Clock.schedule_once(lambda dt: self._render_message(
                     main.ids.message_grid, m), 0)
                 self._pending_attachment = None
@@ -5175,11 +5575,26 @@ class sHadesClientApp(MDApp):
         # display name, best effort; the jarray(String) cursor query from
         # v0.15 needed the same suspect jnius exports as the byte transfer,
         # so both are gone: last path segment with a mime-based fallback.
+        # v0.30: the real display name comes from the resolver's
+        # _display_name column -- lastPathSegment is a content id on
+        # modern pickers (tay: attachments "still says picked.jpg");
+        # the query needs no new jnius exports and falls back on failure.
         name = None
         try:
-            name = uri.getLastPathSegment()
+            cur = resolver.query(uri, ["_display_name"], None, None, None)
+            if cur is not None:
+                try:
+                    if cur.moveToFirst():
+                        name = cur.getString(0)
+                finally:
+                    cur.close()
         except Exception:
             name = None
+        if not name:
+            try:
+                name = uri.getLastPathSegment()
+            except Exception:
+                name = None
         if name:
             name = os.path.basename(name.replace("\\", "/"))
             if not name or "." not in name:
@@ -5247,7 +5662,7 @@ class sHadesClientApp(MDApp):
                             break
                         out.write(chunk)
                         total += len(chunk)
-                        if total > 32 * 1024 * 1024:
+                        if total > 10 * 1024 * 1024:
                             raise OSError("picked file exceeds the 32 MB "
                                           "server cap")
             finally:
@@ -5300,7 +5715,7 @@ class sHadesClientApp(MDApp):
             except Exception:
                 pass
         size = os.path.getsize(target)
-        if size > 32 * 1024 * 1024:
+        if size > 10 * 1024 * 1024:
             os.remove(target)
             raise OSError("picked file exceeds the 32 MB server cap (%d)"
                           % size)
@@ -5427,7 +5842,7 @@ class sHadesClientApp(MDApp):
                     break
                 out.write(bytes(bytearray(buf[:got])))
                 total += got
-                if total > 32 * 1024 * 1024:
+                if total > 10 * 1024 * 1024:
                     raise OSError("picked file exceeds the 32 MB server cap")
         return target
 
@@ -5690,9 +6105,9 @@ class sHadesClientApp(MDApp):
         mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
         name = path.split("/")[-1]
         # Client-side size check so the user gets a clear message instead of
-        # a silent server rejection. Matches server MAX_ATTACHMENT_SZ (32 MB).
-        if len(blob) > 32 * 1024 * 1024:
-            self._set_status("attach failed: file too large (%d MB, max 32 MB)" %
+        # a silent server rejection. Matches server MAX_ATTACHMENT_SZ (10 MB).
+        if len(blob) > 10 * 1024 * 1024:
+            self._set_status("attach failed: file too large (%d MB, max 10 MB)" %
                              (len(blob) / 1024 / 1024))
             return
         self._send_with_attachment(text, name, mime, blob, style)
@@ -6425,35 +6840,6 @@ class sHadesClientApp(MDApp):
         name = path.split("/")[-1]
         self._pending_attachment = [name, mime, blob]
         self._set_status("Attached: %s (%d bytes)" % (name, len(blob)))
-
-    def upload_avatar(self, path):
-        """Upload an avatar image to the guild."""
-        try:
-            with open(path, "rb") as f:
-                blob = f.read()
-        except Exception as e:
-            self._set_status("avatar upload failed: %s" % e)
-            return
-
-        # avatar_upload() blocks on the RNS link — keep it off the main thread.
-        def work():
-            try:
-                res = self.guild_api.avatar_upload(blob)
-            except Exception:
-                res = None
-
-            def apply(dt):
-                if res and res.get("ok"):
-                    self._set_status("Avatar updated")
-                    try:
-                        self.profile_screen.target_avatar = path
-                        self.profile_screen.ids.profile_pfp.source = path
-                    except Exception:
-                        pass
-                else:
-                    self._set_status("avatar upload failed")
-            Clock.schedule_once(apply, 0)
-        threading.Thread(target=work, daemon=True).start()
 
     def save_profile(self):
         """Save username to the guild."""

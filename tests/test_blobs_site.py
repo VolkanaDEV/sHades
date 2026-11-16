@@ -103,6 +103,25 @@ def main():
     out = sHades.serve_blob_file("/file/blobs/../../etc/passwd", None, "r", "L", identity, sHades.now())
     check("serve_blob_file rejects traversal-ish names", out == b"not found", out)
 
+    # ---------- chunked attachment reads (api_v1_att_get) ----------
+    # receive-path chunking: one slice per request instead of the whole
+    # file on a single-shot receipt (v0.31)
+    data = bytes(range(256)) * 700          # ~175 KB, content known
+    afname = sHades.store_attachment("big_note.txt", "text/plain", data)
+    check("store_attachment returns a registered fname", bool(afname), afname)
+    r0 = call("/api/v1/att/get", {"path": "/file/attachments/" + afname,
+                                  "offset": 0, "len": 100000})
+    r1 = call("/api/v1/att/get", {"path": "/file/attachments/" + afname,
+                                  "offset": 100000})
+    check("att get roundtrips and slices",
+          r0.get("ok") == 1 and r1.get("ok") == 1
+          and base64.b64decode(r0["data_b64"]) == data[:100000]
+          and base64.b64decode(r1["data_b64"]) == data[100000:]
+          and r0.get("total") == len(data) and r1.get("eof") is True,
+          (r0.get("ok"), r1.get("ok"), r0.get("total")))
+    r = call("/api/v1/att/get", {"path": "/file/attachments/../../notes"})
+    check("att get rejects non-blob-ish names", r.get("ok") == 0, r)
+
     # ---------- chunked uploads: init -> offset slices -> finish ----------
     # tay (v0.29-c): "The payload should be maximum of 10mb & automatically
     # chunked, not timer based." The ack carries next_offset; the sender is

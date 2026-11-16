@@ -122,7 +122,7 @@ def main():
             try:
                 frame = msgpack.unpackb(plaintext, raw=False)
                 if isinstance(frame, dict) and frame.get("k") == "stream":
-                    push_frames.append(frame)
+                    push_frames.append((frame, len(plaintext)))
             except Exception:
                 pass
         link.set_packet_callback(_on_push)
@@ -171,13 +171,29 @@ def main():
             time.sleep(0.2)
         check("push frame arrived (no poll)", bool(push_frames),
               "frames=%d" % len(push_frames))
-        got_msg = False
-        for fr in push_frames:
-            for ev in fr.get("events") or []:
-                msg = ev.get("data", {}).get("msg") or {}
-                if "push-arrival-marker" in (msg.get("content") or ""):
-                    got_msg = True
-        check("push carries the posted message", got_msg)
+        # v0.31 ticket contract: the frame that rides the raw link
+        # packet carries the seq reference, never bodies. The receipt
+        # that forced this shape: "packet size of 515 exceeds mtu of
+        # 500 bytes" (and a 979) logged seconds apart -- message ROWS
+        # on RNS.Packet cross the 500-byte link MTU for real content.
+        if push_frames:
+            fr, raw_len = push_frames[0]
+            check("push is a ticket: bounded, seq-carried, no bodies",
+                  fr.get("ticket") is True and "events" not in fr
+                  and fr.get("seq") and raw_len <= 500,
+                  (fr, raw_len))
+            # notify + pull: the delta rides the resource path
+            got = link_request_json(
+                "/api/v1/stream/poll",
+                {"channel": gen["id"], "cursor": res.get("cursor"),
+                 "timeout_s": 2})
+            got_msg = bool(got and got.get("ok") == 1 and any(
+                "push-arrival-marker" in (
+                    (e.get("data", {}).get("msg") or {}).get("content")
+                    or "")
+                for e in got.get("events") or []))
+            check("delta after the ticket carries the posted message",
+                  got_msg, got)
     finally:
         proc.terminate()
         try:

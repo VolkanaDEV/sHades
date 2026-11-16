@@ -515,6 +515,24 @@ def main():
                     return json.loads(r.response.decode("utf-8"))
             return {"ok": 0, "error": "no response"}
 
+        def poll_events(cid, cursor):
+            """v0.31 ticket contract: the push is a notification; event
+            bodies ride the long-poll/resource path. Collect rows until
+            the poll returns any, bounded by a 20s deadline."""
+            deadline = time.time() + 20
+            cur = cursor
+            evs = []
+            while time.time() < deadline:
+                r = japi("/api/v1/stream/poll",
+                         {"channel": cid, "cursor": cur, "timeout_s": 3})
+                if r and r.get("ok") == 1:
+                    cur = r.get("cursor", cur)
+                    evs = evs + (r.get("events") or [])
+                    if r.get("events"):
+                        return evs, cur
+                time.sleep(0.15)
+            return evs, cur
+
         cl = japi("/api/v1/channels/list", {})
         check("v1 channels/list over JSON", cl.get("ok") == 1 and
               any(c["name"] == "test" and c["kind"] == "chat" for c in cl.get("channels", [])), cl)
@@ -595,8 +613,12 @@ def main():
         r = japi("/api/v1/site/put", {"channel": site_cid, "path": "/index.mu",
                                       "data_b64": base64.b64encode(page_html.encode()).decode()})
         check("v1 site/put over the mesh", r.get("ok") == 1 and r.get("mime") == "text/micron", r)
-        site_evs = [e for fr in pushed.get(site_cid, [])
-                    for e in fr.get("events", [])]
+        # ticket contract: the push frame is the notification; the event
+        # body rides the notify+pull flow (poll over the resource path)
+        check("site stream pushed a ticket",
+              any(fr.get("ticket") is True for fr in pushed.get(site_cid, [])),
+              str(pushed.get(site_cid, []))[:160])
+        site_evs, _ = poll_events(site_cid, sub.get("cursor"))
         check("site_patch event arrives on the stream",
               any(e["kind"] == "site_patch" and e["data"].get("path") == "/index.mu"
                   for e in site_evs), str(site_evs)[:300])
@@ -619,16 +641,18 @@ def main():
         r = japi("/api/v1/term/open", {"channel": term_cid})
         check("term open ok", r.get("ok") == 1 and r.get("session"), r)
         term_sid = r.get("session")
-        term_evs = [e for fr in pushed.get(term_cid, [])
-                     for e in fr.get("events", [])]
+        # ticket contract: term events ride the notify+pull flow
+        check("term stream pushed a ticket",
+              any(fr.get("ticket") is True for fr in pushed.get(term_cid, [])),
+              str(pushed.get(term_cid, []))[:160])
+        term_evs, tcur = poll_events(term_cid, sub.get("cursor"))
         banner = [e for e in term_evs if e["kind"] == "term_data"]
         check("term banner + prompt arrive on the stream",
               banner and "guild console" in banner[0]["data"]["text"],
               str(term_evs[:2]))
         japi("/api/v1/term/data", {"session": term_sid,
                                    "data_b64": base64.b64encode(b"who\n").decode()})
-        term_evs = [e for fr in pushed.get(term_cid, [])
-                     for e in fr.get("events", [])]
+        term_evs, _ = poll_events(term_cid, tcur)
         outs = " ".join(e["data"]["text"] for e in term_evs
                         if e["kind"] == "term_data")
         check("console 'who' answers over the mesh", "Page Tester" in outs, outs[:200])
