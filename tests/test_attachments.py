@@ -18,6 +18,7 @@ import os
 import sys
 import time
 import functools
+import tempfile
 
 os.environ.setdefault("KIVY_GL_BACKEND", "mock")
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -102,6 +103,15 @@ class StubApp:
             kivy_client.sHadesClientApp._fetch_attachment, self)
         self._add_attachment_embed = functools.partial(
             kivy_client.sHadesClientApp._add_attachment_embed, self)
+        # v0.30 rewrote _add_attachment_embed on top of the classifier and
+        # the app-storage path; bind the real static method to the stub so
+        # kind decisions match production, and route saves into a temp dir
+        # so tests never touch the real app data dir
+        self._attachment_kind = kivy_client.sHadesClientApp._attachment_kind
+        self._attach_dir = tempfile.mkdtemp(prefix="shades-attach-test-")
+        self._attachments_dir = lambda: self._attach_dir
+        self._save_attachment_blob = functools.partial(
+            kivy_client.sHadesClientApp._save_attachment_blob, self)
         self._record_member = functools.partial(
             kivy_client.sHadesClientApp._record_member, self)
         self._refresh_avatar = functools.partial(
