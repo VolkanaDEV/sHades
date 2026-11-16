@@ -5175,11 +5175,26 @@ class sHadesClientApp(MDApp):
         # display name, best effort; the jarray(String) cursor query from
         # v0.15 needed the same suspect jnius exports as the byte transfer,
         # so both are gone: last path segment with a mime-based fallback.
+        # v0.30: the real display name comes from the resolver's
+        # _display_name column -- lastPathSegment is a content id on
+        # modern pickers (tay: attachments "still says picked.jpg");
+        # the query needs no new jnius exports and falls back on failure.
         name = None
         try:
-            name = uri.getLastPathSegment()
+            cur = resolver.query(uri, ["_display_name"], None, None, None)
+            if cur is not None:
+                try:
+                    if cur.moveToFirst():
+                        name = cur.getString(0)
+                finally:
+                    cur.close()
         except Exception:
             name = None
+        if not name:
+            try:
+                name = uri.getLastPathSegment()
+            except Exception:
+                name = None
         if name:
             name = os.path.basename(name.replace("\\", "/"))
             if not name or "." not in name:
