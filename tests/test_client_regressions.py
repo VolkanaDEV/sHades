@@ -434,12 +434,122 @@ def test_ticket_push():
           (repr(app2.applied), repr(app2.fetched)))
 
 
+def test_blobs_put_mobile_receipts():
+    """v0.32: uploads time out on the phone while the identical code sits
+    fine on desktop (tay's receipt). The upload loop must (a) shrink the
+    chunk on receipt timeouts and resume from the last acked offset --
+    the server stores offset-addressed bytes, so that rewrites instead
+    of corrupts -- and (b) restart once when the staged handle aged out.
+    Scripted api responses pin both paths plus the bounded attempt cap."""
+    import base64 as _b64
+
+    import kivy_client as kc
+
+    class _ScriptedApi(kc.GuildAPI):
+        """Fake transport: scripted responses per request path, all
+        recorded for assertions."""
+
+        def __init__(self):
+            super().__init__(reticulum=object(), link=object())
+            self.script = []      # list of (path, response-or-callable)
+            self.calls = []       # list of (path, offset, chunk-b64-len)
+
+        def _request_json(self, path, data, timeout=10.0):
+            self.calls.append((path, data.get("offset"),
+                               len(data.get("data_b64") or "")))
+            for p, r in self.script:
+                if p == path:
+                    return r(p, data) if callable(r) else r
+            return {"ok": 0, "error": "unscripted", "code": 999}
+
+    def init_resp(upload_id, chunk_size):
+        def _f(path, data):
+            return {"ok": 1, "upload_id": upload_id,
+                    "chunk_size": chunk_size}
+        return _f
+
+    def chunk_acks(path, data):
+        """Server-shaped ack: next_offset from the DECODED bytes."""
+        n = len(_b64.b64decode(data["data_b64"]))
+        nxt = data["offset"] + n
+        return {"ok": 1, "next_offset": nxt, "eof": nxt >= 8}
+
+    # ---- path (a): chunk timeout shrinks and resumes -------------------
+    # Sizes must clear the 32 KB floor for halving to engage: start at
+    # 128 KB per chunk, 400 KB of payload.
+    api = _ScriptedApi()
+    chunks_seen = []
+    INIT_B64 = ((131072 + 2) // 3) * 4          # base64 of 131072 bytes
+
+    def chunk_first_timeout(path, data):
+        chunks_seen.append((data["offset"],
+                            len(data.get("data_b64") or "")))
+        if len(chunks_seen) == 1 or chunks_seen[-2][0] != data["offset"]:
+            # first attempt at a fresh offset: receipt timeout
+            return {"ok": 0, "error": "timeout"}
+        n = len(_b64.b64decode(data["data_b64"]))
+        nxt = data["offset"] + n
+        return {"ok": 1, "next_offset": nxt, "eof": nxt >= 400000}
+
+    api.script = [("/api/v1/blobs/put/init", init_resp("u1", 131072)),
+                  ("/api/v1/blobs/put/chunk", chunk_first_timeout),
+                  ("/api/v1/blobs/put/finish",
+                   {"ok": 1, "blob_id": "b1"})]
+    done_bits = []
+
+    up = api.blobs_put("f.bin", "application/octet-stream", b"A" * 400000,
+                       on_progress=lambda d, t: done_bits.append(d))
+    check("shrunk-retry upload completes", bool(up.get("ok")),
+          (up.get("phase"), up.get("error"), chunks_seen[:4]))
+    check("first chunk rode the server's 128 KB size",
+          chunks_seen and chunks_seen[0][1] == INIT_B64,
+          repr(chunks_seen[:1]))
+    check("chunks shrank after receipt timeouts",
+          min(c[1] for c in chunks_seen) <= INIT_B64 // 4,
+          repr(sorted(set(c[1] for c in chunks_seen))))
+    check("every timeouted offset got its retry",
+          all(sum(1 for c in chunks_seen if c[0] == o) >= 2
+              for o in set(c[0] for c in chunks_seen)),
+          repr(chunks_seen))
+    check("progress reported and completed",
+          done_bits and done_bits[-1] == 400000, repr(done_bits[-3:]))
+
+    # ---- path (b): aged-out staged handle restarts once ----------------
+    api2 = _ScriptedApi()
+    reinit_seen = []
+    api2.script = [("/api/v1/blobs/put/init", init_resp("u2", 4)),
+                   ("/api/v1/blobs/put/chunk",
+                    lambda p, d: {"ok": 0, "error": "unknown upload_id",
+                                  "code": 404}),
+                   ("/api/v1/blobs/put/finish", {"ok": 1})]
+    up2 = api2.blobs_put("f.txt", "text/plain", b"B" * 8)
+    n_inits = len(reinit_seen) if False else len(
+        [c for c in api2.calls if c[0].endswith("init")])
+    n_chunks = len([c for c in api2.calls if c[0].endswith("chunk")])
+    check("staged-handle death restarts once, then dies bounded",
+          not up2.get("ok") and up2.get("phase") == "chunk@0"
+          and n_inits == 2 and n_chunks == 2,
+          (up2.get("phase"), up2.get("error"), n_inits, n_chunks))
+
+    # ---- path (c): persistent timeout dies bounded, phase reported -----
+    api3 = _ScriptedApi()
+    api3.script = [("/api/v1/blobs/put/init", init_resp("u1", 4)),
+                   ("/api/v1/blobs/put/chunk",
+                    lambda p, d: {"ok": 0, "error": "timeout"})]
+    up3 = api3.blobs_put("f.txt", "text/plain", b"A" * 8)
+    n_calls = len(api3.calls)
+    check("persistent timeout dies with phase + bounded attempts",
+          not up3.get("ok") and "chunk@" in up3.get("phase", "") and
+          n_calls <= 11, (up3.get("phase"), n_calls))
+
+
 def main():
     for fn in (test_display_name_preserved,
                test_update_applied_once,
                test_attachment_kind_classifier,
                test_stream_lifecycle,
                test_ticket_push,
+               test_blobs_put_mobile_receipts,
                test_admin_panel_not_blocking,
                test_roles_popup_not_blocking,
                test_shutdown_not_blocking):

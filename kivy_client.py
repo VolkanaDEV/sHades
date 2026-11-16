@@ -717,7 +717,7 @@ class GuildAPI:
         """Active users plus the channel each one is streaming."""
         return self._request_json("/api/v1/presence", {})
 
-    def blobs_put(self, name, mime, data):
+    def blobs_put(self, name, mime, data, on_progress=None):
         """Upload one content-addressed blob (v1). Returns
         {ok, blob_id, size, path} — reference blob_id from post_v1.
 
@@ -725,36 +725,76 @@ class GuildAPI:
         of 10mb & automatically chunked, not timer based"): init -> byte-
         offset slices -> finish, the loop driven by each ack's next_offset.
         Retries rewrite the same offset, so they cannot corrupt the stream.
-        Payloads above the limit fail fast with a named error."""
+        Payloads above the limit fail fast with a named error.
+
+        v0.32 mobile receipts: uploads timed out on the phone while the
+        identical code sat fine on desktop (receipt: tay, "Neither one
+        works"). The chunk deadline now matches the download doctrine
+        (15s), and a receipt timeout shrinks the chunk and resumes from
+        the last acked offset -- the server stores offset-addressed bytes
+        (seek+write), so resuming rewrites bytes it already has instead of
+        corrupting anything. Bounded: six shrink steps, then up to three
+        retries at the floor; an aged-out staged handle re-inits once."""
         size = len(data)
         if size > 10 * 1024 * 1024:
             return {"ok": 0, "error": "payload too large: limit is 10 MB",
                     "size": size}
         res = self._request_json("/api/v1/blobs/put/init",
-                                 {"name": name, "mime": mime, "size": size})
+                                 {"name": name, "mime": mime, "size": size},
+                                 timeout=15)
         if not res.get("ok"):
             res.setdefault("phase", "init")
             return res
         upload_id = res["upload_id"]
         step = int(res.get("chunk_size") or (256 * 1024))
         offset = 0
+        fails = 0
+        restarted = False
         while offset < size:
             piece = data[offset:offset + step]
             body = {
                 "upload_id": upload_id, "offset": offset,
                 "data_b64": base64.b64encode(piece).decode("ascii"),
             }
-            res = self._request_json("/api/v1/blobs/put/chunk", body)
+            if on_progress:
+                on_progress(offset, size)
+            res = self._request_json("/api/v1/blobs/put/chunk", body,
+                                     timeout=15)
             if not res.get("ok"):
-                res.setdefault("error", "chunk failed")
+                err = res.get("error", "chunk failed")
+                # the staged handle aged out mid-upload (600s idle law):
+                # one deterministic restart, offsets driven anew
+                if err == "unknown upload_id" and not restarted:
+                    restarted = True
+                    res2 = self._request_json(
+                        "/api/v1/blobs/put/init",
+                        {"name": name, "mime": mime, "size": size},
+                        timeout=15)
+                    if res2.get("ok"):
+                        upload_id = res2["upload_id"]
+                        continue
+                # receipt timeout on a slow/high-RTT pipe: shrink the chunk
+                # and resume from the last acked offset (bounded)
+                if err == "timeout" and fails < 6 and step > 32 * 1024:
+                    fails += 1
+                    step = max(32 * 1024, step // 2)
+                    res["phase"] = "chunk@%d/%d" % (offset, step)
+                    continue
+                if err == "timeout" and fails < 3:
+                    fails += 1
+                    continue
+                res.setdefault("error", err or "chunk failed")
                 res["phase"] = "chunk@%d" % offset
                 return res
+            fails = 0
             offset = int(res.get("next_offset") or (offset + len(piece)))
         res = self._request_json("/api/v1/blobs/put/finish",
-                                 {"upload_id": upload_id})
+                                 {"upload_id": upload_id}, timeout=15)
         if not res.get("ok"):
             res.setdefault("error", "finish failed")
             res["phase"] = "finish"
+        elif on_progress:
+            on_progress(size, size)
         return res
 
     def post_v1(self, channel, content, attachments=None):
@@ -5349,7 +5389,20 @@ class sHadesClientApp(MDApp):
                 # triples exceed the link packet budget (receipt: tay,
                 # "packet size of 515 exceeds mtu of 500") -- the chunked
                 # blob API moves every byte; the post carries a reference.
-                up = self.guild_api.blobs_put(name, mime, blob)
+                # v0.32: progress is visible in the status line, so a slow
+                # mobile uplink reads as movement, not silence.
+                Clock.schedule_once(
+                    lambda dt: self._set_status("attach upload starting"),
+                    0)
+
+                def _up_progress(done, total):
+                    Clock.schedule_once(
+                        lambda dt: self._set_status(
+                            "attach upload %d%%"
+                            % int(100 * done / max(total, 1))), 0)
+
+                up = self.guild_api.blobs_put(name, mime, blob,
+                                              on_progress=_up_progress)
                 if not up.get("ok"):
                     Clock.schedule_once(
                         lambda dt: self._set_status(
