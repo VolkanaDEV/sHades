@@ -615,11 +615,43 @@ class GuildAPI:
 
     def blobs_put(self, name, mime, data):
         """Upload one content-addressed blob (v1). Returns
-        {ok, blob_id, size, path} — reference blob_id from post_v1."""
-        return self._request_json("/api/v1/blobs/put", {
-            "name": name, "mime": mime,
-            "data_b64": base64.b64encode(data).decode("ascii"),
-        })
+        {ok, blob_id, size, path} — reference blob_id from post_v1.
+
+        Chunked automatically (v0.29-c, tay: "The payload should be maximum
+        of 10mb & automatically chunked, not timer based"): init -> byte-
+        offset slices -> finish, the loop driven by each ack's next_offset.
+        Retries rewrite the same offset, so they cannot corrupt the stream.
+        Payloads above the limit fail fast with a named error."""
+        size = len(data)
+        if size > 10 * 1024 * 1024:
+            return {"ok": 0, "error": "payload too large: limit is 10 MB",
+                    "size": size}
+        res = self._request_json("/api/v1/blobs/put/init",
+                                 {"name": name, "mime": mime, "size": size})
+        if not res.get("ok"):
+            res.setdefault("phase", "init")
+            return res
+        upload_id = res["upload_id"]
+        step = int(res.get("chunk_size") or (256 * 1024))
+        offset = 0
+        while offset < size:
+            piece = data[offset:offset + step]
+            body = {
+                "upload_id": upload_id, "offset": offset,
+                "data_b64": base64.b64encode(piece).decode("ascii"),
+            }
+            res = self._request_json("/api/v1/blobs/put/chunk", body)
+            if not res.get("ok"):
+                res.setdefault("error", "chunk failed")
+                res["phase"] = "chunk@%d" % offset
+                return res
+            offset = int(res.get("next_offset") or (offset + len(piece)))
+        res = self._request_json("/api/v1/blobs/put/finish",
+                                 {"upload_id": upload_id})
+        if not res.get("ok"):
+            res.setdefault("error", "finish failed")
+            res["phase"] = "finish"
+        return res
 
     def post_v1(self, channel, content, attachments=None):
         """JSON chat post; attachments are [{blob_id, name?, mime?}] refs or
@@ -6327,7 +6359,21 @@ class sHadesClientApp(MDApp):
             while attempt < 2:
                 try:
                     res = self.guild_api.avatar_upload(blob)
-                    if res and res.get("ok") and not res.get("unconfirmed"):
+                    confirmed = bool(res and res.get("ok")
+                                     and not res.get("unconfirmed"))
+                    if not confirmed and res and res.get("unconfirmed"):
+                        # A bool receipt carries nothing pollable; do NOT
+                        # retry blind (that re-uploads and can double-send).
+                        # Verify by reading the avatar back from the guild;
+                        # only a real state mismatch counts as failure.
+                        try:
+                            got = self.guild_api.avatar_get(self.my_hash or "")
+                            confirmed = (got or {}).get("avatar") == blob
+                            if not confirmed:
+                                last = "read-back mismatch"
+                        except Exception as e:
+                            last = str(e)[:48]
+                    if confirmed:
                         def ok(dt):
                             self._set_status("Avatar updated (%d KB)"
                                              % (len(blob) // 1024))

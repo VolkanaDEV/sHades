@@ -41,7 +41,7 @@ DEBUG           = False   # set via --debug; enables verbose attachment/ingest l
 
 MAX_CONTENT_LEN   = 2000          # per-message character cap (Discord-style)
 MAX_ATTACHMENTS   = 4             # files per message
-MAX_ATTACHMENT_SZ = 32 * 1024 * 1024   # 32 MB per attachment
+MAX_ATTACHMENT_SZ = 10 * 1024 * 1024   # 10 MB per attachment (payload law)
 MAX_AVATAR_SZ     = 64 * 1024
 RATE_MAX_POSTS    = 10            # per sender per channel
 RATE_WINDOW_S     = 60
@@ -68,6 +68,10 @@ _GUILD_MANAGE_BITS = (PERMS["MANAGE_MESSAGES"] | PERMS["MANAGE_CHANNEL"] |
 # uploaded once and referenced by id. Chunked get keeps memory bounded.
 BLOB_CHUNK_DEFAULT = 256 * 1024   # /api/v1/blobs/get default slice
 BLOB_CHUNK_MAX     = 1024 * 1024  # ... and hard cap per request
+BLOB_UPLOAD_CHUNK  = 256 * 1024   # chunked-upload default slice; the server
+# is what dictates chunk_size per session anyway
+MAX_BLOB_SZ        = 10 * 1024 * 1024   # payloads max 10 MB (tay, v0.29-c)
+BLOB_UPLOAD_IDLE_S = 600          # staged upload idle this long -> reaped
 SITE_PATH_RE       = re.compile(r"^/[a-zA-Z0-9][a-zA-Z0-9._/\-]{0,127}$")
 EXT_MIME           = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
                       "gif": "image/gif", "webp": "image/webp", "mp3": "audio/mpeg",
@@ -161,6 +165,9 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE TABLE IF NOT EXISTS attachments (
     msg_id TEXT, idx INTEGER, name TEXT, mime TEXT, size INTEGER, path TEXT,
     PRIMARY KEY (msg_id, idx));
+CREATE TABLE IF NOT EXISTS blobs (
+    id TEXT PRIMARY KEY, name TEXT, mime TEXT, size INTEGER, path TEXT,
+    ts REAL, by TEXT);
 CREATE TABLE IF NOT EXISTS banned (
     dest_hash TEXT PRIMARY KEY, reason TEXT, at REAL);
 CREATE TABLE IF NOT EXISTS muted (
@@ -598,6 +605,11 @@ def _node_reaper():
             _reap_stale_nodes()
         except Exception as e:
             RNS.log("node reaper error: %s" % e, RNS.LOG_ERROR)
+        try:
+            if BLOB_UPLOADS:
+                _reap_stale_uploads()
+        except Exception as e:
+            RNS.log("upload reaper error: %s" % e, RNS.LOG_ERROR)
 
 def online_users():
     """The active user list, derived from guild link liveness (v0.29).
@@ -2056,26 +2068,10 @@ def api_v1_blobs_put(viewer, data, link_id):
         return {"ok": 0, "error": "blob too large", "code": 413}
     name = (data.get("name") or "").strip()[:128]
     mime = (data.get("mime") or "").strip()[:64]
-    digest = hashlib.sha256(blob).hexdigest()[:32]
-    ext = safe_ext(name, mime)
-    fname = f"{digest}.{ext}"
-    bdir = _blob_dir()
-    os.makedirs(bdir, exist_ok=True)
-    fpath = os.path.join(bdir, fname)
-    if not os.path.exists(fpath):
-        try:
-            with open(fpath, "wb") as f:
-                f.write(blob)
-        except OSError as e:
-            RNS.log(f"blob store failed for {fname}: {e}", RNS.LOG_ERROR)
-            return {"ok": 0, "error": "storage failed", "code": 500}
-    if node_destination is not None:
-        node_destination.register_request_handler(
-            "/file/blobs/" + fname, serve_blob_file,
-            allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
-    return {"ok": 1, "blob_id": digest, "size": len(blob),
-            "mime": EXT_MIME.get(ext, mime or "application/octet-stream"),
-            "name": name or fname, "path": "/file/blobs/" + fname}
+    res = _blob_commit(blob, name, mime, by=viewer)
+    if res is None:
+        return {"ok": 0, "error": "storage failed", "code": 500}
+    return res
 
 @api_route("/api/v1/blobs/get")
 @wrap_json_api
@@ -2105,6 +2101,192 @@ def serve_blob_file(path, data, request_id, link_id, remote_identity, requested_
         with open(fpath, "rb") as f:
             return f.read()
     return b"not found"
+
+
+def _blob_commit(blob, name, mime, by=None):
+    """Content-address the blob, store it, register its /file/blobs handler
+    and return the standard response dict. Shared by the legacy single-shot
+    put and the chunked-upload finish; None on storage failure.
+
+    Storage law (tay): files live native on disk as content-addressed
+    <sha256>.<ext>; the database carries only name/mime/size/path metadata
+    (blobs table), never bytes."""
+    digest = hashlib.sha256(blob).hexdigest()[:32]
+    ext = safe_ext(name, mime)
+    fname = f"{digest}.{ext}"
+    bdir = _blob_dir()
+    os.makedirs(bdir, exist_ok=True)
+    fpath = os.path.join(bdir, fname)
+    if not os.path.exists(fpath):
+        try:
+            with open(fpath, "wb") as f:
+                f.write(blob)
+        except OSError as e:
+            RNS.log(f"blob store failed for {fname}: {e}", RNS.LOG_ERROR)
+            return None
+    if node_destination is not None:
+        node_destination.register_request_handler(
+            "/file/blobs/" + fname, serve_blob_file,
+            allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
+    with db_lock:
+        db.execute(
+            "INSERT OR IGNORE INTO blobs (id, name, mime, size, path, ts, by) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (digest, name or fname,
+             EXT_MIME.get(ext, mime or "application/octet-stream"),
+             len(blob), fname, now(), by))
+        db.commit()
+    return {"ok": 1, "blob_id": digest, "size": len(blob),
+            "mime": EXT_MIME.get(ext, mime or "application/octet-stream"),
+            "name": name or fname, "path": "/file/blobs/" + fname}
+
+
+# ---- chunked blob uploads (v0.29-c): max payload + automatic chunking ------
+# tay: "The payload should be maximum of 10mb & automatically chunked,
+# not timer based." The session is byte-offset addressed and every ack
+# carries next_offset, so the sender is driven by data — never by a timer.
+
+# upload_id -> {"path","name","mime","size","offset","user","ts"}
+BLOB_UPLOADS = {}
+BLOB_UPLOADS_LOCK = threading.Lock()
+
+
+def _blob_staging_dir():
+    return os.path.join(_blob_dir(), "staging")
+
+
+def _reap_stale_uploads():
+    """Drop staged uploads with no chunk activity for BLOB_UPLOAD_IDLE_S
+    (hygiene for abandoned transfers; not part of the transfer mechanism)."""
+    cutoff = now() - BLOB_UPLOAD_IDLE_S
+    dead = []
+    with BLOB_UPLOADS_LOCK:
+        for uid, up in BLOB_UPLOADS.items():
+            if up["ts"] < cutoff:
+                dead.append((uid, up["path"]))
+    for uid, path in dead:
+        with BLOB_UPLOADS_LOCK:
+            BLOB_UPLOADS.pop(uid, None)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return [u for u, _ in dead]
+
+
+@api_route("/api/v1/blobs/put/init")
+@wrap_json_api
+def api_v1_blobs_put_init(viewer, data, link_id):
+    """Open a chunked upload session: {name, mime?, size} ->
+    {ok, upload_id, chunk_size, size}. Rejects payloads above MAX_BLOB_SZ
+    (10 MB) up front — named failure, no bytes moved."""
+    if not rate_ok(viewer, "_blobs"):
+        return {"ok": 0, "error": "rate limited", "code": 429}
+    try:
+        size = int(data.get("size", 0))
+    except (TypeError, ValueError):
+        size = -1
+    if size <= 0:
+        return {"ok": 0, "error": "size must be a positive int", "code": 400}
+    if size > MAX_BLOB_SZ:
+        return {"ok": 0, "error": "payload too large: limit is 10 MB",
+                "code": 413}
+    name = (data.get("name") or "").strip()[:128]
+    mime = (data.get("mime") or "").strip()[:64]
+    upload_id = os.urandom(16).hex()
+    sdir = _blob_staging_dir()
+    os.makedirs(sdir, exist_ok=True)
+    part = os.path.join(sdir, upload_id + ".part")
+    with open(part, "wb"):
+        pass
+    with BLOB_UPLOADS_LOCK:
+        BLOB_UPLOADS[upload_id] = {
+            "path": part, "name": name, "mime": mime, "size": size,
+            "offset": 0, "user": viewer, "ts": now(),
+        }
+    return {"ok": 1, "upload_id": upload_id, "chunk_size": BLOB_UPLOAD_CHUNK,
+            "size": size}
+
+
+@api_route("/api/v1/blobs/put/chunk")
+@wrap_json_api
+def api_v1_blobs_put_chunk(viewer, data, link_id):
+    """Write one offset-addressed slice of a staged upload:
+    {upload_id, offset, data_b64} -> {ok, received, next_offset, eof}.
+    Rewriting the same offset is safe, so a retried request cannot corrupt
+    the stream."""
+    upload_id = (data.get("upload_id") or "").strip()
+    with BLOB_UPLOADS_LOCK:
+        up = BLOB_UPLOADS.get(upload_id)
+    if not up:
+        return {"ok": 0, "error": "unknown upload_id", "code": 404}
+    if up["user"] != viewer:
+        return {"ok": 0, "error": "not your upload", "code": 403}
+    chunk = _b64_decode(data.get("data_b64"))
+    if chunk is None:
+        return {"ok": 0, "error": "data_b64 must be valid base64", "code": 400}
+    try:
+        offset = int(data.get("offset", -1))
+    except (TypeError, ValueError):
+        offset = -1
+    if offset < 0 or offset > up["size"]:
+        return {"ok": 0, "error": "offset out of range", "code": 400}
+    if offset + len(chunk) > up["size"]:
+        return {"ok": 0, "error": "chunk overruns declared size", "code": 400}
+    try:
+        with open(up["path"], "r+b") as f:
+            f.seek(offset)
+            f.write(chunk)
+    except OSError as e:
+        RNS.log(f"blob chunk write failed ({up['name']}@{offset}): {e}",
+                RNS.LOG_ERROR)
+        return {"ok": 0, "error": "storage failed", "code": 500}
+    received = offset + len(chunk)
+    with BLOB_UPLOADS_LOCK:
+        if received > up["offset"]:
+            up["offset"] = received
+        up["ts"] = now()
+    return {"ok": 1, "received": received, "next_offset": received,
+            "eof": received >= up["size"], "size": up["size"]}
+
+
+@api_route("/api/v1/blobs/put/finish")
+@wrap_json_api
+def api_v1_blobs_put_finish(viewer, data, link_id):
+    """Commit a staged upload: {upload_id} -> same shape as blobs/put.
+    Content-addresses the assembled bytes (sha256), so the returned
+    blob_id is identical to a legacy single-shot put of the same payload."""
+    upload_id = (data.get("upload_id") or "").strip()
+    with BLOB_UPLOADS_LOCK:
+        up = BLOB_UPLOADS.pop(upload_id, None)
+    if not up:
+        return {"ok": 0, "error": "unknown upload_id", "code": 404}
+    if up["user"] != viewer:
+        with BLOB_UPLOADS_LOCK:
+            BLOB_UPLOADS[upload_id] = up
+        return {"ok": 0, "error": "not your upload", "code": 403}
+    if up["offset"] < up["size"]:
+        return {"ok": 0, "error": "incomplete upload "
+                f"({up['offset']}/{up['size']} bytes)", "code": 400,
+                "received": up["offset"]}
+    try:
+        with open(up["path"], "rb") as f:
+            blob = f.read()
+    except OSError as e:
+        RNS.log(f"blob finish read failed ({up['name']}): {e}", RNS.LOG_ERROR)
+        return {"ok": 0, "error": "storage failed", "code": 500}
+    if len(blob) != up["size"]:
+        return {"ok": 0, "error": "staged bytes do not match declared size",
+                "code": 400}
+    res = _blob_commit(blob, up["name"], up["mime"], by=up["user"])
+    try:
+        os.remove(up["path"])
+    except OSError:
+        pass
+    if res is None:
+        return {"ok": 0, "error": "storage failed", "code": 500}
+    return res
+
 
 # ---- chat posts over v1 JSON (phase 3): inline or blob-referenced attachments ------
 
@@ -3445,12 +3627,26 @@ def run(argv=None):
             allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
 
     # re-register v1 blobs and site resources from previous runs (one handler
-    # per file, the nomadnet Node.py register_files pattern)
+    # per file, the nomadnet Node.py register_files pattern). Also legacy
+    # /file/attachments/ files: handlers live only in RAM from store time,
+    # so a restart would otherwise strand every pre-restart attachment.
+    # Directories (e.g. the chunked-upload staging dir) are not files and
+    # get no handlers.
     bdir = os.path.join(STORAGE, "blobs")
     for fname in os.listdir(bdir):
+        if os.path.isdir(os.path.join(bdir, fname)):
+            continue
         node_destination.register_request_handler(
             "/file/blobs/" + fname, serve_blob_file,
             allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
+    adir = os.path.join(STORAGE, "attachments")
+    if os.path.isdir(adir):
+        for fname in os.listdir(adir):
+            if not re.match(r"^[0-9a-f]{32}\.[a-z0-9]{1,8}$", fname):
+                continue
+            node_destination.register_request_handler(
+                "/file/attachments/" + fname, serve_attachment_file,
+                allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
     sroot = os.path.join(STORAGE, "sites")
     for cid in os.listdir(sroot):
         cdir = os.path.join(sroot, cid)
