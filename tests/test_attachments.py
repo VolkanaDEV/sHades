@@ -112,6 +112,13 @@ class StubApp:
         self._attachments_dir = lambda: self._attach_dir
         self._save_attachment_blob = functools.partial(
             kivy_client.sHadesClientApp._save_attachment_blob, self)
+        # v0.30 non-image branch: tap-to-save rows bind through these two;
+        # the handler runs only on taps, but the bind itself happens at
+        # render time, so the stub must carry them
+        self._download_tap = functools.partial(
+            kivy_client.sHadesClientApp._download_tap, self)
+        self._save_and_report = functools.partial(
+            kivy_client.sHadesClientApp._save_and_report, self)
         self._record_member = functools.partial(
             kivy_client.sHadesClientApp._record_member, self)
         self._refresh_avatar = functools.partial(
