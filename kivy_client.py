@@ -1919,7 +1919,7 @@ class sHadesClientApp(MDApp):
         self.hub_port = DEFAULT_HUB_PORT
         self._seq = 0
         self._last_ts = 0.0
-        self._channels = OrderedDict()   # cid -> name
+        self._channels = OrderedDict()   # name -> cid (filled on guild load)
         self._members = {}               # member_hash -> username
         self._msg_widgets = {}           # msg_id -> MessageRow
         self._popup = None
@@ -2085,6 +2085,14 @@ class sHadesClientApp(MDApp):
         """Convert a channel name to its RNS destination hash ID,
         matching the guild's ensure_channel() formula."""
         return hexstr(RNS.Identity.full_hash(b"main_guild:" + name.encode()))
+
+    def _channel_name(self, cid):
+        """Inverse of the channel map (name -> cid): the ticket push
+        (v0.31) arrives keyed by cid, the fetch path speaks names."""
+        for name, c in self._channels.items():
+            if c == cid:
+                return name
+        return None
 
     # -- lifecycle -------------------------------------------------------
     def build(self):
@@ -3073,18 +3081,46 @@ class sHadesClientApp(MDApp):
             frame = msgpack.unpackb(plaintext, raw=False)
             if not isinstance(frame, dict) or frame.get("k") != "stream":
                 return
-            if frame.get("reset"):
-                # replay window rotated past our cursor: resync
-                self._stream_cursor = None
-                Clock.schedule_once(
-                    lambda dt: self._resync_stream_channel(), 0)
-                return
-            events = frame.get("events") or []
-            if events:
-                self._stream_cursor = frame.get("seq", self._stream_cursor)
-                self._apply_stream_events(events)
+            self._handle_stream_frame(frame)
         except Exception as e:
             print("push frame failed:", repr(e))
+
+    def _handle_stream_frame(self, frame):
+        """v0.31: the push-receive path, split out of the raw callback so
+        frame handling is directly testable."""
+        if frame.get("reset"):
+            # replay window rotated past our cursor: resync
+            self._stream_cursor = None
+            Clock.schedule_once(
+                lambda dt: self._resync_stream_channel(), 0)
+            return
+        if frame.get("ticket"):
+            # ticket push (v0.31): the frame carries seq + refs only, so
+            # no MTU ceiling exists above it. Pull the delta now through
+            # the resource path -- the same path poll and history use --
+            # instead of receiving bodies that can overflow the packet.
+            self._stream_cursor = frame.get("seq", self._stream_cursor)
+            cid = frame.get("channel")
+            Clock.schedule_once(lambda dt: self._ticket_pull(cid), 0)
+            events = frame.get("events") or []
+            if events:                     # legacy frame: still applies
+                self._apply_stream_events(events)
+            return
+        events = frame.get("events") or []
+        if events:
+            self._stream_cursor = frame.get("seq", self._stream_cursor)
+            self._apply_stream_events(events)
+
+    def _ticket_pull(self, cid):
+        """Delta-fetch the channel a ticket pointed at. Current channel
+        refreshes in place; other subscribed channels update through the
+        same render path (unread/older state), exactly like poll events
+        did."""
+        if not cid:
+            return
+        name = self._channel_name(cid)
+        if name:
+            self._fetch_messages(name)
 
     def _start_streamer(self):
         """Establish (or re-establish) the stream subscription on the link.

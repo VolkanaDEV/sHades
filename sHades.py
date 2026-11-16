@@ -1738,14 +1738,21 @@ def _push_stream(cid):
                 if s["channel"] == cid]
     for lid, cursor in subs:
         events, head, reset = _stream_collect(cid, cursor)
+        # v0.31 ticket protocol: the push frame carries REFERENCES, never
+        # bodies. The frame rides a raw RNS.Packet with the 500-byte link
+        # MTU; a single serialized message row (say 400 chars of content,
+        # or any message plus attachment metadata) crossed that line and
+        # the push died with "packet size of X exceeds mtu of 500" -- the
+        # receipt is in the operator console, twice. The event log and
+        # the long-poll endpoint are untouched: they serve on the
+        # request/resource path, which chunks. The ticket says "seq is
+        # now N on this channel"; the client delta-fetches immediately.
+        # Bounded by construction: k + cid + seq + reset + a typing
+        # snapshot capped at eight identities always packs under MTU.
         frame = {"k": "stream", "channel": cid, "seq": head,
-                 "reset": reset, "typing": _typing_snapshot(cid)}
-        if reset:
-            frame["events"] = []
-            out_cursor = head
-        else:
-            frame["events"] = events
-            out_cursor = events[-1]["seq"] if events else cursor
+                 "reset": reset, "ticket": True,
+                 "typing": _typing_snapshot(cid)[:8]}
+        out_cursor = cursor
         packed = msgpack.packb(frame, raw=False)
         sent = False
         for link in list(RNS.Transport.active_links):

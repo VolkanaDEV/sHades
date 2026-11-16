@@ -319,6 +319,60 @@ def main():
     check("woken poll carries the event",
           result["resp"]["events"][0]["data"]["msg"]["content"] == "wake up", result)
 
+    # ---- v0.31 ticket push: references, never bodies -------------------
+    # Receipt: the operator console logged "stream push to link failed:
+    # packet size of 515 exceeds mtu of 500 bytes" (and a 979) -- the old
+    # frame serialized the FULL message rows into a raw RNS.Packet, so
+    # any real content crossed the 500-byte link MTU. The push frame is
+    # now a ticket and the client delta-fetches over the resource path.
+    import msgpack as _mp
+    sent_frames = []
+
+    class _FakePacket:
+        def __init__(self, link, data):
+            sent_frames.append(bytes(data))
+
+        def send(self):
+            return True
+
+    _real_packet = RNS.Packet
+
+    class _LiveSubLink:
+        link_id = "LX"
+        status = RNS.Link.ACTIVE
+
+    try:
+        RNS.Packet = _FakePacket
+        _real_links = list(RNS.Transport.active_links)
+        RNS.Transport.active_links.append(_LiveSubLink())
+        try:
+            # the reap test above dropped the LX subscription (link
+            # death); re-register it for this push
+            call("/api/v1/stream/subscribe", {"channel": cid_chat},
+                 link_id="LX", ident=stranger)
+            # a message with a body that alone would blow the MTU
+            big_content = "x" * 100000
+            sHades._emit_event(cid_chat, "msg", {"msg": {
+                "msg_id": "f" * 32, "channel_id": cid_chat, "ts": 1,
+                "author_hash": "a" * 32, "username": "tester",
+                "content": big_content, "edited_at": None,
+                "deleted_at": None, "attachments": [], "reactions": []}})
+            sHades._push_stream(cid_chat)
+        finally:
+            RNS.Transport.active_links[:] = _real_links
+    finally:
+        RNS.Packet = _real_packet
+    check("ticket push frames exist for the linked subscriber",
+          bool(sent_frames), repr(sent_frames[:1])[:200])
+    if sent_frames:
+        f = _mp.unpackb(sent_frames[-1], raw=False)
+        check("push frame is a ticket: bounded, no bodies, under MTU",
+              f.get("k") == "stream" and f.get("ticket") is True
+              and "events" not in f
+              and len(sent_frames[-1]) <= 500
+              and len(f.get("typing") or []) <= 8,
+              (repr(f)[:160], len(sent_frames[-1])))
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", FAIL)

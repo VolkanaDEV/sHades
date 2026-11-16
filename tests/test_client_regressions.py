@@ -375,11 +375,71 @@ def test_stream_lifecycle():
           repr(app5._stream_tick_event))
 
 
+def test_ticket_push():
+    """v0.31: pushes are tickets (references, never bodies) -- the full
+    message row in a raw RNS.Packet crossed the 500-byte link MTU, which
+    is what the operator console's 515/979 errors were. The client must
+    answer a ticket with an immediate delta fetch; legacy full-body
+    frames still apply to the event renderer."""
+    from kivy.clock import Clock
+
+    import kivy_client as kc
+
+    class _TicketApp(_StubApp):
+        def __init__(self):
+            super().__init__(**{})
+            self._channels = {"ticket-ch": "t" + "0" * 31}
+            self._channel_kinds = {"t" + "0" * 31: "chat"}
+            self.fetched = []
+            self.applied = []
+            self._stream_cursor = None
+            self._stream_cid = None
+
+        def _fetch_messages(self, name):
+            self.fetched.append(name)
+
+        def _apply_stream_events(self, events):
+            self.applied.append(list(events))
+
+    def tick_until(cond, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            Clock.tick()
+            if cond():
+                return True
+            time.sleep(0.02)
+        return False
+
+    handle = kc.sHadesClientApp._handle_stream_frame
+
+    app = _TicketApp()
+    handle(app, {"k": "stream", "ticket": True,
+                 "channel": "t" + "0" * 31, "seq": 9})
+    ok = tick_until(lambda: app.fetched)
+    check("ticket push triggers an immediate delta fetch",
+          ok and app.fetched == ["ticket-ch"], repr(app.fetched))
+    check("ticket push syncs the cursor", app._stream_cursor == 9,
+          repr(app._stream_cursor))
+    check("ticket push carries no body to apply",
+          app.applied == [], repr(app.applied))
+
+    # legacy frames (full bodies, no ticket flag) still flow
+    app2 = _TicketApp()
+    app2._channels = {"general": "c" + "0" * 31}
+    ev = [{"kind": "presence", "data": {"users": []}}]
+    handle(app2, {"k": "stream", "seq": 11, "events": ev})
+    check("legacy full-body frames still apply, nothing fetched",
+          app2.applied == [ev] and app2._stream_cursor == 11
+          and not app2.fetched,
+          (repr(app2.applied), repr(app2.fetched)))
+
+
 def main():
     for fn in (test_display_name_preserved,
                test_update_applied_once,
                test_attachment_kind_classifier,
                test_stream_lifecycle,
+               test_ticket_push,
                test_admin_panel_not_blocking,
                test_roles_popup_not_blocking,
                test_shutdown_not_blocking):
