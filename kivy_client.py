@@ -470,9 +470,12 @@ class GuildAPI:
         if isinstance(receipt, bool):
             if not receipt:
                 return {"ok": 0, "error": "request failed"}
-            # RNS queued the request but gave no receipt — poll for response
-            # via a fresh receipt. Create one by calling request again without data.
-            receipt = self.link.request(path, data={})
+            # v0.26: the old fallback RE-ISSUED the same call with empty
+            # data "to poll for a response" -- which double-sent posts
+            # and re-ran side-effecting calls (register, avatar). A bool
+            # receipt carries nothing pollable; report unconfirmed and
+            # let the caller decide.
+            return {"ok": 1, "unconfirmed": True}
         deadline = time.time() + timeout
         while (hasattr(receipt, "response")
                and receipt.response is None
@@ -532,8 +535,10 @@ class GuildAPI:
         return self._request("/api/register",
                              {"username": username, "profile_node": profile_node})
 
-    def avatar_upload(self, blob):
-        return self._request("/api/avatar", {"avatar": blob})
+    def avatar_upload(self, blob, timeout=30):
+        # v0.26: timeout raised from 10s -- the avatar payload moves as
+        # an RNS resource transfer and slower links need the headroom.
+        return self._request("/api/avatar", {"avatar": blob}, timeout=timeout)
 
     def avatar_get(self, user_hash):
         return self._request("/api/avatar_get", {"user": user_hash})
@@ -6377,17 +6382,33 @@ class sHadesClientApp(MDApp):
             a = PILImageChops.multiply(a, mask)
             crop = PILImage.merge("RGBA", (r, g, b, a))
             crop.save(small_path, "PNG")
+
+            # v0.26: the local display copy stays PNG (alpha circle), but
+            # the UPLOAD copy is JPEG over the theme background: a 256x256
+            # RGBA PNG inside an RNS link request is 60-120 KB and
+            # monopolizes the link while its resource transfer runs, which
+            # stalled every other request behind it (tay: "setting pfp
+            # appears to block all networking"). Corners composite to the
+            # theme bg and the app masks to a circle for display anyway.
+            up_path = os.path.join(pfp_dir, "up_" + base + ".jpg")
+            try:
+                up_img = PILImage.new("RGBA", (256, 256), (26, 26, 26, 255))
+                up_img.alpha_composite(crop)
+                up_img.convert("RGB").save(up_path, "JPEG", quality=85)
+            except Exception:
+                up_path = small_path
         else:
             import shutil
             shutil.copy(path, orig_path)
             shutil.copy(path, small_path)
+            up_path = small_path
 
         # Upload 256x256 version to guild as avatar. avatar_upload() blocks
         # on the RNS link, so do it on a worker thread; the local files are
         # saved either way and applied to the UI on the main thread.
         def upload_work():
             try:
-                with open(small_path, "rb") as f:
+                with open(up_path, "rb") as f:
                     blob = f.read()
                 res = self.guild_api.avatar_upload(blob)
             except Exception:
