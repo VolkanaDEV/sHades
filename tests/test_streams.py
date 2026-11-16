@@ -233,10 +233,9 @@ def main():
           pev and any(u["user_hash"] == USER for u in pev[0]["data"]["users"]), poll)
     pres = call("/api/v1/presence", {})
     me = [u for u in pres["users"] if u["user_hash"] == USER]
-    check("v1 presence reports ping cadence",
-          pres.get("interval") == 4.0 and pres.get("ttl") == 8.0, pres)
     check("v1 presence carries active_channel from the stream",
           me and me[0]["active_channel"] == cid_chat, pres)
+    check("v1 presence reports link-derived mode", pres.get("mode") == "link", pres)
     # a user NOT streaming has active_channel None
     other = RNS.Identity()
     other_hash = sHades.hexstr(RNS.Destination(other, RNS.Destination.OUT,
@@ -252,21 +251,43 @@ def main():
     check("non-streaming user has null active_channel",
           quiet and quiet[0]["active_channel"] is None, pres)
 
-    # reap drops the stale pings and emits a presence event for users that
-    # lost their last node
-    with sHades.NODE_REGISTRY_LOCK:
-        for h in sHades.NODE_REGISTRY:
-            sHades.NODE_REGISTRY[h]["last_seen"] = sHades.now() - 30.0
-    sHades._reap_stale_nodes()
-    poll = call("/api/v1/stream/poll", {"timeout_s": 0})
-    pev = [e for e in poll["events"] if e["kind"] == "presence"]
-    check("reap emits a presence event", bool(pev), poll)
-    check("reaped users are gone from the event",
-          pev and not pev[-1]["data"]["users"], pev)
+    # reap derives presence from links (v0.29): the p1/quiet links die (RNS
+    # does it on teardown). Guild-wide events target channels with LIVE
+    # subscribers, so stage one third-party live link to hold the cid_chat
+    # sub open while p1/quiet are reaped; its holder is bound but never
+    # registered, so the transition event's user list is the empty set.
+    stranger = RNS.Identity()
+    with sHades.db_lock:
+        sHades.db.execute(
+            "INSERT OR IGNORE INTO users (dest_hash, username, registered_at) VALUES (?,?,?)",
+            (sHades.hexstr(RNS.Destination(stranger, RNS.Destination.OUT,
+                                           RNS.Destination.SINGLE,
+                                           "lxmf", "delivery").hash),
+             "liver", sHades.now()))
+    call("/api/v1/stream/subscribe", {"channel": cid_chat},
+         link_id="LX", ident=stranger)
+
+    class _LiveLink:
+        link_id = "LX"
+        status = RNS.Link.ACTIVE
+
+    _real_active = list(RNS.Transport.active_links)
+    RNS.Transport.active_links.append(_LiveLink())
+    try:
+        sHades._reap_stale_nodes()
+    finally:
+        RNS.Transport.active_links[:] = _real_active
+    with sHades.EVENT_COND:
+        ring = list(sHades.EVENT_LOG.get(cid_chat, []))
+    pev = [e for seq, e in ring if e.get("kind") == "presence"]
+    check("link death emits a presence transition", bool(pev)
+          and any(not e["data"]["users"] for e in pev),
+          str([e for seq, e in ring][-3:]))
 
     # ---------- unsubscribe ----------
-    # L1 holds the live subscription (the long-poll poller re-subscribed it);
+    # L1 holds a live subscription (re-created after the simulated teardown);
     # unsubscribing that link must clear the user's active_channel.
+    call("/api/v1/stream/subscribe", {"channel": cid_chat})
     call("/api/v1/stream/unsubscribe", {}, link_id="L1")
     r = call("/api/v1/stream/poll", {"timeout_s": 0}, link_id="L1")
     check("poll after unsubscribe -> not subscribed", r.get("ok") == 0 and r.get("code") == 409, r)
@@ -282,6 +303,7 @@ def main():
     reset_stream_state()
     call("/api/v1/stream/subscribe", {"channel": cid_chat})
     result = {}
+
     def poller():
         t0 = time.time()
         result["resp"] = call("/api/v1/stream/poll", {"timeout_s": 5})

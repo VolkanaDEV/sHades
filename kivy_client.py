@@ -513,20 +513,19 @@ class GuildAPI:
     def delete(self, msg_id):
         return self._request("/api/delete", {"msg": msg_id})
 
-    def register_node(self, node_hash, address, port, identity_hash):
-        """Register this client's node address with the guild index.
+    def register_node(self, node_hash):
+        """Register this client's node destination hash with the guild index.
 
-        This is also the presence ping: the client repeats it every
-        ANNOUNCE_INTERVAL and the guild reads each call as "still here". No
-        identity is asserted in the payload — the guild derives the user hash
-        from the identity this link was identified with, so it cannot be forged.
+        v0.29: a ONE-SHOT directory write at connect (and on reconnect).
+        Presence is not this call any more: the guild derives presence from
+        link liveness (RNS keepalives and teardowns), so the client holds no
+        heartbeat of its own. RNS is cryptographically addressed — members
+        reach a node by its destination hash (Identity.recall + RNS.Link),
+        never by ip:port, so address/port left the protocol. No identity is
+        asserted in the payload — the guild derives the user hash from the
+        identity this link was identified with, so it cannot be forged.
         """
-        return self._request("/api/register_node", {
-            "node_hash": node_hash,
-            "address": address,
-            "port": port,
-            "identity_hash": identity_hash,
-        })
+        return self._request("/api/register_node", {"node_hash": node_hash})
 
     def lookup_node(self, node_hash):
         return self._request("/api/lookup_node", {"node_hash": node_hash})
@@ -1780,14 +1779,9 @@ class sHadesClientApp(MDApp):
         self._popup = None
         self._poll_error_shown = False
         self._ui_populated = False
-        # Presence / ping: re-register (ping) every ANNOUNCE_INTERVAL
-        # seconds; the guild drops a node that misses two consecutive pings.
-        self._announce_stop = threading.Event()
-        self._announce_thread = None
-        self.ANNOUNCE_INTERVAL = 4.0
-        self.announce_host = None
-        self.announce_port = None
-        self.identity_hash = None
+        # v0.29: presence needs no heartbeat. The guild derives it from link
+        # liveness (RNS keepalives + teardown), so nothing pings; register_node
+        # stays a ONE-SHOT directory write at connect (and on reconnect).
         # v1 stream: long-polls ONLY the visible channel. _stream_cid is the
         # channel the guild should stream to us; setting it (with a None
         # cursor) makes the stream loop resubscribe — one subscription per
@@ -2852,21 +2846,14 @@ class sHadesClientApp(MDApp):
             self.node_hash = hexstr(self.node_destination.hash)
             print(f"My node_hash: {self.node_hash}")
 
-            # Register with guild so others can find me via ip:port, then
-            # re-register every ANNOUNCE_INTERVAL seconds — each re-register
-            # is a ping; the guild drops a node that misses two consecutive
-            # pings (8 s) from its active user list.
+            # Register the node's DESTINATION HASH with the guild directory
+            # so profiles / the node index can reach me cryptographically
+            # (Identity.recall + RNS.Link). v0.29: ONE SHOT at connect (and
+            # on reconnect). Presence is not this call: the guild derives it
+            # from link liveness, which RNS monitors with keepalives/teardowns.
             try:
-                import socket
-                my_host = socket.gethostbyname(socket.gethostname())
-                self.announce_host = my_host
-                self.announce_port = self.client_port
-                self.identity_hash = hexstr(self.client_identity.hash)
-                self.guild_api.register_node(
-                    self.node_hash, my_host, self.client_port,
-                    self.identity_hash)
-                print(f"Registered with guild: {my_host}:{self.client_port}")
-                self._start_announce()
+                self.guild_api.register_node(self.node_hash)
+                print(f"Registered with guild: node {self.node_hash[:12]}")
             except Exception as e:
                 print(f"Node registration failed: {e}")
 
@@ -3055,38 +3042,6 @@ class sHadesClientApp(MDApp):
             # full refresh of the visible channel; _render_message dedupes
             # by msg_id, so events already rendered are skipped
             self._resync_stream_channel()
-
-    def _start_announce(self):
-        """Re-register our node every ANNOUNCE_INTERVAL seconds.
-
-        Each re-register is a ping; the guild drops a node that misses two
-        consecutive pings (8 s) from its active user list. Safe to call more
-        than once: an existing thread is stopped before a new one starts.
-        """
-        if self._announce_thread is not None and self._announce_thread.is_alive():
-            self._announce_stop.set()
-        self._announce_stop.clear()
-        self._announce_thread = threading.Thread(target=self._announce_loop,
-                                                 daemon=True)
-        self._announce_thread.start()
-
-    def _announce_loop(self):
-        while not self._announce_stop.wait(self.ANNOUNCE_INTERVAL):
-            if not self.guild_api or not self.node_hash:
-                continue
-            try:
-                self.guild_api.register_node(
-                    self.node_hash, self.announce_host,
-                    self.announce_port, self.identity_hash)
-            except Exception as e:
-                print("announce ping failed:", repr(e))
-                continue
-            # v0.28: the announce tick is the sub's self-heal. A link drop
-            # or a server-side purge invalidates the subscription server-side;
-            # a missing cursor re-fires the one-shot subscribe (this is the
-            # presence ping's own rhythm -- NOT an extra poll).
-            if self._stream_cursor is None:
-                self._start_streamer()
 
     def _start_presence(self):
         """v0.28: the presence POLL was deleted. Presence now arrives as a
@@ -5856,34 +5811,26 @@ class sHadesClientApp(MDApp):
         # worker thread and hop back to the main thread for the status text
         # and the popup, so opening a profile never freezes the UI.
         def work():
-            # Look up node's address via guild
+            # v0.29: the directory confirms the node is registered and gives
+            # the user it belongs to. Reachability is cryptographic: the
+            # node's destination hash is the address (Identity.recall +
+            # RNS.Link below); no ip:port involved.
             try:
                 res = self.guild_api.lookup_node(lookup_hash)
                 if not res.get("ok"):
                     Clock.schedule_once(lambda dt: self._set_status(
                         "Node not found: %s" % res.get("error", "unknown")), 0)
                     return
-                address = res.get("address")
-                port = res.get("port")
-                identity_hash = res.get("identity_hash")
             except Exception as e:
                 err = "Lookup failed: %s" % e
                 Clock.schedule_once(
                     lambda dt: self._set_status(err), 0)
                 return
 
-            if not address or not port:
-                Clock.schedule_once(lambda dt: self._set_status(
-                    "No address for node: %s" % lookup_hash), 0)
-                return
-
             # Connect to remote node via RNS.Link and request profile page
             try:
                 nh = bytes.fromhex(lookup_hash)
                 nid = RNS.Identity.recall(nh)
-                if nid is None:
-                    # Try with identity_hash from lookup
-                    nid = RNS.Identity(bytes.fromhex(identity_hash)) if identity_hash else None
                 if nid is None:
                     Clock.schedule_once(lambda dt: self._set_status(
                         "RNS does not know identity for %s" % target_hash), 0)
@@ -6545,9 +6492,8 @@ class sHadesClientApp(MDApp):
             pass
 
     def on_stop(self):
-        # v0.28: push replaced the poller/streamer/presence-fetcher; only
-        # the presence ping loop remains to stop.
-        self._announce_stop.set()
+        # v0.28: push replaced the poller/streamer/presence-fetcher.
+        # v0.29: nothing pings, so there is no tick loop left to stop.
         # close any open console sessions so they don't idle out server-side.
         # Each term_close() blocks on the RNS link for up to the request
         # timeout, so doing them inline freezes shutdown for N * timeout
