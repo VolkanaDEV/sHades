@@ -103,6 +103,76 @@ def main():
     out = sHades.serve_blob_file("/file/blobs/../../etc/passwd", None, "r", "L", identity, sHades.now())
     check("serve_blob_file rejects traversal-ish names", out == b"not found", out)
 
+    # ---------- chunked uploads: init -> offset slices -> finish ----------
+    # tay (v0.29-c): "The payload should be maximum of 10mb & automatically
+    # chunked, not timer based." The ack carries next_offset; the sender is
+    # data-driven, the server never waits on a timer.
+    upb = bytes(range(256)) * 600          # 153,600 bytes
+    updigest = hashlib.sha256(upb).hexdigest()[:32]
+    st = call("/api/v1/blobs/put/init", {"name": "up.bin", "mime": "application/octet-stream",
+                                         "size": len(upb)})
+    check("upload init issues session + chunk size",
+          st.get("ok") == 1 and len(st.get("upload_id", "")) == 32
+          and st.get("chunk_size") == sHades.BLOB_UPLOAD_CHUNK, st)
+    uid = st.get("upload_id", "")
+    STEP = st["chunk_size"]
+    acks = []
+    for off in range(0, len(upb), STEP):
+        piece = upb[off:off + STEP]
+        r = call("/api/v1/blobs/put/chunk", {"upload_id": uid, "offset": off,
+                                             "data_b64": b64(piece)})
+        acks.append(r)
+    check("every chunk acked with correct next_offset",
+          all(r["ok"] == 1 and r["next_offset"] == min(off + STEP, len(upb))
+              for r, off in zip(acks, range(0, len(upb), STEP))), acks[-1])
+    final_r = acks[-1]
+    check("last chunk flagged eof", final_r.get("eof") is True, final_r)
+    fin = call("/api/v1/blobs/put/finish", {"upload_id": uid})
+    check("finish returns the content digest", fin.get("ok") == 1
+          and fin.get("blob_id") == updigest, fin)
+    leg = call("/api/v1/blobs/put", {"name": "up.bin", "mime": "application/octet-stream",
+                                     "data_b64": b64(upb)})
+    check("chunked and single-shot digests agree",
+          leg.get("ok") == 1 and leg.get("blob_id") == updigest, leg)
+    back = call("/api/v1/blobs/get", {"blob_id": updigest})
+    check("uploaded blob round-trips byte-identical",
+          base64.b64decode(back["data_b64"]) == upb, len(back.get("data_b64", "")))
+
+    # retry-safety: rewriting the same offset cannot corrupt
+    st2 = call("/api/v1/blobs/put/init", {"name": "retry.bin", "size": 8,
+                                          "mime": "application/octet-stream"})
+    uid2 = st2["upload_id"]
+    call("/api/v1/blobs/put/chunk", {"upload_id": uid2, "offset": 0,
+                                     "data_b64": b64(b"XXXXXXXX")})
+    call("/api/v1/blobs/put/chunk", {"upload_id": uid2, "offset": 0,
+                                     "data_b64": b64(b"AAAA")})
+    call("/api/v1/blobs/put/chunk", {"upload_id": uid2, "offset": 4,
+                                     "data_b64": b64(b"BBBB")})
+    fin2 = call("/api/v1/blobs/put/finish", {"upload_id": uid2})
+    check("retried + out-of-order offsets finish ok",
+          fin2.get("ok") == 1 and fin2.get("size") == 8, fin2)
+    stored = call("/api/v1/blobs/get", {"blob_id": fin2.get("blob_id", ""), "offset": 0, "len": 8})
+    check("staged file content is AAAABBBB",
+          base64.b64decode(stored.get("data_b64", "")) == b"AAAABBBB", stored)
+
+    # session ownership: another identity cannot finish someone else's upload
+    st3 = call("/api/v1/blobs/put/init", {"name": "owned.bin", "size": 4,
+                                          "mime": "application/octet-stream"})
+    r = call("/api/v1/blobs/put/finish", {"upload_id": st3["upload_id"]}, ident=other)
+    check("foreign finish rejected", r.get("ok") == 0 and r.get("code") == 403, r)
+    big = call("/api/v1/blobs/put/init", {"name": "big.bin", "mime": "application/octet-stream",
+                                          "size": sHades.MAX_BLOB_SZ + 1})
+    check("over-cap payload rejected at init",
+          big.get("ok") == 0 and big.get("code") == 413
+          and "10 MB" in big.get("error", ""), big)
+    bad = call("/api/v1/blobs/put/chunk", {"upload_id": st3["upload_id"], "offset": 2,
+                                           "data_b64": b64(b"XXXX")})
+    check("chunk overrunning declared size rejected",
+          bad.get("ok") == 0 and bad.get("code") == 400, bad)
+    missing = call("/api/v1/blobs/put/finish", {"upload_id": "z" * 32})
+    check("finish on unknown upload_id -> 404",
+          missing.get("ok") == 0 and missing.get("code") == 404, missing)
+
     # ---------- v1 post: inline + blob-referenced attachments ----------
     sHades.reset_for_tests() if hasattr(sHades, "reset_for_tests") else None
     call("/api/v1/stream/subscribe", {"channel": cid_chat})
