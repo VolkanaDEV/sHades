@@ -71,6 +71,7 @@ try:
     from kivy.uix.button import Button
     from kivy.uix.textinput import TextInput
     from kivy.uix.widget import Widget
+    from kivy.uix.slider import Slider
     from kivy.graphics import Color, Ellipse, Line, Rectangle
     from kivy.metrics import dp, sp
     KIVY = True
@@ -192,6 +193,109 @@ def _boot_hide():
     if lbl is not None and lbl.parent is not None:
         lbl.parent.remove_widget(lbl)
     _boot_label["ref"] = None
+
+
+class _AudioAttachRow(BoxLayout):
+    """Embedded audio attachment row (tay, v0.30): play/pause/stop,
+    download and volume controls around the sound itself, rendered inside
+    the message bubble. Playback delegates to the app's _play_audio():
+    Android MediaPlayer when on device, kivy SoundLoader on desktop
+    (desktop pause is stop-then-restart; the mixer backend has no pause)."""
+
+    def __init__(self, path="", name="", size=0, player=None, **kw):
+        super().__init__(orientation="horizontal", size_hint_y=None,
+                         height=dp(40), spacing=dp(6), **kw)
+        self._path = path
+        self._player = player
+        self._playing = False
+        self._paused = False
+        short = (name or "audio")[:28]
+        self.add_widget(Label(
+            text="[audio] %s (%d KB)" % (short, size // 1024),
+            size_hint_x=1, font_size=sp(12), color=(0.7, 0.73, 0.77, 1)))
+        self.btn_play = Button(text="play", size_hint_x=None, width=dp(56),
+                               font_size=sp(11))
+        self.btn_play.bind(on_release=self._toggle)
+        self.add_widget(self.btn_play)
+        self.btn_stop = Button(text="stop", size_hint_x=None, width=dp(48),
+                               font_size=sp(11))
+        self.btn_stop.bind(on_release=self._stop)
+        self.add_widget(self.btn_stop)
+        self.btn_save = Button(text="save", size_hint_x=None, width=dp(52),
+                               font_size=sp(11))
+        self.btn_save.bind(on_release=self._report)
+        self.add_widget(self.btn_save)
+        self.vol = Slider(min=0, max=1, value=0.8, size_hint_x=None,
+                          width=dp(80))
+        self.vol.bind(value=self._volume)
+        self.add_widget(self.vol)
+
+    def _toggle(self, w=None):
+        p = self._player
+        if not p:
+            return
+        mp = getattr(p, "_audio_media", None)
+        if self._playing and mp is not None:
+            try:
+                if hasattr(mp, "pause"):
+                    mp.pause()
+                    self._paused = True
+                else:
+                    mp.stop()
+                    p._audio_media = None
+                    self._playing = False
+            except Exception:
+                pass
+            self.btn_play.text = "play"
+        elif self._paused and mp is not None:
+            try:
+                mp.start()
+                self._playing = True
+                self._paused = False
+            except Exception:
+                pass
+            self.btn_play.text = "pause"
+        else:
+            if p._play_audio(self._path) is not None:
+                self._playing = True
+                self._paused = False
+                self.btn_play.text = "pause"
+
+    def _stop(self, w=None):
+        p = self._player
+        self._playing = False
+        self._paused = False
+        if p:
+            mp = getattr(p, "_audio_media", None)
+            if mp is not None:
+                try:
+                    mp.stop()
+                    rel = getattr(mp, "release", None)
+                    if rel:
+                        rel()
+                except Exception:
+                    pass
+                p._audio_media = None
+        self.btn_play.text = "play"
+
+    def _report(self, w=None):
+        p = self._player
+        if p:
+            p._set_status("audio in app storage: %s"
+                          % os.path.basename(self._path or "attachment"))
+
+    def _volume(self, w=None, v=0.8):
+        p = self._player
+        mp = getattr(p, "_audio_media", None) if p else None
+        if mp is None:
+            return
+        try:
+            if hasattr(mp, "setVolume"):
+                mp.setVolume(float(v), float(v))
+            elif hasattr(mp, "volume"):
+                mp.volume = float(v)
+        except Exception:
+            pass
 
 
 import RNS  # noqa: E402  (after the guarded kivy/diagnostics block, by design)
@@ -3417,53 +3521,144 @@ class sHadesClientApp(MDApp):
         self._popup = popup
         popup.open()
 
+    ATT_MEDIA_IMAGE = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+    ATT_MEDIA_AUDIO = (".mp3", ".ogg", ".wav", ".flac", ".m4a", ".opus",
+                       ".oga", ".mp2", ".aac")
+    ATT_MEDIA_VIDEO = (".mp4", ".webm", ".mkv", ".mov", ".avi", ".ogv")
+
+    @staticmethod
+    def _attachment_kind(name, mime=None):
+        """Classify an attachment name (+optional mime) into
+        image / audio / video / file. One decision site for embeds and
+        for the player row; the send side (mimetypes) and the render side
+        share it. Video is download-only for now (v0.30): embedded video
+        playback needs ffpyplayer in the build or a native surface -- a
+        deliberate follow-up, named for tay, not smuggled in."""
+        n = (name or "").lower()
+        ext = os.path.splitext(n)[1]
+        if m := (mime or "").lower():
+            if m.startswith("image/"):
+                return "image"
+            if m.startswith("audio/") or "ogg" in m:
+                return "audio"
+            if m.startswith("video/"):
+                return "video"
+            if m in ("application/ogg",):
+                return "audio"
+        if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
+            return "image"
+        if ext in (".mp3", ".ogg", ".wav", ".flac", ".m4a", ".opus",
+                   ".oga", ".mp2", ".aac"):
+            return "audio"
+        if ext in (".mp4", ".webm", ".mkv", ".mov", ".avi", ".ogv"):
+            return "video"
+        return "file"
+
     def _add_attachment_embed(self, row, name, blob):
-        """Render one attachment: images inline, everything else as a label."""
-        print(
-            f"[TRACE] _add_attachment_embed: name={name} "
-            f"blob_size={len(blob)} ext={os.path.splitext(name)[1].lower()}",
-            flush=True)
+        """Render one attachment. tay's v0.30 spec: images render inline, or
+        audio as play/pause/stop, download, volume and the stream itself
+        embedded; video and other files present as tappable download rows
+        (embedded video playback is a named follow-up, not hidden)."""
         dlog(
             f"_add_attachment_embed: name={name} "
             f"blob_size={len(blob)} ext={os.path.splitext(name)[1].lower()}")
-        ext = os.path.splitext(name)[1].lower()
-        if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
-            import tempfile
-            tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
-            tmp.write(blob)
-            tmp.close()
-            emb = MessageEmbed(source=tmp.name, size_hint_y=None, height=dp(200))
-            row.ids.embed_container.add_widget(emb)
-        elif ext in (".mp3", ".ogg", ".wav", ".flac"):
-            row.ids.embed_container.add_widget(
-                Label(
-                    text="[audio] " + name,
-                    size_hint_y=None,
-                    height=dp(20),
-                    color=(0.7, 0.73, 0.77, 1),
-                    font_size=sp(12),
-                )
-            )
-        elif ext in (".mp4", ".webm"):
-            row.ids.embed_container.add_widget(
-                Label(
-                    text="[video] " + name,
-                    size_hint_y=None,
-                    height=dp(20),
-                    color=(0.7, 0.73, 0.77, 1),
-                    font_size=sp(12),
-                )
-            )
+        kind = self._attachment_kind(name)
+        container = row.ids.embed_container
+        path = self._save_attachment_blob(blob, name)
+        if kind == "image":
+            source = path
+            if not source:
+                import tempfile
+                tmp = tempfile.NamedTemporaryFile(suffix=os.path.splitext(name)[1] or ".png",
+                                                  delete=False)
+                tmp.write(blob)
+                tmp.close()
+                source = tmp.name
+            emb = MessageEmbed(source=source,
+                               size_hint_y=None, height=dp(200))
+            emb.bind(on_release=lambda w, n=name: self._status(
+                "%s (%d KB)" % (n, len(blob) // 1024)))
+            container.add_widget(emb)
+        elif kind == "audio":
+            container.add_widget(
+                _AudioAttachRow(path=path, name=name, size=len(blob),
+                                player=self))
         else:
-            row.ids.embed_container.add_widget(
-                Label(
-                    text="[file] " + name,
-                    size_hint_y=None,
-                    height=dp(20),
-                    color=(0.7, 0.73, 0.77, 1),
-                    font_size=sp(12),
-                )
+            # video + every other file: tappable download row
+            lbl = Label(
+                text="[file] %s -- tap to (%d KB) save" % (name, len(blob) // 1024)
+                if kind == "file" else
+                "[video] %s -- tap to (%d KB) save" % (name, len(blob) // 1024),
+                size_hint_y=None,
+                height=dp(20),
+                color=(0.7, 0.73, 0.77, 1),
+                font_size=sp(12),
+                markup=True,
             )
+            lbl.bind(on_touch_down=self._download_tap(
+                name, blob, getattr(row, "msg_id", None)))
+            container.add_widget(lbl)
+
+    def _download_tap(self, name, blob, msg_id):
+        """Touch handler for tap-to-save attachment rows: saves the bytes
+        into the app attachments dir and names where in the status line."""
+
+        def handler(widget, touch):
+            if widget.collide_point(*touch.pos) and touch.button == "left":
+                self._save_and_report(name, blob, widget)
+                return True
+            return False
+        return handler
+
+    def _save_and_report(self, name, blob, widget=None):
+        path = self._save_attachment_blob(blob, name)
+        if path:
+            self._set_status("saved %s to app storage (%d KB)"
+                             % (name, len(blob) // 1024))
+        else:
+            self._set_status("save failed for %s" % name)
+
+    def _play_audio(self, path):
+        """Play an embedded sound file (tay's v0.30 player spec):
+        android uses the platform MediaPlayer (play/pause/stop/volume
+        real); desktop builds fall back to kivy SoundLoader (load,
+        play/stop/volume with pause as best effort). One active sound
+        at a time: starting a new one stops the previous."""
+        try:
+            import platform as _pf
+            old = getattr(self, "_audio_media", None)
+            if old is not None:
+                try:
+                    old.stop()
+                    old.release()
+                except Exception:
+                    pass
+                self._audio_media = None
+            if _pf.system() == "Android":
+                from jnius import autoclass
+                MediaPlayer = autoclass("android.media.MediaPlayer")
+                mp = MediaPlayer()
+                # load from the app dir; MediaPlayer.setDataSource wants a
+                # file descriptor for sandboxed paths (no root, SAF law)
+                FileInputStream = autoclass("java.io.FileInputStream")
+                fd = FileInputStream(path).getFD()
+                mp.setDataSource(fd)
+                mp.prepare()
+                mp.start()
+                self._audio_media = mp
+            else:
+                from kivy.core.audio import SoundLoader
+                snd = SoundLoader.load(path)
+                if snd is None:
+                    self._set_status("audio format not loadable on desktop")
+                    return None
+                snd.play()
+                self._audio_media = snd
+            return self._audio_media
+        except Exception as e:
+            dlog("audio play failed: %r" % (e,))
+            self._set_status("audio play failed: %s" % str(e)[:48])
+            return None
 
     def _fetch_attachment(self, row, msg_id, att):
         """Download an attachment blob from the guild and render it.

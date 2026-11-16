@@ -205,9 +205,42 @@ def test_shutdown_not_blocking():
           dt < 3.0, "blocked for %.2fs (3 sessions)" % dt)
 
 
+def test_attachment_kind_classifier():
+    """One decision site governs embeds (tay v0.30): images inline, audio
+    player row, video download-only for now, everything else file row."""
+    k = kc.sHadesClientApp._attachment_kind
+    cases = (
+        ("photo.jpg", "image"),
+        ("scan.PNG", "image"),
+        ("blob.webp", "image"),
+        ("song.mp3", "audio"),
+        ("voice.ogg", "audio"),
+        ("note.wav", "audio"),
+        ("book.m4a", "audio"),
+        ("clip.mp4", "video"),
+        ("screen.webm", "video"),
+        ("take.mov", "video"),
+        ("report.pdf", "file"),
+        ("data.csv", "file"),
+        ("noext", "file"),
+    )
+    for name, want in cases:
+        got = k(name)
+        check("kind(%s) == %s" % (name, want), got == want, got)
+    # mime wins over extension ambiguity
+    check("mime audio overrides ext", k("weird.bin", "audio/mpeg") == "audio",
+          k("weird.bin", "audio/mpeg"))
+    check("mime video overrides ext", k("weird.bin", "video/mp4") == "video",
+          k("weird.bin", "video/mp4"))
+    check("application/ogg counts as audio",
+          k("stream.ogg", "application/ogg") == "audio",
+          k("stream.ogg", "application/ogg"))
+
+
 def main():
     for fn in (test_display_name_preserved,
                test_update_applied_once,
+               test_attachment_kind_classifier,
                test_admin_panel_not_blocking,
                test_roles_popup_not_blocking,
                test_shutdown_not_blocking):
