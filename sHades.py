@@ -2090,6 +2090,31 @@ def api_v1_blobs_get(viewer, data, link_id):
             "eof": offset + len(chunk) >= total,
             "data_b64": base64.b64encode(chunk).decode("ascii")}
 
+@api_route("/api/v1/att/get")
+@wrap_json_api
+def api_v1_att_get(viewer, data, link_id):
+    """Chunked attachment read: {path, offset?, len?} -> {data_b64,
+    total, offset, eof}. The chunked-reader shape of /api/v1/blobs/get,
+    keyed by the attachment's /file/attachments/<fname> path.
+
+    Receipt: single-shot attachment fetches hold the entire payload on
+    one link receipt with a 15s deadline; a real multi-MB attachment
+    from a remote hub overruns the deadline and the embed spins with no
+    error surfaced. Stored attachments carry no blob_id in their
+    metadata (ingest copies the blob into the attachments dir), so a
+    path-keyed slice endpoint is what the receive path can use."""
+    fname = ((data.get("path") or "").rsplit("/", 1)[-1]).strip()
+    if not re.match(r"^[0-9a-f]{32}\.[a-z0-9]{1,8}$", fname):
+        return {"ok": 0, "error": "unknown path", "code": 404}
+    offset, length = _chunk_params(data)
+    total, chunk = _read_slice(
+        os.path.join(STORAGE, "attachments", fname), offset, length)
+    if total is None:
+        return {"ok": 0, "error": "attachment unreadable", "code": 404}
+    return {"ok": 1, "path": "/file/attachments/" + fname, "total": total,
+            "offset": offset, "eof": offset + len(chunk) >= total,
+            "data_b64": base64.b64encode(chunk).decode("ascii")}
+
 def serve_blob_file(path, data, request_id, link_id, remote_identity, requested_at):
     """Raw /file/blobs/<fname> handler (one per stored blob, attachments
     pattern). Path is the registration key; validate before touching disk."""

@@ -19,6 +19,7 @@ import sys
 import time
 import functools
 import tempfile
+import base64
 
 os.environ.setdefault("KIVY_GL_BACKEND", "mock")
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -70,6 +71,7 @@ class StubGuild:
         self.files = files or {}
         self.posted = []
         self.uploads = []
+        self.att_calls = []
 
     def post(self, channel, content, attachments=None):
         self.posted.append((channel, content, attachments))
@@ -91,6 +93,16 @@ class StubGuild:
                              "data": bytes(data)})
         return {"ok": 1, "blob_id": blob_id, "size": len(data),
                 "path": "/file/blobs/%s" % blob_id}
+
+    def att_get(self, path, offset=0, length=None):
+        # stand-in for the chunked reader, slicing out of the fake store:
+        # the offset echoes drive the client exactly like the wire does
+        self.att_calls.append((path, offset))
+        data = self.files.get(path) or b""
+        chunk = data[offset:offset + 100000]
+        return {"ok": 1, "path": path, "total": len(data),
+                "offset": offset, "eof": offset + len(chunk) >= len(data),
+                "data_b64": base64.b64encode(chunk).decode("ascii")}
 
     def avatar_get(self, user_hash):
         return {"ok": 0}
@@ -275,6 +287,43 @@ def main():
     check("optimistically rendered message shows the attachment",
           len(row4.ids.embed_container.children) == 1,
           "%d embeds in row" % len(row4.ids.embed_container.children))
+
+    # --- 6. big attachments walk the chunked reader ----------------------
+    # (v0.31: one receipt per slice, offset-driven, not one 15s deadline
+    #  for the whole file; the full bytes land in app storage byte-equal)
+    big = b"A" * 100000 + b"B" * 100000
+    grid6 = GridLayout(cols=1)
+    app6 = StubApp(kc, grid6,
+                   files={"/file/attachments/big.txt": big})
+    m6 = {"msg_id": "m-6", "author_hash": "a1", "username": "tester",
+          "content": "big file", "ts": 0,
+          "attachments": [{"name": "big.txt", "mime": "text/plain",
+                           "size": len(big),
+                           "path": "/file/attachments/big.txt"}]}
+    kc.sHadesClientApp._render_message(app6, grid6, m6)
+    row6 = grid6.children[0]
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        Clock.tick()
+        if len(row6.ids.embed_container.children) == 1:
+            break
+        time.sleep(0.02)
+    check("large attachment walks att_get slice by slice",
+          len(app6.guild_api.att_calls) >= 2
+          and app6.guild_api.att_calls[0][1] == 0
+          and app6.guild_api.att_calls[1][1] == 100000,
+          repr(app6.guild_api.att_calls))
+    saved = None
+    if os.path.isdir(app6._attach_dir):
+        for nm in os.listdir(app6._attach_dir):
+            if "big" in nm:
+                saved = os.path.join(app6._attach_dir, nm)
+    check("chunked fetch assembles the full payload, byte-equal",
+          bool(saved) and open(saved, "rb").read() == big,
+          ("no saved file" if not saved else "mismatch"))
+    check("large attachment renders its embed",
+          len(row6.ids.embed_container.children) == 1,
+          "%d embeds in row6" % len(row6.ids.embed_container.children))
 
     print()
     print("%d passed, %d failed" % (len(PASS), len(FAIL)))

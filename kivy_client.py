@@ -772,6 +772,16 @@ class GuildAPI:
             data["len"] = length
         return self._request_json("/api/v1/blobs/get", data)
 
+    def att_get(self, path, offset=0, length=None):
+        """Chunked attachment read (v0.31). Returns {data_b64, total,
+        offset, eof} for a /file/attachments/... path — the same slice
+        machinery as blobs_get, keyed by the path the server puts in
+        message metadata."""
+        data = {"path": path, "offset": offset}
+        if length is not None:
+            data["len"] = length
+        return self._request_json("/api/v1/att/get", data, timeout=15)
+
     def site_get(self, channel, path, offset=0, length=None):
         """Chunked site resource read (micron pages, images, media)."""
         data = {"channel": channel, "path": path, "offset": offset}
@@ -3740,6 +3750,42 @@ class sHadesClientApp(MDApp):
             self._set_status("audio play failed: %s" % str(e)[:48])
             return None
 
+    def _att_get_chunked(self, path):
+        """Download a stored attachment in server-side slices.
+
+        Receipted mechanics (v0.31): the receive path's single-shot
+        request carries one receipt and one deadline; attachments
+        fetched with size > 128 KB walk /api/v1/att/get instead, one
+        slice per request, each with its own deadline, loop driven by
+        the server's {offset, eof} echoes the same way the upload loop
+        follows its acks. A slice failure raises with the phase named;
+        nothing here is a timer-based retry."""
+        api = self.guild_api
+        if not api:
+            raise OSError("attachment fetch: no guild link")
+        blob = b""
+        off = 0
+        for _ in range(64):          # 64 slices x slice cap >> 10 MB law
+            res = api.att_get(path, off)
+            if not res.get("ok"):
+                raise OSError("attachment slice %d failed: %s"
+                              % (off, res.get("error") or res.get("code")
+                                 or "unknown"))
+            chunk = base64.b64decode(res.get("data_b64") or "")
+            if not chunk:
+                if res.get("eof"):
+                    return blob
+                raise OSError("attachment slice %d empty" % off)
+            blob += chunk
+            off += len(chunk)
+            total = res.get("total")
+            if total is not None and off >= total:
+                return blob
+            if res.get("eof"):
+                return blob
+        raise OSError("attachment fetch exceeded 64 slices at offset %d"
+                      % off)
+
     def _fetch_attachment(self, row, msg_id, att):
         """Download an attachment blob from the guild and render it.
 
@@ -3768,8 +3814,18 @@ class sHadesClientApp(MDApp):
             Clock.schedule_once(
                 lambda dt: self._set_status(
                     "attachment: fetching %s ..." % name), 0)
+            # v0.31: big attachments download in server-side slices, the
+            # same chunk shape as the upload law: one receipt per slice
+            # with its own deadline instead of the whole file on a single
+            # 15s receipt that a multi-MB transfer is guaranteed to
+            # overrun (receipted: the embed spun forever, no error).
+            # Small attachments keep the single-shot path; every slice
+            # failure still surfaces by name.
             try:
-                blob = self.guild_api.fetch_file(path)
+                if int(att.get("size") or 0) > 128 * 1024:
+                    blob = self._att_get_chunked(path)
+                else:
+                    blob = self.guild_api.fetch_file(path)
             except Exception as e:
                 blob = None
                 dlog("_fetch_attachment.work: fetch raised %r" % (e,))
