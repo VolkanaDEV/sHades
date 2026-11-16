@@ -69,10 +69,28 @@ class StubGuild:
     def __init__(self, files=None):
         self.files = files or {}
         self.posted = []
+        self.uploads = []
 
     def post(self, channel, content, attachments=None):
         self.posted.append((channel, content, attachments))
         return {"ok": 1, "msg_id": "sent-1"}
+
+    def post_v1(self, channel, content, attachments=None):
+        self.posted.append((channel, content, attachments))
+        return {"ok": 1, "msg_id": "sent-v1",
+                "attachments": [{"name": "notes.txt", "mime": "text/plain",
+                                 "size": 5,
+                                 "path": "/file/attachments/notes.txt"}]}
+
+    def blobs_put(self, name, mime, data):
+        # stand-in for the chunked uploader: one blob_id per call, bytes
+        # recorded so the test can prove WHERE the payload moved
+        blob_id = "bl0b" + str(len(self.uploads))
+        self.uploads.append({"blob_id": blob_id, "name": name,
+                             "mime": mime, "size": len(data),
+                             "data": bytes(data)})
+        return {"ok": 1, "blob_id": blob_id, "size": len(data),
+                "path": "/file/blobs/%s" % blob_id}
 
     def avatar_get(self, user_hash):
         return {"ok": 0}
@@ -223,9 +241,13 @@ def main():
           len(row3.ids.embed_container.children) == 1,
           "%d embeds in row" % len(row3.ids.embed_container.children))
 
-    # --- 4. optimistic send keeps the attachment shape --------------------
+    # --- 4. attachment send moves bytes through the chunked uploader ------
+    # (tay's v0.30 law, receipted on the MTU failure: the blob never rides
+    #  the message packet; init/chunk/finish moves it, the post carries a
+    #  blob_id reference, and the render uses the server's path metadata)
     grid4 = GridLayout(cols=1)
-    app4 = StubApp(kc, grid4)
+    app4 = StubApp(kc, grid4,
+                   files={"/file/attachments/notes.txt": b"hello"})
     app4.root.get_screen("main").ids.msg_input.text = "with file"
     app4._pending_attachment = ["notes.txt", "text/plain", b"hello"]
     kc.sHadesClientApp.send_message(app4)
@@ -236,10 +258,18 @@ def main():
             break
         time.sleep(0.05)
     posted = app4.guild_api.posted[0] if app4.guild_api.posted else None
-    check("send posts the attachment as [name, mime, blob]",
-          posted is not None and posted[2] == [["notes.txt", "text/plain",
-                                               b"hello"]],
-          posted)
+    uploaded = app4.guild_api.uploads
+    check("attachment send uploaded the bytes via blobs_put first",
+          len(uploaded) == 1 and uploaded[0]["data"] == b"hello"
+          and uploaded[0]["name"] == "notes.txt",
+          repr(uploaded))
+    check("send posts a blob_id reference, not inline bytes",
+          posted is not None and isinstance(posted[2], list) and posted[2]
+          and isinstance(posted[2][0], dict)
+          and posted[2][0].get("blob_id") == (uploaded[0]["blob_id"]
+                                              if uploaded else "?")
+          and posted[2][0].get("name") == "notes.txt",
+          repr(posted))
     Clock.tick()
     row4 = grid4.children[0]
     check("optimistically rendered message shows the attachment",

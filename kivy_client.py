@@ -5154,22 +5154,45 @@ class sHadesClientApp(MDApp):
             return
         cid = self._channel_cid(cid)
         inp.text = ""
+        # Capture ONCE here (main thread): a second send during this
+        # worker's flight must not mutate what this one posts.
+        att = getattr(self, "_pending_attachment", None)
 
         def work():
-            res = self.guild_api.post(cid, text,
-                                      attachments=[self._pending_attachment]
-                                      if getattr(self, "_pending_attachment",
-                                                 None) else None)
+            atts_req = None
+            atts_render = None
+            if att:
+                name, mime, blob = att
+                # v0.30: the blob NEVER rides the message packet. Inline
+                # triples exceed the link packet budget (receipt: tay,
+                # "packet size of 515 exceeds mtu of 500") -- the chunked
+                # blob API moves every byte; the post carries a reference.
+                up = self.guild_api.blobs_put(name, mime, blob)
+                if not up.get("ok"):
+                    Clock.schedule_once(
+                        lambda dt: self._set_status(
+                            "attach upload failed (%s): %s"
+                            % (up.get("phase", "init"),
+                               up.get("error", "unknown"))[:80]), 0)
+                    return
+                atts_req = [{"blob_id": up.get("blob_id"),
+                             "name": name, "mime": mime}]
+            if atts_req:
+                res = self.guild_api.post_v1(cid, text, attachments=atts_req)
+                # the server answers with stored metadata (name, mime,
+                # size, path) and no bytes -- the optimistic render is the
+                # same shape push delivers to everyone else, so it renders
+                # lazily through _fetch_attachment just like received rows
+                atts_render = res.get("attachments") or None
+            else:
+                res = self.guild_api.post(cid, text)
             if res.get("ok"):
                 # optimistically show
                 msg_id = res.get("msg_id")
                 m = {"msg_id": msg_id, "author_hash": self.my_hash,
                      "username": self.username, "content": text,
                      "ts": now(), "channel_id": cid,
-                     # one attachment = [name, mime, blob]; the list holds
-                     # those triples, matching the guild's ingest format
-                     "attachments": [self._pending_attachment]
-                     if getattr(self, "_pending_attachment", None) else None}
+                     "attachments": atts_render}
                 Clock.schedule_once(lambda dt: self._render_message(
                     main.ids.message_grid, m), 0)
                 self._pending_attachment = None
