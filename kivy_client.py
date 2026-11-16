@@ -6359,7 +6359,21 @@ class sHadesClientApp(MDApp):
             while attempt < 2:
                 try:
                     res = self.guild_api.avatar_upload(blob)
-                    if res and res.get("ok") and not res.get("unconfirmed"):
+                    confirmed = bool(res and res.get("ok")
+                                     and not res.get("unconfirmed"))
+                    if not confirmed and res and res.get("unconfirmed"):
+                        # A bool receipt carries nothing pollable; do NOT
+                        # retry blind (that re-uploads and can double-send).
+                        # Verify by reading the avatar back from the guild;
+                        # only a real state mismatch counts as failure.
+                        try:
+                            got = self.guild_api.avatar_get(self.my_hash or "")
+                            confirmed = (got or {}).get("avatar") == blob
+                            if not confirmed:
+                                last = "read-back mismatch"
+                        except Exception as e:
+                            last = str(e)[:48]
+                    if confirmed:
                         def ok(dt):
                             self._set_status("Avatar updated (%d KB)"
                                              % (len(blob) // 1024))

@@ -380,6 +380,17 @@ def main():
         r = api("/api/avatar_get", {"user": hexstr(client_dest.hash)})
         check("avatar roundtrip", r.get("avatar") == png, r)
 
+        # ---- avatar at realistic size: multi-packet request data over the
+        # same link while push frames flow (v0.29 world, tay's phone case)
+        big_png = b"\x89PNG\r\n\x1a\n" + b"p" * 6144
+        r = api("/api/avatar", {"avatar": big_png})
+        check("realistic-size avatar accepted", r.get("ok") == 1, r)
+        r = api("/api/avatar_get", {"user": hexstr(client_dest.hash)})
+        check("realistic-size avatar round-trips", r.get("avatar") == big_png, len(r.get("avatar") or b""))
+        r = api("/api/avatar", {"avatar": b"x" * (65 * 1024)})
+        check("over-cap avatar rejected with named error",
+              r.get("ok") == 0 and r.get("code") == 413, r)
+
         # ================= PRESENCE: ping-driven active users =================
         # The client's node_hash is the hash of its own nomadnetwork.node
         # destination; the guild keys presence by the *user* hash it derives
