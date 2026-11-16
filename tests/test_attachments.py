@@ -142,6 +142,11 @@ class StubApp:
         self._attachments_dir = lambda: self._attach_dir
         self._save_attachment_blob = functools.partial(
             kivy_client.sHadesClientApp._save_attachment_blob, self)
+        # v0.31: _fetch_attachment calls _att_get_chunked for large
+        # attachments; the stub must bind it or the real method resolves
+        # to nothing and the chunk branch dies in the fetch try/except
+        self._att_get_chunked = functools.partial(
+            kivy_client.sHadesClientApp._att_get_chunked, self)
         # v0.30 non-image branch: tap-to-save rows bind through these two;
         # the handler runs only on taps, but the bind itself happens at
         # render time, so the stub must carry them
