@@ -113,9 +113,13 @@ MODERATORS    = set()             # canonical user hashes; seeded from moderator
 ADMIN_USERS   = set()             # canonical user hashes; seeded from admin.txt at boot
 NODE_REGISTRY = {}                # node_hash -> {address, port, last_seen}
 NODE_REGISTRY_LOCK = threading.Lock()
-NODE_ANNOUNCE_INTERVAL = 4.0      # clients re-register (ping) this often
-NODE_MISS_LIMIT = 2               # miss this many consecutive announcements → drop
-NODE_STALE_S = NODE_ANNOUNCE_INTERVAL * NODE_MISS_LIMIT   # 8.0 s
+# Presence is link-derived (v0.29): a user is online iff at least one of their
+# guild links is ACTIVE. RNS monitors link health with its own keepalives and
+# teardowns -- the "pings baked in" -- so no application-layer heartbeat runs
+# on top. ONLINE_LINKS maps link_id -> user_hash, bound on every API request
+# (the request's remote_identity is the proof of who is behind the link).
+ONLINE_LINKS = {}                 # link_id -> user_hash
+ONLINE_LINKS_LOCK = threading.Lock()
 
 # Stream state for the JSON API. One subscription per link: subscribing to a
 # channel replaces whatever that link was streaming, which is what makes
@@ -233,6 +237,10 @@ def ensure_channel(name, kind="chat"):
                    (cid, name, time.time(), kind if kind in CHANNEL_KINDS else "chat"))
         db.execute("INSERT OR IGNORE INTO channel_state (channel_id, seq) VALUES (?, 0)", (cid,))
         db.commit()
+        # v0.28: a NEW channel must reach stream subscribers (the 3s state
+        # poller that used to notice renames/creates is being deleted);
+        # name changes ride the same event.
+        _emit_event(cid, "channels_changed", {"channel": name}, guild_wide=True)
     return cid
 
 def channel_name(cid):
@@ -548,29 +556,39 @@ def load_role_seeds(storage):
                     _assign_role(line, role_id)
 
 def _reap_stale_nodes():
-    """Drop NODE_REGISTRY entries whose last_seen is older than NODE_STALE_S,
-    i.e. the client missed NODE_MISS_LIMIT consecutive 4s announcements.
+    """Presence sweep (v0.29): derive presence from link liveness.
 
-    The presence event fires when a user loses their LAST node — comparing
-    online-set snapshots around the deletion can't see the transition: by the
-    time the reaper runs, the entries it drops are already too stale to be
-    'online' from the snapshot's point of view."""
-    cutoff = now() - NODE_STALE_S
-    stale = []
-    gone_users = set()
+    A binding whose link is no longer in RNS.Transport.active_links is
+    dropped; directory entries for users with no live link go with them
+    (the node is unreachable). Presence transitions fire exactly once --
+    comparing the derived online set around the prune -- and stream as
+    guild-wide presence events. Previously every client had to re-register
+    every 4 seconds so an 8s timer could guess liveness; RNS keepalives
+    and teardowns already do that job."""
+    before = set(online_users())
+    active = {l.link_id for l in list(RNS.Transport.active_links)
+              if l.status == RNS.Link.ACTIVE}
+    with ONLINE_LINKS_LOCK:
+        for lid in [lid for lid in ONLINE_LINKS if lid not in active]:
+            del ONLINE_LINKS[lid]
+        live_users = set(ONLINE_LINKS.values())
+    with SUB_LOCK:
+        for lid in [lid for lid in SUBSCRIPTIONS if lid not in active]:
+            s = SUBSCRIPTIONS.pop(lid)
+            cur = SUB_BY_USER.get(s["user_hash"])
+            if cur and cur.get("link_id") == lid:
+                del SUB_BY_USER[s["user_hash"]]
     with NODE_REGISTRY_LOCK:
         stale = [h for h, e in list(NODE_REGISTRY.items())
-                 if e["last_seen"] < cutoff]
+                 if e.get("user_hash") not in live_users]
         if stale:
-            gone_users = {NODE_REGISTRY[h].get("user_hash") for h in stale}
             for h in stale:
                 del NODE_REGISTRY[h]
-                RNS.log("dropped stale node %s (missed %d consecutive announcements)"
-                        % (h[:12], NODE_MISS_LIMIT), RNS.LOG_NOTICE)
-            gone_users -= {e.get("user_hash") for e in NODE_REGISTRY.values()}
-    if gone_users:
-        # users just went offline — guild-wide event for every streamer
-        _emit_event(None, "presence", {"users": _presence_payload()}, guild_wide=True)
+                RNS.log("dropped node %s (link down)" % h[:12], RNS.LOG_NOTICE)
+    after = set(online_users())
+    if after != before:
+        _emit_event(None, "presence", {"users": _presence_payload()},
+                    guild_wide=True)
     return stale
 
 def _node_reaper():
@@ -582,13 +600,13 @@ def _node_reaper():
             RNS.log("node reaper error: %s" % e, RNS.LOG_ERROR)
 
 def online_users():
-    """The active user list, derived from the client ping registry.
+    """The active user list, derived from guild link liveness (v0.29).
 
-    Presence is *read out of* NODE_REGISTRY rather than kept in a second table:
-    every client re-registers every NODE_ANNOUNCE_INTERVAL seconds (its IRC-style
-    ping), and _node_reaper drops an entry that misses NODE_MISS_LIMIT consecutive
-    pings. Deriving presence from that single structure means it prunes for free
-    and can never disagree with the reaper.
+    A user is online iff at least one of their guild links is in
+    RNS.Transport.active_links (RNS Link.ACTIVE -- keepalives and teardown
+    monitor the link natively). ONLINE_LINKS binds link_id -> user_hash on
+    every API request; the remote_identity on the request is the proof of
+    who is behind the link, so a binding cannot be forged.
 
     Keyed by canonical user hash (the lxmf.delivery destination hash) so the
     result joins directly against messages.author_hash / members.member_hash.
@@ -596,11 +614,12 @@ def online_users():
 
     Returns {user_hash: {user_hash, username, node_hash, last_seen}}.
     """
-    cutoff = now() - NODE_STALE_S
+    with ONLINE_LINKS_LOCK:
+        live_users = set(ONLINE_LINKS.values())
     with NODE_REGISTRY_LOCK:
         entries = [(e.get("user_hash"), h, e.get("last_seen", 0.0))
                    for h, e in NODE_REGISTRY.items()
-                   if e.get("last_seen", 0.0) >= cutoff and e.get("user_hash")]
+                   if e.get("user_hash") in live_users]
     users = {}
     for user_hash, node_hash, last_seen in entries:
         prev = users.get(user_hash)
@@ -1073,11 +1092,10 @@ def page_members(path, data, request_id, link_id, remote_identity, requested_at)
     online = online_users()
     out = [page_header()]
     out.append("> Members of #" + esc_micron_text(chan["name"]) + "\n-\n")
-    # Presence, straight from the client ping registry: everyone still pinging.
-    # Stale clients are already gone — the reaper drops a node that misses
-    # NODE_MISS_LIMIT consecutive pings, so this list prunes itself.
+    # Presence is link-derived (v0.29): everyone with a live link is here;
+    # the presence keeper prunes the list the moment a link dies.
     out.append("`!Online now`!  `F555" + str(len(online)) +
-               " pinging (guild-wide)`f\n")
+               " online (guild-wide)`f\n")
     if online:
         for u in sorted(online.values(), key=lambda u: u["username"].lower()):
             # "+" and not "*"/"_": those are Micron formatting controls, so
@@ -1087,7 +1105,7 @@ def page_members(path, data, request_id, link_id, remote_identity, requested_at)
                 out.append(" `F555(you)`f")
             out.append("\n")
     else:
-        out.append("`F555(nobody pinging)`f\n")
+        out.append("`F555(nobody online)`f\n")
     out.append("\n`!Channel history`!\n")
     for r in rows:
         out.append(("`F2a2+`f " if r["member_hash"] in online else "  ") +
@@ -1280,6 +1298,11 @@ def wrap_api(fn):
         viewer = viewer_of(remote_identity)
         if viewer is None:
             return api_error("identified link required", 401)
+        # v0.29: every identified request binds presence -- this link belongs
+        # to this user until the link dies (the presence keeper prunes it).
+        if link_id:
+            with ONLINE_LINKS_LOCK:
+                ONLINE_LINKS[link_id] = viewer
         try:
             if not isinstance(data, dict):
                 return api_error("dict payload required", 400)
@@ -1479,11 +1502,17 @@ def api_register(viewer, data):
 @api_route("/api/register_node")
 @wrap_api
 def api_register_node(viewer, data):
-    """Client registers its node address with the guild index.
+    """Client registers its node destination with the guild index (v0.29: a
+    ONE-SHOT directory write at connect, and on reconnect).
 
-    This call is also the presence ping: each client repeats it every
-    NODE_ANNOUNCE_INTERVAL seconds and the guild treats the ping as "still
-    here". data: {node_hash, address, port, identity_hash?}
+    Presence is NOT this call: presence is link liveness (the guild derives
+    it from RNS.Transport.active_links, where RNS keepalives and teardowns
+    already monitor health). data: {node_hash} — the RNS destination hash of
+    the member's nomadnetwork/node. This network is cryptographically
+    addressed: members reach a node by hash (Identity.recall + RNS.Link),
+    never by ip:port — that pair is TCP-hub transport config, not a
+    directory concern. If an older client still sends address/port they are
+    ignored. The node_hash is what profiles and the node index join on.
 
     The user identity is taken from the *identified link* the request arrived
     on (viewer = the lxmf.delivery hash derived from the requester's identity),
@@ -1492,35 +1521,28 @@ def api_register_node(viewer, data):
     isn't theirs — whereas the link identity is bound by the RNS handshake.
     """
     node_hash = (data.get("node_hash") or "").strip().lower()
-    address = (data.get("address") or "").strip()
-    port = data.get("port")
     if not node_hash or not re.match(r"^[0-9a-f]{32}$", node_hash):
         return api_error("invalid node_hash", 400)
-    if not address:
-        return api_error("address required", 400)
-    try:
-        port = int(port)
-    except (TypeError, ValueError):
-        return api_error("invalid port", 400)
     before = set(online_users())
     with NODE_REGISTRY_LOCK:
         NODE_REGISTRY[node_hash] = {
-            "address": address,
-            "port": port,
             "last_seen": now(),
             "user_hash": viewer,
         }
-    # A first ping (or the last ping before a reap) changes the online set —
-    # streamers get a guild-wide presence event so member lists update live.
+    # A first register (or a re-register after a prune) changes the online
+    # set — streamers get a guild-wide presence event so member lists live.
     _emit_presence_if_changed(before)
     return msgpack.packb({"ok": 1})
 
 @api_route("/api/lookup_node")
 @wrap_api
 def api_lookup_node(viewer, data):
-    """Look up a node's address by node_hash.
+    """Look up a node by hash. The hash is the address (RNS is
+    cryptographically addressed); the registry row exists to join the node
+    destination to the user who runs it and to state that it is registered.
     data: {node_hash}
-    Returns: {ok, address, port} or {ok: 0, error: "not found"}
+    Returns: {ok, node_hash, user_hash, last_seen} or
+             {ok: 0, error: "node not found"}
     """
     node_hash = (data.get("node_hash") or "").strip().lower()
     if not node_hash:
@@ -1529,7 +1551,9 @@ def api_lookup_node(viewer, data):
         entry = NODE_REGISTRY.get(node_hash)
     if not entry:
         return msgpack.packb({"ok": 0, "error": "node not found"})
-    return msgpack.packb({"ok": 1, "address": entry["address"], "port": entry["port"]})
+    return msgpack.packb({"ok": 1, "node_hash": node_hash,
+                          "user_hash": entry.get("user_hash"),
+                          "last_seen": entry.get("last_seen")})
 
 @api_route("/api/nodes")
 @wrap_api
@@ -1542,27 +1566,23 @@ def api_nodes(viewer, data):
 @api_route("/api/presence")
 @wrap_api
 def api_presence(viewer, data):
-    """The active user list (who is currently pinging), for member presence.
+    """The active user list (v0.29: link-derived presence).
 
-    Strictly ping-driven: the requesting client is NOT added just for asking —
-    being able to make a request is not the same as being present. A client
-    whose ping loop has died drops off this list even if it is still polling,
-    which is the point of ping-based presence. Its first ping lands at connect,
-    so a healthy client always sees itself.
+    Being able to make a request has always been strictly necessary but never
+    sufficient: presence follows the link, not the traffic. A user is online
+    iff their link to the guild is in RNS.Transport.active_links; the link
+    identity binds it to a user. A client that vanishes drops off when its
+    link dies (RNS teardown), within at most the keeper's 1s sweep, and fires
+    a presence event for every streamer when it does.
 
-    Stale users are *absent*, not flagged: the reaper has already dropped them
-    from the ping registry, so a client that stops pinging disappears from this
-    list within at most ttl seconds.
-
-    Returns {ok, users: [{user_hash, username, node_hash, last_seen}],
-             interval, ttl, now}.
+    Returns {ok, mode: "link", users: [{user_hash, username, node_hash,
+    last_seen}], now}.
     """
     users = online_users()
     return msgpack.packb({
         "ok": 1,
+        "mode": "link",
         "users": sorted(users.values(), key=lambda u: u["username"].lower()),
-        "interval": NODE_ANNOUNCE_INTERVAL,
-        "ttl": NODE_STALE_S,
         "now": now(),
     })
 
@@ -1642,6 +1662,11 @@ def wrap_json_api(fn):
         viewer = viewer_of(remote_identity)
         if viewer is None:
             return _json_resp({"ok": 0, "error": "identified link required", "code": 401})
+        # v0.29: every identified request binds presence -- this link belongs
+        # to this user until the link dies (the presence keeper prunes it).
+        if link_id:
+            with ONLINE_LINKS_LOCK:
+                ONLINE_LINKS[link_id] = viewer
         args = _json_args(data)
         if args is None:
             return _json_resp({"ok": 0, "error": "invalid JSON payload", "code": 400})
@@ -1669,6 +1694,8 @@ def _emit_event(channel_id, kind, data, guild_wide=False):
     else:
         targets = {channel_id} if channel_id else set()
     if not targets:
+        RNS.log("emit %s dropped: no targets (guild_wide=%s, ch=%s)"
+                % (kind, guild_wide, channel_id), RNS.LOG_NOTICE)
         return  # nobody is streaming; presence history is served on demand
     with EVENT_COND:
         EVENT_SEQ += 1
@@ -1677,6 +1704,53 @@ def _emit_event(channel_id, kind, data, guild_wide=False):
             ring = EVENT_LOG.setdefault(cid, deque(maxlen=EVENT_LOG_MAX))
             ring.append((EVENT_SEQ, ev))
         EVENT_COND.notify_all()
+    RNS.log("emit %s seq %d targets %d" % (kind, ev["seq"], len(targets)),
+            RNS.LOG_DEBUG)
+    # v0.28 push: hand each event to its subscribers directly. Runs after
+    # the cond block releases -- the sender never holds the event lock.
+    for cid in targets:
+        try:
+            _push_stream(cid)
+        except Exception as e:
+            RNS.log("stream push failed: %s" % e, RNS.LOG_ERROR)
+
+def _push_stream(cid):
+    """v0.28 push: deliver the subscribed channel's new events down the
+    link the moment they exist, instead of holding them for the client's
+    long-poll. RNS links are full duplex; RNS.Packet(link, bytes) sends a
+    raw frame over an established link and the client's packet callback
+    receives it. The poll endpoint stays for one-shot gap recovery.
+    """
+    with SUB_LOCK:
+        subs = [(lid, s["cursor"]) for lid, s in SUBSCRIPTIONS.items()
+                if s["channel"] == cid]
+    for lid, cursor in subs:
+        events, head, reset = _stream_collect(cid, cursor)
+        frame = {"k": "stream", "channel": cid, "seq": head,
+                 "reset": reset, "typing": _typing_snapshot(cid)}
+        if reset:
+            frame["events"] = []
+            out_cursor = head
+        else:
+            frame["events"] = events
+            out_cursor = events[-1]["seq"] if events else cursor
+        packed = msgpack.packb(frame, raw=False)
+        sent = False
+        for link in list(RNS.Transport.active_links):
+            if link.link_id == lid and link.status == RNS.Link.ACTIVE:
+                try:
+                    RNS.Packet(link, packed).send()
+                    sent = True
+                except Exception as e:
+                    RNS.log("stream push to link failed: %s" % e,
+                            RNS.LOG_ERROR)
+                break
+        with SUB_LOCK:
+            s = SUBSCRIPTIONS.get(lid)
+            if s and s["channel"] == cid:
+                if sent:
+                    s["cursor"] = out_cursor   # mirror the poll's advance
+                s["at"] = now()                # push keeps the sub alive
 
 def _emit_presence_if_changed(before):
     """Emit a guild-wide presence event when the online set changed."""
@@ -1910,10 +1984,9 @@ def api_v1_typing(viewer, data, link_id):
 @api_route("/api/v1/presence")
 @wrap_json_api
 def api_v1_presence(viewer, data, link_id):
-    """Ping-driven active users (same discipline as /api/presence) plus the
-    channel each user is currently streaming, and the ping cadence."""
-    return {"ok": 1, "users": _presence_payload(),
-            "interval": NODE_ANNOUNCE_INTERVAL, "ttl": NODE_STALE_S, "now": now()}
+    """Link-derived active users (v0.29) plus the channel each user is
+    currently streaming."""
+    return {"ok": 1, "mode": "link", "users": _presence_payload(), "now": now()}
 
 # ---- blobs (phase 3): content-addressed image/media get+put ------------------------
 
@@ -2368,7 +2441,7 @@ def _dispatch_command(viewer, line):
             "  %s%s" % (u["username"],
                        "  in " + channel_name(u["active_channel"])
                        if u.get("active_channel") else "")
-            for u in users) or "  nobody pinging"
+            for u in users) or "  nobody online"
     elif cmd == "uptime":
         secs = int(now() - _GUILD_BOOT)
         out = "up %dd %dh %dm" % (secs // 86400, (secs % 86400) // 3600,
@@ -2409,6 +2482,8 @@ def _dispatch_command(viewer, line):
                     db.execute("UPDATE channels SET name=? WHERE id=?",
                                (new, row["id"]))
                     db.commit()
+                _emit_event(row["id"], "channels_changed",
+                            {"channel": new}, guild_wide=True)
                 out = "renamed #%s -> #%s" % (chan, new)
     elif cmd == "topic":
         chan, _, text = arg.partition(" ")
@@ -2425,6 +2500,9 @@ def _dispatch_command(viewer, line):
                 db.execute("UPDATE channels SET topic=? WHERE id=?",
                            (text or None, row["id"]))
                 db.commit()
+            _emit_event(row["id"], "channels_changed",
+                        {"channel": chan.lstrip("#").strip()},
+                        guild_wide=True)
             out = ("topic set on #%s: %s" % (chan, text)) if text \
                 else "topic cleared on #%s" % chan
     elif cmd in ("ban", "mute", "unban", "unmute"):
@@ -3210,6 +3288,8 @@ def api_v1_channels_patch(viewer, data, link_id):
             db.execute("UPDATE channels SET topic=? WHERE id=?",
                        (str(topic).strip()[:200] or None, cid))
             db.commit()
+        _emit_event(cid, "channels_changed", {"channel": channel_name(cid)},
+                    guild_wide=True)
     overwrites = data.get("overwrites")
     if overwrites is not None:
         if not isinstance(overwrites, dict):

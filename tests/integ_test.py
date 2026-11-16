@@ -145,6 +145,20 @@ def main():
         check("link to guild node active", link.status == RNS.Link.ACTIVE)
         link.identify(client_identity)   # required for api/post/edit/delete/registers
 
+        # v0.28 push: pushed stream frames arrive on this link; the real
+        # client applies them (polls are for gap recovery). Read them here
+        # the same way; pushed[channel] accumulates frames across links.
+        pushed = {}
+
+        def _read_push(plaintext, packet=None):
+            try:
+                frame = msgpack.unpackb(plaintext, raw=False)
+            except Exception:
+                return
+            if isinstance(frame, dict) and frame.get("k") == "stream":
+                pushed.setdefault(frame["channel"], []).append(frame)
+        link.set_packet_callback(_read_push)
+
         def api(path, data):
             r = link.request(path, data=data)
             for _ in range(200):
@@ -376,18 +390,16 @@ def main():
                                        "nomadnetwork", "node")
         my_node_hash = hexstr(my_node_dest.hash)
 
-        r = api("/api/register_node", {"node_hash": my_node_hash,
-                                       "address": "127.0.0.1", "port": 29222,
-                                       "identity_hash": hexstr(client_identity.hash)})
-        check("api/register_node (presence ping) ok", r.get("ok") == 1, r)
+        r = api("/api/register_node", {"node_hash": my_node_hash})
+        check("api/register_node (node directory) ok", r.get("ok") == 1, r)
 
         pres = api("/api/presence", {})
         check("api/presence ok", pres.get("ok") == 1, pres)
-        check("api/presence reports the ping cadence + stale window",
-              pres.get("interval") == 4.0 and pres.get("ttl") == 8.0, pres)
+        check("api/presence reports link-derived mode",
+              pres.get("mode") == "link", pres)
         pusers = {u["user_hash"]: u for u in pres.get("users", [])}
-        check("a pinging client is online, keyed by user hash",
-              my_user_hash in pusers, list(pusers))
+        check("a registered client with a live link is online, keyed by user hash",
+              my_user_hash in pusers, str(list(pusers)))
         check("presence entry carries the username",
               (pusers.get(my_user_hash) or {}).get("username") == "Page Tester",
               pusers.get(my_user_hash))
@@ -398,7 +410,9 @@ def main():
         # the node index resolves by node_hash (this is what profile clicks use)
         lk = api("/api/lookup_node", {"node_hash": my_node_hash})
         check("lookup_node resolves the registered node",
-              lk.get("ok") == 1 and lk.get("address") == "127.0.0.1", lk)
+              lk.get("ok") == 1 and
+              lk.get("node_hash") == my_node_hash and
+              lk.get("user_hash") == my_user_hash, lk)
 
         # the Micron members page surfaces presence to NomadNet users too
         members_page = page("/page/sHades/members.mu", {"var_channel": test_cid})
@@ -407,29 +421,74 @@ def main():
         check("members page lists the online client",
               b"Page Tester" in members_page, members_page[-400:])
 
-        # ---- prune: a client that stops pinging drops off the list ----
-        # Nothing pings for longer than the 8s stale window; the guild's reaper
-        # should evict the node and presence should stop reporting the user.
-        time.sleep(8.0 + 2.0)
-        pres2 = api("/api/presence", {})
-        present2 = {u["user_hash"] for u in pres2.get("users", [])}
-        check("stale client is pruned from presence",
-              my_user_hash not in present2, present2)
-        lk2 = api("/api/lookup_node", {"node_hash": my_node_hash})
-        check("stale node is evicted from the node index",
-              lk2.get("ok") == 0, lk2)
-        members_page2 = page("/page/sHades/members.mu", {"var_channel": test_cid})
-        check("members page no longer lists the stale client as online",
-              b"nobody pinging" in members_page2 or
-              b"`F2a2+`f Page Tester" not in members_page2, members_page2[-400:])
+        # v0.29 prune: presence follows the link. The client tears its link
+        # down (RNS would do it on socket death); the guild's presence keeper
+        # drops the binding, the sub and the directory entry, and presence
+        # stops reporting the user. The absence is read over an OBSERVER
+        # link (a third identity): our own reconnect on the main link must
+        # not be able to hold the torn-down user online in the reads.
+        link.teardown()
+        for _ in range(50):
+            if link.status != RNS.Link.ACTIVE:
+                break
+            time.sleep(0.2)
+        olink = RNS.Link(node_out)
+        for _ in range(100):
+            if olink.status == RNS.Link.ACTIVE:
+                break
+            time.sleep(0.1)
+        check("observer link active", olink.status == RNS.Link.ACTIVE)
+        olink.identify(RNS.Identity())
 
-        # and pinging again brings the client back
-        api("/api/register_node", {"node_hash": my_node_hash,
-                                   "address": "127.0.0.1", "port": 29222,
-                                   "identity_hash": hexstr(client_identity.hash)})
+        def oapi(path, data):
+            r = olink.request(path, data=data)
+            for _ in range(200):
+                if r.response is not None:
+                    break
+                time.sleep(0.1)
+            return msgpack.unpackb(r.response) if r.response else {"ok": 0, "error": "no response"}
+
+        gone = None
+        for _ in range(30):
+            pres2 = oapi("/api/presence", {})
+            gone = my_user_hash not in {u["user_hash"]
+                                        for u in pres2.get("users", [])}
+            if gone:
+                break
+            time.sleep(0.5)
+        check("torn-down client is pruned from presence", gone is True, str(gone))
+        lk2 = oapi("/api/lookup_node", {"node_hash": my_node_hash})
+        check("torn-down node is evicted from the node index",
+              lk2.get("ok") == 0, lk2)
+        pr = olink.request("/page/sHades/members.mu", data={"var_channel": test_cid})
+        for _ in range(200):
+            if pr.response is not None:
+                break
+            time.sleep(0.1)
+        members_page2 = pr.response or b""
+        check("members page no longer lists the gone client as online",
+              b"nobody online" in members_page2 or
+              b"`F2a2+`f Page Tester" not in members_page2, str(members_page2[-400:]))
+        olink.teardown()
+        for _ in range(50):
+            if olink.status != RNS.Link.ACTIVE:
+                break
+            time.sleep(0.2)
+
+        # a fresh main link for the rest of the run; re-registering restores
+        # presence (the register request itself rebinds the link)
+        link = RNS.Link(node_out)
+        for _ in range(100):
+            if link.status == RNS.Link.ACTIVE:
+                break
+            time.sleep(0.1)
+        check("fresh guild link active", link.status == RNS.Link.ACTIVE)
+        link.identify(client_identity)
+        link.set_packet_callback(_read_push)
+        api("/api/register_node", {"node_hash": my_node_hash})
         pres3 = api("/api/presence", {})
-        check("re-pinging restores presence",
-              my_user_hash in {u["user_hash"] for u in pres3.get("users", [])}, pres3)
+        check("re-register restores presence",
+              my_user_hash in {u["user_hash"] for u in pres3.get("users", [])}, str(pres3))
 
         # ================= JSON API v1: channel kinds + stream =================
         # v1 speaks JSON bytes over the same RNS link (no HTTP anywhere).
@@ -493,8 +552,8 @@ def main():
               r.get("ok") == 0 and r.get("code") == 409, r)
         pres = japi("/api/v1/presence", {})
         me = [u for u in pres.get("users", []) if u["user_hash"] == my_user_hash]
-        check("v1 presence ok (ping cadence intact)",
-              pres.get("ok") == 1 and pres.get("interval") == 4.0, pres)
+        check("v1 presence ok (link-derived mode)",
+              pres.get("ok") == 1 and pres.get("mode") == "link", str(pres))
         check("v1 presence active_channel cleared after unsubscribe",
               me and me[0]["active_channel"] is None, pres)
         # re-subscribe for nothing: leave the stream clean for later sections
@@ -525,10 +584,11 @@ def main():
         r = japi("/api/v1/site/put", {"channel": site_cid, "path": "/index.mu",
                                       "data_b64": base64.b64encode(page_html.encode()).decode()})
         check("v1 site/put over the mesh", r.get("ok") == 1 and r.get("mime") == "text/micron", r)
-        poll = japi("/api/v1/stream/poll", {"timeout_s": 5})
+        site_evs = [e for fr in pushed.get(site_cid, [])
+                    for e in fr.get("events", [])]
         check("site_patch event arrives on the stream",
               any(e["kind"] == "site_patch" and e["data"].get("path") == "/index.mu"
-                  for e in poll.get("events", [])), poll)
+                  for e in site_evs), str(site_evs)[:300])
         got = japi("/api/v1/site/get", {"channel": site_cid, "path": "/index.mu"})
         check("v1 site/get roundtrip", got.get("ok") == 1
               and base64.b64decode(got["data_b64"]).decode() == page_html, got)
@@ -548,14 +608,17 @@ def main():
         r = japi("/api/v1/term/open", {"channel": term_cid})
         check("term open ok", r.get("ok") == 1 and r.get("session"), r)
         term_sid = r.get("session")
-        poll = japi("/api/v1/stream/poll", {"timeout_s": 5})
-        banner = [e for e in poll.get("events", []) if e["kind"] == "term_data"]
+        term_evs = [e for fr in pushed.get(term_cid, [])
+                     for e in fr.get("events", [])]
+        banner = [e for e in term_evs if e["kind"] == "term_data"]
         check("term banner + prompt arrive on the stream",
-              banner and "guild console" in banner[0]["data"]["text"], poll)
+              banner and "guild console" in banner[0]["data"]["text"],
+              str(term_evs[:2]))
         japi("/api/v1/term/data", {"session": term_sid,
                                    "data_b64": base64.b64encode(b"who\n").decode()})
-        poll = japi("/api/v1/stream/poll", {"timeout_s": 5})
-        outs = " ".join(e["data"]["text"] for e in poll.get("events", [])
+        term_evs = [e for fr in pushed.get(term_cid, [])
+                     for e in fr.get("events", [])]
+        outs = " ".join(e["data"]["text"] for e in term_evs
                         if e["kind"] == "term_data")
         check("console 'who' answers over the mesh", "Page Tester" in outs, outs[:200])
         japi("/api/v1/term/data", {"session": term_sid,

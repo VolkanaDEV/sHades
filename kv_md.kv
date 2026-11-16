@@ -302,6 +302,17 @@
             text_color_normal: app.theme_colors['text']
             text_color_focus: app.theme_colors['text']
             cursor_color: app.theme_colors['text']
+            MDTextFieldHintText:
+                text: 'Username'
+                text_color_normal: app.theme_colors['text']
+                text_color_focus: app.theme_colors['text']
+        Label:
+            id: profile_status
+            text: ''
+            font_size: sp(11)
+            color: app.theme_colors['text_muted']
+            size_hint_y: None
+            height: dp(18)
         Label:
             text: 'Node hash: ' + root.target_hash
             font_size: sp(11)
@@ -384,9 +395,6 @@
                 Rectangle:
                     pos: self.x, self.y
                     size: self.width, dp(1)
-            HamburgerIcon:
-                on_press: root.toggle_left()
-                color: app.theme_colors['text']
             CtxHeaderLabel:
                 id: channel_header
                 text: '#' + (root._current_channel or 'general')
@@ -407,102 +415,97 @@
             orientation: 'horizontal'
             size_hint_y: 1
 
-            # ---------------- far-left: servers (guild list) ---------------
-            BoxLayout:
-                id: server_sidebar
-                size_hint_x: None
-                width: dp(64)
-                orientation: 'vertical'
-                canvas.before:
-                    Color:
-                        rgba: app.theme_colors['bg_sidebar']
-                    Rectangle:
-                        pos: self.pos
-                        size: self.size
-                ScrollView:
-                    do_scroll_x: False
-                    GridLayout:
-                        id: server_grid
-                        cols: 1
-                        size_hint_y: None
-                        height: self.minimum_height
-                        spacing: dp(4)
-                        padding: [dp(4), dp(8)]
-                # Add server button at bottom
-                MDButton:
-                    id: add_server_btn
-                    style: 'filled'
-                    size_hint_y: None
-                    height: scaled(dp(40))
-                    theme_bg_color: 'Custom'
-                    md_bg_color: app.theme_colors['primary']
-                    on_press: app._open_add_server_popup()
-                    MDButtonText:
-                        text: '+'
-                        text_color: app.theme_colors['btn_text']
-                        font_size: sp(24)
-
-            # ---------------- left: channels (collapsable) ----------------
+            # -------- left: servers + channels in ONE swipe drawer --------
+            # The server rail lives INSIDE the drawer so closing the drawer
+            # hides the '+' button too (receipt: the rail held the pane
+            # open). Open width 284 = 64 rail + 220 channels.
             BoxLayout:
                 id: left_sidebar
                 size_hint_x: None
-                width: dp(220) if root.left_open else dp(0)
-                orientation: 'vertical'
+                width: dp(284) if root.left_open else dp(0)
+                orientation: 'horizontal'
                 canvas.before:
                     Color:
                         rgba: app.theme_colors['bg_sidebar']
                     Rectangle:
                         pos: self.pos
                         size: self.size
-                Image:
-                    id: banner_channel
-                    source: app.banner_channel_path or ''
-                    size_hint_y: None
-                    height: dp(160)
-                    size_hint_x: None
-                    width: dp(200)
-                    allow_stretch: False
-                    keep_ratio: True
-                    pos_hint: {'center_x': 0.5}
+
+                # ---- server rail (guild list) ----
                 BoxLayout:
-                    size_hint_y: None
-                    height: dp(34)
-                    padding: [dp(6), dp(2)]
-                    Widget:
-                        size_hint_x: 1
+                    id: server_sidebar
+                    size_hint_x: None
+                    width: dp(64)
+                    orientation: 'vertical'
+                    canvas.before:
+                        Color:
+                            rgba: app.theme_colors['bg_sidebar']
+                        Rectangle:
+                            pos: self.pos
+                            size: self.size
+                    ScrollView:
+                        do_scroll_x: False
+                        GridLayout:
+                            id: server_grid
+                            cols: 1
+                            size_hint_y: None
+                            height: self.minimum_height
+                            spacing: dp(4)
+                            padding: [dp(4), dp(8)]
+                    # Add server button at bottom
                     MDButton:
-                        style: 'outlined'
+                        id: add_server_btn
+                        style: 'filled'
                         size_hint_y: None
                         height: scaled(dp(40))
-                        width: dp(48)
                         theme_bg_color: 'Custom'
-                        md_bg_color: app.theme_colors['sidebar_ctrl']
-                        on_press: app.open_config()
+                        md_bg_color: app.theme_colors['primary']
+                        on_press: app._open_add_server_popup()
                         MDButtonText:
-                            text: 'cfg'
-                            shorten: True
-                MDButton:
-                    style: 'outlined'
-                    size_hint_y: None
-                    height: scaled(dp(40))
-                    theme_bg_color: 'Custom'
-                    md_bg_color: app.theme_colors['sidebar_ctrl']
-                    on_press: root.toggle_left()
-                    MDButtonText:
-                        text: 'channels v' if root.left_open else 'channels >'
-                ScrollView:
-                    do_scroll_x: False
-                    GridLayout:
-                        id: channel_grid
-                        cols: 1
-                        size_hint_y: None
-                        height: self.minimum_height
-                        spacing: dp(2)
-                        padding: [dp(6), dp(6)]
+                            text: '+'
+                            text_color: app.theme_colors['btn_text']
+                            font_size: sp(24)
 
-            SlimButton:
-                text: '<'
-                on_press: root.toggle_left()
+                # ---- channels column ----
+                BoxLayout:
+                    orientation: 'vertical'
+                    Image:
+                        id: banner_channel
+                        source: app.banner_channel_path or ''
+                        size_hint_y: None
+                        height: dp(160)
+                        size_hint_x: None
+                        width: dp(200)
+                        allow_stretch: False
+                        keep_ratio: True
+                        pos_hint: {'center_x': 0.5}
+                    BoxLayout:
+                        size_hint_y: None
+                        height: dp(34)
+                        padding: [dp(6), dp(2)]
+                        Widget:
+                            size_hint_x: 1
+                        MDButton:
+                            style: 'outlined'
+                            size_hint_y: None
+                            height: scaled(dp(40))
+                            width: dp(48)
+                            theme_bg_color: 'Custom'
+                            md_bg_color: app.theme_colors['sidebar_ctrl']
+                            on_press: app.open_config()
+                            MDButtonText:
+                                text: 'cfg'
+                                shorten: True
+                    ScrollView:
+                        do_scroll_x: False
+                        GridLayout:
+                            id: channel_grid
+                            cols: 1
+                            size_hint_y: None
+                            height: self.minimum_height
+                            spacing: dp(2)
+                            padding: [dp(6), dp(6)]
+
             # ---------------- center: chat ----------------
             BoxLayout:
                 orientation: 'vertical'
@@ -541,7 +544,6 @@
                             size: self.size
                     MDTextField:
                         id: msg_input
-                        hint_text: 'Message...'
                         mode: 'filled'
                         multiline: True
                         size_hint_x: 1
@@ -559,6 +561,10 @@
                         text_color_focus: app.theme_colors['text']
                         cursor_color: app.theme_colors['text']
                         on_text_validate: app.send_message()
+                        MDTextFieldHintText:
+                            text: 'Message...'
+                            text_color_normal: app.theme_colors['text']
+                            text_color_focus: app.theme_colors['text']
                     MDButton:
                         style: 'filled'
                         size_hint_x: None
@@ -587,10 +593,7 @@
                             text: '+'
                             text_color: app.theme_colors['btn_text']
 
-            SlimButton:
-                text: '>'
-                on_press: root.toggle_right()
-            # ---------------- right: members (collapsable) ----------------
+            # right: members drawer (swipe from the right edge opens)
             BoxLayout:
                 id: right_sidebar
                 size_hint_x: None
@@ -602,15 +605,6 @@
                     Rectangle:
                         pos: self.pos
                         size: self.size
-                MDButton:
-                    style: 'outlined'
-                    size_hint_y: None
-                    height: scaled(dp(40))
-                    theme_bg_color: 'Custom'
-                    md_bg_color: app.theme_colors['sidebar_ctrl']
-                    on_press: root.toggle_right()
-                    MDButtonText:
-                        text: 'members v' if root.right_open else 'members >'
                 ScrollView:
                     do_scroll_x: False
                     GridLayout:
@@ -688,7 +682,6 @@
                         width: dp(420)
                         MDTextField:
                             id: hub_address
-                            hint_text: 'Hub address (ip:port)'
                             multiline: False
                             size_hint_y: None
                             height: dp(44)
@@ -697,9 +690,12 @@
                             text_color_normal: app.theme_colors['text']
                             text_color_focus: app.theme_colors['text']
                             cursor_color: app.theme_colors['text']
+                            MDTextFieldHintText:
+                                text: 'Hub address (ip:port)'
+                                text_color_normal: app.theme_colors['text']
+                                text_color_focus: app.theme_colors['text']
                         MDTextField:
                             id: username
-                            hint_text: 'Your username'
                             multiline: False
                             size_hint_y: None
                             height: dp(44)
@@ -708,6 +704,10 @@
                             text_color_normal: app.theme_colors['text']
                             text_color_focus: app.theme_colors['text']
                             cursor_color: app.theme_colors['text']
+                            MDTextFieldHintText:
+                                text: 'Your username'
+                                text_color_normal: app.theme_colors['text']
+                                text_color_focus: app.theme_colors['text']
                         # The guild hashes are optional -- auto-discovery from
                         # the hub's announce covers them -- so they are behind
                         # a disclosure instead of four more always-visible

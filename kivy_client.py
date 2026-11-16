@@ -31,6 +31,25 @@ from ui_scale import scaled
 # ---------------------------------------------------------------------------
 # Kivy (guarded so the module can be imported for linting without Kivy present)
 # ---------------------------------------------------------------------------
+def _make_kivy_stub(name, err=None):
+    # Module-scope so BOTH guard branches can bind stub names. Each name
+    # gets its own distinct stub class (the client stacks several in the
+    # same bases tuple; two occurrences of one class make that definition
+    # a TypeError). Import-only: instantiating one raises, embedding `err`
+    # -- the real import failure -- so a phone death names its cause.
+    class _Stub(object):
+        pass
+
+    def _init_stub(*args, **kwargs):
+        raise RuntimeError(
+            "Kivy stub class %s instantiated; not available, cause=%r"
+            % (name, err))
+
+    _Stub.__name__ = name
+    _Stub.__init__ = _init_stub
+    return _Stub
+
+
 try:
     from kivy.app import App
     from kivy.uix.boxlayout import BoxLayout
@@ -60,27 +79,15 @@ except Exception as _e:  # pragma: no cover - Kivy missing at import time
     _KIVY_IMPORT_ERROR = _e
 
     # Minimal stubs so module-scope class definitions (below) can evaluate
-    # when Kivy is absent. Each name gets its own distinct stub class:
-    # the client stacks several of them in the same bases tuple, and two
-    # occurrences of one class make that definition a TypeError. They are
-    # import-only: instantiating one raises, so nothing silently pretends
-    # to be a widget. Client test suites that need real widgets already
-    # SKIP on their own via kc.KIVY.
-    def _make_kivy_stub(name):
-        class _Stub(object):
-            def __init__(self, *args, **kwargs):
-                raise RuntimeError(
-                    "Kivy stub class %s instantiated; Kivy is not "
-                    "available (%r)" % (name, _KIVY_IMPORT_ERROR))
-        _Stub.__name__ = name
-        return _Stub
-
-    FloatLayout = _make_kivy_stub("FloatLayout")
-    BoxLayout = _make_kivy_stub("BoxLayout")
-    Label = _make_kivy_stub("Label")
-    ButtonBehavior = _make_kivy_stub("ButtonBehavior")
-    App = _make_kivy_stub("App")
-    MDApp = _make_kivy_stub("MDApp")
+    # when Kivy is absent. They are import-only: instantiating one raises,
+    # so nothing silently pretends to be a widget. Client test suites that
+    # need real widgets already SKIP on their own via kc.KIVY.
+    FloatLayout = _make_kivy_stub("FloatLayout", _e)
+    BoxLayout = _make_kivy_stub("BoxLayout", _e)
+    Label = _make_kivy_stub("Label", _e)
+    ButtonBehavior = _make_kivy_stub("ButtonBehavior", _e)
+    App = _make_kivy_stub("App", _e)
+    MDApp = _make_kivy_stub("MDApp", _e)
 
     def _stub_property(*args, **kwargs):
         return None
@@ -94,18 +101,113 @@ if KIVY:
         from kivymd.app import MDApp
         KIVYMD = True
     except Exception as _e:
+        # The exception path MUST bind MDApp: the module-level
+        # `class sHadesClientApp(MDApp):` evaluates at import time, and an
+        # unbound name here was the exact cause of tay's phone crash
+        # (NameError: name 'MDApp' is not defined, kivy_client.py:1643).
+        # The stub embeds the real kivymd failure, so the death later --
+        # at app instantiation -- NAMES the cause instead of a bare
+        # NameError.
+        MDApp = _make_kivy_stub("MDApp", _e)
         KIVYMD = False
         _KIVYMD_IMPORT_ERROR = _e
+        # The tee (main.py) captures stdout from process start, so this
+        # line lands in sHades_boot.log and the on-screen crash console:
+        # it names the actual kivymd-side failure on-device.
+        print("PYTHON: kivymd import failed: %r" % (_e,), flush=True)
 else:
     KIVYMD = False
 
-import RNS
-from RNS.vendor import umsgpack as msgpack
-import invite
-import dms
-import ui_geom
-from micron import (micron_parse, micron_page_bg, micron_media_target,
+# ---------------------------------------------------------------------------
+# TEMP boot diagnostics (v0.4): window-level heartbeat overlay + boot log.
+# v0.3 lesson: a heartbeat inside a screen's root layout is at the mercy of
+# that layout -- a vertical BoxLayout can squeeze it to nothing or push it
+# below the fold, which reads as "no heartbeat". The overlay now hangs on
+# the Kivy Window itself with an explicit pos, so no layout can move it.
+# Every milestone is ALSO appended to sHades_boot.log (external files dir
+# preferred, app-storage fallback) alongside the stdout/stderr tee that
+# main.py installs at process start, so the launch story survives even a
+# dead renderer. Remove BOOT_DEBUG once the launch diagnosis is done.
+# ---------------------------------------------------------------------------
+BOOT_DEBUG = True
+
+_boot_lines = []
+_boot_label = {"ref": None}
+
+
+def _boot_file(msg):
+    """Append a milestone to the boot log file. Never raises."""
+    try:
+        from main import _log_path
+        p = _log_path()
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
+
+def _boot_mark(msg):
+    """Record a boot milestone; drawn onto the overlay once it exists."""
+    if not BOOT_DEBUG:
+        return
+    _boot_lines.append(msg)
+    _boot_file("BOOT %s" % msg)
+    _boot_refresh()
+
+
+def _boot_refresh():
+    lbl = _boot_label["ref"]
+    if lbl is not None:
+        lbl.text = "\n".join(_boot_lines)
+
+
+def _boot_install(screen=None):
+    """Hang the heartbeat on the Kivy Window itself (explicit pos: no
+    layout can squeeze or move it); auto-hides after 90 s."""
+    from kivy.clock import Clock
+
+    lbl = Label(
+        text="\n".join(_boot_lines), color=(1, 0.85, 0.4, 1),
+        font_size="10sp", halign="left", valign="top", markup=False,
+        size_hint=(None, None),
+    )
+    _boot_label["ref"] = lbl
+
+    def _place(*a):
+        lbl.size = (min(max(lbl.texture_size[0], 1), 420),
+                    max(lbl.texture_size[1], 1))
+        lbl.pos = (24, Window.height - 26 - lbl.height)
+
+    lbl.bind(texture_size=_place)
+    Window.bind(size=_place)
+    Window.add_widget(lbl)
+    lbl.text = "\n".join(_boot_lines)
+    _place()
+
+    Clock.schedule_once(lambda dt: _boot_hide(), 90)
+
+
+def _boot_hide():
+    lbl = _boot_label["ref"]
+    if lbl is not None and lbl.parent is not None:
+        lbl.parent.remove_widget(lbl)
+    _boot_label["ref"] = None
+
+
+import RNS  # noqa: E402  (after the guarded kivy/diagnostics block, by design)
+from RNS.vendor import umsgpack as msgpack  # noqa: E402
+import invite  # noqa: E402
+import dms  # noqa: E402
+import ui_geom  # noqa: E402
+from micron import (micron_parse, micron_page_bg, micron_media_target,  # noqa: E402
                     runs_to_markup)
+
+# TEMP boot diagnostics: the absence of this line in sHades_boot.log
+# pins a crash INSIDE the import chain above (RNS / LXMF / micron...).
+_kv_mod = sys.modules.get("kivy")
+if BOOT_DEBUG and _kv_mod is not None:
+    _boot_file("kivy_client module imported ok (KIVY=%s KIVYMD=%s) "
+               "kivy=%s" % (KIVY, KIVYMD, _kv_mod.__version__))
 
 # Attachment storage styles:
 #   server   - file is stored on the guild; bytes re-fetched via /file/attachments
@@ -368,9 +470,12 @@ class GuildAPI:
         if isinstance(receipt, bool):
             if not receipt:
                 return {"ok": 0, "error": "request failed"}
-            # RNS queued the request but gave no receipt — poll for response
-            # via a fresh receipt. Create one by calling request again without data.
-            receipt = self.link.request(path, data={})
+            # v0.26: the old fallback RE-ISSUED the same call with empty
+            # data "to poll for a response" -- which double-sent posts
+            # and re-ran side-effecting calls (register, avatar). A bool
+            # receipt carries nothing pollable; report unconfirmed and
+            # let the caller decide.
+            return {"ok": 1, "unconfirmed": True}
         deadline = time.time() + timeout
         while (hasattr(receipt, "response")
                and receipt.response is None
@@ -408,20 +513,19 @@ class GuildAPI:
     def delete(self, msg_id):
         return self._request("/api/delete", {"msg": msg_id})
 
-    def register_node(self, node_hash, address, port, identity_hash):
-        """Register this client's node address with the guild index.
+    def register_node(self, node_hash):
+        """Register this client's node destination hash with the guild index.
 
-        This is also the presence ping: the client repeats it every
-        ANNOUNCE_INTERVAL and the guild reads each call as "still here". No
-        identity is asserted in the payload — the guild derives the user hash
-        from the identity this link was identified with, so it cannot be forged.
+        v0.29: a ONE-SHOT directory write at connect (and on reconnect).
+        Presence is not this call any more: the guild derives presence from
+        link liveness (RNS keepalives and teardowns), so the client holds no
+        heartbeat of its own. RNS is cryptographically addressed — members
+        reach a node by its destination hash (Identity.recall + RNS.Link),
+        never by ip:port, so address/port left the protocol. No identity is
+        asserted in the payload — the guild derives the user hash from the
+        identity this link was identified with, so it cannot be forged.
         """
-        return self._request("/api/register_node", {
-            "node_hash": node_hash,
-            "address": address,
-            "port": port,
-            "identity_hash": identity_hash,
-        })
+        return self._request("/api/register_node", {"node_hash": node_hash})
 
     def lookup_node(self, node_hash):
         return self._request("/api/lookup_node", {"node_hash": node_hash})
@@ -430,8 +534,10 @@ class GuildAPI:
         return self._request("/api/register",
                              {"username": username, "profile_node": profile_node})
 
-    def avatar_upload(self, blob):
-        return self._request("/api/avatar", {"avatar": blob})
+    def avatar_upload(self, blob, timeout=30):
+        # v0.26: timeout raised from 10s -- the avatar payload moves as
+        # an RNS resource transfer and slower links need the headroom.
+        return self._request("/api/avatar", {"avatar": blob}, timeout=timeout)
 
     def avatar_get(self, user_hash):
         return self._request("/api/avatar_get", {"user": user_hash})
@@ -1425,8 +1531,11 @@ if KIVY:
             return actions
 
     class MainScreen(Screen):
-        left_open = BooleanProperty(True)
-        right_open = BooleanProperty(True)
+        # Default: chat only. Both drawers closed (tay's direction: the
+        # main app screen defaults to the chat; side panels open by
+        # SWIPE, not by tap -- see on_touch_* below).
+        left_open = BooleanProperty(False)
+        right_open = BooleanProperty(False)
         _current_channel = StringProperty("general")
 
         def toggle_left(self):
@@ -1434,6 +1543,73 @@ if KIVY:
 
         def toggle_right(self):
             self.right_open = not self.right_open
+
+        # -- swipe gestures (edge bands + drawn-panel travel) ------------
+        # Kivy routes on_touch_down to parent before children, so we only
+        # CLASSIFY here (never consume): returning super()'s result lets
+        # buttons and scrolls behave normally. A drag fires at most once.
+        _SWIPE_EDGE = None   # "left_open" / "left_close" / right_*
+        _SWIPE_FIRE = False
+
+        def _swipe_plan(self, touch):
+            """Classify a new touch into a drawer gesture or None.
+
+            Left edge band (in from the screen's left) opens the channels
+            drawer on rightward travel; with that drawer open, a band just
+            inside its right border closes it on leftward travel. Mirrored
+            for the members drawer on the right side.
+            """
+            try:
+                left = self.ids["left_sidebar"]
+                right = self.ids["right_sidebar"]
+            except Exception:
+                return None
+            x, w = touch.x, self.width
+            band = dp(24)
+            if x <= band:
+                return None if self.left_open else "left_open"
+            if x >= w - band:
+                return None if self.right_open else "right_open"
+            # closing bands: inside an open drawer near its inner border
+            if self.left_open and left.width > dp(0) and \
+                    abs(x - (left.x + left.width)) <= band:
+                return "left_close"
+            if self.right_open and right.width > dp(0) and \
+                    abs(x - right.x) <= band:
+                return "right_close"
+            return None
+
+        def on_touch_down(self, touch):
+            self._SWIPE_EDGE = self._swipe_plan(touch)
+            self._SWIPE_FIRE = False
+            self._swipe_x = touch.x
+            return super().on_touch_down(touch)
+
+        def on_touch_move(self, touch):
+            if self._SWIPE_EDGE and not self._SWIPE_FIRE and \
+                    abs(touch.x - self._swipe_x) >= dp(48):
+                self._SWIPE_FIRE = True
+                opening = self._SWIPE_EDGE.endswith("_open")
+                rightward = touch.x > self._swipe_x
+                on_right = self._SWIPE_EDGE.startswith("right")
+                # open = drag toward center; close = drag away
+                if (rightward if not on_right else not rightward):
+                    if opening:
+                        setattr(self, "left_open" if not on_right
+                                else "right_open", True)
+                else:
+                    closing_left = self._SWIPE_EDGE == "left_close"
+                    closing_right = self._SWIPE_EDGE == "right_close"
+                    if closing_left:
+                        self.left_open = False
+                    elif closing_right:
+                        self.right_open = False
+            return super().on_touch_move(touch)
+
+        def on_touch_up(self, touch):
+            self._SWIPE_EDGE = None
+            self._SWIPE_FIRE = False
+            return super().on_touch_up(touch)
 
     class ConfigScreen(Screen):
         """Config screen: unified UI theme colors, persisted to ui_config.json.
@@ -1595,8 +1771,6 @@ class sHadesClientApp(MDApp):
         self.hub_address = DEFAULT_HUB_ADDRESS
         self.hub_host = DEFAULT_HUB_HOST
         self.hub_port = DEFAULT_HUB_PORT
-        self._poll_thread = None
-        self._poll_stop = threading.Event()
         self._seq = 0
         self._last_ts = 0.0
         self._channels = OrderedDict()   # cid -> name
@@ -1605,20 +1779,13 @@ class sHadesClientApp(MDApp):
         self._popup = None
         self._poll_error_shown = False
         self._ui_populated = False
-        # Presence / ping: re-register (ping) every ANNOUNCE_INTERVAL
-        # seconds; the guild drops a node that misses two consecutive pings.
-        self._announce_stop = threading.Event()
-        self._announce_thread = None
-        self.ANNOUNCE_INTERVAL = 4.0
-        self.announce_host = None
-        self.announce_port = None
-        self.identity_hash = None
+        # v0.29: presence needs no heartbeat. The guild derives it from link
+        # liveness (RNS keepalives + teardown), so nothing pings; register_node
+        # stays a ONE-SHOT directory write at connect (and on reconnect).
         # v1 stream: long-polls ONLY the visible channel. _stream_cid is the
         # channel the guild should stream to us; setting it (with a None
         # cursor) makes the stream loop resubscribe — one subscription per
         # link is a server-side rule, so switching channels reroutes the flow.
-        self._stream_stop = threading.Event()
-        self._stream_thread = None
         self._stream_cid = None
         self._stream_cursor = None
         # site channels: kind per cid, the rendered page stack, the page
@@ -1654,13 +1821,11 @@ class sHadesClientApp(MDApp):
         except Exception as e:
             print("muted-channel load failed:", repr(e))
 
-        # Presence: mirror the guild's active-user list every PRESENCE_INTERVAL.
-        # _active_users maps user_hash -> {"username", "node_hash"} and is
-        # rebuilt from each /api/presence response, so a member who stops
-        # pinging drops out of the member list instead of lingering in it.
-        self._presence_stop = threading.Event()
-        self._presence_thread = None
-        self.PRESENCE_INTERVAL = 5.0
+        # Presence: members arrive as a guild-wide PUSH event on the link
+        # (server "presence" kind); _active_users maps user_hash ->
+        # {"username", "node_hash"} and is rebuilt from each pushed event,
+        # so a member who stops pinging drops out of the member list
+        # instead of lingering in it. No interval fetches.
         self._active_users = {}
         # Has the guild answered a presence request? Distinguishes "nobody is
         # online" from "this guild has no presence API" — different UI each.
@@ -1776,6 +1941,8 @@ class sHadesClientApp(MDApp):
 
     # -- lifecycle -------------------------------------------------------
     def build(self):
+        if BOOT_DEBUG:
+            _boot_mark("0.3 build(): python + kivy window alive")
         if Window:
             self.theme_cls.set_colors()
             Window.clearcolor = self.theme_cls.backgroundColor
@@ -1793,9 +1960,14 @@ class sHadesClientApp(MDApp):
         # Plain Enter sends the message; Shift+Enter inserts a newline
         # (multiline input). Handled via _on_key_down below.
         Window.bind(on_key_down=self._on_key_down)
+        if BOOT_DEBUG:
+            _boot_mark("screens ok: %d registered" % len(sm.screens))
+            _boot_install(sm.get_screen(sm.current))
         return sm
 
     def on_start(self):
+        if BOOT_DEBUG:
+            _boot_mark("on_start")
         # Try to resume a saved session
         sess = self._load_session()
         if sess and sess.get("hub_address"):
@@ -1817,6 +1989,8 @@ class sHadesClientApp(MDApp):
                         self._active_server_idx = idx
                         break
             self._open_main()
+            if BOOT_DEBUG:
+                _boot_mark("session resumed: %s" % (self.hub_address,))
             Clock.schedule_once(lambda dt: self._init_reticulum(), 0.5)
             # Re-render persisted history (embeds survive close/re-open) once
             # the guild API is up; server-stored attachments re-fetch with a
@@ -1828,6 +2002,8 @@ class sHadesClientApp(MDApp):
             # up (showing progress) and is used as the fallback if the
             # default hub is unreachable, so a fresh install is never locked
             # out of the app.
+            if BOOT_DEBUG:
+                _boot_mark("fresh install -> default hub")
             self._auto_connect_default_hub()
 
     def _auto_connect_default_hub(self):
@@ -2390,6 +2566,8 @@ class sHadesClientApp(MDApp):
     def _init_reticulum(self):
         """Main thread only: create RNS instance (signal handlers), then
         spawn a background thread for the blocking link establishment."""
+        if BOOT_DEBUG:
+            _boot_mark("RNS: writing config")
         try:
             storage = os.path.join(_app_data_dir(), "rns")
             os.makedirs(storage, exist_ok=True)
@@ -2448,6 +2626,8 @@ class sHadesClientApp(MDApp):
 
             reticulum = RNS.Reticulum(configdir=storage)
             self.reticulum = reticulum
+            if BOOT_DEBUG:
+                _boot_mark("RNS: instance up (config ok)")
         except Exception as e:
             print("init reticulum error:", repr(e))
             self._set_status("connect failed: %s" % e)
@@ -2456,6 +2636,8 @@ class sHadesClientApp(MDApp):
         # see _init_identity_and_lxmf. Only the blocking link work below
         # moves to a worker.
         self._init_identity_and_lxmf()
+        if BOOT_DEBUG:
+            _boot_mark("identity + LXMF router ok, link worker starting")
         threading.Thread(target=self._connect_after_rns, daemon=True).start()
 
     def _config_needs_update(self, cfgfile):
@@ -2641,6 +2823,13 @@ class sHadesClientApp(MDApp):
             self.link = link
 
             self.guild_api = GuildAPI(reticulum, link)
+            # v0.28 push: stream frames arrive on this link the moment
+            # events exist. The callback is the client's entire intake;
+            # no polling loops exist anywhere in the client.
+            try:
+                link.set_packet_callback(self._on_push_frame)
+            except Exception as e:
+                print("push callback registration failed: %s" % e)
             self._save_session()
 
             # Create this client's own nomadnetwork.node destination
@@ -2657,22 +2846,14 @@ class sHadesClientApp(MDApp):
             self.node_hash = hexstr(self.node_destination.hash)
             print(f"My node_hash: {self.node_hash}")
 
-            # Register with guild so others can find me via ip:port, then
-            # re-register every ANNOUNCE_INTERVAL seconds — each re-register
-            # is a ping; the guild drops a node that misses two consecutive
-            # pings (8 s) from its active user list.
+            # Register the node's DESTINATION HASH with the guild directory
+            # so profiles / the node index can reach me cryptographically
+            # (Identity.recall + RNS.Link). v0.29: ONE SHOT at connect (and
+            # on reconnect). Presence is not this call: the guild derives it
+            # from link liveness, which RNS monitors with keepalives/teardowns.
             try:
-                import socket
-                my_host = socket.gethostbyname(socket.gethostname())
-                self.announce_host = my_host
-                self.announce_port = self.client_port
-                self.identity_hash = hexstr(self.client_identity.hash)
-                self.guild_api.register_node(
-                    self.node_hash, my_host, self.client_port,
-                    self.identity_hash)
-                print(f"Registered with guild: {my_host}:{self.client_port}")
-                self._start_announce()
-                self._start_presence()
+                self.guild_api.register_node(self.node_hash)
+                print(f"Registered with guild: node {self.node_hash[:12]}")
             except Exception as e:
                 print(f"Node registration failed: {e}")
 
@@ -2713,100 +2894,63 @@ class sHadesClientApp(MDApp):
         self._stream_cursor = None
 
     def _start_poll(self):
-        self._poll_stop.clear()
-        self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
-        self._poll_thread.start()
+        # v0.28: no polling loops anywhere in the client. This one-shot
+        # keeps what the first poll tick did (seed the UI once); every
+        # later update arrives as a server push on the link.
+        def bootstrap(dt):
+            self._ensure_general_channel()
+            if not getattr(self, "_ui_populated", False):
+                self._ui_populated = True
+                try:
+                    main = self.root.get_screen("main")
+                    name = getattr(main, "_current_channel", "general")
+                    self._fetch_messages(name)
+                    self._refresh_members_ui(self._channel_cid(name))
+                except Exception:
+                    pass
+        Clock.schedule_once(bootstrap, 0)
 
-    def _poll_loop(self):
-        tick = 0
-        while not self._poll_stop.is_set():
-            tick += 1
-            try:
-                # periodic channel-index refresh: renames, topics, new
-                # channels and unread badges stay current (cheap JSON call)
-                if tick % 5 == 0:
-                    self._refresh_channels_from_guild()
-                main = self.root.get_screen("main")
-                cid = getattr(main, "_current_channel", "general")
-                st = self.guild_api.state(self._channel_cid(cid))
-                if st.get("ok"):
-                    self._poll_error_shown = False
-                    seq = st.get("seq", 0)
-                    last_ts = st.get("last_ts", 0.0)
-                    msg_count = len(st.get("messages", []))
-                    print("poll state ok: seq=%s last_ts=%s msgs=%s" % (seq, last_ts, msg_count))
-                    if seq != self._seq or last_ts != self._last_ts:
-                        self._seq = seq
-                        self._last_ts = last_ts
-                        self._fetch_messages(cid)
-                        self._refresh_members_ui(self._channel_cid(cid))
-                    else:
-                        # no change, but make sure UI is populated on first poll
-                        if not getattr(self, "_ui_populated", False):
-                            self._ui_populated = True
-                            self._fetch_messages(cid)
-                            self._refresh_members_ui(self._channel_cid(cid))
-                else:
-                    err = st.get("error", "unknown")
-                    self._poll_error_shown = True
-                    Clock.schedule_once(
-                        lambda dt: self._set_status("poll failed: %s" % err), 0)
-                    print("poll state failed: %s" % err)
-                Clock.schedule_once(lambda dt: self._ensure_general_channel(), 0)
-            except Exception as exc:
-                print("poll exception: %s" % repr(exc))
-                self._poll_error_shown = True
-                err_msg = "poll exception: %s" % exc
+    def _on_push_frame(self, plaintext, packet=None):
+        """v0.28 push: the guild delivers stream frames down the link the
+        moment events exist (RNS.Packet(link, bytes), context NONE, which
+        is the only traffic this callback receives). Runs on an RNS
+        thread: threadsafe updates + Clock marshalling only."""
+        try:
+            frame = msgpack.unpackb(plaintext, raw=False)
+            if not isinstance(frame, dict) or frame.get("k") != "stream":
+                return
+            if frame.get("reset"):
+                # replay window rotated past our cursor: resync
+                self._stream_cursor = None
                 Clock.schedule_once(
-                    lambda dt: self._set_status(err_msg), 0)
-            self._poll_stop.wait(3.0)
+                    lambda dt: self._resync_stream_channel(), 0)
+                return
+            events = frame.get("events") or []
+            if events:
+                self._stream_cursor = frame.get("seq", self._stream_cursor)
+                self._apply_stream_events(events)
+        except Exception as e:
+            print("push frame failed:", repr(e))
 
     def _start_streamer(self):
-        """Long-poll stream for the visible channel only (JSON API v1)."""
-        if self._stream_thread is not None and self._stream_thread.is_alive():
-            return
-        self._stream_stop.clear()
-        self._stream_thread = threading.Thread(target=self._stream_loop,
-                                               daemon=True)
-        self._stream_thread.start()
-
-    def _stream_loop(self):
-        """Subscribe to the active channel and long-poll it.
-
+        """v0.28: subscribe ONCE per channel. The server pushes from there.
         Only ONE subscription per link exists server-side, so pointing
-        _stream_cid at a new channel (cursor=None) reroutes the stream —
-        background channels get nothing until they are opened again.
-        """
-        while not self._stream_stop.is_set():
-            if not self.guild_api or not self._stream_cid:
-                self._stream_stop.wait(1.0)
-                continue
-            try:
+        _stream_cid at a new channel (cursor=None) re-points the push. A
+        failed subscribe leaves cursor None; the announce tick re-fires
+        this until it sticks (self-healing, not polling)."""
+        if not self.guild_api or not self._stream_cid:
+            return
+        try:
+            res = self.guild_api.stream_subscribe(
+                self._stream_cid, cursor=self._stream_cursor)
+            if res.get("ok"):
                 if self._stream_cursor is None:
-                    res = self.guild_api.stream_subscribe(self._stream_cid)
-                    if res.get("ok"):
-                        self._stream_cursor = res.get("seq", 0)
-                    else:
-                        self._stream_stop.wait(2.0)
-                    continue
-                res = self.guild_api.stream_poll(self._stream_cursor, timeout_s=4.0)
-                if not res.get("ok"):
-                    if res.get("error") == "not subscribed":
-                        self._stream_cursor = None
-                    self._stream_stop.wait(2.0)
-                    continue
-                if res.get("reset"):
-                    # replay window rotated past our cursor: resync
-                    self._stream_cursor = None
-                    self._resync_stream_channel()
-                    continue
-                events = res.get("events") or []
-                if events:
-                    self._stream_cursor = res.get("cursor", self._stream_cursor)
-                    self._apply_stream_events(events)
-            except Exception as e:
-                print("stream exception:", repr(e))
-                self._stream_stop.wait(2.0)
+                    self._stream_cursor = res.get("seq", 0)
+            else:
+                self._stream_cursor = None
+        except Exception as e:
+            print("stream subscribe failed:", repr(e))
+            self._stream_cursor = None
 
     def _resync_stream_channel(self):
         """Fetch the subscribed channel's history after a gap/reset."""
@@ -2888,67 +3032,22 @@ class sHadesClientApp(MDApp):
                     elif data.get("text"):
                         self._term_page.append(data["text"])
                 Clock.schedule_once(apply_term, 0)
+            elif kind == "channels_changed":
+                # v0.28: channel create/rename/topic arrive as pushes; the
+                # 3s state poller that used to notice them is deleted.
+                Clock.schedule_once(
+                    lambda dt: self._refresh_channels_from_guild(), 0)
             # "typing" events are consumed by a later phase
         if touched:
             # full refresh of the visible channel; _render_message dedupes
             # by msg_id, so events already rendered are skipped
             self._resync_stream_channel()
 
-    def _start_announce(self):
-        """Re-register our node every ANNOUNCE_INTERVAL seconds.
-
-        Each re-register is a ping; the guild drops a node that misses two
-        consecutive pings (8 s) from its active user list. Safe to call more
-        than once: an existing thread is stopped before a new one starts.
-        """
-        if self._announce_thread is not None and self._announce_thread.is_alive():
-            self._announce_stop.set()
-        self._announce_stop.clear()
-        self._announce_thread = threading.Thread(target=self._announce_loop,
-                                                 daemon=True)
-        self._announce_thread.start()
-
-    def _announce_loop(self):
-        while not self._announce_stop.wait(self.ANNOUNCE_INTERVAL):
-            if not self.guild_api or not self.node_hash:
-                continue
-            try:
-                self.guild_api.register_node(
-                    self.node_hash, self.announce_host,
-                    self.announce_port, self.identity_hash)
-            except Exception as e:
-                print("announce ping failed:", repr(e))
-
     def _start_presence(self):
-        """Fetch active node list from guild every PRESENCE_INTERVAL seconds."""
-        if self._presence_thread is not None and self._presence_thread.is_alive():
-            self._presence_stop.set()
-        self._presence_stop.clear()
-        self._presence_thread = threading.Thread(target=self._presence_loop,
-                                                 daemon=True)
-        self._presence_thread.start()
-
-    def _presence_loop(self):
-        while not self._presence_stop.wait(self.PRESENCE_INTERVAL):
-            if not self.guild_api:
-                continue
-            try:
-                res = self.guild_api.presence()
-                if not res.get("ok"):
-                    continue
-                users = {}
-                for u in res.get("users") or []:
-                    if not isinstance(u, dict):
-                        continue
-                    uh = (u.get("user_hash") or "").lower()
-                    if uh:
-                        users[uh] = {"username": u.get("username") or "",
-                                     "node_hash": u.get("node_hash")}
-                self._active_users = users
-                self._presence_ok = True
-                Clock.schedule_once(lambda dt: self._refresh_presence_ui(), 0)
-            except Exception as e:
-                print("presence fetch failed:", repr(e))
+        """v0.28: the presence POLL was deleted. Presence now arrives as a
+        guild-wide push event on the link (server \"presence\" kind);
+        _apply_stream_events applies it. Nothing runs on an interval here."""
+        self._active_users = {}
 
     def _refresh_presence_ui(self):
         """Rebuild the member sidebar from the presence list.
@@ -3359,17 +3458,27 @@ class sHadesClientApp(MDApp):
         def work():
             print(f"[TRACE] _fetch_attachment.work: fetching {path}", flush=True)
             dlog(f"_fetch_attachment.work: fetching {path}")
+            Clock.schedule_once(
+                lambda dt: self._set_status(
+                    "attachment: fetching %s ..." % name), 0)
             try:
                 blob = self.guild_api.fetch_file(path)
-            except Exception:
+            except Exception as e:
                 blob = None
+                dlog("_fetch_attachment.work: fetch raised %r" % (e,))
             if not blob:
                 print(
                     f"[TRACE] _fetch_attachment.work: fetch returned empty for {path}", flush=True)
                 dlog(f"_fetch_attachment.work: fetch returned empty for {path}")
                 Clock.schedule_once(
+                    lambda dt, m="attachment fetch failed: %s"
+                    % name: self._set_status(m), 0)
+                Clock.schedule_once(
                     lambda dt: self._remove_placeholder(row), 0)
                 return
+            Clock.schedule_once(
+                lambda dt: self._set_status(
+                    "attachment loaded (%d KB)" % (len(blob) // 1024)), 0)
             print(
                 f"[TRACE] _fetch_attachment.work: received {len(blob)} bytes "
                 f"for {path}", flush=True)
@@ -4922,6 +5031,9 @@ class sHadesClientApp(MDApp):
           * ephemeral (P2P) - bytes sent inline; kept locally so they survive
                              restart, but no server copy exists.
         """
+        if self._android_platform():
+            self._open_attach_dialog_android()
+            return
         from kivy.uix.boxlayout import BoxLayout
         from kivy.uix.label import Label
         from kivy.uix.button import Button
@@ -5001,6 +5113,540 @@ class sHadesClientApp(MDApp):
         btn_cancel.bind(on_press=lambda *_: popup.dismiss())
         popup.open()
 
+    # ---------------- Android SAF file picking ---------------------------
+    # kivy's FileChooserListView browses the app sandbox only, which on
+    # Android contains no user files, so chooser popups showed nothing
+    # (tay's receipt). The system picker (ACTION_OPEN_DOCUMENT) needs no
+    # storage permission and returns a content:// uri read through the
+    # app's ContentResolver into a local copy, then the normal pipeline
+    # takes over (_send_attached_file / _on_file_selected).
+    _SAF_ATTACH = 0x5A17
+    _SAF_GENERIC = 0x5A18
+
+    def _android_platform(self):
+        from kivy.utils import platform
+        return platform == "android"
+
+    def _saf_copy_uri(self, uri):
+        """Copy a content:// uri into the app dir; return the local path.
+        No python-side byte arrays: the transfer runs java-side via
+        java.nio.file.Files.copy (minapi 26), so the only jnius name
+        imported is autoclass -- the one proven to import on-device.
+        (v0.15 raised E4 ImportError importing jbyte/jarray here.)"""
+        try:
+            import mimetypes as _mt
+        except ImportError:
+            _mt = None
+        from jnius import autoclass
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        resolver = PythonActivity.mActivity.getContentResolver()
+        # display name, best effort; the jarray(String) cursor query from
+        # v0.15 needed the same suspect jnius exports as the byte transfer,
+        # so both are gone: last path segment with a mime-based fallback.
+        name = None
+        try:
+            name = uri.getLastPathSegment()
+        except Exception:
+            name = None
+        if name:
+            name = os.path.basename(name.replace("\\", "/"))
+            if not name or "." not in name:
+                name = None
+        if not name:
+            try:
+                mime = resolver.getType(uri)
+            except Exception:
+                mime = None
+            ext = (_mt.guess_extension(mime) if (_mt and mime) else None) or ""
+            name = "picked" + ext
+        name = os.path.basename(name.replace("\\", "/")) or "picked"
+        if name.startswith("."):
+            name = "picked" + name
+        out_dir = os.path.join(_app_data_dir(), "picked")
+        os.makedirs(out_dir, exist_ok=True)
+        candidate = name
+        stem, ext = os.path.splitext(candidate)
+        n = 1
+        while os.path.exists(os.path.join(out_dir, candidate)):
+            candidate = "%s (%d)%s" % (stem, n, ext)
+            n += 1
+        target = os.path.join(out_dir, candidate)
+        if os.path.exists(target):
+            os.remove(target)
+
+        def step(what, fn):
+            """Wrap one copy hop so a failure names the hop exactly."""
+            try:
+                return fn()
+            except Exception as e:
+                dlog("saf %s failed: %r" % (what, e))
+                raise OSError("%s: %s" % (what, type(e).__name__))
+
+        # v0.24 PRIMARY: the file-descriptor path. tay's v0.23 receipt
+        # (224113 bytes, head=00 00 00 00 00 00 00 00) caught the
+        # java-array trap: the JVM fills ITS copy of the reflect byte
+        # array while the python wrapper keeps the original zeros, so
+        # the streamed copy had the right size and no content.
+        # ParcelFileDescriptor.detachFd() hands over the NATIVE fd int;
+        # python os.read owns it end to end and no java byte array
+        # crosses the bridge at all.
+        pfd = None
+        fd = None
+        try:
+            pfd = step("open-pfd", lambda: resolver.openFileDescriptor(uri, "r"))
+        except OSError as e:
+            dlog("saf pfd open failed: %s (falling back to streams)" % e)
+        if pfd is not None:
+            fd = step("detach-fd", lambda: pfd.detachFd())
+            if fd is None:
+                dlog("saf detachFd returned None")
+        if fd is not None:
+            total = 0
+            try:
+                first = os.read(fd, 8)
+                if len(first) == 8 and first == b"\x00" * 8:
+                    raise OSError("provider served zero-filled bytes "
+                                  "(fd head=00 x8)")
+                os.lseek(fd, 0, 0)
+                with open(target, "wb") as out:
+                    while True:
+                        chunk = os.read(fd, 1 << 20)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        total += len(chunk)
+                        if total > 32 * 1024 * 1024:
+                            raise OSError("picked file exceeds the 32 MB "
+                                          "server cap")
+            finally:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+            dlog("saf copy done via fd: %s (%d bytes)"
+                 % (target, total))
+            transfer = "fd"
+        else:
+            # legacy stream path (v0.15-v0.23 machinery), fallback only
+            stream = step("open-stream", lambda: resolver.openInputStream(uri))
+            if stream is None:
+                raise OSError("content provider refused read (stream None)")
+            transfer = None
+            try:
+                # primary: java.nio transfer via exact-signature hops only.
+                # File(String) ctor and File.toPath() have single overloads --
+                # the varargs suspects from v0.16 (getPath/Files.copy) stay
+                # quarantined behind this one call.
+                jfile = step("jfile", lambda: autoclass("java.io.File")(target))
+                jpath = step("jtopath", lambda: jfile.toPath())
+                step("niocopy",
+                     lambda: autoclass("java.nio.file.Files").copy(stream, jpath))
+                transfer = "nio"
+            except OSError as e:
+                dlog("saf nio path failed: %s" % e)
+            if transfer is None:
+                # fallback: re-open fresh (nio may have consumed the stream),
+                # copy python-side through reflect.Array -- no jnius scalar
+                # exports anywhere, no varargs overloads.
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+                stream2 = step("reopen-stream",
+                               lambda: resolver.openInputStream(uri))
+                try:
+                    step("reflect-copy",
+                         lambda: self._reflect_copy(stream2, target))
+                finally:
+                    try:
+                        stream2.close()
+                    except Exception:
+                        pass
+                transfer = "reflect"
+            try:
+                stream.close()
+            except Exception:
+                pass
+        size = os.path.getsize(target)
+        if size > 32 * 1024 * 1024:
+            os.remove(target)
+            raise OSError("picked file exceeds the 32 MB server cap (%d)"
+                          % size)
+        # v0.20 integrity gate: a provider stream can return zero bytes
+        # (or truncated data) and the transfer still "succeeds" -- every
+        # downstream consumer then spins or renders nothing with no
+        # error (tay's v0.19 receipt). tay's v0.20 receipt answered the
+        # zero-byte branch: 203434 real bytes that pillow cannot
+        # decode. v0.21 policy: sniff the magic so the file's TRUE
+        # format names itself. A kivy-decodable magic decodes or not in
+        # the editor (texture check names it); an undecodable family
+        # (HEIC/AVIF) fails here with a message tay can act on.
+        if size == 0:
+            os.remove(target)
+            raise OSError("copy produced a 0-byte file via %s "
+                          "(provider stream empty)" % transfer)
+        if os.path.splitext(target)[1].lower() \
+                in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
+            magic = self._saf_magic(target)
+            if magic is None:
+                os.remove(target)
+                raise OSError("copy produced unreadable data "
+                              "(%d bytes via %s, unknown magic)"
+                              % (size, transfer))
+            if magic in ("heic", "avif", "unknown"):
+                if magic == "unknown" and self._saf_image_ok(target):
+                    # extension lied, bytes decode anyway: keep it
+                    dlog("saf copy done via %s: %s (%d bytes, "
+                         "magic<ext mismatch but PIL verified)"
+                         % (transfer, target, size))
+                    return target
+                # v0.23: HEAD BYTES BEFORE DELETE -- v0.22 removed the
+                # file first, so the hex receipt read nothing
+                # ('(unreadable)' on tay's flash).
+                head_hex = self._saf_head_hex(target)
+                os.remove(target)
+                if magic == "unknown":
+                    raise OSError("picked image is not a decodable format "
+                                  "(%d bytes, head=%s) - please pick a "
+                                  "JPEG or PNG" % (size, head_hex))
+                raise OSError("picked image is %s - kivy cannot render "
+                              "that format here, please pick a JPEG "
+                              "or PNG (%d bytes via %s, head=%s)"
+                              % (magic.upper(), size, transfer, head_hex))
+            # known-decodable magic: PIL verify is advisory here. If
+            # pillow's decode stack is broken on-device, a hard gate
+            # would block good files (v0.20 receipt could be either);
+            # the editor's texture check gives the REAL verdict.
+            if not self._saf_image_ok(target):
+                dlog("saf: PIL could not verify %s magic=%s (%d bytes); "
+                     "letting kivy attempt the render"
+                     % (target, magic, size))
+        dlog("saf copy done via %s: %s (%d bytes, verified)"
+             % (transfer, target, size))
+        return target
+
+    @staticmethod
+    def _saf_head_hex(path, n=8):
+        """First n bytes as space-separated hex -- names unknown content
+        in a status/error line (v0.22, tay's gallery mystery)."""
+        try:
+            with open(path, "rb") as f:
+                head = f.read(n)
+        except Exception:
+            return "(unreadable)"
+        return " ".join("%02X" % b for b in head)
+
+    @staticmethod
+    def _saf_magic(path):
+        """Sniff the file's format from its first bytes: jpeg/png/gif/
+        webp/heic/avif/pdf/unknown/None (None = unreadable)."""
+        try:
+            with open(path, "rb") as f:
+                head = f.read(16)
+        except Exception:
+            return None
+        if head[:3] == b"\xff\xd8\xff":
+            return "jpeg"
+        if head[:8] == b"\x89PNG\r\n\x1a\n":
+            return "png"
+        if head[:4] in (b"GIF8",):
+            return "gif"
+        if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+            return "webp"
+        if head[:4] == b"%PDF":
+            return "pdf"
+        if head[4:8] == b"ftyp":
+            brand = head[8:12].lower()
+            if brand.startswith(b"heic") or brand.startswith(b"mif1"):
+                return "heic"
+            if brand.startswith(b"avif") or brand.startswith(b"avis"):
+                return "avif"
+            return "heic" if brand[:2] in (b"he", b"ms") else "heic"
+        return "unknown"
+
+    def _saf_image_ok(self, path):
+        """True iff the local file decodes as an image (pillow, an
+        in-repo dependency). Any exception -> False; the caller turns
+        it into a named error. Non-image extensions are not checked."""
+        try:
+            from PIL import Image
+            with Image.open(path) as im:
+                im.verify()
+            return True
+        except Exception as e:
+            dlog("saf image verify failed: %s: %s"
+                 % (type(e).__name__, e))
+            return False
+
+    def _reflect_copy(self, stream, target):
+        """Python-side copy with no jbyte/jarray exports: the byte[] is
+        built via java.lang.reflect.Array.newInstance + Byte.TYPE
+        (public, documented surface), read via stream.read(buf). Slow
+        per-element conversion -- correctness fallback only."""
+        from jnius import autoclass
+        make = autoclass("java.lang.reflect.Array")
+        jbyte_cls = autoclass("java.lang.Byte").TYPE
+        buf = make.newInstance(jbyte_cls, 65536)
+        with open(target, "wb") as out:
+            total = 0
+            while True:
+                got = stream.read(buf)
+                if got <= 0:
+                    break
+                out.write(bytes(bytearray(buf[:got])))
+                total += got
+                if total > 32 * 1024 * 1024:
+                    raise OSError("picked file exceeds the 32 MB server cap")
+        return target
+
+    def _saf_pick(self, request_code, on_file, on_fail=None):
+        """Launch the system picker; on_file(local_path) fires on success,
+        on_fail(reason) on any failure. Both run on the kivy thread --
+        the activity callback arrives on the Android UI thread and is
+        marshalled via Clock (kivy widgets must not be touched from
+        foreign threads; property dispatch there is silent-no-op)."""
+        from jnius import autoclass
+        from android import activity as android_activity
+        handlers = getattr(self, "_saf_handlers", None)
+        if handlers is None:
+            handlers = {}
+            self._saf_handlers = handlers
+            android_activity.bind(on_activity_result=self._on_saf_result)
+        if request_code in handlers:
+            self._set_status("file picker already open")
+            return
+        handlers[request_code] = (on_file, on_fail)
+        Intent = autoclass("android.content.Intent")
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        intent.setType("*/*")
+        PythonActivity.mActivity.startActivityForResult(intent, request_code)
+        self._set_status("system picker open — choose a file there")
+
+    def _on_saf_result(self, request_code, result_code, intent):
+        """Called on the ANDROID UI thread by the p4a activity bridge.
+        Never touch kivy state here: snapshot, marshal onto the kivy
+        thread, and process in _finish_saf_result."""
+        handlers = getattr(self, "_saf_handlers", None)
+        if not handlers:
+            return
+        entry = handlers.pop(request_code, None)
+        if entry is None:
+            return
+        from kivy.clock import Clock
+        payload = {
+            "request_code": request_code,
+            "result_code": result_code,
+            "intent": intent,
+            "on_file": entry[0],
+            "on_fail": entry[1],
+        }
+        Clock.schedule_once(
+            lambda dt: self._finish_saf_result(payload), 0)
+
+    def _finish_saf_result(self, payload):
+        """Process a picker result on the kivy thread."""
+        result_code = payload["result_code"]
+        intent = payload["intent"]
+        on_file = payload["on_file"]
+        on_fail = payload["on_fail"]
+
+        def fail(reason):
+            dlog("pick fail: %s" % reason)
+            self._set_status("pick failed: %s" % reason)
+            if on_fail:
+                on_fail(reason)
+
+        from jnius import autoclass
+        ACT = autoclass("android.app.Activity")
+        if result_code != ACT.RESULT_OK:
+            fail("E1: cancelled (code %s)" % result_code)
+            return
+        if intent is None:
+            fail("E2: picker returned no data")
+            return
+        uri = intent.getData()
+        if uri is None:
+            fail("E3: no file uri in result")
+            return
+        tail = "file"
+        try:
+            tail = uri.getLastPathSegment() or "file"
+        except Exception:
+            pass
+        self._set_status("copying %s ..." % os.path.basename(tail))
+
+        def on_file_marshalled(local):
+            # v0.25: handlers run on the kivy thread only (thread-marshal
+            # law); the copy itself now owns a background thread so a big
+            # pick can no longer freeze the UI (tay's v0.24 stall).
+            try:
+                kb = os.path.getsize(local) // 1024
+                self._set_status("picked %s (%d KB)"
+                                 % (os.path.basename(local), kb))
+            except Exception:
+                pass
+            on_file(local)
+
+        def copy_work():
+            try:
+                local = self._saf_copy_uri(uri)
+            except Exception as e:
+                dlog("saf copy failed: %r" % e)
+                reason = "E4: copy failed: %s" % (
+                    str(e) or type(e).__name__)
+                Clock.schedule_once(lambda dt, r=reason: fail(r), 0)
+                return
+            Clock.schedule_once(
+                lambda dt: on_file_marshalled(local), 0)
+
+        threading.Thread(target=copy_work, daemon=True).start()
+
+    def _open_attach_dialog_android(self):
+        """Android attach flow: system picker + storage-style selector."""
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.label import Label
+        from kivy.uix.button import Button
+        from kivy.uix.popup import Popup
+
+        main = self.root.get_screen("main")
+        text = (main.ids.msg_input.text or "").strip()
+        app = App.get_running_app()
+        state = {"style": ATT_SERVER, "path": None}
+
+        style_box = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        style_box.add_widget(
+            Label(text="Store:", size_hint_x=None, width=dp(50),
+                  color=app.theme_colors['text'] if app else (1, 1, 1, 1),
+                  font_size=sp(12), halign="left", valign="middle"))
+        btn_server = Button(text="Server-stored", size_hint_x=None,
+                            width=dp(130), size_hint_y=None,
+                            height=scaled(dp(44)), pos_hint={"center_y": 0.5})
+        btn_ephem = Button(text="Ephemeral (P2P)", size_hint_x=None,
+                           width=dp(130), size_hint_y=None,
+                           height=scaled(dp(44)), pos_hint={"center_y": 0.5})
+
+        def pick(s):
+            state["style"] = s
+            active_bg = (app.theme_colors['primary'] if app
+                         else (0.42, 0.48, 1.0, 1))
+            inactive_bg = (app.theme_colors['panel_darker'] if app
+                           else (0.25, 0.27, 0.31, 1))
+            btn_server.background_color = (active_bg if s == ATT_SERVER
+                                           else inactive_bg)
+            btn_ephem.background_color = (active_bg if s == ATT_EPHEMERAL
+                                          else inactive_bg)
+
+        btn_server.bind(on_press=lambda *_: pick(ATT_SERVER))
+        btn_ephem.bind(on_press=lambda *_: pick(ATT_EPHEMERAL))
+        pick(ATT_SERVER)
+        style_box.add_widget(btn_server)
+        style_box.add_widget(btn_ephem)
+
+        chosen = Label(text="No file picked yet", size_hint_y=None,
+                       height=dp(56),
+                       color=app.theme_colors['text'] if app else (1, 1, 1, 1),
+                       font_size=sp(12), halign="left", valign="middle")
+        chosen.bind(width=lambda inst, w: setattr(inst, "text_size", (w, None)))
+        btn_pick = Button(text="Choose file (system picker)",
+                          size_hint_y=None, height=scaled(dp(44)),
+                          background_color=(app.theme_colors['panel_darker']
+                                            if app
+                                            else (0.25, 0.27, 0.31, 1)),
+                          color=app.theme_colors['text'] if app else (1, 1, 1, 1))
+        btn_ok = Button(text="OK — Send", size_hint_y=None,
+                        height=scaled(dp(44)),
+                        background_color=(app.theme_colors['primary']
+                                          if app else (0.42, 0.48, 1.0, 1)),
+                        color=app.theme_colors['text'] if app else (1, 1, 1, 1))
+        btn_cancel = Button(text="Cancel", size_hint_y=None,
+                            height=scaled(dp(44)),
+                            background_color=(app.theme_colors['panel_darker']
+                                              if app
+                                              else (0.25, 0.27, 0.31, 1)),
+                            color=app.theme_colors['text'] if app
+                            else (1, 1, 1, 1))
+        btn_box = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        btn_box.add_widget(btn_ok)
+        btn_box.add_widget(btn_cancel)
+
+        content = BoxLayout(orientation="vertical", spacing=dp(8),
+                            padding=dp(8))
+        content.add_widget(Label(
+            text="Attach a file — choose how it is stored:",
+            size_hint_y=None, height=dp(24),
+            color=app.theme_colors['text'] if app else (1, 1, 1, 1),
+            font_size=sp(12)))
+        content.add_widget(btn_pick)
+        content.add_widget(chosen)
+        content.add_widget(style_box)
+        content.add_widget(btn_box)
+
+        popup = Popup(title="Attach file", content=content,
+                      size_hint=(0.9, 0.7), auto_dismiss=False)
+
+        def do_pick(*_):
+            def on_fail(reason):
+                chosen.text = reason
+                chosen.color = (1, 0.5, 0.4, 1)
+
+            def on_file(local):
+                state["path"] = local
+                chosen.text = os.path.basename(local)
+                self._set_status("picked %s (%d KB) — choose storage, then OK"
+                                 % (chosen.text,
+                                    os.path.getsize(local) // 1024))
+            self._saf_pick(self._SAF_ATTACH, on_file, on_fail)
+
+        def do_ok(*_):
+            if not state["path"]:
+                self._set_status("No file selected")
+                return
+            popup.dismiss()
+            self._send_attached_file(text, state["path"], state["style"])
+
+        btn_pick.bind(on_press=do_pick)
+        btn_ok.bind(on_press=do_ok)
+        btn_cancel.bind(on_press=lambda *_: popup.dismiss())
+        popup.open()
+
+    def _android_pick_generic(self, avatar):
+        """Android generic picker for open_file_chooser(avatar=...)."""
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.label import Label
+        from kivy.uix.button import Button
+        from kivy.uix.popup import Popup
+        app = App.get_running_app()
+        hint = Label(text="Use the system picker to choose a file.",
+                     size_hint_y=None, height=dp(48),
+                     color=app.theme_colors['text'] if app else (1, 1, 1, 1),
+                     font_size=sp(12), halign="left", valign="middle")
+        hint.bind(width=lambda inst, w: setattr(inst, "text_size", (w, None)))
+        btn = Button(text="Choose file (system picker)",
+                     size_hint_y=None, height=scaled(dp(44)),
+                     background_color=(app.theme_colors['primary'] if app
+                                       else (0.42, 0.48, 1.0, 1)),
+                     color=app.theme_colors['text'] if app else (1, 1, 1, 1))
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        box.add_widget(hint)
+        box.add_widget(btn)
+        popup = Popup(title="Select file", content=box,
+                      size_hint=(0.9, 0.5), auto_dismiss=False)
+
+        def do_pick(*_):
+            def on_fail(reason):
+                hint.text = reason
+                hint.color = (1, 0.5, 0.4, 1)
+
+            def on_file(local):
+                popup.dismiss()
+                self._on_file_selected([local], None)
+            self._saf_pick(self._SAF_GENERIC, on_file, on_fail)
+
+        btn.bind(on_press=do_pick)
+        popup.open()
+
     def _send_attached_file(self, text, path, style):
         """Read the chosen file and send it as an attachment of the given style."""
         try:
@@ -5040,37 +5686,79 @@ class sHadesClientApp(MDApp):
         cid = self._channel_cid(cid)
 
         def work():
-            print(f"[TRACE] _send_with_attachment.work: posting to channel={cid}", flush=True)
-            dlog(f"_send_with_attachment.work: posting to channel={cid}")
-            # v1 path: upload the blob once, post by reference (no re-transfer
-            # on retry). Fall back to the legacy inline msgpack post when the
-            # guild predates /api/v1.
-            res = None
             try:
-                up = self.guild_api.blobs_put(name, mime, blob)
-                if up.get("ok"):
-                    res = self.guild_api.post_v1(
-                        cid, text,
-                        attachments=[{"name": name, "mime": mime,
-                                      "blob_id": up["blob_id"]}])
-                else:
-                    print("[TRACE] blob upload failed: %s" % up.get("error"), flush=True)
+                print(f"[TRACE] _send_with_attachment.work: posting to channel={cid}", flush=True)
+                dlog(f"_send_with_attachment.work: posting to channel={cid}")
+
+                def stage(msg):
+                    Clock.schedule_once(
+                        lambda dt, m=msg: self._set_status(m), 0)
+
+                # v1 path: upload the blob once, post by reference (no re-transfer
+                # on retry). Fall back to the legacy inline msgpack post when the
+                # guild predates /api/v1.
+                res = None
+                try:
+                    stage("attachment: uploading %s (%d KB)"
+                          % (name, len(blob) // 1024))
+                    up = self.guild_api.blobs_put(name, mime, blob)
+                    if up.get("ok"):
+                        stage("attachment: blob ok, posting %s" % name)
+                        res = self.guild_api.post_v1(
+                            cid, text,
+                            attachments=[{"name": name, "mime": mime,
+                                          "blob_id": up["blob_id"]}])
+                        dlog("send.post_v1 response: %r" % (res,))
+                    else:
+                        stage("attachment: blob failed (%s), legacy ..."
+                              % up.get("error", "unknown"))
+                        print("[TRACE] blob upload failed: %s"
+                              % up.get("error"), flush=True)
+                except Exception as e:
+                    dlog("v1 blob path failed: %r" % (e,))
+                    print("[TRACE] v1 blob path failed, falling back:",
+                          repr(e), flush=True)
+                if res is None or not res.get("ok"):
+                    try:
+                        stage("attachment: posting inline %s ..." % name)
+                        legacy = self.guild_api.post(
+                            cid, text, attachments=[[name, mime, blob]])
+                        res = legacy if (res is None
+                                         or not res.get("ok")) else res
+                        dlog("send.legacy post response: %r" % (res,))
+                    except Exception as e:
+                        # pre-v0.16 bug: a raise here killed the worker
+                        # thread silently, leaving a spinner forever.
+                        dlog("legacy attachment post raised: %r" % (e,))
+                        Clock.schedule_once(
+                            lambda dt, m="attach send failed: %s: %s"
+                            % (type(e).__name__, e): self._set_status(m), 0)
+                        return
+                if res is None:
+                    Clock.schedule_once(
+                        lambda dt: self._set_status(
+                            "attach send failed: no response"), 0)
+                    return
+                print(
+                    f"[TRACE] _send_with_attachment.work: post response "
+                    f"ok={res.get('ok')} msg_id={res.get('msg_id')} "
+                    f"attachment={res.get('attachment')}", flush=True)
+                dlog(
+                    f"_send_with_attachment.work: post response "
+                    f"ok={res.get('ok')} msg_id={res.get('msg_id')} "
+                    f"attachment={res.get('attachment')}")
+                if not res.get("ok"):
+                    Clock.schedule_once(
+                        lambda dt, m="send failed: %s"
+                        % res.get("error", "unknown"): self._set_status(m), 0)
+                    return
             except Exception as e:
-                print("[TRACE] v1 blob path failed, falling back:", repr(e), flush=True)
-            if res is None or not res.get("ok"):
-                legacy = self.guild_api.post(cid, text, attachments=[[name, mime, blob]])
-                res = legacy if (res is None or not res.get("ok")) else res
-            print(
-                f"[TRACE] _send_with_attachment.work: post response "
-                f"ok={res.get('ok')} msg_id={res.get('msg_id')} "
-                f"attachment={res.get('attachment')}", flush=True)
-            dlog(
-                f"_send_with_attachment.work: post response "
-                f"ok={res.get('ok')} msg_id={res.get('msg_id')} "
-                f"attachment={res.get('attachment')}")
-            if not res.get("ok"):
+                import traceback
+                dlog("attachment send thread crashed: trace=%s"
+                     % traceback.format_exc())
                 Clock.schedule_once(
-                    lambda dt: self._set_status("send failed: %s" % res.get("error", "unknown")), 0)
+                    lambda dt, m="attachment send crashed: %s"
+                    % type(e).__name__: self._set_status(m), 0)
                 return
             msg_id = res.get("msg_id")
             # The guild may ack with stored metadata (path) => server-stored.
@@ -5123,34 +5811,26 @@ class sHadesClientApp(MDApp):
         # worker thread and hop back to the main thread for the status text
         # and the popup, so opening a profile never freezes the UI.
         def work():
-            # Look up node's address via guild
+            # v0.29: the directory confirms the node is registered and gives
+            # the user it belongs to. Reachability is cryptographic: the
+            # node's destination hash is the address (Identity.recall +
+            # RNS.Link below); no ip:port involved.
             try:
                 res = self.guild_api.lookup_node(lookup_hash)
                 if not res.get("ok"):
                     Clock.schedule_once(lambda dt: self._set_status(
                         "Node not found: %s" % res.get("error", "unknown")), 0)
                     return
-                address = res.get("address")
-                port = res.get("port")
-                identity_hash = res.get("identity_hash")
             except Exception as e:
                 err = "Lookup failed: %s" % e
                 Clock.schedule_once(
                     lambda dt: self._set_status(err), 0)
                 return
 
-            if not address or not port:
-                Clock.schedule_once(lambda dt: self._set_status(
-                    "No address for node: %s" % lookup_hash), 0)
-                return
-
             # Connect to remote node via RNS.Link and request profile page
             try:
                 nh = bytes.fromhex(lookup_hash)
                 nid = RNS.Identity.recall(nh)
-                if nid is None:
-                    # Try with identity_hash from lookup
-                    nid = RNS.Identity(bytes.fromhex(identity_hash)) if identity_hash else None
                 if nid is None:
                     Clock.schedule_once(lambda dt: self._set_status(
                         "RNS does not know identity for %s" % target_hash), 0)
@@ -5355,6 +6035,9 @@ class sHadesClientApp(MDApp):
     def open_file_chooser(self, avatar=False):
         """Open a file chooser popup to attach a file or select an avatar."""
         self._avatar_mode = avatar
+        if self._android_platform():
+            self._android_pick_generic(avatar)
+            return
         chooser = FileChooserListView(filters=["*.png", "*.jpg", "*.jpeg",
                                                "*.gif", "*.webp", "*.mp4",
                                                "*.mp3", "*.pdf", "*.txt"])
@@ -5365,14 +6048,22 @@ class sHadesClientApp(MDApp):
         popup.open()
 
     def _on_file_selected(self, selection, popup):
-        popup.dismiss()
+        if popup is not None:
+            popup.dismiss()
         if not selection:
             return
         path = selection[0]
-        if getattr(self, "_avatar_mode", False):
-            self._open_pfp_editor(path)
-        else:
-            self.attach_file(path)
+        try:
+            if getattr(self, "_avatar_mode", False):
+                self._set_status("opening PFP editor ...")
+                self._open_pfp_editor(path)
+            else:
+                self.attach_file(path)
+        except Exception as e:
+            import traceback
+            dlog("on_file_selected failed: %s" % traceback.format_exc())
+            self._set_status("pick routing failed: %s: %s"
+                             % (type(e).__name__, e))
 
     def _open_pfp_editor(self, path):
         """Open round-mask PFP picker popup — drag circle to position, drag outside to resize.
@@ -5448,9 +6139,35 @@ class sHadesClientApp(MDApp):
         def do_cancel(*_):
             popup.dismiss()
 
+        def _trace_dismiss(*a):
+            # v0.19: the editor flashed-and-closed on tay's phone with no
+            # error; kivy has no caller attribution, so print the live
+            # dismiss stack: top frames name the file/line that closed it.
+            import traceback
+            fr = traceback.format_stack(limit=6)
+            dlog("editor popup dismissed; stack:\n" + "".join(fr))
+            top = fr[-2].strip() if len(fr) > 1 else "?"
+            Clock.schedule_once(
+                lambda dt: self._set_status(
+                    "editor closed by: %s" % top), 0)
+
         save_btn.bind(on_press=do_save)
         cancel_btn.bind(on_press=do_cancel)
+        popup.bind(on_dismiss=_trace_dismiss)
         popup.open()
+
+        def _check_image(dt):
+            try:
+                pimg = editor.ids.get("pfp_img")
+            except Exception:
+                pimg = None
+            if pimg is None:
+                self._set_status("editor: no pfp_img child (kv rule "
+                                 "missing)")
+            elif not pimg.texture:
+                self._set_status("editor: image not loaded: %s"
+                                 % os.path.basename(path))
+        Clock.schedule_once(_check_image, 2.0)
 
     def _save_pfp_crop(self, path, crop_cx=0, crop_cy=0, crop_r=0,
                        image_pos=None, image_size=None):
@@ -5562,28 +6279,70 @@ class sHadesClientApp(MDApp):
             a = PILImageChops.multiply(a, mask)
             crop = PILImage.merge("RGBA", (r, g, b, a))
             crop.save(small_path, "PNG")
+
+            # v0.26: the local display copy stays PNG (alpha circle), but
+            # the UPLOAD copy is JPEG over the theme background: a 256x256
+            # RGBA PNG inside an RNS link request is 60-120 KB and
+            # monopolizes the link while its resource transfer runs, which
+            # stalled every other request behind it (tay: "setting pfp
+            # appears to block all networking"). Corners composite to the
+            # theme bg and the app masks to a circle for display anyway.
+            # v0.27: 128x128 upload copy. The v0.26 256px JPEG (~15-20KB)
+            # still moved as a multi-packet resource that outran the
+            # poll's window (tay: "Poll timeout, upload failed. Happens
+            # in under 5 seconds"). A quarter of the pixel area is a
+            # 3-6 KB resource -- the avatar rides between poll packets.
+            # Display copies stay 256px local PNG.
+            up_path = os.path.join(pfp_dir, "up_" + base + ".jpg")
+            try:
+                up_img = PILImage.new("RGBA", (128, 128), (26, 26, 26, 255))
+                mini = crop.resize((128, 128), PILImage.LANCZOS)
+                up_img.alpha_composite(mini)
+                up_img.convert("RGB").save(up_path, "JPEG", quality=75)
+            except Exception:
+                up_path = small_path
         else:
             import shutil
             shutil.copy(path, orig_path)
             shutil.copy(path, small_path)
+            up_path = small_path
 
         # Upload 256x256 version to guild as avatar. avatar_upload() blocks
         # on the RNS link, so do it on a worker thread; the local files are
         # saved either way and applied to the UI on the main thread.
         def upload_work():
             try:
-                with open(small_path, "rb") as f:
+                with open(up_path, "rb") as f:
                     blob = f.read()
-                res = self.guild_api.avatar_upload(blob)
             except Exception:
-                res = None
+                blob = None
+            # v0.27: name the failure + retry once -- a fast "request
+            # failed" often means the link's queue was mid-poll; after a
+            # short drain the same small resource rides through.
+            attempt = 0
+            last = "no response"
+            if blob is None:
+                last = "unable to read upload copy"
+                attempt = 2
+            while attempt < 2:
+                try:
+                    res = self.guild_api.avatar_upload(blob)
+                    if res and res.get("ok") and not res.get("unconfirmed"):
+                        def ok(dt):
+                            self._set_status("Avatar updated (%d KB)"
+                                             % (len(blob) // 1024))
+                        Clock.schedule_once(ok, 0)
+                        return
+                    last = str((res or {}).get("error") or "no response")[:48]
+                except Exception as e:
+                    last = str(e)[:48]
+                attempt += 1
+                if attempt < 2:
+                    time.sleep(2.0)
 
-            def apply_upload(dt):
-                if res and res.get("ok"):
-                    self._set_status("Avatar updated")
-                else:
-                    self._set_status("avatar upload failed")
-            Clock.schedule_once(apply_upload, 0)
+            def fail2(dt):
+                self._set_status("avatar upload failed: %s" % last)
+            Clock.schedule_once(fail2, 0)
         threading.Thread(target=upload_work, daemon=True).start()
 
         # Always store paths locally regardless of guild API result —
@@ -5662,17 +6421,31 @@ class sHadesClientApp(MDApp):
             # fallback, and it matches what the guild already shows.
             if not new_name:
                 new_name = self.username or default_username(self.my_hash)
-        except Exception:
+        except Exception as e:
+            import traceback
+            dlog("save_profile pre-register failed: %s"
+                 % traceback.format_exc())
+            self._set_status("save failed (input read): %s: %s"
+                             % (type(e).__name__, e))
             return
 
         # register() blocks on the RNS link — keep it off the main thread.
+        self._set_status("registering \"%s\" ..." % new_name)
+
         def work():
             try:
                 res = self.guild_api.register(new_name, "")
             except Exception as e:
-                err = "save failed: %s" % e
+                err = "save failed: %s: %s" % (type(e).__name__, e)
+                dlog("save_profile register raised: %s" % repr(e))
                 Clock.schedule_once(
                     lambda dt: self._set_status(err), 0)
+                return
+            dlog("save_profile register response: %r" % (res,))
+            if not isinstance(res, dict):
+                Clock.schedule_once(
+                    lambda dt: self._set_status(
+                        "save failed: bad response %r" % (res,)), 0)
                 return
             if res.get("ok"):
                 def apply(dt):
@@ -5681,12 +6454,23 @@ class sHadesClientApp(MDApp):
                         self.profile_screen.target_username = new_name
                     except Exception:
                         pass
-                    self._set_status("Profile saved")
+                    # persist: restarts load the session file
+                    try:
+                        self._save_session()
+                    except Exception:
+                        pass
+                    self._set_status("Profile saved: %s" % new_name)
                 Clock.schedule_once(apply, 0)
             else:
-                Clock.schedule_once(
-                    lambda dt: self._set_status(
-                        "save failed: %s" % res.get("error", "unknown")), 0)
+                def fail(dt):
+                    self._set_status(
+                        "save failed: %s" % res.get("error", "unknown"))
+                    try:
+                        inp.helper_text = (
+                            "server: %s" % str(res.get("error"))[:64])
+                    except Exception:
+                        pass
+                Clock.schedule_once(fail, 0)
         threading.Thread(target=work, daemon=True).start()
 
     # -- ui helpers ------------------------------------------------------
@@ -5695,15 +6479,21 @@ class sHadesClientApp(MDApp):
             self.root.get_screen("connect").ids.status.text = text
         except Exception:
             pass
+        # v0.25: the connect screen is usually not on display. Mirror
+        # every status onto the profile screen's own line -- tay's
+        # v0.24 receipt ("name change does not actually do anything")
+        # was the register verdicts rendering on an invisible screen.
+        try:
+            ps = self.root.get_screen("profile")
+            lbl = ps.ids.get("profile_status")
+            if lbl is not None:
+                lbl.text = str(text)
+        except Exception:
+            pass
 
     def on_stop(self):
-        # Stop every background loop: the poller, the presence ping, and the
-        # presence fetcher. Without the last one a reconnect would leak a
-        # presence thread per session.
-        self._poll_stop.set()
-        self._stream_stop.set()
-        self._announce_stop.set()
-        self._presence_stop.set()
+        # v0.28: push replaced the poller/streamer/presence-fetcher.
+        # v0.29: nothing pings, so there is no tick loop left to stop.
         # close any open console sessions so they don't idle out server-side.
         # Each term_close() blocks on the RNS link for up to the request
         # timeout, so doing them inline freezes shutdown for N * timeout
