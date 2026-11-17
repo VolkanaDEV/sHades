@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Exercise the connect form and drawer navigation with a real Kivy window."""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from kivy.clock import Clock  # noqa: E402
+from kivy.core.window import Window  # noqa: E402
+from kivy.metrics import dp  # noqa: E402
+from kivy_client import sHadesClientApp  # noqa: E402
+
+
+class LayoutProbe(sHadesClientApp):
+    def on_start(self):
+        self.failures = []
+        Clock.schedule_once(self.check_connect, 1.2)
+
+    def check(self, condition, message):
+        print(("PASS " if condition else "FAIL ") + message, flush=True)
+        if not condition:
+            self.failures.append(message)
+
+    def check_connect(self, dt):
+        screen = self.root.get_screen("connect")
+        fields = [screen.ids[k] for k in
+                  ("hub_address", "username", "advanced_toggle")]
+        self.check(all(w.width >= dp(220) for w in fields),
+                   "connection controls retain a readable width on mobile")
+        self.check(all(0 <= w.to_window(*w.pos)[0]
+                       and w.to_window(*w.pos)[0] + w.width <= Window.width
+                       for w in fields), "connection controls fit the viewport")
+        self.check(fields[0].y > fields[1].top - dp(1)
+                   and fields[1].y > fields[2].top - dp(1),
+                   "connection controls do not overlap")
+        screen.toggle_advanced()
+        self.check(screen.ids.advanced_box.height >= dp(98),
+                   "advanced connection fields expand")
+
+        self.root.current = "main"
+        main = self.root.get_screen("main")
+        main.toggle_left()
+        main.toggle_right()
+        self.check(main.right_open and not main.left_open,
+                   "opening members closes channels")
+        main.toggle_left()
+        self.check(main.left_open and not main.right_open,
+                   "opening channels closes members")
+        Clock.schedule_once(self.check_main, 0.3)
+
+    def check_main(self, dt):
+        main = self.root.get_screen("main")
+        self.check(main.ids.left_sidebar.width <= main.width * 0.8 + 1,
+                   "channel drawer leaves a visible chat edge")
+        self.check(main.ids.msg_input.height <= dp(40) + 1,
+                   "composer stays inside its toolbar")
+        self.root.current = "config"
+        Clock.schedule_once(self.check_config, 0.3)
+
+    def check_config(self, dt):
+        config = self.root.get_screen("config")
+        original = dict(self.theme_colors)
+        config._color_fields["bg_main"].text = "#123456"
+        config._color_fields["border_subtle"].text = "invalid"
+        config.save_config()
+        self.check(dict(self.theme_colors) == original,
+                   "invalid theme cannot partially change live colors")
+
+        class InvalidAddress:
+            def __init__(self):
+                self.status = ""
+
+            def _set_status(self, message):
+                self.status = message
+
+            def _add_server(self, *args):
+                raise AssertionError("invalid address was persisted")
+
+        for address in (":29221", "example.com:0", "example.com:65536",
+                        "example.com\nextra:29221"):
+            target = InvalidAddress()
+            sHadesClientApp.connect_to_guild(target, address, "tester")
+            self.check(bool(target.status),
+                       "invalid hub address rejected: " + address)
+        self.stop()
+
+
+if __name__ == "__main__":
+    Window.size = (360, 640)
+    probe = LayoutProbe()
+    probe.run()
+    sys.exit(bool(probe.failures))

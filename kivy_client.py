@@ -130,7 +130,7 @@ else:
 # main.py installs at process start, so the launch story survives even a
 # dead renderer. Remove BOOT_DEBUG once the launch diagnosis is done.
 # ---------------------------------------------------------------------------
-BOOT_DEBUG = True
+BOOT_DEBUG = False
 
 _boot_lines = []
 _boot_label = {"ref": None}
@@ -328,31 +328,23 @@ ATT_PLACEHOLDER_TEXT = "[loading image…]"
 # expressions resolve (THEME_KEYS + THEME_LABELS drive the config screen's
 # generated colour rows).
 DEFAULT_THEME_COLORS = {
-    "bg_main": (0.04, 0.04, 0.04, 1),      # screens / root background - near black
-    "panel": (0.07, 0.07, 0.07, 1),        # center chat area
-    "panel_darker": (0.09, 0.09, 0.09, 1),  # input bar / dropdowns
-    "bg_sidebar": (0.05, 0.05, 0.05, 1),   # side window backgrounds
-    "sidebar_ctrl": (0.08, 0.08, 0.08, 1),  # sidebar buttons / slim bars
-    "topbar": (0.04, 0.04, 0.04, 1),       # top bar background - near black
-    "primary": (0.87, 0.60, 0.23, 1),      # primary buttons - vintage amber #DF993A
-    "accent": (0.0, 0.75, 0.65, 1),        # accent / destructive - vibrant teal #00BFA6
-    "text": (0.87, 0.60, 0.23, 1),         # body text - vintage amber
-    "text_muted": (0.72, 0.53, 0.18, 1),   # secondary text - aged amber #B8862D
-    # #B08C46 -- the old #997026 measured 4.19:1 on the chat surface and
-    # 3.90:1 on the focused input fill, both below the 4.5:1 WCAG AA
-    # threshold for body text. This value measures 5.96:1 / 5.54:1.
-    "text_dim": (0.690, 0.549, 0.275, 1),   # dimmer secondary text
-    "input_bg": (0.09, 0.09, 0.09, 1),     # text field fill
-    "input_bg_focus": (0.11, 0.11, 0.11, 1),
-    # #1E1E1E -- msg_own used to equal the panel colour exactly, so the
-    # own-message bubble was invisible against the chat surface.
-    "msg_own": (0.118, 0.118, 0.118, 1),   # own-message bubble / embeds
-    "btn_text": (0.04, 0.04, 0.04, 1),     # button text - near black (for amber buttons)
-    # #646464 -- first value that clears 3:1 against all three dark
-    # surfaces (3.35 / 3.26 / 3.17), so input outlines are actually
-    # visible. Without a border token, inputs read as flat rectangles.
-    "border": (0.392, 0.392, 0.392, 1),    # input outlines, focus rings
-    "border_subtle": (0.227, 0.227, 0.227, 1),  # dividers, scrollbar trough
+    "bg_main": (0.043, 0.063, 0.090, 1),       # #0B1017 midnight
+    "panel": (0.067, 0.098, 0.145, 1),         # #111925 conversation
+    "panel_darker": (0.075, 0.118, 0.169, 1),  # #131E2B composer
+    "bg_sidebar": (0.055, 0.082, 0.122, 1),    # #0E151F navigation
+    "sidebar_ctrl": (0.090, 0.133, 0.192, 1),  # #172231 selected surface
+    "topbar": (0.075, 0.118, 0.169, 1),        # #131E2B header
+    "primary": (0.961, 0.718, 0.373, 1),      # #F5B75F warm signal
+    "accent": (0.345, 0.839, 0.765, 1),       # #58D6C3 live state
+    "text": (0.957, 0.941, 0.906, 1),         # #F4F0E7 warm white
+    "text_muted": (0.722, 0.769, 0.820, 1),   # #B8C4D1 secondary
+    "text_dim": (0.569, 0.639, 0.706, 1),     # #91A3B4 metadata
+    "input_bg": (0.090, 0.133, 0.192, 1),
+    "input_bg_focus": (0.110, 0.173, 0.239, 1),
+    "msg_own": (0.106, 0.173, 0.227, 1),      # #1B2C3A own posts
+    "btn_text": (0.063, 0.090, 0.133, 1),
+    "border": (0.388, 0.478, 0.529, 1),       # #637A87 visible outline
+    "border_subtle": (0.165, 0.231, 0.286, 1),
 }
 
 THEME_KEYS = (
@@ -1526,6 +1518,7 @@ class ClickableLabel(ContextMenuMixin, ButtonBehavior, Label):
 class ChannelButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
     channel_name = StringProperty("")
     badge = NumericProperty(0)
+    selected = BooleanProperty(False)
 
     def build_context_menu(self):
         app = App.get_running_app()
@@ -1781,6 +1774,14 @@ if KIVY:
         def toggle_right(self):
             self.right_open = not self.right_open
 
+        def on_left_open(self, instance, opened):
+            if opened:
+                self.right_open = False
+
+        def on_right_open(self, instance, opened):
+            if opened:
+                self.left_open = False
+
         # -- swipe gestures (edge bands + drawn-panel travel) ------------
         # Kivy routes on_touch_down to parent before children, so we only
         # CLASSIFY here (never consume): returning super()'s result lets
@@ -1935,21 +1936,23 @@ if KIVY:
                 status = self.ids["config_status"]
             except Exception:
                 status = None
+            # Validate the whole form before changing the live palette.
+            updated = dict(app.theme_colors)
             for key in THEME_KEYS:
                 fld = self._color_fields.get(key)
                 if fld is None:
                     continue
                 try:
-                    app.theme_colors[key] = hex_to_rgba(fld.text)
+                    updated[key] = hex_to_rgba(fld.text)
                 except Exception as e:
                     if status:
                         status.text = "Invalid color for %s: %s" % (key, e)
                     return
-            app._save_ui_config()
             # Reassign the whole property so KV bindings re-evaluate every
             # app.theme_colors['key'] expression (item mutation alone does not
             # dispatch the property change).
-            app.theme_colors = dict(app.theme_colors)
+            app.theme_colors = updated
+            app._save_ui_config()
             if status:
                 status.text = "Theme saved."
 
@@ -2608,6 +2611,11 @@ class sHadesClientApp(MDApp):
             self._set_status("Invalid port number")
             return
 
+        if (not host.strip() or any(ch.isspace() for ch in host)
+                or not 1 <= port <= 65535):
+            self._set_status("Hub address needs a host and port from 1 to 65535")
+            return
+
         # Validate hashes if provided
         if node_hash and not re.fullmatch(r"[0-9a-f]{32}", node_hash):
             self._set_status("Invalid node_hash (need 32 hex)")
@@ -2976,13 +2984,15 @@ class sHadesClientApp(MDApp):
                 # buildozer set_env may not survive into the app's runtime
                 # environment, so the platform decides, not the env var;
                 # RH_DEBUG=1 still forces it anywhere, RH_DEBUG=0 silences.
-                return _is_android() and os.environ.get("RH_DEBUG") != "0"
+                return _is_android() and os.environ.get("RH_DEBUG") is None
+
+            debug_setting = os.environ.get("RH_DEBUG", "").strip().lower()
+            debug_enabled = (debug_setting in ("1", "true", "yes") or
+                             (not debug_setting and _android_diag_default()))
 
             reticulum = RNS.Reticulum(
                 configdir=storage,
-                loglevel=(RNS.LOG_DEBUG
-                          if os.environ.get("RH_DEBUG") or
-                          _android_diag_default() else None))
+                loglevel=RNS.LOG_DEBUG if debug_enabled else None)
             self.reticulum = reticulum
             if BOOT_DEBUG:
                 _boot_mark("RNS: instance up (config ok)")
@@ -5276,7 +5286,8 @@ class sHadesClientApp(MDApp):
     def _add_channel(self, name):
         main = self.root.get_screen("main")
         grid = main.ids.channel_grid
-        btn = ChannelButton(channel_name=name)
+        btn = ChannelButton(channel_name=name,
+                            selected=name == main._current_channel)
         btn.bind(on_press=lambda inst: self._switch_channel(name))
         grid.add_widget(btn)
 
@@ -5286,6 +5297,13 @@ class sHadesClientApp(MDApp):
     def _switch_channel(self, name):
         main = self.root.get_screen("main")
         main._current_channel = name
+        if getattr(main, "width", dp(720)) < dp(720):
+            main.left_open = False
+        channel_grid = getattr(main.ids, "channel_grid", None)
+        if channel_grid is not None:
+            for button in channel_grid.children:
+                if isinstance(button, ChannelButton):
+                    button.selected = button.channel_name == name
         # Keep the channel header in sync with the active channel.
         try:
             main.ids.channel_header.text = "#" + name

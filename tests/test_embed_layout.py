@@ -10,8 +10,7 @@ Embeds must:
     overlapping.
 """
 import os
-os.environ.setdefault("KIVY_GL_BACKEND", "mock")
-os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+# Use the real SDL window on DISPLAY (including CI's Xvfb).
 
 import sys
 import tempfile

@@ -40,12 +40,9 @@ jobs:
           python tests/test_invite.py
 
   client-tests:
-    # Requires real Widget behaviour; runs headless on linux with the
-    # KIVY_GL_BACKEND=mock / SDL_VIDEODRIVER=dummy defaults the suites
-    # set themselves. Skipped everywhere Kivy cannot create a window.
+    # The widget suites use a real SDL window under Xvfb.
     name: kivy client tests (ubuntu)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -76,12 +73,16 @@ jobs:
         run: xvfb-run -a python -c "import kivy_client; assert kivy_client.KIVY and kivy_client.KIVYMD, 'client import requires kivy+kivymd'"
       - name: Run client suites under a virtual display
         run: |
+          xvfb-run -a python tests/test_admin_panel.py
           xvfb-run -a python tests/test_attachments.py
+          xvfb-run -a python tests/test_client_regressions.py
           xvfb-run -a python tests/test_embed_features.py
           xvfb-run -a python tests/test_embed_layout.py
           xvfb-run -a python tests/test_pfp_crop.py
           xvfb-run -a python tests/test_fullscreen_parent.py
           xvfb-run -a python tests/test_default_hub.py
+          xvfb-run -a python tests/test_fresh_install.py
+          xvfb-run -a python tests/test_ui_layout.py
 
   integ-test:
     name: integration mesh (ubuntu)

@@ -40,8 +40,8 @@
     orientation: 'horizontal'
     size_hint_y: None
     height: self.minimum_height
-    padding: [dp(8), dp(6)]
-    spacing: dp(8)
+    padding: [dp(12), dp(10)]
+    spacing: dp(10)
     canvas.before:
         Color:
             rgba: app.theme_colors['msg_own'] if root.is_own else (0, 0, 0, 0)
@@ -49,6 +49,12 @@
             pos: self.pos
             size: self.size
             radius: [dp(8), dp(8), dp(8), dp(8)]
+        Color:
+            rgba: app.theme_colors['primary'] if root.is_own else app.theme_colors['border_subtle']
+        RoundedRectangle:
+            pos: self.x, self.y + dp(6)
+            size: dp(2), self.height - dp(12)
+            radius: [dp(1), dp(1), dp(1), dp(1)]
 
     PfpImage:
         id: pfp
@@ -71,9 +77,9 @@
             ClickableLabel:
                 text: root.username
                 target_hash: root.author_hash
-                # Other people's names are the ones you are reading -- they
-                # get the bright 'text'; your own is dimmer.
-                color: app.theme_colors['text_muted'] if root.is_own else app.theme_colors['text']
+                # Warm white carries the conversation; amber identifies
+                # your own posts without tinting every line of body text.
+                color: app.theme_colors['primary'] if root.is_own else app.theme_colors['text']
                 bold: True
                 font_size: sp(13)
                 text_size: self.width, None
@@ -122,20 +128,32 @@
 <ChannelButton>:
     orientation: 'vertical'
     size_hint_y: None
-    height: dp(44)
-    padding: [dp(10), 0]
+    height: dp(48)
+    padding: [dp(14), 0]
     spacing: dp(4)
+    canvas.before:
+        Color:
+            rgba: app.theme_colors['sidebar_ctrl'] if root.selected else (0, 0, 0, 0)
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(7), dp(7), dp(7), dp(7)]
+        Color:
+            rgba: app.theme_colors['primary'] if root.selected else (0, 0, 0, 0)
+        Rectangle:
+            pos: self.x, self.y + dp(8)
+            size: dp(3), self.height - dp(16)
     BoxLayout:
         orientation: 'horizontal'
-        size_hint_y: None
-        height: dp(20)
+        size_hint_y: 1
         Label:
-            text: root.channel_name
-            color: app.theme_colors['text_muted']
-            font_size: sp(13)
+            text: '#   ' + root.channel_name
+            color: app.theme_colors['text'] if root.selected else app.theme_colors['text_muted']
+            bold: root.selected
+            font_size: sp(14)
             halign: 'left'
             valign: 'middle'
-            text_size: self.width, None
+            text_size: self.width, self.height
             size_hint_x: 1
         Label:
             id: badge
@@ -147,6 +165,7 @@
             width: dp(40) if root.badge else 0
             halign: 'right'
             valign: 'middle'
+            text_size: self.width, self.height
 
 <MessageEmbed>:
     size_hint_y: None
@@ -379,9 +398,9 @@
         BoxLayout:
             orientation: 'horizontal'
             size_hint_y: None
-            height: dp(48)
-            padding: [dp(8), dp(4)]
-            spacing: dp(8)
+            height: dp(56)
+            padding: [dp(10), dp(6)]
+            spacing: dp(6)
             canvas.before:
                 Color:
                     rgba: app.theme_colors['topbar']
@@ -395,16 +414,28 @@
                 Rectangle:
                     pos: self.x, self.y
                     size: self.width, dp(1)
+            HamburgerIcon:
+                on_press: root.toggle_left()
+                color: app.theme_colors['primary'] if root.left_open else app.theme_colors['text_muted']
             CtxHeaderLabel:
                 id: channel_header
                 text: '#' + (root._current_channel or 'general')
                 color: app.theme_colors['text']
                 bold: True
-                font_size: sp(16)
+                font_size: sp(18)
                 size_hint_x: 1
                 halign: 'left'
                 valign: 'middle'
                 text_size: self.width, None
+                shorten: True
+            MDButton:
+                style: 'text'
+                size_hint_x: None
+                width: dp(82)
+                on_press: root.toggle_right()
+                MDButtonText:
+                    text: 'People'
+                    text_color: app.theme_colors['primary'] if root.right_open else app.theme_colors['text_muted']
             SearchIcon:
                 on_press: app.open_search()
                 color: app.theme_colors['text']
@@ -422,7 +453,7 @@
             BoxLayout:
                 id: left_sidebar
                 size_hint_x: None
-                width: dp(284) if root.left_open else dp(0)
+                width: min(dp(284), root.width * 0.8) if root.left_open else 0
                 orientation: 'horizontal'
                 canvas.before:
                     Color:
@@ -473,7 +504,7 @@
                         id: banner_channel
                         source: app.banner_channel_path or ''
                         size_hint_y: None
-                        height: dp(160)
+                        height: dp(96)
                         size_hint_x: None
                         width: dp(200)
                         allow_stretch: False
@@ -481,10 +512,16 @@
                         pos_hint: {'center_x': 0.5}
                     BoxLayout:
                         size_hint_y: None
-                        height: dp(34)
-                        padding: [dp(6), dp(2)]
-                        Widget:
-                            size_hint_x: 1
+                        height: dp(52)
+                        padding: [dp(12), dp(6)]
+                        Label:
+                            text: 'CHANNELS'
+                            color: app.theme_colors['text_dim']
+                            bold: True
+                            font_size: sp(11)
+                            halign: 'left'
+                            valign: 'middle'
+                            text_size: self.width, None
                         MDButton:
                             style: 'outlined'
                             size_hint_y: None
@@ -494,7 +531,7 @@
                             md_bg_color: app.theme_colors['sidebar_ctrl']
                             on_press: app.open_config()
                             MDButtonText:
-                                text: 'cfg'
+                                text: 'Edit'
                                 shorten: True
                     ScrollView:
                         do_scroll_x: False
@@ -527,7 +564,7 @@
                         size_hint_y: None
                         height: self.minimum_height
                         spacing: dp(2)
-                        padding: [dp(6), dp(6)]
+                        padding: [dp(8), dp(8)]
                 BoxLayout:
                     # 48px: the bar must CONTAIN the field and the buttons.
                     # At 24px a 35px field and 26.7px buttons overflowed
@@ -597,7 +634,7 @@
             BoxLayout:
                 id: right_sidebar
                 size_hint_x: None
-                width: dp(200) if root.right_open else dp(0)
+                width: min(dp(200), root.width * 0.72) if root.right_open else 0
                 orientation: 'vertical'
                 canvas.before:
                     Color:
@@ -605,6 +642,16 @@
                     Rectangle:
                         pos: self.pos
                         size: self.size
+                Label:
+                    text: 'PEOPLE'
+                    color: app.theme_colors['text_dim']
+                    bold: True
+                    font_size: sp(11)
+                    size_hint_y: None
+                    height: dp(48)
+                    halign: 'left'
+                    valign: 'middle'
+                    text_size: max(0, self.width - dp(24)), self.height
                 ScrollView:
                     do_scroll_x: False
                     GridLayout:
@@ -642,7 +689,7 @@
                     id: banner_config
                     source: app.banner_config_path or ''
                     size_hint_y: None
-                    height: dp(120)
+                    height: dp(96)
                     size_hint_x: None
                     width: dp(240)
                     pos_hint: {'center_x': 0.5}
@@ -658,7 +705,7 @@
                     halign: 'center'
                     text_size: self.width, None
                 Label:
-                    text: 'Connect to a guild'
+                    text: 'A quieter place to gather, beyond the grid.'
                     color: app.theme_colors['text_muted']
                     size_hint_y: None
                     height: dp(24)
@@ -672,14 +719,14 @@
                 BoxLayout:
                     orientation: 'horizontal'
                     size_hint_y: None
-                    height: dp(44)
+                    height: dp(206)
                     Widget:
                         size_hint_x: 1
                     BoxLayout:
                         orientation: 'vertical'
                         spacing: dp(10)
                         size_hint_x: None
-                        width: dp(420)
+                        width: min(dp(420), root.width - dp(48))
                         MDTextField:
                             id: hub_address
                             multiline: False
@@ -715,6 +762,8 @@
                         MDButton:
                             id: advanced_toggle
                             style: 'outlined'
+                            size_hint_x: None
+                            width: self.parent.width
                             size_hint_y: None
                             height: scaled(dp(40))
                             theme_bg_color: 'Custom'
@@ -725,6 +774,8 @@
                                 text: 'Advanced: guild hashes'
                         MDButton:
                             style: 'filled'
+                            size_hint_x: None
+                            width: self.parent.width
                             size_hint_y: None
                             height: scaled(dp(40))
                             theme_bg_color: 'Custom'
@@ -753,7 +804,9 @@
                         orientation: 'vertical'
                         spacing: dp(10)
                         size_hint_x: None
-                        width: dp(420)
+                        width: min(dp(420), root.width - dp(48))
+                        size_hint_y: None
+                        height: self.minimum_height
                         MDTextField:
                             id: node_hash
                             hint_text: 'Guild node_hash (32 hex, optional)'
