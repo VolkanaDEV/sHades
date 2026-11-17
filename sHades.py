@@ -149,7 +149,7 @@ CREATE TABLE IF NOT EXISTS guilds (
 CREATE TABLE IF NOT EXISTS channels (
     id TEXT PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE, created REAL,
     kind TEXT NOT NULL DEFAULT 'chat', manifest TEXT NOT NULL DEFAULT '{}',
-    topic TEXT);
+    topic TEXT, position INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS channel_state (
     channel_id TEXT PRIMARY KEY, seq INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS members (
@@ -211,7 +211,7 @@ def _migrate_schema(conn):
     to SCHEMA after a guild has already booted has to be added explicitly."""
     have = {r["name"] for r in conn.execute("PRAGMA table_info(channels)").fetchall()}
     for col, decl in (("kind", "TEXT NOT NULL DEFAULT 'chat'"), ("manifest", "TEXT"),
-                      ("topic", "TEXT")):
+                      ("topic", "TEXT"), ("position", "INTEGER NOT NULL DEFAULT 0")):
         if col not in have:
             conn.execute("ALTER TABLE channels ADD COLUMN %s %s" % (col, decl))
 
@@ -1849,17 +1849,43 @@ def _presence_payload():
 @wrap_json_api
 def api_v1_channels_list(viewer, data, link_id):
     with db_lock:
-        rows = db.execute("SELECT id, name, kind, created, topic FROM channels "
-                          "ORDER BY name ASC").fetchall()
+        rows = db.execute("SELECT id, name, kind, created, topic, position FROM channels "
+                          "ORDER BY position ASC, name ASC").fetchall()
         chans = [{"id": r["id"], "name": r["name"], "kind": r["kind"],
                   "created": r["created"], "topic": r["topic"],
-                  "seq": get_seq(r["id"])} for r in rows]
+                  "position": r["position"], "seq": get_seq(r["id"])} for r in rows]
     # VIEW permission: channels the viewer cannot read are absent entirely
     chans = [c for c in chans if has_perm(viewer, c["id"], PERMS["VIEW"])]
     for c in chans:
         last_id = _receipt_last_id(c["id"], viewer)
         c["unread"] = _unread_count(c["id"], last_id)
     return {"ok": 1, "channels": chans}
+
+@api_route("/api/v1/channels/reorder")
+@wrap_json_api
+def api_v1_channels_reorder(viewer, data, link_id):
+    """Persist the channel list order (drag result). {order: [cid, ...]} must
+    list EVERY channel exactly once; the position column is rewritten in one
+    transaction. Needs MANAGE_CHANNEL (guild-wide) — ADMIN carries it."""
+    if not has_role_perm(viewer, PERMS["MANAGE_CHANNEL"]):
+        return {"ok": 0, "error": "manage channel permission required", "code": 403}
+    order = data.get("order")
+    if not isinstance(order, list) or not order \
+            or not all(isinstance(c, str) for c in order) \
+            or len(set(order)) != len(order):
+        return {"ok": 0, "error": "order must be a unique cid list", "code": 400}
+    with db_lock:
+        known = {r["id"] for r in db.execute("SELECT id FROM channels").fetchall()}
+        if set(order) != known:
+            return {"ok": 0, "error": "order must cover every channel exactly once",
+                    "code": 400}
+        for idx, cid in enumerate(order, start=1):
+            db.execute("UPDATE channels SET position=? WHERE id=?", (idx, cid))
+        db.commit()
+    # every subscriber sees the new order through their own channel's stream
+    _audit(viewer, "channel.reorder", None, "channels=%d" % len(order))
+    _emit_event(None, "channels_changed", {"order": order}, guild_wide=True)
+    return {"ok": 1, "order": order}
 
 def _create_channel_txn(viewer, name, kind, manifest=None):
     """Shared channel creation (API + slash command). Returns
@@ -1880,9 +1906,12 @@ def _create_channel_txn(viewer, name, kind, manifest=None):
         if db.execute("SELECT 1 FROM channels WHERE id=? OR (name=? COLLATE NOCASE)",
                       (cid, name)).fetchone():
             return None, "channel exists"
-        db.execute("INSERT INTO channels (id, name, created, kind, manifest) "
-                   "VALUES (?, ?, ?, ?, ?)",
-                   (cid, name, now(), kind, manifest_json))
+        # explicit ordering: new channels sink to the end of the drag list
+        nxt = (db.execute("SELECT COALESCE(MAX(position), 0) + 1 AS nxt "
+                          "FROM channels").fetchone()["nxt"])
+        db.execute("INSERT INTO channels (id, name, created, kind, manifest, position) "
+                   "VALUES (?, ?, ?, ?, ?, ?)",
+                   (cid, name, now(), kind, manifest_json, nxt))
         db.execute("INSERT OR IGNORE INTO channel_state (channel_id, seq) VALUES (?, 0)", (cid,))
         db.commit()
     _audit(viewer, "channel.create", cid, "%s (%s)" % (name, kind))
