@@ -1603,16 +1603,12 @@ class ChannelButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
                    if isinstance(w, ChannelButton)]
         if len(buttons) < 2:
             return
-        rows = {}  # button -> visual row y-range center (children are
-        # laid out top row first by GridLayout; reversed(children) = top
-        # to bottom)
         top = grid.top
         row_h = 0.0
         for b in buttons:
             row_h = b.height
         my_row = None
         for i, b in enumerate(buttons):
-            y_mid = top - (i + 0.5) * row_h if row_h else b.center_y
             if b is self:
                 my_row = i
         if my_row is None or not row_h:
@@ -1623,7 +1619,6 @@ class ChannelButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
         if target == my_row:
             return
         # move self within the children list so the visual order changes
-        children_idx = grid.children.index(self)
         # GridLayout fills rows in reversed-children order: children index
         # (len-1-row) is row 0 (top).
         child_at_row = len(buttons) - 1 - target
@@ -5356,14 +5351,15 @@ class sHadesClientApp(MDApp):
             cid = self._channels.get(b.channel_name)
             if cid and cid not in order:
                 order.append(cid)
-        all_cids = [self._channels.get(n) for n in self._channels]
 
         def work():
             try:
                 res = self.guild_api.channels_reorder(order)
             except Exception as e:
+                msg = repr(e)
                 Clock.schedule_once(
-                    lambda dt: self._set_status("reorder failed: %r" % e), 0)
+                    lambda dt: self._set_status("reorder failed: %s" % msg),
+                    0)
                 return
             if res.get("ok"):
                 for i, cid in enumerate(res.get("order") or order, start=1):
@@ -5384,8 +5380,10 @@ class sHadesClientApp(MDApp):
                 res = self.guild_api.invites("create",
                                              label="#%s" % name, channel=cid)
             except Exception as e:
+                msg = repr(e)
                 Clock.schedule_once(
-                    lambda dt: self._set_status("invite failed: %r" % e), 0)
+                    lambda dt: self._set_status("invite failed: %s" % msg),
+                    0)
                 return
             if res.get("ok"):
                 link = "shades://join/%s" % res.get("code", "")

@@ -59,11 +59,11 @@ def _scaled(v):
 
 def _row_label(text, w=0.5, h=26, fs=None):
     fs = fs or sp(11)
-    l = Label(text=text, size_hint_x=w, halign="left", valign="middle",
-              size_hint_y=None, height=_scaled(h), font_size=fs,
-              color=(0.85, 0.87, 0.9, 1))
-    l.bind(size=lambda inst, s: setattr(inst, "text_size", s))
-    return l
+    lbl = Label(text=text, size_hint_x=w, halign="left", valign="middle",
+                size_hint_y=None, height=_scaled(h), font_size=fs,
+                color=(0.85, 0.87, 0.9, 1))
+    lbl.bind(size=lambda inst, s: setattr(inst, "text_size", s))
+    return lbl
 
 
 def _btn(text, width=70, h=30, fs=None):
