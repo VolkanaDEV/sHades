@@ -4046,7 +4046,12 @@ class sHadesClientApp(MDApp):
         self._set_row_reactions(msg_id, m.get("reactions") or [])
 
     # -- reactions (phase 6) ----------------------------------------------
-    REACTION_PRESETS = ("+1", "-1", "laugh", "heart", "eyes", "question")
+    # tay (task 8): "reactions use emojis". Unicode chips render the char
+    # as-is; old rows carry ascii aliases and stay renderable (they show as
+    # :name). The presets are the picker's face; the server accepts any
+    # gated emoji (phase 1 unicode gate).
+    REACTION_PRESETS = ("👍", "👎", "😂", "❤️", "👀", "❓", "😮", "🙃",
+                        "🎉", "🔥", "🙏", "👏", "💯", "🤔", "😭", "💀")
 
     def _set_row_reactions(self, msg_id, reactions):
         """Replace a row's reaction chips with the given summary. Safe to
@@ -4066,21 +4071,33 @@ class sHadesClientApp(MDApp):
         if not reactions:
             return
         line = BoxLayout(orientation="horizontal", size_hint_y=None,
-                         height=dp(20), spacing=dp(6))
+                         height=dp(22), spacing=dp(6))
         for e in reactions:
             if not isinstance(e, dict) or not e.get("emoji"):
                 continue
-            chip = ClickableLabel(text=":%s %d" % (e["emoji"], e.get("count", 0)),
-                                  color=(0.75, 0.78, 0.85, 1), font_size=sp(12))
+            if ord(e["emoji"][0]) < 128:
+                # legacy ascii alias row: render the old :name chips
+                chip = ClickableLabel(
+                    text=":%s %d" % (e["emoji"], e.get("count", 0)),
+                    color=(0.75, 0.78, 0.85, 1), font_size=sp(12))
+                chip.size_hint_x = None
+                chip.width = dp(24 + 9 * len(e["emoji"]))
+                chip.bind(on_press=lambda inst, m=msg_id, em=e["emoji"]:
+                          self._toggle_reaction(m, em))
+                line.add_widget(chip)
+                continue
+            chip = ClickableLabel(text="%s %d" % (e["emoji"],
+                                                  e.get("count", 0)),
+                                  color=(0.75, 0.78, 0.85, 1), font_size=sp(13))
             chip.size_hint_x = None
-            chip.width = dp(24 + 9 * len(e["emoji"]))
+            chip.width = dp(34 + 12 * (e.get("count", 0) >= 10))
             chip.bind(on_press=lambda inst, m=msg_id, em=e["emoji"]:
                       self._toggle_reaction(m, em))
             line.add_widget(chip)
         plus = ClickableLabel(text="[+]", color=(0.5, 0.53, 0.6, 1), font_size=sp(12))
         plus.size_hint_x = None
         plus.width = dp(30)
-        plus.bind(on_press=lambda inst, m=msg_id: self._open_reaction_popup(m))
+        plus.bind(on_press=lambda inst, m=msg_id: self._open_emoji_picker(m))
         line.add_widget(plus)
         row._reaction_widgets.append(line)
         container.add_widget(line)
@@ -4107,25 +4124,33 @@ class sHadesClientApp(MDApp):
         return [{"emoji": e, "count": n, "users": []}
                 for e, n in sorted(counts.items())]
 
-    def _open_reaction_popup(self, msg_id):
+    def _open_emoji_picker(self, msg_id):
+        """Emoji picker (task 8): a grid of the 16 presets; picking one
+        toggles the reaction and closes the picker."""
         try:
             self.root.get_screen("main")
         except Exception:
             return
         box = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(10))
-        line = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint_y=None,
-                         height=dp(40))
+        grid = GridLayout(cols=8, size_hint_y=None, spacing=dp(6),
+                          padding=[dp(2)] * 2)
+        grid.bind(minimum_height=grid.setter("height"))
         for emoji in self.REACTION_PRESETS:
-            btn = Button(text=":%s" % emoji, size_hint_x=None, width=dp(70),
-                         size_hint_y=None, height=scaled(dp(40)),
-                         pos_hint={"center_y": 0.5})
+            btn = Button(text=emoji, font_size=sp(18),
+                         size_hint_y=None, height=scaled(dp(44)))
             btn.bind(on_press=lambda inst, m=msg_id, em=emoji:
                      (self._toggle_reaction(m, em), popup.dismiss()))
-            line.add_widget(btn)
-        box.add_widget(line)
-        popup = Popup(title="react", content=box, size_hint=(0.7, 0.25))
+            grid.add_widget(btn)
+        scroll = ScrollView(size_hint=(1, 1))
+        scroll.add_widget(grid)
+        box.add_widget(scroll)
+        popup = Popup(title="react", content=box, size_hint=(0.7, 0.5))
         self._popup = popup
         popup.open()
+
+    def _open_reaction_popup(self, msg_id):
+        """Backward-compatible alias for the emoji picker."""
+        self._open_emoji_picker(msg_id)
 
     # -- search (phase 6) --------------------------------------------------
     def open_search(self, prefill=""):
