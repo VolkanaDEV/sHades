@@ -137,7 +137,10 @@ def main():
     legacy.row_factory = sqlite3.Row
     legacy.executescript(
         "CREATE TABLE IF NOT EXISTS channels (id TEXT PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE, "
-        "created REAL, kind TEXT NOT NULL DEFAULT 'chat', manifest TEXT NOT NULL DEFAULT '{}', topic TEXT);")
+        "created REAL, kind TEXT NOT NULL DEFAULT 'chat', manifest TEXT NOT NULL DEFAULT '{}', topic TEXT);"
+        "CREATE TABLE IF NOT EXISTS invites (code TEXT PRIMARY KEY, label TEXT, "
+        "created_at REAL, expires_at REAL, max_uses INTEGER NOT NULL DEFAULT 0, "
+        "uses INTEGER NOT NULL DEFAULT 0, created_by TEXT);")
     legacy.execute("INSERT INTO channels (id, name, created) VALUES ('x', 'old', 0)")
     legacy.commit()
     sHades._migrate_schema(legacy)
