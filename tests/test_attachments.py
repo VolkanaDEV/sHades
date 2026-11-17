@@ -121,6 +121,7 @@ class StubApp:
         self.username = "me"
         self._members = {}
         self._msg_widgets = {}
+        self._pending_reply = None
         self._pending_attachment = None
         self._channel_kinds = {}
         self.theme_colors = dict(kivy_client.DEFAULT_THEME_COLORS)

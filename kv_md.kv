@@ -40,7 +40,7 @@
     orientation: 'horizontal'
     size_hint_y: None
     height: self.minimum_height
-    padding: [dp(12), dp(10)]
+    padding: [dp(12), dp(5) if root.grouped else dp(10)]
     spacing: dp(10)
     canvas.before:
         Color:
@@ -59,7 +59,8 @@
     PfpImage:
         id: pfp
         size_hint: None, None
-        size: dp(32), dp(32)
+        size: dp(32), 0 if root.grouped else dp(32)
+        opacity: 0 if root.grouped else 1
         source: root.avatar_source or ""
         allow_stretch: False
         keep_ratio: True
@@ -73,7 +74,8 @@
         BoxLayout:
             orientation: 'horizontal'
             size_hint_y: None
-            height: dp(18)
+            height: 0 if root.grouped else dp(18)
+            opacity: 0 if root.grouped else 1
             ClickableLabel:
                 text: root.username
                 target_hash: root.author_hash
@@ -97,6 +99,34 @@
                 width: dp(50)
                 halign: 'right'
                 valign: 'middle'
+
+        BoxLayout:
+            orientation: 'vertical'
+            size_hint_y: None
+            height: dp(44) if root.reply_author else 0
+            opacity: 1 if root.reply_author else 0
+            padding: [dp(10), dp(4)]
+            canvas.before:
+                Color:
+                    rgba: app.theme_colors['border_subtle']
+                RoundedRectangle:
+                    pos: self.pos
+                    size: self.size
+                    radius: [dp(10), dp(10), dp(10), dp(10)]
+            Label:
+                text: '↳ @' + root.reply_author
+                color: app.theme_colors['accent']
+                bold: True
+                font_size: sp(11)
+                text_size: self.width, None
+                halign: 'left'
+            Label:
+                text: root.reply_excerpt
+                color: app.theme_colors['text_muted']
+                font_size: sp(11)
+                shorten: True
+                text_size: self.width, None
+                halign: 'left'
 
         # Embed container - holds image embeds for this message.
         # Placed directly under the username header so embeds are top-left,
@@ -583,6 +613,25 @@
                         height: self.minimum_height
                         spacing: dp(2)
                         padding: [dp(8), dp(8)]
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(32) if app.reply_draft else 0
+                    opacity: 1 if app.reply_draft else 0
+                    padding: [dp(16), dp(2)]
+                    Label:
+                        text: app.reply_draft
+                        color: app.theme_colors['accent']
+                        shorten: True
+                        text_size: self.width, None
+                        halign: 'left'
+                        font_size: sp(11)
+                    MDButton:
+                        style: 'text'
+                        size_hint_x: None
+                        width: dp(38)
+                        on_press: app.cancel_reply()
+                        MDButtonText:
+                            text: '×'
                 BoxLayout:
                     # 56px (task 9): the bar contains the pfp (dp(42)) and
                     # the field. At 48px a dp(42) pfp plus padding

@@ -27,7 +27,7 @@ from PIL import ImageDraw as PILImageDraw
 from PIL import ImageChops as PILImageChops
 
 from ui_scale import scaled
-from mesh_ui import link_state
+from mesh_ui import grouped_with, link_state, reply_wire, split_reply
 from ui_theme import preset_colors
 
 # ---------------------------------------------------------------------------
@@ -74,7 +74,8 @@ try:
     from kivy.uix.textinput import TextInput
     from kivy.uix.widget import Widget
     from kivy.uix.slider import Slider
-    from kivy.graphics import Color, Ellipse, Line, Rectangle
+    from kivy.graphics import Color, Ellipse, Line, Rectangle, \
+        RoundedRectangle
     from kivy.metrics import dp, sp
     KIVY = True
 except Exception as _e:  # pragma: no cover - Kivy missing at import time
@@ -1413,6 +1414,10 @@ if KIVY:
         avatar_source = StringProperty("")
         msg_id = StringProperty("")
         is_own = BooleanProperty(False)
+        # message grouping + reply cards (tier 2, drop parity)
+        grouped = BooleanProperty(False)
+        reply_author = StringProperty("")
+        reply_excerpt = StringProperty("")
 
         def build_context_menu(self):
             app = App.get_running_app()
@@ -1583,6 +1588,37 @@ class MeshConstellation(Widget):
             for i, (x, y) in enumerate(points):
                 Color(*rgb, 0.85 if self.mode != "offline" or i == 0 else 0.3)
                 Ellipse(pos=(x - dp(2.5), y - dp(2.5)), size=(dp(5), dp(5)))
+
+
+class SkeletonRow(Widget):
+    """Two quiet shimmer bars while a history page is on its way."""
+    phase = NumericProperty(0)
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.size_hint_y = None
+        self.height = dp(70)
+        self.bind(pos=self._draw, size=self._draw, phase=self._draw)
+        from kivy.animation import Animation
+        self._anim = Animation(phase=1, duration=1.6, t="linear")
+        self._anim.repeat = True
+        self._anim.start(self)
+
+    def _draw(self, *a):
+        self.canvas.clear()
+        width = max(dp(40), self.width - dp(72))
+        with self.canvas:
+            Color(0.64, 0.75, 0.76, 0.12)
+            Ellipse(pos=(self.x + dp(12), self.y + dp(18)), size=(dp(34), dp(34)))
+            RoundedRectangle(pos=(self.x + dp(58), self.y + dp(44)),
+                             size=(width * 0.45, dp(10)), radius=[dp(5)] * 4)
+            RoundedRectangle(pos=(self.x + dp(58), self.y + dp(21)),
+                             size=(width * 0.8, dp(10)), radius=[dp(5)] * 4)
+            # Short highlight moves within the body bar.
+            Color(0.70, 0.92, 0.89, 0.13)
+            RoundedRectangle(pos=(self.x + dp(58) + width * 0.64 * self.phase,
+                                  self.y + dp(21)),
+                             size=(width * 0.16, dp(10)), radius=[dp(5)] * 4)
 
 
 class CtxHeaderLabel(ContextMenuMixin, Label):
@@ -2280,6 +2316,8 @@ class sHadesClientApp(MDApp):
     mesh_mode = StringProperty("offline")
     mesh_hops = NumericProperty(0)
     mesh_label = StringProperty("OFFLINE")
+    # reply staging: the composer's "Replying to @x" card + wire prefix
+    reply_draft = StringProperty("")
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -2382,6 +2420,7 @@ class sHadesClientApp(MDApp):
         # Chat pagination: per channel, oldest loaded message id + whether
         # older messages remain. Used by scroll-triggered loading.
         self._older = {}          # cid -> {oldest_id, has_older, loading}
+        self._pending_reply = None
         self._scroll_bound = False
 
         # Banner images - random selection from media folder on startup.
@@ -4020,6 +4059,8 @@ class sHadesClientApp(MDApp):
                 err = res.get("error", "unknown")
                 Clock.schedule_once(
                     lambda dt: self._set_status("fetch failed: %s" % err), 0)
+                Clock.schedule_once(
+                    lambda dt: self._remove_skeleton(cid), 0)
                 return
             msgs = res.get("messages", []) or []
             updates = res.get("updates", []) or []
@@ -4037,6 +4078,7 @@ class sHadesClientApp(MDApp):
                 try:
                     main = self.root.get_screen("main")
                     grid = main.ids.message_grid
+                    self._remove_skeleton(cid)
                     if prepend:
                         if not msgs:
                             # Server has no older pages; stop trying.
@@ -4074,6 +4116,7 @@ class sHadesClientApp(MDApp):
                     else:
                         for m in msgs:
                             self._render_message(grid, m)
+                        self._regroup_messages(grid)
                         Clock.schedule_once(
                             lambda dt: self._scroll_to_bottom(), 0.1)
                     for u in updates:
@@ -4082,6 +4125,29 @@ class sHadesClientApp(MDApp):
                     print("render messages error:", e)
             Clock.schedule_once(apply, 0)
         threading.Thread(target=work, daemon=True).start()
+
+    def _show_skeleton(self, cid):
+        main = self.root.get_screen("main")
+        grid = main.ids.message_grid
+        self._skeleton_cid = cid
+        self._skeleton_rows = [SkeletonRow() for _ in range(4)]
+        for row in self._skeleton_rows:
+            grid.add_widget(row)
+
+    def _remove_skeleton(self, cid):
+        if getattr(self, "_skeleton_cid", None) != cid:
+            return
+        try:
+            grid = self.root.get_screen("main").ids.message_grid
+            for row in getattr(self, "_skeleton_rows", []):
+                from kivy.animation import Animation
+                Animation.cancel_all(row)
+                if row.parent is grid:
+                    grid.remove_widget(row)
+        except Exception:
+            pass
+        self._skeleton_rows = []
+        self._skeleton_cid = None
 
     def _on_scroll_y(self, value):
         """Scroll-triggered pagination: when the user reaches the top of the
@@ -4111,6 +4177,7 @@ class sHadesClientApp(MDApp):
         uname = m.get("username") or ("user-" + author[:6])
         self._record_member(author, uname)
         content = m.get("content") or ""
+        reply_author, reply_excerpt, body = split_reply(content)
         ts = time.strftime("%H:%M", time.localtime(m.get("ts", 0)))
         is_own = (author == self.my_hash)
 
@@ -4142,13 +4209,17 @@ class sHadesClientApp(MDApp):
             username=uname,
             ts=ts,
             content=content,
-            content_markup=md_to_kivy(content),
+            content_markup=md_to_kivy(body),
             avatar_source=avatar_source,
             msg_id=msg_id,
             is_own=is_own,
+            reply_author=reply_author,
+            reply_excerpt=reply_excerpt,
         )
+        row._message_meta = {"author_hash": author, "ts": m.get("ts", 0)}
         self._msg_widgets[msg_id] = row
         grid.add_widget(row)
+        sHadesClientApp._regroup_messages(grid)
 
         # attachment embeds (files uploaded with the message)
         for att in m.get("attachments") or []:
@@ -4190,6 +4261,18 @@ class sHadesClientApp(MDApp):
 
         # reaction summary line (tappable: toggles that emoji for me)
         self._set_row_reactions(msg_id, m.get("reactions") or [])
+
+    @staticmethod
+    def _regroup_messages(grid):
+        """Recompute after history prepends and live arrivals, including boundaries."""
+        previous = None
+        for row in reversed(grid.children):
+            if not isinstance(row, MessageRow):
+                previous = None
+                continue
+            meta = getattr(row, "_message_meta", None)
+            row.grouped = grouped_with(previous, meta)
+            previous = meta
 
     # -- reactions (phase 6) ----------------------------------------------
     # tay (task 8): "reactions use emojis". Unicode chips render the char
@@ -5251,16 +5334,22 @@ class sHadesClientApp(MDApp):
         self._set_status("copied to clipboard")
 
     def _reply_quote(self, username, content):
-        """Quote a message into the input bar: '> name: line' per line."""
-        lines = (content or "").split("\n")[:3]
-        quote = "\n".join("> %s: %s" % (username, ln[:120]) for ln in lines)
+        """Stage a reply card. The wire prefix stays readable on older clients."""
+        _author, _excerpt, body = split_reply(content)
+        self._pending_reply = (username, body)
+        self.reply_draft = "Replying to @%s · %s" % (
+            username, " ".join(body.split())[:80])
+
         try:
             main = self.root.get_screen("main")
             inp = main.ids.msg_input
-            inp.text = (quote + "\n" + (inp.text or "")).strip("\n") + "\n"
             inp.focus = True
         except Exception as e:
-            print("reply quote failed:", repr(e))
+            print("reply stage failed:", repr(e))
+
+    def cancel_reply(self):
+        self._pending_reply = None
+        self.reply_draft = ""
 
     def _mention(self, username):
         try:
@@ -5561,6 +5650,7 @@ class sHadesClientApp(MDApp):
             pass
         grid = main.ids.message_grid
         grid.clear_widgets()
+        self._remove_skeleton(getattr(self, "_skeleton_cid", None))
         self._msg_widgets.clear()
         self._seq = 0
         self._last_ts = 0.0
@@ -5583,6 +5673,7 @@ class sHadesClientApp(MDApp):
             return
         self._older.setdefault(cid, {"oldest_id": None, "has_older": True,
                                      "loading": False})
+        self._show_skeleton(cid)
         self._fetch_messages(name)
         self._refresh_members_ui(name)
         # v0.31: re-subscribe NOW. The server binds the channel at
@@ -5717,6 +5808,7 @@ class sHadesClientApp(MDApp):
             return   # user switched away while the page was in flight
         grid = main.ids.message_grid
         grid.clear_widgets()
+        self._remove_skeleton(getattr(self, "_skeleton_cid", None))
         self._msg_widgets.clear()
         blocks = micron_parse(text)
         page = SitePage()
@@ -5960,6 +6052,9 @@ class sHadesClientApp(MDApp):
         # Allow attachment-only messages (no text) when a file is pending.
         if not text and not getattr(self, "_pending_attachment", None):
             return
+        if self._pending_reply:
+            text = reply_wire(*self._pending_reply, text)
+            self.cancel_reply()
         cid = self._channel_cid(cid)
         inp.text = ""
         # Capture ONCE here (main thread): a second send during this
