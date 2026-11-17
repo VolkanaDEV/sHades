@@ -664,9 +664,15 @@
                     Widget:
                         # task 9 (tay): the flat attach '+' reads as a
                         # delimited extension of the field, not a second
-                        # button: body = input_bg, left corners rounded
-                        size_hint_x: None
+                        # button: body = input_bg, left corners rounded.
+                        # Height matches the field (v0.32 tay device note:
+                        # 'attach plate overlaps the pfp at 44px next to
+                        # a 40px field'); the glyph is pinned to the plate
+                        # because an unbound Label defaults to a 100x100
+                        # box and its '+' floats past the plate edge.
+                        size_hint: None, None
                         width: dp(38)
+                        height: dp(40)
                         canvas.before:
                             Color:
                                 rgba: app.theme_colors['input_bg']
@@ -680,6 +686,8 @@
                             text: '+'
                             color: app.theme_colors['text']
                             font_size: sp(18)
+                            pos: self.parent.pos
+                            size: self.parent.size
                     MDTextField:
                         id: msg_input
                         mode: 'filled'

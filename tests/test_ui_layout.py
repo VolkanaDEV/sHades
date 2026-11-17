@@ -87,6 +87,21 @@ class LayoutProbe(sHadesClientApp):
                    "composer order: pfp, flat '+', field (got %s)" %
                    repr((None if pfp is None else pfp.x,
                          None if flat is None else flat.x, field.x)))
+        # v0.32 (tay device note): the plate must match the field
+        # height and the '+' glyph must live INSIDE the plate (an
+        # unbound Label defaults to a 100x100 box and its glyph
+        # floats past the plate edge).
+        self.check(flat is not None
+                   and abs(flat.height - field.height) <= 1,
+                   "attach plate matches the field height (got %r)"
+                   % (None if flat is None else flat.height))
+        glyph = None if flat is None else flat.children[0]
+        self.check(glyph is not None
+                   and glyph.x >= flat.x - 1
+                   and glyph.right <= flat.right + 1
+                   and glyph.y >= flat.y - 1
+                   and glyph.top <= flat.top + 1,
+                   "attach '+' glyph stays inside its plate")
 
         self.root.current = "config"
         Clock.schedule_once(self.check_config, 0.3)
