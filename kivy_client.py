@@ -675,6 +675,18 @@ class GuildAPI:
                and time.time() < deadline):
             time.sleep(0.05)
         if not hasattr(receipt, "response") or receipt.response is None:
+            # v0.31.1 diag: a deadline without a response means different
+            # things -- "the wire transfer died" (receipt concluded FAILED)
+            # vs "still moving, we gave up early" (receipt unsettled; the
+            # resource outlives us client-side and RNS's watchdog owns
+            # it). Distinguish, do not guess.
+            try:
+                st = getattr(receipt, "status", None)
+                if st is not None:
+                    return {"ok": 0, "error": "timeout",
+                            "receipt_state": str(st)}
+            except Exception:
+                pass
             return {"ok": 0, "error": "timeout"}
         try:
             return json.loads(receipt.response.decode("utf-8"))
@@ -783,6 +795,8 @@ class GuildAPI:
                 if err == "timeout" and fails < 3:
                     fails += 1
                     continue
+                print("blobs_put FAIL off=%s step=%s err=%s state=%s"
+                      % (offset, step, err, res.get("receipt_state")))
                 res.setdefault("error", err or "chunk failed")
                 res["phase"] = "chunk@%d" % offset
                 return res
@@ -2825,7 +2839,10 @@ class sHadesClientApp(MDApp):
                     # the ingress limiter.
                     f.write("    ingress_control = no\n")
 
-            reticulum = RNS.Reticulum(configdir=storage)
+            reticulum = RNS.Reticulum(
+                configdir=storage,
+                loglevel=(RNS.LOG_DEBUG
+                          if os.environ.get("RH_DEBUG") else None))
             self.reticulum = reticulum
             if BOOT_DEBUG:
                 _boot_mark("RNS: instance up (config ok)")
