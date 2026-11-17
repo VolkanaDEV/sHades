@@ -4985,9 +4985,22 @@ class sHadesClientApp(MDApp):
             return
         try:
             from ui_server_config import ServerConfigScreen
-            screen = self.root.get_screen("server_config")
-            screen.client = self
-            self.root.current = "server_config"
+            if self.root is not None:
+                screen = self.root.get_screen("server_config")
+                screen.client = self
+                self.root.current = "server_config"
+                self._admin_popup = None
+                return
+            # kv ScreenManager not bound yet (pre-boot, tests, applets):
+            # host the same tabbed screen in a popup so the panel opens
+            # on every invocation path.
+            from kivy.uix.popup import Popup
+            screen = ServerConfigScreen(client=self, name="server_config")
+            screen.build_tabs()
+            popup = Popup(title="server settings", content=screen,
+                          size_hint=(0.9, 0.9))
+            popup.open()
+            self._admin_popup = popup
         except Exception as e:
             print("server_config screen failed:", repr(e))
             return

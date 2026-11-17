@@ -38,6 +38,53 @@ class StubGuild:
         self.mods = ["b" * 32]
         self.admins = ["c" * 32]
         self.saved = []
+        self._chan_seq = 0
+        self._role_seq = 1
+
+    def channels_list(self):
+        self._chan_seq += 1
+        return {"ok": True, "channels": [
+            {"id": ("o" * 64), "name": "general", "kind": "chat",
+             "topic": "", "position": 0},
+            {"id": ("m" * 64), "name": "memes", "kind": "chat",
+             "topic": "only memes", "position": 1}]}
+
+    def channels_patch(self, cid=None, **kw):
+        for k, v in kw.items():
+            self.saved.append(("channel:" + str(cid), (k, v)))
+        return {"ok": True}
+
+    def channels_delete(self, cid=None):
+        self.saved.append(("channel_delete", str(cid)))
+        return {"ok": True}
+
+    def roles_list(self):
+        self._role_seq += 1
+        return {"ok": True, "roles": [
+            {"role_id": 1, "name": "admin", "perms": 32, "color": None,
+             "position": 1, "members": []},
+            {"role_id": 2, "name": "member", "perms": 0, "color": None,
+             "position": 0, "members": []}]}
+
+    def roles_create(self, name=None, perms=0, color=None, position=0):
+        self.saved.append(("role_create", str(name)))
+        self._role_seq += 1
+        return {"ok": True, "role": {"role_id": self._role_seq,
+                                     "name": name, "perms": perms,
+                                     "color": color, "position": position,
+                                     "members": []}}
+
+    def roles_assign(self, role=None, target_hash=None):
+        self.saved.append(("role_assign", (role, target_hash)))
+        return {"ok": True}
+
+    def roles_unassign(self, role=None, target_hash=None):
+        self.saved.append(("role_unassign", (role, target_hash)))
+        return {"ok": True}
+
+    def roles_delete(self, role=None):
+        self.saved.append(("role_delete", role))
+        return {"ok": True}
 
     def admin_config(self, key=None, value=None):
         if key is None:
@@ -111,81 +158,23 @@ def main():
         print("\nPASS: %d  FAIL: %d" % (len(PASS), len(FAIL)))
         return 1
 
-    content = popup.content
-    # Kivy's `children` list is in reverse insertion order, so find the tab
-    # strip and the scroll view by structure rather than by index.
-    tabs = None
-    grid = None
-    for c in content.children:
-        if type(c).__name__ == "BoxLayout" and len(c.children) == 4 \
-                and all(isinstance(b, Button) for b in c.children):
-            tabs = c
-        elif type(c).__name__ == "ScrollView":
-            for gc in c.children:
-                if type(gc).__name__ == "GridLayout":
-                    grid = gc
-    check("tab strip found", tabs is not None)
-    check("content grid found", grid is not None)
-    if tabs is None or grid is None:
-        print("\nPASS: %d  FAIL: %d" % (len(PASS), len(FAIL)))
-        return 1
+    # Rootless contract: without a kv ScreenManager the panel hosts the
+    # same tabbed ServerConfigScreen in a popup (deep widget behavior
+    # lives in test_server_config_screen.py).
+    from ui_server_config import ServerConfigScreen
+    screen = popup.content
+    check("panel hosts the tabbed ServerConfigScreen",
+          isinstance(screen, ServerConfigScreen), type(screen).__name__)
+    check("screen wired to the client", screen.client is app)
 
-    tab_buttons = [c for c in tabs.children if isinstance(c, Button)]
-    check("tab strip has one button per view", len(tab_buttons) == 4,
-          "%d buttons" % len(tab_buttons))
-    titles = sorted(getattr(b, "text", "") for b in tab_buttons)
-    check("tab titles are config/moderators/audit/invites",
-          titles == ["audit", "config", "invites", "moderators"], titles)
+    tabs_raw = list(getattr(screen, "tab_buttons", []) or [])
+    tabs = [getattr(b, "text", "") for b in tabs_raw]
+    check("tabbed screen built its tabs", len(tabs) >= 1, str(tabs))
 
-    # The first view must actually have rendered into the grid.
-    grid_texts = []
-    for w in _walk(grid):
-        t = getattr(w, "text", None)
-        if isinstance(t, str):
-            grid_texts.append(t)
-    check("first view rendered config rows",
-          any("motd" in t for t in grid_texts), grid_texts[:8])
-
-    # --- switching tabs must repopulate the grid -------------------------
-    for b in tab_buttons:
-        if getattr(b, "text", "") == "audit":
-            b.dispatch("on_press")
-            break
-    for _ in range(4):
-        Clock.tick()
-    audit_texts = []
-    for w in _walk(grid):
-        t = getattr(w, "text", None)
-        if isinstance(t, str):
-            audit_texts.append(t)
-    check("audit tab renders the audit log",
-          any("audit log" in t for t in audit_texts), audit_texts[:8])
-
-    for b in tab_buttons:
-        if getattr(b, "text", "") == "moderators":
-            b.dispatch("on_press")
-            break
-    for _ in range(4):
-        Clock.tick()
-    mod_texts = []
-    for w in _walk(grid):
-        t = getattr(w, "text", None)
-        if isinstance(t, str):
-            mod_texts.append(t)
-    check("moderators tab renders the moderator list",
-          any("moderators" in t for t in mod_texts), mod_texts[:8])
-
-    # --- the save path calls refresh() — it must not raise NameError ----
-    for b in tab_buttons:
-        if getattr(b, "text", "") == "config":
-            b.dispatch("on_press")
-            break
-    for _ in range(4):
-        Clock.tick()
-
-    save_buttons = [w for w in _walk(grid)
+    # --- the save path must not raise NameError (keeps the old pin) ------
+    save_buttons = [w for w in _walk(screen)
                     if isinstance(w, Button) and getattr(w, "text", "") == "save"]
-    check("config view has a save button", len(save_buttons) >= 1,
+    check("panel has a save button", len(save_buttons) >= 1,
           "%d save buttons" % len(save_buttons))
     if save_buttons:
         try:
@@ -197,6 +186,22 @@ def main():
             check("saving a config value does not raise NameError", False, e)
         except Exception as e:
             check("saving a config value does not raise NameError", False, repr(e))
+
+    # --- gating: non-admin and no-guild never open the panel ------------
+    app2 = _ThemeApp()
+    app2.guild_api = StubGuild()
+    app2.i_am_admin = False
+    kc.sHadesClientApp._open_admin_panel(app2)
+    for _ in range(2):
+        Clock.tick()
+    check("non-admin never opens the panel", app2._admin_popup is None)
+
+    app3 = _ThemeApp()
+    app3.i_am_admin = True
+    kc.sHadesClientApp._open_admin_panel(app3)
+    for _ in range(2):
+        Clock.tick()
+    check("panel refuses without a guild api", app3._admin_popup is None)
 
     print()
     print("PASS: %d  FAIL: %d" % (len(PASS), len(FAIL)))
