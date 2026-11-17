@@ -3065,9 +3065,12 @@ def api_v1_whoami(viewer, data, link_id):
     roles = [{"role_id": r["role_id"], "name": r["name"], "perms": r["perms"],
               "color": r["color"]} for r in rows]
     is_admin = any(r["perms"] & PERMS["ADMIN"] for r in roles)
+    icon = _cfg_get("guild_icon", "") or None
     return {"ok": 1, "user_hash": viewer, "username": get_username(viewer),
             "is_moderator": is_moderator(viewer) or is_admin,
-            "is_admin": is_admin, "roles": roles}
+            "is_admin": is_admin, "roles": roles,
+            "guild": {"name": _cfg_get("guild_name", "") or GUILD_NAME,
+                      "icon": icon}}
 
 def _register_mod_endpoint(path, verb, apply_fn):
     """Register one moderator-gated JSON endpoint. `apply_fn(viewer, target,
@@ -3144,6 +3147,7 @@ SERVER_CONFIG_KEYS = {
     "registration": "open",      # open | code
     "slowmode": "0",             # seconds between posts, 0 = off
     "motd": "",
+    "guild_icon": "",            # empty = no icon; else a stored blob_id
 }
 
 def _require_admin(viewer):
@@ -3177,6 +3181,15 @@ def api_v1_admin_config(viewer, data, link_id):
     if key == "registration" and value not in ("open", "code"):
         return {"ok": 0, "error": "registration must be 'open' or 'code'",
                 "code": 400}
+    if key == "guild_icon" and value:
+        # the icon rides the standard blob store: the value must resolve to
+        # a committed blob (uploaded via blobs/put or the chunked flow)
+        digest = value.strip().lower()
+        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
+                or not _blob_fname(digest):
+            return {"ok": 0, "error": "guild_icon must be a stored blob_id",
+                    "code": 400}
+        value = digest
     if key == "slowmode":
         try:
             secs = int(value)
