@@ -3055,6 +3055,13 @@ class sHadesClientApp(MDApp):
 
         return None
 
+    _up_active = False  # an attachment/blob upload is in flight (set at both
+    # blobs_put call sites); while true, keepalive misses are ignored --
+    # an upload monopolizes the priority-agnostic link FIFO and legitimately
+    # delays the poll's receipt past its deadline (manual receipt: RNS is
+    # priority-agnostic on general traffic). Two counting misses here would
+    # tear the link MID-UPLOAD (v0.31.2 self-inflicted; receipted this
+    # session) -- this gate removes that path entirely.
     _DMA_INTERVAL = 300.0  # seconds between client lxmf.delivery re-announces
 
     def _announce_dm_once(self):
@@ -3414,6 +3421,13 @@ class sHadesClientApp(MDApp):
             self._ka_miss()
 
     def _ka_miss(self):
+        # Uploads in flight: no counting (see _up_active note). A busy link
+        # during a transfer is not a dead link; re-establishing here would
+        # tear the link under our own transfer.
+        if self._up_active:
+            print("[link] keepalive missed, upload in flight -- not counting")
+            self._ka_fail = 0
+            return
         misses = getattr(self, "_ka_fail", 0) + 1
         self._ka_fail = misses
         print("[link] keepalive miss %d/2" % misses)
@@ -5580,8 +5594,12 @@ class sHadesClientApp(MDApp):
                             "attach upload %d%%"
                             % int(100 * done / max(total, 1))), 0)
 
-                up = self.guild_api.blobs_put(name, mime, blob,
-                                              on_progress=_up_progress)
+                self._up_active = True
+                try:
+                    up = self.guild_api.blobs_put(name, mime, blob,
+                                                  on_progress=_up_progress)
+                finally:
+                    self._up_active = False
                 if not up.get("ok"):
                     Clock.schedule_once(
                         lambda dt: self._set_status(
@@ -6380,7 +6398,11 @@ class sHadesClientApp(MDApp):
                 try:
                     stage("attachment: uploading %s (%d KB)"
                           % (name, len(blob) // 1024))
-                    up = self.guild_api.blobs_put(name, mime, blob)
+                    self._up_active = True
+                    try:
+                        up = self.guild_api.blobs_put(name, mime, blob)
+                    finally:
+                        self._up_active = False
                     if up.get("ok"):
                         stage("attachment: blob ok, posting %s" % name)
                         res = self.guild_api.post_v1(

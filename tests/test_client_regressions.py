@@ -584,6 +584,52 @@ def test_dm_announce_interval_sane():
     assert 60 <= interval <= 3600, interval
 
 
+class _KAStubClock(object):
+    def __init__(self):
+        self.scheduled = []
+
+    def schedule_once(self, fn, delay=0):
+        self.scheduled.append((fn, delay))
+
+
+def test_keepalive_miss_not_counting_during_upload():
+    """v0.31.4: an upload monopolizes the priority-agnostic link FIFO, so
+    the 45s stream poll can time out mid-upload without the link being
+    dead. Counting those misses and re-establishing at two tears the link
+    under our own transfer (0.31.2 self-inflicted, receipted during the
+    attach-drop audit). Pins: misses while _up_active are ignored (no
+    re-establish scheduled, counter reset); misses without an upload
+    still count and fire the re-establish at two."""
+
+    real_clock = kc.Clock
+    kc.Clock = _KAStubClock()
+    try:
+        class _App(object):
+            _up_active = True
+            _ka_fail = 0
+            _ka_miss = kc.sHadesClientApp._ka_miss
+            _do_reestablish = kc.sHadesClientApp._do_reestablish
+
+        app = _App()
+        app._ka_miss()
+        app._ka_miss()
+        assert app._ka_fail == 0, app._ka_fail
+        assert len(kc.Clock.scheduled) == 0, kc.Clock.scheduled
+
+        app._up_active = False
+        app._ka_miss()
+        assert app._ka_fail == 1, app._ka_fail
+        assert len(kc.Clock.scheduled) == 0, "one miss must not re-establish"
+        app._ka_miss()
+        assert app._ka_fail == 0, "counter resets at re-establish trigger"
+        assert len(kc.Clock.scheduled) == 1
+        fn, delay = kc.Clock.scheduled[0]
+        assert getattr(fn, "__name__", "") == "_do_reestablish", fn
+        assert delay == 0, delay
+    finally:
+        kc.Clock = real_clock
+
+
 def main():
     for fn in (test_display_name_preserved,
                test_update_applied_once,
@@ -595,7 +641,8 @@ def main():
                test_roles_popup_not_blocking,
                test_shutdown_not_blocking,
                test_periodic_dm_announce,
-               test_dm_announce_interval_sane):
+               test_dm_announce_interval_sane,
+               test_keepalive_miss_not_counting_during_upload):
         try:
             fn()
         except Exception as e:
