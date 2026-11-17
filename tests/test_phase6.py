@@ -119,7 +119,7 @@ def main():
     r = call("/api/v1/react", {"msg": m1, "emoji": "fire_100"})
     check("shortcode charset accepted", r.get("ok") == 1, r)
     r = call("/api/v1/react", {"msg": m1, "emoji": "🔥"})
-    check("raw unicode emoji rejected", r.get("ok") == 0 and r.get("code") == 400, r)
+    check("raw unicode emoji accepted (unicode gate, v0.33)", r.get("ok") == 1, r)
     r = call("/api/v1/react", {"msg": m1, "emoji": "x" * 20})
     check("overlong shortcode rejected", r.get("ok") == 0 and r.get("code") == 400, r)
     r = call("/api/v1/react", {"msg": "f" * 64, "emoji": "+1"})

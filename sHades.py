@@ -149,7 +149,7 @@ CREATE TABLE IF NOT EXISTS guilds (
 CREATE TABLE IF NOT EXISTS channels (
     id TEXT PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE, created REAL,
     kind TEXT NOT NULL DEFAULT 'chat', manifest TEXT NOT NULL DEFAULT '{}',
-    topic TEXT);
+    topic TEXT, position INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS channel_state (
     channel_id TEXT PRIMARY KEY, seq INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS members (
@@ -196,7 +196,7 @@ CREATE TABLE IF NOT EXISTS server_config (
 CREATE TABLE IF NOT EXISTS invites (
     code TEXT PRIMARY KEY, label TEXT, created_at REAL, expires_at REAL,
     max_uses INTEGER NOT NULL DEFAULT 0, uses INTEGER NOT NULL DEFAULT 0,
-    created_by TEXT);
+    created_by TEXT, channel_id TEXT);
 CREATE TABLE IF NOT EXISTS guild_joins (
     user_hash TEXT PRIMARY KEY, joined_at REAL, code TEXT);
 CREATE INDEX IF NOT EXISTS idx_reactions_msg ON reactions(msg_id);
@@ -211,9 +211,12 @@ def _migrate_schema(conn):
     to SCHEMA after a guild has already booted has to be added explicitly."""
     have = {r["name"] for r in conn.execute("PRAGMA table_info(channels)").fetchall()}
     for col, decl in (("kind", "TEXT NOT NULL DEFAULT 'chat'"), ("manifest", "TEXT"),
-                      ("topic", "TEXT")):
+                      ("topic", "TEXT"), ("position", "INTEGER NOT NULL DEFAULT 0")):
         if col not in have:
             conn.execute("ALTER TABLE channels ADD COLUMN %s %s" % (col, decl))
+    have_inv = {r["name"] for r in conn.execute("PRAGMA table_info(invites)").fetchall()}
+    if "channel_id" not in have_inv:
+        conn.execute("ALTER TABLE invites ADD COLUMN channel_id TEXT")
 
 def open_db(path):
     conn = sqlite3.connect(path, check_same_thread=False)
@@ -1849,17 +1852,43 @@ def _presence_payload():
 @wrap_json_api
 def api_v1_channels_list(viewer, data, link_id):
     with db_lock:
-        rows = db.execute("SELECT id, name, kind, created, topic FROM channels "
-                          "ORDER BY name ASC").fetchall()
+        rows = db.execute("SELECT id, name, kind, created, topic, position FROM channels "
+                          "ORDER BY position ASC, name ASC").fetchall()
         chans = [{"id": r["id"], "name": r["name"], "kind": r["kind"],
                   "created": r["created"], "topic": r["topic"],
-                  "seq": get_seq(r["id"])} for r in rows]
+                  "position": r["position"], "seq": get_seq(r["id"])} for r in rows]
     # VIEW permission: channels the viewer cannot read are absent entirely
     chans = [c for c in chans if has_perm(viewer, c["id"], PERMS["VIEW"])]
     for c in chans:
         last_id = _receipt_last_id(c["id"], viewer)
         c["unread"] = _unread_count(c["id"], last_id)
     return {"ok": 1, "channels": chans}
+
+@api_route("/api/v1/channels/reorder")
+@wrap_json_api
+def api_v1_channels_reorder(viewer, data, link_id):
+    """Persist the channel list order (drag result). {order: [cid, ...]} must
+    list EVERY channel exactly once; the position column is rewritten in one
+    transaction. Needs MANAGE_CHANNEL (guild-wide) — ADMIN carries it."""
+    if not has_role_perm(viewer, PERMS["MANAGE_CHANNEL"]):
+        return {"ok": 0, "error": "manage channel permission required", "code": 403}
+    order = data.get("order")
+    if not isinstance(order, list) or not order \
+            or not all(isinstance(c, str) for c in order) \
+            or len(set(order)) != len(order):
+        return {"ok": 0, "error": "order must be a unique cid list", "code": 400}
+    with db_lock:
+        known = {r["id"] for r in db.execute("SELECT id FROM channels").fetchall()}
+        if set(order) != known:
+            return {"ok": 0, "error": "order must cover every channel exactly once",
+                    "code": 400}
+        for idx, cid in enumerate(order, start=1):
+            db.execute("UPDATE channels SET position=? WHERE id=?", (idx, cid))
+        db.commit()
+    # every subscriber sees the new order through their own channel's stream
+    _audit(viewer, "channel.reorder", None, "channels=%d" % len(order))
+    _emit_event(None, "channels_changed", {"order": order}, guild_wide=True)
+    return {"ok": 1, "order": order}
 
 def _create_channel_txn(viewer, name, kind, manifest=None):
     """Shared channel creation (API + slash command). Returns
@@ -1880,9 +1909,12 @@ def _create_channel_txn(viewer, name, kind, manifest=None):
         if db.execute("SELECT 1 FROM channels WHERE id=? OR (name=? COLLATE NOCASE)",
                       (cid, name)).fetchone():
             return None, "channel exists"
-        db.execute("INSERT INTO channels (id, name, created, kind, manifest) "
-                   "VALUES (?, ?, ?, ?, ?)",
-                   (cid, name, now(), kind, manifest_json))
+        # explicit ordering: new channels sink to the end of the drag list
+        nxt = (db.execute("SELECT COALESCE(MAX(position), 0) + 1 AS nxt "
+                          "FROM channels").fetchone()["nxt"])
+        db.execute("INSERT INTO channels (id, name, created, kind, manifest, position) "
+                   "VALUES (?, ?, ?, ?, ?, ?)",
+                   (cid, name, now(), kind, manifest_json, nxt))
         db.execute("INSERT OR IGNORE INTO channel_state (channel_id, seq) VALUES (?, 0)", (cid,))
         db.commit()
     _audit(viewer, "channel.create", cid, "%s (%s)" % (name, kind))
@@ -2884,7 +2916,23 @@ def api_v1_term_close(viewer, data, link_id):
 # ---- receipts, reactions, search (phase 6) -----------------------------------------
 
 _EMOJI_RE = re.compile(r"^[a-z0-9_+\-]{1,16}$")
-MAX_EMOJI_PER_MSG = 16   # distinct shortcodes per message
+# Unicode emoji gate: BMP symbols (arrows/misc/dingbats incl 2705/2764) and
+# supplementary-plane atoms (1F000-1FAFF), with variation selectors / ZWJs as
+# joiners between-or-after atoms only. NOTE the 8-digit \U escapes: \u1F000
+# in a regex class is five hex digits (\u1F00 + "00"), which silently widens
+# the class to every codepoint below U+1FAF — accepted letters and punctuation.
+_EMOJI_CORE_RE = re.compile(
+    r"^(?:[\u2190-\u2BFF\U0001F000-\U0001FAFF]"
+    r"(?:[\uFE0F\u200D]*[\u2190-\u2BFF\U0001F000-\U0001FAFF])*)"
+    r"[\uFE0F\u200D]*$")
+MAX_EMOJI_PER_MSG = 16   # distinct shortcodes/emoji per message
+
+def _emoji_ok(emoji):
+    """"+1" and friends; or unicode emoji atoms with ZWJ/VS joiners;
+    byte-capped so nothing absurd reaches the PK column."""
+    if _EMOJI_RE.match(emoji):
+        return True
+    return len(emoji.encode("utf-8")) <= 32 and bool(_EMOJI_CORE_RE.match(emoji))
 
 def _receipt_last_id(cid, viewer):
     with db_lock:
@@ -2929,12 +2977,14 @@ def api_v1_receipts(viewer, data, link_id):
 @api_route("/api/v1/react")
 @wrap_json_api
 def api_v1_react(viewer, data, link_id):
-    """Toggle a reaction (one emoji per user per message). Emoji are ASCII
-    shortcodes ('+1', 'laugh', ...), never raw unicode from the wire."""
+    """Toggle a reaction (one emoji per user per message). Emoji are unicode
+    emoji characters (BMP symbols, supplementary plane, ZWJ composites) or
+    legacy ASCII shortcodes ('+1', 'laugh', ...) for older rows."""
     msg_id = data.get("msg")
     emoji = (data.get("emoji") or "").strip().lower()
-    if not _EMOJI_RE.match(emoji):
-        return {"ok": 0, "error": "emoji must be a shortcode (a-z0-9_+-)", "code": 400}
+    if not _emoji_ok(emoji):
+        return {"ok": 0, "error": "emoji must be an emoji or a shortcode (a-z0-9_+-)",
+                "code": 400}
     with db_lock:
         row = db.execute("SELECT channel_id, deleted_at FROM messages WHERE msg_id=?",
                          (msg_id,)).fetchone()
@@ -3015,9 +3065,12 @@ def api_v1_whoami(viewer, data, link_id):
     roles = [{"role_id": r["role_id"], "name": r["name"], "perms": r["perms"],
               "color": r["color"]} for r in rows]
     is_admin = any(r["perms"] & PERMS["ADMIN"] for r in roles)
+    icon = _cfg_get("guild_icon", "") or None
     return {"ok": 1, "user_hash": viewer, "username": get_username(viewer),
             "is_moderator": is_moderator(viewer) or is_admin,
-            "is_admin": is_admin, "roles": roles}
+            "is_admin": is_admin, "roles": roles,
+            "guild": {"name": _cfg_get("guild_name", "") or GUILD_NAME,
+                      "icon": icon}}
 
 def _register_mod_endpoint(path, verb, apply_fn):
     """Register one moderator-gated JSON endpoint. `apply_fn(viewer, target,
@@ -3094,6 +3147,7 @@ SERVER_CONFIG_KEYS = {
     "registration": "open",      # open | code
     "slowmode": "0",             # seconds between posts, 0 = off
     "motd": "",
+    "guild_icon": "",            # empty = no icon; else a stored blob_id
 }
 
 def _require_admin(viewer):
@@ -3127,6 +3181,15 @@ def api_v1_admin_config(viewer, data, link_id):
     if key == "registration" and value not in ("open", "code"):
         return {"ok": 0, "error": "registration must be 'open' or 'code'",
                 "code": 400}
+    if key == "guild_icon" and value:
+        # the icon rides the standard blob store: the value must resolve to
+        # a committed blob (uploaded via blobs/put or the chunked flow)
+        digest = value.strip().lower()
+        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
+                or not _blob_fname(digest):
+            return {"ok": 0, "error": "guild_icon must be a stored blob_id",
+                    "code": 400}
+        value = digest
     if key == "slowmode":
         try:
             secs = int(value)
@@ -3255,12 +3318,18 @@ def api_v1_join(viewer, data, link_id):
                 "policy": policy}
     if not required:
         # open guild: joining is implicit, but still record it so the state
-        # is consistent if the policy is tightened later
+        # is consistent if the policy is tightened later. A channel-targeted
+        # code still resolves its landing channel in an open guild.
+        channel_id = None
         with db_lock:
             db.execute("INSERT OR IGNORE INTO guild_joins (user_hash, joined_at, "
-                       "code) VALUES (?, ?, ?)", (viewer, now(), ""))
+                       "code) VALUES (?, ?, ?)", (viewer, now(), code))
             db.commit()
-        return {"ok": 1, "required": False, "joined": True, "policy": policy}
+            row = db.execute("SELECT channel_id FROM invites WHERE code=?",
+                             (code,)).fetchone()
+            channel_id = (row["channel_id"] or None) if row else None
+        return {"ok": 1, "required": False, "joined": True, "policy": policy,
+                "channel_id": channel_id}
     if not re.match(r"^[A-Z0-9]{6,16}$", code):
         return {"ok": 0, "error": "invalid code", "code": 400}
     with db_lock:
@@ -3276,7 +3345,11 @@ def api_v1_join(viewer, data, link_id):
                    "code) VALUES (?, ?, ?)", (viewer, now(), code))
         db.commit()
     _audit(viewer, "join", None, "code=%s" % code)
-    return {"ok": 1, "required": True, "joined": True, "policy": policy}
+    with db_lock:
+        row = db.execute("SELECT channel_id FROM invites WHERE code=?",
+                         (code,)).fetchone()
+    return {"ok": 1, "required": True, "joined": True, "policy": policy,
+            "channel_id": (row["channel_id"] or None) if row else None}
 
 @api_route("/api/v1/invites")
 @wrap_json_api
@@ -3295,7 +3368,8 @@ def api_v1_invites(viewer, data, link_id):
         return {"ok": 1, "invites": [
             {"code": r["code"], "label": r["label"], "created_at": r["created_at"],
              "expires_at": r["expires_at"], "max_uses": r["max_uses"],
-             "uses": r["uses"], "created_by": r["created_by"]} for r in rows]}
+             "uses": r["uses"], "created_by": r["created_by"],
+             "channel_id": r["channel_id"] or None} for r in rows]}
     if op == "create":
         try:
             max_uses = int(data.get("max_uses", 0))
@@ -3308,19 +3382,27 @@ def api_v1_invites(viewer, data, link_id):
         if expires_in < 0 or expires_in > 60 * 60 * 24 * 30:
             return {"ok": 0, "error": "expires_in must be 0-2592000", "code": 400}
         label = str(data.get("label") or "")[:64]
+        # optional channel target: the joiner is told which channel to open
+        channel = data.get("channel")
+        if channel:
+            with db_lock:
+                if not db.execute("SELECT 1 FROM channels WHERE id=?",
+                                  (channel,)).fetchone():
+                    return {"ok": 0, "error": "unknown channel", "code": 400}
         code = _new_invite_code()
         with db_lock:
             if db.execute("SELECT 1 FROM invites WHERE code=?", (code,)).fetchone():
                 code = _new_invite_code()
             expires_at = (now() + expires_in) if expires_in else 0
             db.execute("INSERT INTO invites (code, label, created_at, "
-                       "expires_at, max_uses, uses, created_by) "
-                       "VALUES (?, ?, ?, ?, ?, 0, ?)",
-                       (code, label, now(), expires_at, max_uses, viewer))
+                       "expires_at, max_uses, uses, created_by, channel_id) "
+                       "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+                       (code, label, now(), expires_at, max_uses, viewer,
+                        channel or None))
             db.commit()
         _audit(viewer, "invite.create", code, label)
         return {"ok": 1, "code": code, "label": label, "max_uses": max_uses,
-                "expires_at": expires_at}
+                "expires_at": expires_at, "channel_id": channel or None}
     if op == "revoke":
         code = (data.get("code") or "").strip().upper()
         if not re.match(r"^[A-Z0-9]{6,16}$", code):
