@@ -569,12 +569,12 @@
                         spacing: dp(2)
                         padding: [dp(8), dp(8)]
                 BoxLayout:
-                    # 48px: the bar must CONTAIN the field and the buttons.
-                    # At 24px a 35px field and 26.7px buttons overflowed
-                    # upward into the message list.
+                    # 56px (task 9): the bar contains the pfp (dp(42)) and
+                    # the field. At 48px a dp(42) pfp plus padding
+                    # overflowed upward into the message list.
                     size_hint_y: None
-                    height: dp(48)
-                    padding: [dp(4), dp(4)]
+                    height: dp(56)
+                    padding: [dp(4), dp(6)]
                     spacing: dp(4)
                     canvas.before:
                         Color:
@@ -582,24 +582,63 @@
                         Rectangle:
                             pos: self.pos
                             size: self.size
+                    Button:
+                        id: composer_pfp_holder
+                        background_normal: ''
+                        background_down: ''
+                        background_color: [0, 0, 0, 0]
+                        size_hint_x: None
+                        width: dp(46)
+                        on_press: app.open_file_chooser(avatar=True)
+                        PfpImage:
+                            id: composer_pfp
+                            source: app.composer_pfp_path or ''
+                            size: dp(42), dp(42)
+                            center: self.parent.center if self.parent else (0, 0)
+                            allow_stretch: True
+                            keep_ratio: True
+                    Widget:
+                        # task 9 (tay): the flat attach '+' reads as a
+                        # delimited extension of the field, not a second
+                        # button: body = input_bg, left corners rounded
+                        size_hint_x: None
+                        width: dp(38)
+                        canvas.before:
+                            Color:
+                                rgba: app.theme_colors['input_bg']
+                            RoundedRectangle:
+                                pos: self.pos
+                                size: self.size
+                                radius: [dp(6), 0, 0, dp(6)]
+                        on_touch_down:
+                            app.open_attach_dialog() if self.collide_point(*args[1].pos) else None
+                        Label:
+                            text: '+'
+                            color: app.theme_colors['text']
+                            font_size: sp(18)
                     MDTextField:
                         id: msg_input
                         mode: 'filled'
                         multiline: True
                         size_hint_x: 1
                         size_hint_y: None
-                        # max_height caps the field at one line inside a
-                        # 48px bar; adjust_height() otherwise balloons it
-                        # to dp(56) and it overflows the bar.
+                        # max_height caps the field at one line inside the
+                        # bar; adjust_height() otherwise balloons it to
+                        # dp(56) and it overflows the bar.
                         height: dp(40)
                         min_height: dp(40)
                         max_height: dp(40)
-                        radius: [dp(6), dp(6), dp(6), dp(6)]
+                        radius: [0, dp(6), dp(6), 0]
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
                         text_color_normal: app.theme_colors['text']
                         text_color_focus: app.theme_colors['text']
                         cursor_color: app.theme_colors['text']
+                        # v0.31.10: the helper line carries the attach
+                        # progress; persistent keeps it visible unfocused
+                        helper_text_mode: 'persistent'
+                        helper_text: ''
+                        helper_text_color: app.theme_colors['text_dim']
                         on_text_validate: app.send_message()
                         MDTextFieldHintText:
                             text: 'Message...'
@@ -616,21 +655,6 @@
                         on_press: app.send_message()
                         MDButtonText:
                             text: 'Send'
-                            text_color: app.theme_colors['btn_text']
-                    Widget:
-                        size_hint_x: None
-                        width: dp(3)
-                    MDButton:
-                        style: 'filled'
-                        size_hint_x: None
-                        width: dp(48)
-                        size_hint_y: None
-                        height: scaled(dp(40))
-                        theme_bg_color: 'Custom'
-                        md_bg_color: app.theme_colors['primary']
-                        on_press: app.open_attach_dialog()
-                        MDButtonText:
-                            text: '+'
                             text_color: app.theme_colors['btn_text']
 
             # right: members drawer (swipe from the right edge opens)

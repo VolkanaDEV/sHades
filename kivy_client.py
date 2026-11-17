@@ -2156,6 +2156,8 @@ class sHadesClientApp(MDApp):
     # Unified UI palette: edited in the config screen, persisted to
     # ui_config.json, referenced by kv_md.kv as app.theme_colors['key'].
     theme_colors = DictProperty({})
+    # task 9: the composer rail's pfp; "" = letterless default disc
+    composer_pfp_path = StringProperty("")
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -2268,6 +2270,9 @@ class sHadesClientApp(MDApp):
         # Avatar pfp paths (set by _save_pfp_crop)
         self.my_avatar_orig = None
         self.my_avatar_small = None
+        # task 9: the composer's pfp live-binds to the kv bar; the class
+        # property is declared next to the other app properties
+        self.composer_pfp_path = ""
 
         # Friends roster + DM state (U7, client-local; the guild never sees
         # either). DM transport is a direct LXMRouter exchange, initialised
@@ -7362,6 +7367,12 @@ class sHadesClientApp(MDApp):
         if hasattr(self, "profile_screen"):
             self.profile_screen.target_avatar = small_path
             self.profile_screen.ids.profile_pfp.source = small_path
+
+        # task 9: the composer pfp follows the saved crop immediately
+        try:
+            self.composer_pfp_path = small_path
+        except Exception:
+            pass
 
         # Refresh existing chat message rows for local user with new pfp
         msg_widgets = getattr(self, "_msg_widgets", {})

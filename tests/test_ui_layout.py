@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from kivy.clock import Clock  # noqa: E402
 from kivy.core.window import Window  # noqa: E402
 from kivy.metrics import dp  # noqa: E402
+from kivy.uix.widget import Widget  # noqa: E402
 from kivy_client import sHadesClientApp  # noqa: E402
 
 
@@ -55,6 +56,38 @@ class LayoutProbe(sHadesClientApp):
                    "channel drawer leaves a visible chat edge")
         self.check(main.ids.msg_input.height <= dp(40) + 1,
                    "composer stays inside its toolbar")
+
+        # ---- task 9 composer geometry (additive, tay's file) ----
+        def walk(w):
+            yield w
+            for c in w.children:
+                yield from walk(c)
+        bar = main.ids.msg_input.parent
+        self.check(abs(bar.height - dp(56)) <= 1,
+                   "composer bar grew to hold the pfp (got %r)" % bar.height)
+        pfp = main.ids.composer_pfp
+        self.check(pfp is not None and pfp.width == dp(42),
+                   "composer pfp occupies the rail slot (got " +
+                   repr(None if pfp is None else (pfp.width, pfp.height)) + ")")
+        field = main.ids.msg_input
+        helper_ok = getattr(field, "helper_text_mode", "") == "persistent"
+        self.check(helper_ok, "attach-progress helper line stays visible")
+        holder = main.ids.composer_pfp_holder
+        self.check(pfp.x >= bar.x and pfp.right <= holder.right
+                   and pfp.y >= bar.y and pfp.top <= bar.top,
+                   "pfp stays inside the bar")
+        flat = None
+        for w in walk(bar):
+            if isinstance(w, Widget) and w is not bar and w.width == dp(38):
+                flat = w
+                break
+        self.check(flat is not None and flat.x < field.x,
+                   "flat '+' extension sits left of the field")
+        self.check(flat is not None and pfp.x < flat.x < field.x,
+                   "composer order: pfp, flat '+', field (got %s)" %
+                   repr((None if pfp is None else pfp.x,
+                         None if flat is None else flat.x, field.x)))
+
         self.root.current = "config"
         Clock.schedule_once(self.check_config, 0.3)
 
