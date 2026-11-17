@@ -6577,37 +6577,43 @@ class sHadesClientApp(MDApp):
                 # retry the whole flow around the socket gap.
                 res = None
                 up = None
-                for attempt in range(4):
-                    stage("attachment: uploading %s (%d KB)%s"
-                          % (name, len(blob) // 1024,
-                             "" if attempt == 0 else " (attempt %d)" % (attempt + 1)))
-                    try:
-                        self._up_active = True
+                # 0.31.9 (boot_2 receipt 13:23:20): the gate must hold across
+                # the WHOLE retry window. Released between attempts, the
+                # keepalive reaper counted 3 misses and tore the guild link
+                # mid-retry ("guild link dead (3)"), so attempt 2 saw a dead
+                # link instead of the reconnected socket.
+                self._up_active = True
+                try:
+                    for attempt in range(4):
+                        stage("attachment: uploading %s (%d KB)%s"
+                              % (name, len(blob) // 1024,
+                                 "" if attempt == 0 else " (attempt %d)" % (attempt + 1)))
                         try:
                             up = self.guild_api.blobs_put(name, mime, blob)
-                        finally:
-                            self._up_active = False
-                    except Exception as e:
-                        dlog("v1 blob path failed: %r" % (e,))
-                        print("[TRACE] v1 blob path failed, falling back:",
-                              repr(e), flush=True)
+                        except Exception as e:
+                            dlog("v1 blob path failed: %r" % (e,))
+                            print("[TRACE] v1 blob path failed, falling back:",
+                                  repr(e), flush=True)
+                            break
+                        if up.get("ok"):
+                            break
+                        err = up.get("error", "unknown")
+                        print("[TRACE] blob upload attempt %d failed: %s"
+                              % (attempt + 1, err), flush=True)
+                        link = getattr(getattr(self, "guild_api", None),
+                                       "link", None)
+                        dead = link is None or getattr(
+                            link, "status", None) not in (None, RNS.Link.ACTIVE)
+                        if attempt < 3 and err == "timeout" and not dead:
+                            # Only the receipted socket-gap timeout retries; a
+                            # dead link is the re-establish path's job.
+                            time.sleep(8.0)
+                            continue
+                        stage("attachment: upload failed (%s); link lost -- "
+                              "retry the attach" % err)
                         break
-                    if up.get("ok"):
-                        break
-                    err = up.get("error", "unknown")
-                    print("[TRACE] blob upload attempt %d failed: %s"
-                          % (attempt + 1, err), flush=True)
-                    link = getattr(getattr(self, "guild_api", None), "link", None)
-                    dead = link is None or getattr(
-                        link, "status", None) not in (None, RNS.Link.ACTIVE)
-                    if attempt < 3 and err == "timeout" and not dead:
-                        # Only the receipted socket-gap timeout retries; a
-                        # dead link is the re-establish path's job.
-                        time.sleep(8.0)
-                        continue
-                    if err == "timeout":
-                        stage("attachment: upload timed out; link lost -- retry the attach")
-                    break
+                finally:
+                    self._up_active = False
                 if up is not None and up.get("ok"):
                     stage("attachment: blob ok, posting %s" % name)
                     try:
@@ -6630,12 +6636,13 @@ class sHadesClientApp(MDApp):
                             % name: self._set_status(m), 0)
                         return
                 if res is None or not res.get("ok"):
-                    # 0.31.8: the legacy inline post is the pre-/api/v1
-                    # fallback only. With blobs retried above, a timeout
-                    # never reaches here; do not push a multi-megabyte
-                    # inline blob at a flapping link.
-                    if res is None and up is not None and not up.get("ok") \
-                            and up.get("error") == "timeout":
+                    # 0.31.9: the legacy inline post is the pre-/api/v1
+                    # fallback only. ANY blobs_put failure after the retry
+                    # loop (timeout or link dead) must never fall through:
+                    # boot_2 receipt at 13:23:22 -- a "link dead" race
+                    # between attempts bypassed the timeout-only guard and
+                    # the inline post pushed the full blob again.
+                    if res is None and up is not None and not up.get("ok"):
                         return
                     try:
                         stage("attachment: posting inline %s ..." % name)

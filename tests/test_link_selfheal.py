@@ -348,7 +348,111 @@ def test_blob_retry_never_inlines_big_blob_on_timeout():
     assert calls["blob"] == 1, "retried against a dead link"
     assert calls["legacy"] == 0, "inline blob pushed at a dead link"
     assert calls["post_v1"] == 0, calls
-    assert any("timed out" in m for m in calls.get("status", [])), calls
+    assert any("upload failed" in m and "retry the attach" in m
+               for m in calls.get("status", [])), calls
+
+
+def test_blob_linkdead_never_falls_through():
+    """0.31.9 (boot_2 receipt 13:23:20): tay's phone -- attempt 1 timed out
+    in the socket gap, the keepalive reaper tore the guild link during the
+    sleep ("guild link dead (3)"), attempt 2 saw "link dead", and the
+    timeout-only fallthrough guard let the LEGACY inline post run anyway
+    ("post response ok=0" on the full blob). Any blobs_put failure must
+    end the flow: no retry after link dead, no legacy inline post, a
+    status telling the user to retry the attach.
+
+    Also pins the gate fix: _up_active must STILL be held across the
+    inter-attempt sleep, so the reaper cannot tear the link mid-retry.
+    """
+
+    app = kc.sHadesClientApp.__new__(kc.sHadesClientApp)
+    calls = {"blob": 0, "post_v1": 0, "legacy": 0, "up_at_rest": []}
+
+    class _Fakes(object):
+        pass
+
+    main_screen = _Fakes()
+    main_screen._current_channel = "general"
+    main_screen.ids = _Fakes()
+
+    class _Root(object):
+        def get_screen(self, *_a, **_k):
+            return main_screen
+
+    app.root = _Root()
+    app._channel_cid = lambda cid: cid
+    app._set_status = lambda msg: calls.setdefault("status", []).append(msg)
+    app.my_hash = "aa" * 16
+    app.username = "tester"
+    app._add_to_history = lambda m: None
+    app._save_history = lambda: None
+    app._render_message = lambda *a, **k: None
+    app._save_attachment_blob = lambda blob, name: "/tmp/fake"
+
+    class _API(object):
+        link = object()  # plain stub: liveness unknown while retry rides
+
+        def blobs_put(self, name, mime, blob):
+            calls["blob"] += 1
+            if calls["blob"] < 2:
+                return {"ok": 0, "error": "timeout"}
+            return {"ok": 0, "error": "link dead"}
+
+        def post_v1(self, *a, **k):
+            calls["post_v1"] += 1
+            return {"ok": 0}
+
+        def post(self, *a, **k):
+            calls["legacy"] += 1
+            return {"ok": 1}
+
+    app.guild_api = _API()
+
+    real_threading = kc.threading
+    real_time = kc.time
+    real_clock = kc.Clock
+
+    class _NowClock(object):
+        @staticmethod
+        def schedule_once(cb, dt=0):
+            cb(dt)
+
+    shim = types.ModuleType("shim-threading")
+
+    class _SyncThread(object):
+        def __init__(self, target=None, daemon=False):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    shim.Thread = _SyncThread
+    kc.threading = shim
+
+    def _sleep(_s):
+        calls["up_at_rest"].append(app._up_active)
+
+    shim_time = types.ModuleType("shim-time")
+    shim_time.time = lambda *_a, **_k: 0.0
+    shim_time.sleep = _sleep
+    kc.time = shim_time
+    kc.Clock = _NowClock
+    try:
+        app._send_with_attachment("hi", "f.bin", "application/octet-stream",
+                                  b"data", kc.ATT_SERVER)
+    finally:
+        kc.threading = real_threading
+        kc.time = real_time
+        kc.Clock = real_clock
+
+    assert calls["blob"] == 2, calls
+    assert calls["up_at_rest"] == [True], \
+        "gate released between attempts; reaper tore the link mid-retry"
+    assert calls["legacy"] == 0, \
+        '"link dead" fell through to the legacy inline post'
+    assert calls["post_v1"] == 0, calls
+    assert any("link dead" in m for m in calls.get("status", [])), calls
+    assert not app._up_active, "gate stuck held after the flow finished"
 
 
 def test_wait_path_mtu_bounded_and_uses_live_path():
@@ -425,9 +529,10 @@ def main():
     test_heal_rebuild_only_when_router_gone()
     test_blob_upload_retries_timeout_then_posts()
     test_blob_retry_never_inlines_big_blob_on_timeout()
+    test_blob_linkdead_never_falls_through()
     test_wait_path_mtu_bounded_and_uses_live_path()
     test_wait_path_mtu_bounded_gives_up()
-    print("PASS: 9  FAIL: 0")
+    print("PASS: 10  FAIL: 0")
 
 
 if __name__ == "__main__":
