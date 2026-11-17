@@ -3064,6 +3064,60 @@ class sHadesClientApp(MDApp):
     # session) -- this gate removes that path entirely.
     _DMA_INTERVAL = 300.0  # seconds between client lxmf.delivery re-announces
 
+    def _init_lxmf_router(self):
+        """Build/repair the LXMF router on the existing client identity.
+
+        Extracted (v0.31.5) from the boot path so the resume heal can run
+        the identical sequence: Android STOPS the activity for every SAF
+        file pick (opaque picker, OS-mandated), and on_stop historically
+        exited the router mid-session there (receipted). Boot failure also
+        retries here on every resume instead of disabling DMs for good.
+        """
+        if self.client_identity is None:
+            return
+        try:
+            import LXMF
+            router_was_none = self.lxmf_router is None
+            self.lxmf_router = LXMF.LXMRouter(
+                identity=self.client_identity,
+                storagepath=os.path.join(_app_data_dir(), "lxmf"))
+            self.lxmf_delivery = self.lxmf_router.register_delivery_identity(
+                self.client_identity,
+                display_name=(self.username or "sHades"))
+            self.lxmf_router.register_delivery_callback(self._on_dm_delivery)
+            # announce (re)so friends can hear our lxmf.delivery
+            self.lxmf_router.announce(self.lxmf_delivery.hash)
+            if router_was_none:
+                threading.Thread(
+                    target=self._dm_announce_loop, daemon=True).start()
+        except Exception as e:
+            print("LXMF router init failed (DMs disabled):", repr(e))
+            self.lxmf_router = None
+            self.lxmf_delivery = None
+
+    def _heal_after_resume(self):
+        """v0.31.5 resume heal (tay: 'We don't *want* to stop the app.
+
+        That is literally the blocking behavior'). Android stops the
+        activity for every SAF pick; we cannot prevent the stop, so the
+        return must be seamless: reset the keepalive counter (it froze
+        mid-stop), rebuild the LXMF router if on_stop exited it, and
+        re-establish a dead guild link. Chat must work immediately after
+        every pick, without a restart.
+        """
+        try:
+            self._ka_fail = 0
+            self._init_lxmf_router()
+            api = self.guild_api
+            if api is not None:
+                link = getattr(api, "link", None)
+                if link is not None and getattr(link, "status", None) \
+                        not in (None, RNS.Link.ACTIVE):
+                    Clock.schedule_once(self._do_reestablish, 0)
+        except Exception as e:
+            print("resume heal error:", repr(e))
+
+
     def _announce_dm_once(self):
         if self.lxmf_router and self.lxmf_delivery:
             try:
@@ -3128,29 +3182,7 @@ class sHadesClientApp(MDApp):
             # (nothing else ever does — guild chat rides the API link), so the
             # delivery callback IS the DM inbox. Failure to init just
             # disables DMs; chat keeps working.
-            try:
-                import LXMF
-                self.lxmf_router = LXMF.LXMRouter(
-                    identity=self.client_identity,
-                    storagepath=os.path.join(_app_data_dir(), "lxmf"))
-                self.lxmf_delivery = self.lxmf_router.register_delivery_identity(
-                    self.client_identity,
-                    display_name=(self.username or "sHades"))
-                self.lxmf_router.register_delivery_callback(self._on_dm_delivery)
-                # announce now so friends can hear our lxmf.delivery
-                self.lxmf_router.announce(self.lxmf_delivery.hash)
-                # v0.31.3: periodic re-announce (RNS practice for changing
-                # topologies). Mobile clients churn: reconnects change the
-                # hub-side interface and paths back to us age out, and a
-                # boot-time announce alone goes stale over a long session.
-                # The hub hears our delivery destination every _DMA_INTERVAL
-                # seconds, which also gives the server side a periodic
-                # liveness receipt per client.
-                threading.Thread(target=self._dm_announce_loop, daemon=True).start()
-            except Exception as e:
-                print("LXMF router init failed (DMs disabled):", repr(e))
-                self.lxmf_router = None
-                self.lxmf_delivery = None
+            self._init_lxmf_router()
         except Exception as e:
             print("identity init error:", repr(e))
             self.client_identity = None
@@ -7177,9 +7209,26 @@ class sHadesClientApp(MDApp):
         except Exception:
             pass
 
+    def on_resume(self):
+        """v0.31.5: the app came back (SAF pick return, any foreground).
+        Android stopped the activity underneath us; heal everything the
+        stop may have disturbed instead of demanding a restart."""
+        self._heal_after_resume()
+
     def on_stop(self):
         # v0.28: push replaced the poller/streamer/presence-fetcher.
         # v0.29: nothing pings, so there is no tick loop left to stop.
+        # v0.31.5 (tay: "We don't *want* to stop the app"): Android fires
+        # on_stop for EVERY opaque-surface activity stop -- i.e. every
+        # SAF file pick -- not just real exits, and swipe-away terminates
+        # the process without running this at all. Tearing state down
+        # here froze DMs and console work mid-session on the phone.
+        # Desktop closes are real closes: keep the tidy teardown there
+        # only. Android: leave everything running.
+        from RNS.vendor.platformutils import is_android as _is_android
+        if _is_android():
+            self._term_sessions.clear()
+            return
         # close any open console sessions so they don't idle out server-side.
         # Each term_close() blocks on the RNS link for up to the request
         # timeout, so doing them inline freezes shutdown for N * timeout

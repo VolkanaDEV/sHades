@@ -630,6 +630,107 @@ def test_keepalive_miss_not_counting_during_upload():
         kc.Clock = real_clock
 
 
+class _FakeLXMFModule(object):
+    class _FakeDelivery(object):
+        hash = b"delivery-hash"
+
+    class LXMRouter(object):
+        def __init__(self, identity=None, storagepath=None):
+            self.stor = storagepath
+            self.registered = 0
+            self.callbacks = 0
+            self.announce_calls = []
+
+        def register_delivery_identity(self, identity, display_name=None):
+            self.registered += 1
+            self.delivery = _FakeLXMFModule._FakeDelivery()
+            self.delivery_name = display_name
+            return self.delivery
+
+        def register_delivery_callback(self, cb):
+            self.callbacks += 1
+
+        def announce(self, h):
+            self.announce_calls.append(h)
+
+
+def test_resume_heal_rebuilds_lxmf_and_dead_links():
+    """v0.31.5: Android stops the activity for every SAF pick (opaque
+    picker, cannot be prevented); on_stop used to exit the LXMF router on
+    that stop, freezing DMs for the rest of the session. tay: 'We don't
+    *want* to stop the app. That is literally the blocking behavior.'
+    Pins: (a) resume heal rebuilds the router from the existing identity
+    and announces, without duplicate announce-loop threads; (b) a dead
+    guild link schedules _do_reestablish; (c) a healthy link schedules
+    nothing; (d) no identity = nothing rebuilt, no crash."""
+
+    import types as _types
+
+    class _App(object):
+        _heal_after_resume = kc.sHadesClientApp._heal_after_resume
+        _init_lxmf_router = kc.sHadesClientApp._init_lxmf_router
+        _dm_announce_loop = kc.sHadesClientApp._dm_announce_loop
+        _on_dm_delivery = kc.sHadesClientApp._on_dm_delivery
+        _do_reestablish = kc.sHadesClientApp._do_reestablish
+        client_identity = object()
+        username = "tay"
+        lxmf_router = None
+        lxmf_delivery = None
+        guild_api = None
+        _ka_fail = 3
+
+    saved_mod = sys.modules.get("LXMF")
+    sys.modules["LXMF"] = _types.SimpleNamespace(LXMRouter=_FakeLXMFModule.LXMRouter)
+    real_clock = kc.Clock
+    kc.Clock = _KAStubClock()
+    try:
+        app = _App()
+        app._heal_after_resume()
+        assert isinstance(app.lxmf_router, _FakeLXMFModule.LXMRouter), app.lxmf_router
+        assert app.lxmf_delivery.hash == b"delivery-hash", app.lxmf_delivery
+        assert len(app.lxmf_router.announce_calls) == 1, "heal re-announces"
+        assert app._ka_fail == 0, "resume resets the keepalive counter"
+        assert len(kc.Clock.scheduled) == 0, "healthy link: nothing scheduled"
+
+        # second heal with an existing router: no duplicate announce thread
+        # (guarded by router_was_none) -- router object replaced, announce still fires
+        app._heal_after_resume()
+        assert isinstance(app.lxmf_router, _FakeLXMFModule.LXMRouter)
+        assert len(app.lxmf_router.announce_calls) == 1
+
+        # dead guild link heals
+        class _DeadLink(object):
+            status = kc.RNS.Link.CLOSED
+
+        app.guild_api = type("A", (), {"link": None})()
+        app.guild_api.link = _DeadLink()
+        app._heal_after_resume()
+        assert len(kc.Clock.scheduled) == 1, "dead link schedules re-establish"
+        fn, delay = kc.Clock.scheduled[0]
+        assert getattr(fn, "__name__", "") == "_do_reestablish", fn
+
+        # healthy link does not
+        class _LiveLink(object):
+            status = kc.RNS.Link.ACTIVE
+
+        app.guild_api = type("A", (), {"link": None})()
+        app.guild_api.link = _LiveLink()
+        app._heal_after_resume()
+        assert len(kc.Clock.scheduled) == 1, "live link: nothing new scheduled"
+
+        # no identity: no-op, no crash
+        app2 = _App()
+        app2.client_identity = None
+        app2._heal_after_resume()
+        assert app2.lxmf_router is None
+    finally:
+        if saved_mod is not None:
+            sys.modules["LXMF"] = saved_mod
+        else:
+            sys.modules.pop("LXMF", None)
+        kc.Clock = real_clock
+
+
 def main():
     for fn in (test_display_name_preserved,
                test_update_applied_once,
@@ -642,7 +743,8 @@ def main():
                test_shutdown_not_blocking,
                test_periodic_dm_announce,
                test_dm_announce_interval_sane,
-               test_keepalive_miss_not_counting_during_upload):
+               test_keepalive_miss_not_counting_during_upload,
+               test_resume_heal_rebuilds_lxmf_and_dead_links):
         try:
             fn()
         except Exception as e:
