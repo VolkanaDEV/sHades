@@ -434,15 +434,344 @@ def test_ticket_push():
           (repr(app2.applied), repr(app2.fetched)))
 
 
+def test_blobs_put_mobile_receipts():
+    """v0.32: uploads time out on the phone while the identical code sits
+    fine on desktop (tay's receipt). The upload loop must (a) shrink the
+    chunk on receipt timeouts and resume from the last acked offset --
+    the server stores offset-addressed bytes, so that rewrites instead
+    of corrupts -- and (b) restart once when the staged handle aged out.
+    Scripted api responses pin both paths plus the bounded attempt cap."""
+    import base64 as _b64
+
+    import kivy_client as kc
+
+    class _ScriptedApi(kc.GuildAPI):
+        """Fake transport: scripted responses per request path, all
+        recorded for assertions."""
+
+        def __init__(self):
+            super().__init__(reticulum=object(), link=object())
+            self.script = []      # list of (path, response-or-callable)
+            self.calls = []       # list of (path, offset, chunk-b64-len)
+
+        def _request_json(self, path, data, timeout=10.0):
+            self.calls.append((path, data.get("offset"),
+                               len(data.get("data_b64") or "")))
+            for p, r in self.script:
+                if p == path:
+                    return r(p, data) if callable(r) else r
+            return {"ok": 0, "error": "unscripted", "code": 999}
+
+    def init_resp(upload_id, chunk_size):
+        def _f(path, data):
+            return {"ok": 1, "upload_id": upload_id,
+                    "chunk_size": chunk_size}
+        return _f
+
+    def chunk_acks(path, data):
+        """Server-shaped ack: next_offset from the DECODED bytes."""
+        n = len(_b64.b64decode(data["data_b64"]))
+        nxt = data["offset"] + n
+        return {"ok": 1, "next_offset": nxt, "eof": nxt >= 8}
+
+    # ---- path (a): chunk timeout shrinks and resumes -------------------
+    # Sizes must clear the 32 KB floor for halving to engage: start at
+    # 128 KB per chunk, 400 KB of payload.
+    api = _ScriptedApi()
+    chunks_seen = []
+    INIT_B64 = ((131072 + 2) // 3) * 4          # base64 of 131072 bytes
+
+    def chunk_first_timeout(path, data):
+        chunks_seen.append((data["offset"],
+                            len(data.get("data_b64") or "")))
+        if len(chunks_seen) == 1 or chunks_seen[-2][0] != data["offset"]:
+            # first attempt at a fresh offset: receipt timeout
+            return {"ok": 0, "error": "timeout"}
+        n = len(_b64.b64decode(data["data_b64"]))
+        nxt = data["offset"] + n
+        return {"ok": 1, "next_offset": nxt, "eof": nxt >= 400000}
+
+    api.script = [("/api/v1/blobs/put/init", init_resp("u1", 131072)),
+                  ("/api/v1/blobs/put/chunk", chunk_first_timeout),
+                  ("/api/v1/blobs/put/finish",
+                   {"ok": 1, "blob_id": "b1"})]
+    done_bits = []
+
+    up = api.blobs_put("f.bin", "application/octet-stream", b"A" * 400000,
+                       on_progress=lambda d, t: done_bits.append(d))
+    check("shrunk-retry upload completes", bool(up.get("ok")),
+          (up.get("phase"), up.get("error"), chunks_seen[:4]))
+    check("first chunk rode the server's 128 KB size",
+          chunks_seen and chunks_seen[0][1] == INIT_B64,
+          repr(chunks_seen[:1]))
+    check("chunks shrank after receipt timeouts",
+          min(c[1] for c in chunks_seen) <= INIT_B64 // 4,
+          repr(sorted(set(c[1] for c in chunks_seen))))
+    check("every timeouted offset got its retry",
+          all(sum(1 for c in chunks_seen if c[0] == o) >= 2
+              for o in set(c[0] for c in chunks_seen)),
+          repr(chunks_seen))
+    check("progress reported and completed",
+          done_bits and done_bits[-1] == 400000, repr(done_bits[-3:]))
+
+    # ---- path (b): aged-out staged handle restarts once ----------------
+    api2 = _ScriptedApi()
+    reinit_seen = []
+    api2.script = [("/api/v1/blobs/put/init", init_resp("u2", 4)),
+                   ("/api/v1/blobs/put/chunk",
+                    lambda p, d: {"ok": 0, "error": "unknown upload_id",
+                                  "code": 404}),
+                   ("/api/v1/blobs/put/finish", {"ok": 1})]
+    up2 = api2.blobs_put("f.txt", "text/plain", b"B" * 8)
+    n_inits = len(reinit_seen) if False else len(
+        [c for c in api2.calls if c[0].endswith("init")])
+    n_chunks = len([c for c in api2.calls if c[0].endswith("chunk")])
+    check("staged-handle death restarts once, then dies bounded",
+          not up2.get("ok") and up2.get("phase") == "chunk@0"
+          and n_inits == 2 and n_chunks == 2,
+          (up2.get("phase"), up2.get("error"), n_inits, n_chunks))
+
+    # ---- path (c): persistent timeout dies bounded, phase reported -----
+    api3 = _ScriptedApi()
+    api3.script = [("/api/v1/blobs/put/init", init_resp("u1", 4)),
+                   ("/api/v1/blobs/put/chunk",
+                    lambda p, d: {"ok": 0, "error": "timeout"})]
+    up3 = api3.blobs_put("f.txt", "text/plain", b"A" * 8)
+    n_calls = len(api3.calls)
+    check("persistent timeout dies with phase + bounded attempts",
+          not up3.get("ok") and "chunk@" in up3.get("phase", "") and
+          n_calls <= 11, (up3.get("phase"), n_calls))
+
+
+class _FakeRouter(object):
+    def __init__(self):
+        self.hash = b"delivery-hash"
+        self.announce_calls = 0
+
+    def announce(self, destination_hash=None, **kwargs):
+        assert destination_hash == self.hash, destination_hash
+        self.announce_calls += 1
+
+
+def test_periodic_dm_announce():
+    """v0.31.3: the client re-announces its lxmf.delivery destination on a
+    periodic _DMA_INTERVAL timer (RNS practice for changing topologies --
+    mobile churn and reconnects age out hub-side paths); one boot announce
+    (kivy_client.py, _init_identity_and_lxmf) is not enough for long
+    sessions. Pins: a router with a registered delivery destination gets
+    announce() called exactly on that hash, and nothing fires when no
+    router/delivery exists."""
+
+    class _App(object):
+        lxmf_router = None
+        lxmf_delivery = None
+        _DMA_INTERVAL = kc.sHadesClientApp._DMA_INTERVAL
+        _announce_dm_once = kc.sHadesClientApp._announce_dm_once
+
+    app = _App()
+    app.lxmf_router = _FakeRouter()
+    app.lxmf_delivery = app.lxmf_router
+    assert app._announce_dm_once() is True
+    assert app.lxmf_router.announce_calls == 1, app.lxmf_router.announce_calls
+
+    # missing router -> silent no-op, no exception
+    app.lxmf_router, app.lxmf_delivery = None, None
+    assert app._announce_dm_once() is True
+
+
+def test_dm_announce_interval_sane():
+    interval = kc.sHadesClientApp._DMA_INTERVAL
+    assert 60 <= interval <= 3600, interval
+
+
+class _KAStubClock(object):
+    def __init__(self):
+        self.scheduled = []
+
+    def schedule_once(self, fn, delay=0):
+        self.scheduled.append((fn, delay))
+
+
+def test_keepalive_miss_not_counting_during_upload():
+    """v0.31.4: an upload monopolizes the priority-agnostic link FIFO, so
+    the 45s stream poll can time out mid-upload without the link being
+    dead. Counting those misses and re-establishing at two tears the link
+    under our own transfer (0.31.2 self-inflicted, receipted during the
+    attach-drop audit). Pins: misses while _up_active are ignored (no
+    re-establish scheduled, counter reset); misses without an upload
+    still count and fire the re-establish at two."""
+
+    real_clock = kc.Clock
+    kc.Clock = _KAStubClock()
+    try:
+        class _App(object):
+            _up_active = True
+            _ka_fail = 0
+            _ka_miss = kc.sHadesClientApp._ka_miss
+            _do_reestablish = kc.sHadesClientApp._do_reestablish
+
+        app = _App()
+        app._ka_miss()
+        app._ka_miss()
+        assert app._ka_fail == 0, app._ka_fail
+        assert len(kc.Clock.scheduled) == 0, kc.Clock.scheduled
+
+        app._up_active = False
+        app._ka_miss()
+        assert app._ka_fail == 1, app._ka_fail
+        assert len(kc.Clock.scheduled) == 0, "one miss must not re-establish"
+        app._ka_miss()
+        assert app._ka_fail == 0, "counter resets at re-establish trigger"
+        assert len(kc.Clock.scheduled) == 1
+        fn, delay = kc.Clock.scheduled[0]
+        assert getattr(fn, "__name__", "") == "_do_reestablish", fn
+        assert delay == 0, delay
+    finally:
+        kc.Clock = real_clock
+
+
+class _FakeLXMFModule(object):
+    class _FakeDelivery(object):
+        hash = b"delivery-hash"
+
+    class LXMRouter(object):
+        def __init__(self, identity=None, storagepath=None):
+            self.stor = storagepath
+            self.registered = 0
+            self.callbacks = 0
+            self.announce_calls = []
+
+        def register_delivery_identity(self, identity, display_name=None):
+            self.registered += 1
+            self.delivery = _FakeLXMFModule._FakeDelivery()
+            self.delivery_name = display_name
+            return self.delivery
+
+        def register_delivery_callback(self, cb):
+            self.callbacks += 1
+
+        def announce(self, h):
+            self.announce_calls.append(h)
+
+
+def test_resume_heal_rebuilds_lxmf_and_dead_links():
+    """v0.31.5: Android stops the activity for every SAF pick (opaque
+    picker, cannot be prevented); on_stop used to exit the LXMF router on
+    that stop, freezing DMs for the rest of the session. tay: 'We don't
+    *want* to stop the app. That is literally the blocking behavior.'
+    Pins: (a) resume heal rebuilds the router from the existing identity
+    and announces, without duplicate announce-loop threads; (b) a dead
+    guild link schedules _do_reestablish; (c) a healthy link schedules
+    nothing; (d) no identity = nothing rebuilt, no crash."""
+
+    import types as _types
+
+    class _App(object):
+        _heal_after_resume = kc.sHadesClientApp._heal_after_resume
+        _init_lxmf_router = kc.sHadesClientApp._init_lxmf_router
+        _dm_announce_loop = kc.sHadesClientApp._dm_announce_loop
+        _on_dm_delivery = kc.sHadesClientApp._on_dm_delivery
+        _do_reestablish = kc.sHadesClientApp._do_reestablish
+        client_identity = object()
+        username = "tay"
+        lxmf_router = None
+        lxmf_delivery = None
+        guild_api = None
+        _ka_fail = 3
+
+    saved_mod = sys.modules.get("LXMF")
+    sys.modules["LXMF"] = _types.SimpleNamespace(LXMRouter=_FakeLXMFModule.LXMRouter)
+    real_clock = kc.Clock
+    kc.Clock = _KAStubClock()
+    try:
+        app = _App()
+        app._heal_after_resume()
+        assert isinstance(app.lxmf_router, _FakeLXMFModule.LXMRouter), app.lxmf_router
+        assert app.lxmf_delivery.hash == b"delivery-hash", app.lxmf_delivery
+        assert len(app.lxmf_router.announce_calls) == 1, "heal re-announces"
+        assert app._ka_fail == 0, "resume resets the keepalive counter"
+        assert len(kc.Clock.scheduled) == 0, "healthy link: nothing scheduled"
+
+        # second heal with an existing router: no duplicate announce thread
+        # (guarded by router_was_none) -- router object replaced, announce still fires
+        app._heal_after_resume()
+        assert isinstance(app.lxmf_router, _FakeLXMFModule.LXMRouter)
+        assert len(app.lxmf_router.announce_calls) == 1
+
+        # dead guild link heals
+        class _DeadLink(object):
+            status = kc.RNS.Link.CLOSED
+
+        app.guild_api = type("A", (), {"link": None})()
+        app.guild_api.link = _DeadLink()
+        app._heal_after_resume()
+        assert len(kc.Clock.scheduled) == 1, "dead link schedules re-establish"
+        fn, delay = kc.Clock.scheduled[0]
+        assert getattr(fn, "__name__", "") == "_do_reestablish", fn
+
+        # healthy link does not
+        class _LiveLink(object):
+            status = kc.RNS.Link.ACTIVE
+
+        app.guild_api = type("A", (), {"link": None})()
+        app.guild_api.link = _LiveLink()
+        app._heal_after_resume()
+        assert len(kc.Clock.scheduled) == 1, "live link: nothing new scheduled"
+
+        # no identity: no-op, no crash
+        app2 = _App()
+        app2.client_identity = None
+        app2._heal_after_resume()
+        assert app2.lxmf_router is None
+    finally:
+        if saved_mod is not None:
+            sys.modules["LXMF"] = saved_mod
+        else:
+            sys.modules.pop("LXMF", None)
+        kc.Clock = real_clock
+
+
+def test_channel_management_gates_and_kinds():
+    """v0.31.6 founder/channel work: the create-gate mirrors the server's
+    MANAGE_CHANNEL|ADMIN rule, and the kind chooser carries exactly tay's
+    three kinds (text / site (micron) / text stream -> chat / site / term)."""
+
+    kind_map = dict(kc.sHadesClientApp.CHANNEL_KIND_LABELS)
+    check("kind chooser: exactly tay's three kinds",
+          kind_map == {"text": "chat", "site (micron)": "site",
+                       "text stream": "term"}, kind_map)
+
+    class _App(object):
+        i_am_admin = False
+        my_roles = []
+        PERM_MANAGE_CHANNEL = 8
+        PERM_ADMIN = 32
+        _can_create_channels = kc.sHadesClientApp._can_create_channels
+
+    app = _App()
+    check("no powers: create gate closed", app._can_create_channels() is False)
+    app.my_roles = [{"perms": 8}]
+    check("MANAGE_CHANNEL role: gate open", app._can_create_channels() is True)
+    app.my_roles = [{"perms": 0}]
+    app.i_am_admin = True
+    check("admin flag: gate open", app._can_create_channels() is True)
+
+
 def main():
     for fn in (test_display_name_preserved,
                test_update_applied_once,
                test_attachment_kind_classifier,
                test_stream_lifecycle,
                test_ticket_push,
+               test_blobs_put_mobile_receipts,
                test_admin_panel_not_blocking,
                test_roles_popup_not_blocking,
-               test_shutdown_not_blocking):
+               test_shutdown_not_blocking,
+               test_periodic_dm_announce,
+               test_dm_announce_interval_sane,
+               test_keepalive_miss_not_counting_during_upload,
+               test_resume_heal_rebuilds_lxmf_and_dead_links,
+               test_channel_management_gates_and_kinds):
         try:
             fn()
         except Exception as e:

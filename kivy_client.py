@@ -560,15 +560,39 @@ def dlog(msg):
 class GuildAPI:
     """Thin wrapper around an RNS Link to the sHades guild node."""
 
-    def __init__(self, reticulum, link, on_error=None):
+    def __init__(self, reticulum, link, on_error=None, on_dead=None):
         self.reticulum = reticulum
         self.link = link
         self.on_error = on_error or (lambda *a: None)
+        # v0.31.2 link self-heal: called when a request lands on a link
+        # that is no longer ACTIVE (or raises) -- the app re-establishes
+        # and re-primes in one place instead of dying until restart.
+        self.on_dead = on_dead or (lambda *a: None)
+
+    def _check_dead(self):
+        st = getattr(self.link, "status", None)
+        if st is not None and st != RNS.Link.ACTIVE:
+            try:
+                self.on_dead(st)
+            except Exception:
+                pass
+            return True
+        return False
 
     def _request(self, path, data, timeout=10):
         if not isinstance(data, dict):
             data = {}
-        receipt = self.link.request(path, data=data)
+        if self._check_dead():
+            return {"ok": 0, "error": "link dead"}
+        try:
+            receipt = self.link.request(path, data=data)
+        except Exception as e:
+            print("request on link failed: %r" % (e,))
+            try:
+                self.on_dead("raise")
+            except Exception:
+                pass
+            return {"ok": 0, "error": "link dead"}
         # link.request() may return a Receipt object (with .response) or
         # True/False (bool) depending on RNS version. Handle both.
         if isinstance(receipt, bool):
@@ -662,7 +686,17 @@ class GuildAPI:
 
     def _request_json(self, path, data, timeout=10.0):
         payload = json.dumps(data if data is not None else {}).encode("utf-8")
-        receipt = self.link.request(path, data=payload)
+        if self._check_dead():
+            return {"ok": 0, "error": "link dead"}
+        try:
+            receipt = self.link.request(path, data=payload)
+        except Exception as e:
+            print("json request on link failed: %r" % (e,))
+            try:
+                self.on_dead("raise")
+            except Exception:
+                pass
+            return {"ok": 0, "error": "link dead"}
         # link.request() may return a Receipt object or True/False depending
         # on the RNS version (see _request). Re-issue with the SAME payload.
         if isinstance(receipt, bool):
@@ -675,6 +709,18 @@ class GuildAPI:
                and time.time() < deadline):
             time.sleep(0.05)
         if not hasattr(receipt, "response") or receipt.response is None:
+            # v0.31.1 diag: a deadline without a response means different
+            # things -- "the wire transfer died" (receipt concluded FAILED)
+            # vs "still moving, we gave up early" (receipt unsettled; the
+            # resource outlives us client-side and RNS's watchdog owns
+            # it). Distinguish, do not guess.
+            try:
+                st = getattr(receipt, "status", None)
+                if st is not None:
+                    return {"ok": 0, "error": "timeout",
+                            "receipt_state": str(st)}
+            except Exception:
+                pass
             return {"ok": 0, "error": "timeout"}
         try:
             return json.loads(receipt.response.decode("utf-8"))
@@ -717,7 +763,7 @@ class GuildAPI:
         """Active users plus the channel each one is streaming."""
         return self._request_json("/api/v1/presence", {})
 
-    def blobs_put(self, name, mime, data):
+    def blobs_put(self, name, mime, data, on_progress=None):
         """Upload one content-addressed blob (v1). Returns
         {ok, blob_id, size, path} — reference blob_id from post_v1.
 
@@ -725,36 +771,78 @@ class GuildAPI:
         of 10mb & automatically chunked, not timer based"): init -> byte-
         offset slices -> finish, the loop driven by each ack's next_offset.
         Retries rewrite the same offset, so they cannot corrupt the stream.
-        Payloads above the limit fail fast with a named error."""
+        Payloads above the limit fail fast with a named error.
+
+        v0.32 mobile receipts: uploads timed out on the phone while the
+        identical code sat fine on desktop (receipt: tay, "Neither one
+        works"). The chunk deadline now matches the download doctrine
+        (15s), and a receipt timeout shrinks the chunk and resumes from
+        the last acked offset -- the server stores offset-addressed bytes
+        (seek+write), so resuming rewrites bytes it already has instead of
+        corrupting anything. Bounded: six shrink steps, then up to three
+        retries at the floor; an aged-out staged handle re-inits once."""
         size = len(data)
         if size > 10 * 1024 * 1024:
             return {"ok": 0, "error": "payload too large: limit is 10 MB",
                     "size": size}
         res = self._request_json("/api/v1/blobs/put/init",
-                                 {"name": name, "mime": mime, "size": size})
+                                 {"name": name, "mime": mime, "size": size},
+                                 timeout=15)
         if not res.get("ok"):
             res.setdefault("phase", "init")
             return res
         upload_id = res["upload_id"]
         step = int(res.get("chunk_size") or (256 * 1024))
         offset = 0
+        fails = 0
+        restarted = False
         while offset < size:
             piece = data[offset:offset + step]
             body = {
                 "upload_id": upload_id, "offset": offset,
                 "data_b64": base64.b64encode(piece).decode("ascii"),
             }
-            res = self._request_json("/api/v1/blobs/put/chunk", body)
+            if on_progress:
+                on_progress(offset, size)
+            res = self._request_json("/api/v1/blobs/put/chunk", body,
+                                     timeout=15)
             if not res.get("ok"):
-                res.setdefault("error", "chunk failed")
+                err = res.get("error", "chunk failed")
+                # the staged handle aged out mid-upload (600s idle law):
+                # one deterministic restart, offsets driven anew
+                if err == "unknown upload_id" and not restarted:
+                    restarted = True
+                    res2 = self._request_json(
+                        "/api/v1/blobs/put/init",
+                        {"name": name, "mime": mime, "size": size},
+                        timeout=15)
+                    if res2.get("ok"):
+                        upload_id = res2["upload_id"]
+                        continue
+                # receipt timeout on a slow/high-RTT pipe: shrink the chunk
+                # and resume from the last acked offset (bounded)
+                if err == "timeout" and fails < 6 and step > 32 * 1024:
+                    fails += 1
+                    step = max(32 * 1024, step // 2)
+                    res["phase"] = "chunk@%d/%d" % (offset, step)
+                    continue
+                if err == "timeout" and fails < 3:
+                    fails += 1
+                    continue
+                print("blobs_put FAIL off=%s step=%s err=%s state=%s"
+                      % (offset, step, err, res.get("receipt_state")))
+                res.setdefault("error", err or "chunk failed")
                 res["phase"] = "chunk@%d" % offset
                 return res
+            fails = 0
             offset = int(res.get("next_offset") or (offset + len(piece)))
         res = self._request_json("/api/v1/blobs/put/finish",
-                                 {"upload_id": upload_id})
+                                 {"upload_id": upload_id}, timeout=15)
         if not res.get("ok"):
             res.setdefault("error", "finish failed")
             res["phase"] = "finish"
+        elif on_progress:
+            on_progress(size, size)
         return res
 
     def post_v1(self, channel, content, attachments=None):
@@ -1445,6 +1533,9 @@ class ChannelButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
         cid = app._channels.get(name) if app else None
         actions = [("open #" + name, True,
                     lambda: app and app._switch_channel(name))]
+        if app and app._can_create_channels():
+            actions.append(("create channel...", True,
+                            lambda: app and app._open_create_channel_popup()))
         if cid:
             actions.append(("copy channel id", True,
                             lambda: app and app._copy_text(cid)))
@@ -2724,6 +2815,99 @@ class sHadesClientApp(MDApp):
         popup = Popup(title="", content=box, size_hint=(0.8, 0.75), auto_dismiss=False)
         popup.open()
 
+    def _establish_guild_link(self):
+        """Establish the RNS link to the guild node; up to 3 attempts.
+
+        Extracted from _init_reticulum (v0.31.2) so boot and the
+        link self-heal both go through the identical routine: fresh
+        destination from the recalled hub identity, 20s wait for
+        ACTIVE per attempt, identify, closed-callback registration.
+        Raises RuntimeError when no attempt goes ACTIVE.
+        """
+        nh = bytes.fromhex(self.guild_node_hash)
+        nid = RNS.Identity.recall(nh)
+        if nid is None:
+            raise RuntimeError(
+                "RNS does not know identity for node_hash %s — "
+                "the guild's announce was not heard yet. Try again." % self.guild_node_hash)
+        link = None
+        for attempt in range(3):
+            nd = RNS.Destination(nid, RNS.Destination.OUT,
+                                 RNS.Destination.SINGLE, "nomadnetwork", "node")
+            link = RNS.Link(nd)
+            for _ in range(200):
+                if link.status == RNS.Link.ACTIVE:
+                    break
+                time.sleep(0.1)
+            if link.status == RNS.Link.ACTIVE:
+                break
+            print(f"Link attempt {attempt + 1} not ACTIVE, retrying...")
+            time.sleep(1.0)
+
+        if link.status != RNS.Link.ACTIVE:
+            raise RuntimeError(
+                "Could not establish RNS link to guild node — "
+                "link never went ACTIVE after 3 attempts.")
+        link.identify(self.client_identity)
+        # v0.31.2: the teardown event is the fastest dead signal we get.
+        try:
+            link.set_link_closed_callback(self._on_guild_link_closed)
+        except Exception as e:
+            print("link closed-callback registration failed: %s" % e)
+        return link
+
+    def _on_guild_link_closed(self, link, reason=None):
+        print("[link] guild link closed (%r) — scheduling re-establish" % (reason,))
+        Clock.schedule_once(self._do_reestablish, 1.0)
+
+    def _on_guild_link_dead(self, state=None):
+        # Request-path signal (GuildAPI saw a non-ACTIVE link or a raise).
+        print("[link] guild link dead (%r) — scheduling re-establish" % (state,))
+        Clock.schedule_once(self._do_reestablish, 0.5)
+
+    def _do_reestablish(self, dt=None):
+        """One guarded re-establish attempt; any caller can schedule it.
+
+        Idempotency: concurrent triggers (request-path on_dead, link
+        closed callback, keepalive zombie counter) all funnel here;
+        the flag guarantees a single in-flight attempt and a failure
+        reschedules once. On success the fresh link replaces the old
+        one everywhere (self.link, GuildAPI, push callback) and the
+        stream subscription is re-primed from the watermark (the
+        server binds one subscription per link; a new link has none).
+        """
+        if getattr(self, "_reestablishing", False):
+            return
+        self._reestablishing = True
+        try:
+            old = getattr(self, "link", None)
+            if old is not None and getattr(old, "status", None) == RNS.Link.ACTIVE:
+                # Someone already restored an ACTIVE link (or the signal
+                # was stale); only a non-ACTIVE link needs replacing.
+                Clock.schedule_once(
+                    lambda dt2: self._start_streamer(), 0)
+                return
+            print("[link] re-establishing guild link...")
+            try:
+                old.teardown()
+            except Exception:
+                pass
+            link = self._establish_guild_link()
+            self.link = link
+            self.guild_api = GuildAPI(self.reticulum, link,
+                                      on_dead=self._on_guild_link_dead)
+            try:
+                link.set_packet_callback(self._on_push_frame)
+            except Exception as e:
+                print("push callback registration failed: %s" % e)
+            print("[link] guild link re-established")
+            Clock.schedule_once(lambda dt2: self._start_streamer(), 0)
+        except Exception as e:
+            print("[link] re-establish failed: %r — retrying in 8s" % (e,))
+            Clock.schedule_once(self._do_reestablish, 8.0)
+        finally:
+            self._reestablishing = False
+
     def _init_reticulum(self):
         """Main thread only: create RNS instance (signal handlers), then
         spawn a background thread for the blocking link establishment."""
@@ -2785,7 +2969,20 @@ class sHadesClientApp(MDApp):
                     # the ingress limiter.
                     f.write("    ingress_control = no\n")
 
-            reticulum = RNS.Reticulum(configdir=storage)
+            from RNS.vendor.platformutils import is_android as _is_android
+
+            def _android_diag_default():
+                # Diag builds: RNS debug verbosity ON by default on-device.
+                # buildozer set_env may not survive into the app's runtime
+                # environment, so the platform decides, not the env var;
+                # RH_DEBUG=1 still forces it anywhere, RH_DEBUG=0 silences.
+                return _is_android() and os.environ.get("RH_DEBUG") != "0"
+
+            reticulum = RNS.Reticulum(
+                configdir=storage,
+                loglevel=(RNS.LOG_DEBUG
+                          if os.environ.get("RH_DEBUG") or
+                          _android_diag_default() else None))
             self.reticulum = reticulum
             if BOOT_DEBUG:
                 _boot_mark("RNS: instance up (config ok)")
@@ -2861,6 +3058,85 @@ class sHadesClientApp(MDApp):
 
         return None
 
+    _up_active = False  # an attachment/blob upload is in flight (set at both
+    # blobs_put call sites); while true, keepalive misses are ignored --
+    # an upload monopolizes the priority-agnostic link FIFO and legitimately
+    # delays the poll's receipt past its deadline (manual receipt: RNS is
+    # priority-agnostic on general traffic). Two counting misses here would
+    # tear the link MID-UPLOAD (v0.31.2 self-inflicted; receipted this
+    # session) -- this gate removes that path entirely.
+    _DMA_INTERVAL = 300.0  # seconds between client lxmf.delivery re-announces
+
+    def _init_lxmf_router(self):
+        """Build/repair the LXMF router on the existing client identity.
+
+        Extracted (v0.31.5) from the boot path so the resume heal can run
+        the identical sequence: Android STOPS the activity for every SAF
+        file pick (opaque picker, OS-mandated), and on_stop historically
+        exited the router mid-session there (receipted). Boot failure also
+        retries here on every resume instead of disabling DMs for good.
+        """
+        if self.client_identity is None:
+            return
+        try:
+            import LXMF
+            router_was_none = self.lxmf_router is None
+            self.lxmf_router = LXMF.LXMRouter(
+                identity=self.client_identity,
+                storagepath=os.path.join(_app_data_dir(), "lxmf"))
+            self.lxmf_delivery = self.lxmf_router.register_delivery_identity(
+                self.client_identity,
+                display_name=(self.username or "sHades"))
+            self.lxmf_router.register_delivery_callback(self._on_dm_delivery)
+            # announce (re)so friends can hear our lxmf.delivery
+            self.lxmf_router.announce(self.lxmf_delivery.hash)
+            if router_was_none:
+                threading.Thread(
+                    target=self._dm_announce_loop, daemon=True).start()
+        except Exception as e:
+            print("LXMF router init failed (DMs disabled):", repr(e))
+            self.lxmf_router = None
+            self.lxmf_delivery = None
+
+    def _heal_after_resume(self):
+        """v0.31.5 resume heal (tay: 'We don't *want* to stop the app.
+
+        That is literally the blocking behavior'). Android stops the
+        activity for every SAF pick; we cannot prevent the stop, so the
+        return must be seamless: reset the keepalive counter (it froze
+        mid-stop), rebuild the LXMF router if on_stop exited it, and
+        re-establish a dead guild link. Chat must work immediately after
+        every pick, without a restart.
+        """
+        try:
+            self._ka_fail = 0
+            self._init_lxmf_router()
+            api = self.guild_api
+            if api is not None:
+                link = getattr(api, "link", None)
+                if link is not None and getattr(link, "status", None) \
+                        not in (None, RNS.Link.ACTIVE):
+                    Clock.schedule_once(self._do_reestablish, 0)
+        except Exception as e:
+            print("resume heal error:", repr(e))
+
+
+    def _announce_dm_once(self):
+        if self.lxmf_router and self.lxmf_delivery:
+            try:
+                self.lxmf_router.announce(self.lxmf_delivery.hash)
+            except Exception as e:
+                print("announce failed:", repr(e))
+        return True
+
+    def _dm_announce_loop(self):
+        # Runs on a daemon thread started by _init_identity_and_lxmf; the
+        # router and delivery destination persist across reconnects, so
+        # the loop only dies with the process. See v0.31.3 comment there.
+        while True:
+            time.sleep(self._DMA_INTERVAL)
+            self._announce_dm_once()
+
     def _init_identity_and_lxmf(self):
         """Main thread only: build the client identity, the lxmf.delivery
         destination and the LXMRouter.
@@ -2909,21 +3185,7 @@ class sHadesClientApp(MDApp):
             # (nothing else ever does — guild chat rides the API link), so the
             # delivery callback IS the DM inbox. Failure to init just
             # disables DMs; chat keeps working.
-            try:
-                import LXMF
-                self.lxmf_router = LXMF.LXMRouter(
-                    identity=self.client_identity,
-                    storagepath=os.path.join(_app_data_dir(), "lxmf"))
-                self.lxmf_delivery = self.lxmf_router.register_delivery_identity(
-                    self.client_identity,
-                    display_name=(self.username or "sHades"))
-                self.lxmf_router.register_delivery_callback(self._on_dm_delivery)
-                # announce now so friends can hear our lxmf.delivery
-                self.lxmf_router.announce(self.lxmf_delivery.hash)
-            except Exception as e:
-                print("LXMF router init failed (DMs disabled):", repr(e))
-                self.lxmf_router = None
-                self.lxmf_delivery = None
+            self._init_lxmf_router()
         except Exception as e:
             print("identity init error:", repr(e))
             self.client_identity = None
@@ -2961,29 +3223,12 @@ class sHadesClientApp(MDApp):
                     "the guild's announce was not heard yet. Try again." % self.guild_node_hash)
             print(f"RNS recalled identity for node_hash {self.guild_node_hash}")
 
-            # link to guild node — retry up to 3 times
-            link = None
-            for attempt in range(3):
-                nd = RNS.Destination(nid, RNS.Destination.OUT,
-                                     RNS.Destination.SINGLE, "nomadnetwork", "node")
-                link = RNS.Link(nd)
-                for _ in range(200):
-                    if link.status == RNS.Link.ACTIVE:
-                        break
-                    time.sleep(0.1)
-                if link.status == RNS.Link.ACTIVE:
-                    break
-                print(f"Link attempt {attempt + 1} not ACTIVE, retrying...")
-                time.sleep(1.0)
-
-            if link.status != RNS.Link.ACTIVE:
-                raise RuntimeError(
-                    "Could not establish RNS link to guild node — "
-                    "link never went ACTIVE after 3 attempts.")
-            link.identify(self.client_identity)
+            # link to guild node -- extracted so the self-heal path
+            # (v0.31.2) re-establishes through the exact same routine.
+            link = self._establish_guild_link()
             self.link = link
-
-            self.guild_api = GuildAPI(reticulum, link)
+            self.guild_api = GuildAPI(self.reticulum, link,
+                                      on_dead=self._on_guild_link_dead)
             # v0.28 push: stream frames arrive on this link the moment
             # events exist. The callback is the client's entire intake;
             # no polling loops exist anywhere in the client.
@@ -3189,8 +3434,10 @@ class sHadesClientApp(MDApp):
         try:
             res = api.stream_poll(cursor=self._stream_cursor, timeout_s=0)
         except Exception:
+            self._ka_miss()
             return
         if res.get("ok"):
+            self._ka_fail = 0
             self._stream_cursor = res.get("cursor", self._stream_cursor)
             events = res.get("events") or []
             if events:
@@ -3201,6 +3448,27 @@ class sHadesClientApp(MDApp):
             # subscription expired (two quiet minutes): re-subscribe from
             # the watermark so the TTL-eaten gap replays
             Clock.schedule_once(lambda dt: self._start_streamer(), 0)
+        else:
+            # v0.31.2 zombie detection: a non-ok poll that is NOT the 409
+            # subscribe-expiry is a dead-or-zombie link. One miss stays a
+            # miss (uploads can legitimately tie up a link); two in a row
+            # through the 45s keepalive = the link no longer answers.
+            self._ka_miss()
+
+    def _ka_miss(self):
+        # Uploads in flight: no counting (see _up_active note). A busy link
+        # during a transfer is not a dead link; re-establishing here would
+        # tear the link under our own transfer.
+        if self._up_active:
+            print("[link] keepalive missed, upload in flight -- not counting")
+            self._ka_fail = 0
+            return
+        misses = getattr(self, "_ka_fail", 0) + 1
+        self._ka_fail = misses
+        print("[link] keepalive miss %d/2" % misses)
+        if misses >= 2:
+            self._ka_fail = 0
+            Clock.schedule_once(self._do_reestablish, 0)
 
     def _release_stream(self):
         """Drop this link's stream subscription: switching to a push-less
@@ -4017,6 +4285,96 @@ class sHadesClientApp(MDApp):
         return any(r.get("perms", 0) & (self.PERM_MANAGE_ROLES |
                                         self.PERM_ADMIN)
                    for r in self.my_roles)
+
+    # tay (channel kinds): "Channels can be text, site (micron pages), or
+    # a text stream." Server CHANNEL_KINDS keys are stable ("chat", "site",
+    # "term") — existing channels keep working; the labels are the user's
+    # words. "term" IS the text-stream channel: text arrives as live
+    # pushed rows, no chat framing.
+    CHANNEL_KIND_LABELS = (
+        ("text", "chat"),
+        ("site (micron)", "site"),
+        ("text stream", "term"),
+    )
+
+    def _can_create_channels(self):
+        """UI gate: any of my roles carries MANAGE_CHANNEL or ADMIN (the
+        Founder role carries both; server enforces the same bits)."""
+        return bool(self.i_am_admin) or any(
+            r.get("perms", 0) & (self.PERM_MANAGE_CHANNEL | self.PERM_ADMIN)
+            for r in self.my_roles)
+
+    def _open_create_channel_popup(self):
+        """Add a channel (text / site / text stream) -- the add half of
+        tay's "the creator should be able to add/delete channels". The
+        delete half already exists in the channel context menu. Server
+        enforces MANAGE_CHANNEL/ADMIN; a successful create lands in the
+        sidebar through the channels_changed push."""
+        if not self.guild_api or not self._can_create_channels():
+            return
+        box = BoxLayout(orientation="vertical", spacing=4, padding=4)
+        title = Label(text="new channel", size_hint_y=None, height=22)
+        box.add_widget(title)
+        name_in = TextInput(hint_text="channel name (a-z 0-9 _ -)",
+                            multiline=False)
+        box.add_widget(name_in)
+        kind_box = BoxLayout(size_hint_y=None, height=scaled(30), spacing=4)
+        box.add_widget(kind_box)
+        kind_state = ["chat"]  # chosen server kind
+        kind_btns = {}
+
+        def make_pick(mine):
+            def pick(_btn):
+                kind_state[0] = mine
+                for key, cb in kind_btns.items():
+                    cb.background_color = ((0.2, 0.35, 0.2, 1) if key == mine
+                                           else (0.2, 0.2, 0.25, 1))
+            return pick
+
+        for label, k in self.CHANNEL_KIND_LABELS:
+            btn = Button(text=label, font_size=sp(13),
+                         background_color=((0.2, 0.35, 0.2, 1) if k == "chat"
+                                           else (0.2, 0.2, 0.25, 1)))
+            kind_btns[k] = btn
+            btn.bind(on_press=make_pick(k))
+            kind_box.add_widget(btn)
+        create_btn = Button(text="create", size_hint_y=None, height=scaled(30),
+                            font_size=sp(14))
+        box.add_widget(create_btn)
+        close = Button(text="close", size_hint_y=None, height=scaled(28))
+        box.add_widget(close)
+        popup = Popup(title="create channel", content=box,
+                      size_hint=(0.7, 0.5))
+        self._popup = popup
+
+        def do_create(_btn):
+            name = (name_in.text or "").strip()
+            if not name:
+                self._show_notice("channel name required")
+                return
+            kind = kind_state[0]
+
+            def work():
+                try:
+                    res = self.guild_api.channels_create(name, kind)
+                except Exception as e:
+                    err = "create: %r" % e
+                    Clock.schedule_once(
+                        lambda dt: self._show_notice(err), 0)
+                    return
+                ok = res.get("ok")
+                err = res.get("error", "failed")
+                Clock.schedule_once(
+                    lambda dt: ((popup.dismiss(),
+                                 self._set_status("#%s created" % name))
+                                if ok else
+                                self._show_notice("create: %s" % err)), 0)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        create_btn.bind(on_press=do_create)
+        close.bind(on_press=lambda _b: popup.dismiss())
+        popup.open()
 
     def _open_roles_popup(self, target_hash, target_name):
         """Role manager (U5): list roles, toggle assignment for one user,
@@ -5349,7 +5707,24 @@ class sHadesClientApp(MDApp):
                 # triples exceed the link packet budget (receipt: tay,
                 # "packet size of 515 exceeds mtu of 500") -- the chunked
                 # blob API moves every byte; the post carries a reference.
-                up = self.guild_api.blobs_put(name, mime, blob)
+                # v0.32: progress is visible in the status line, so a slow
+                # mobile uplink reads as movement, not silence.
+                Clock.schedule_once(
+                    lambda dt: self._set_status("attach upload starting"),
+                    0)
+
+                def _up_progress(done, total):
+                    Clock.schedule_once(
+                        lambda dt: self._set_status(
+                            "attach upload %d%%"
+                            % int(100 * done / max(total, 1))), 0)
+
+                self._up_active = True
+                try:
+                    up = self.guild_api.blobs_put(name, mime, blob,
+                                                  on_progress=_up_progress)
+                finally:
+                    self._up_active = False
                 if not up.get("ok"):
                     Clock.schedule_once(
                         lambda dt: self._set_status(
@@ -6148,7 +6523,11 @@ class sHadesClientApp(MDApp):
                 try:
                     stage("attachment: uploading %s (%d KB)"
                           % (name, len(blob) // 1024))
-                    up = self.guild_api.blobs_put(name, mime, blob)
+                    self._up_active = True
+                    try:
+                        up = self.guild_api.blobs_put(name, mime, blob)
+                    finally:
+                        self._up_active = False
                     if up.get("ok"):
                         stage("attachment: blob ok, posting %s" % name)
                         res = self.guild_api.post_v1(
@@ -6892,6 +7271,10 @@ class sHadesClientApp(MDApp):
                     except Exception:
                         pass
                     self._set_status("Profile saved: %s" % new_name)
+                # v0.31.6: a register can grant the Founder role (first
+                # member of a server) — refresh the role view so the
+                # channel-management affordances appear without a restart.
+                self._fetch_whoami()
                 Clock.schedule_once(apply, 0)
             else:
                 def fail(dt):
@@ -6923,9 +7306,26 @@ class sHadesClientApp(MDApp):
         except Exception:
             pass
 
+    def on_resume(self):
+        """v0.31.5: the app came back (SAF pick return, any foreground).
+        Android stopped the activity underneath us; heal everything the
+        stop may have disturbed instead of demanding a restart."""
+        self._heal_after_resume()
+
     def on_stop(self):
         # v0.28: push replaced the poller/streamer/presence-fetcher.
         # v0.29: nothing pings, so there is no tick loop left to stop.
+        # v0.31.5 (tay: "We don't *want* to stop the app"): Android fires
+        # on_stop for EVERY opaque-surface activity stop -- i.e. every
+        # SAF file pick -- not just real exits, and swipe-away terminates
+        # the process without running this at all. Tearing state down
+        # here froze DMs and console work mid-session on the phone.
+        # Desktop closes are real closes: keep the tidy teardown there
+        # only. Android: leave everything running.
+        from RNS.vendor.platformutils import is_android as _is_android
+        if _is_android():
+            self._term_sessions.clear()
+            return
         # close any open console sessions so they don't idle out server-side.
         # Each term_close() blocks on the RNS link for up to the request
         # timeout, so doing them inline freezes shutdown for N * timeout

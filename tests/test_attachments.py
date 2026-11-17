@@ -84,7 +84,7 @@ class StubGuild:
                                  "size": 5,
                                  "path": "/file/attachments/notes.txt"}]}
 
-    def blobs_put(self, name, mime, data):
+    def blobs_put(self, name, mime, data, on_progress=None):
         # stand-in for the chunked uploader: one blob_id per call, bytes
         # recorded so the test can prove WHERE the payload moved
         blob_id = "bl0b" + str(len(self.uploads))

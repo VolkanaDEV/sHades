@@ -542,6 +542,28 @@ def _assign_role(user_hash, role_id):
                    "VALUES (?, ?)", (user_hash, role_id))
         db.commit()
 
+FOUNDER_ROLE_NAME = "Founder"
+
+def _maybe_founder(viewer):
+    """Grant the Founder role to the first member of a server (the creator).
+
+    tay: "add roles. first person into a server (the creator) should be
+    able to add/delete channels and have founder role." The Founder role
+    carries every permission bit, so add/delete channels (and role
+    management) flow through the existing U5 gates with no new gates.
+    Called after every users upsert; grants exactly once, when this
+    upsert created the users table's first row — no later registration
+    can ever reach it, and existing deployments with members are never
+    touched.
+    """
+    with db_lock:
+        n = db.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+        if n != 1:
+            return
+        rid = _ensure_role(FOUNDER_ROLE_NAME, PERM_ALL, position=200, color="FB8")
+        _assign_role(viewer, rid)
+        _audit(viewer, "role.founder", None, "first member granted Founder")
+
 def load_role_seeds(storage):
     """Boot-time role seeding (U5): admin.txt hashes get the Admin role
     (ADMIN + all manage bits), moderators.txt hashes the Moderator role
@@ -1287,6 +1309,7 @@ def page_save_settings(path, data, request_id, link_id, remote_identity, request
                    "profile_node=excluded.profile_node",
                    (viewer, username, profile_node, now()))
         db.commit()
+        _maybe_founder(viewer)
     out = [page_header()]
     out.append("> Saved\n-\n")
     out.append("Username: `!" + esc_micron_text(username) + "!`\n")
@@ -1509,6 +1532,7 @@ def api_register(viewer, data):
                    "profile_node=excluded.profile_node",
                    (viewer, username, profile_node.lower() or None, now()))
         db.commit()
+        _maybe_founder(viewer)
     return msgpack.packb({"ok": 1})
 
 @api_route("/api/register_node")

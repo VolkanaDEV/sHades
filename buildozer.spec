@@ -7,9 +7,14 @@ package.domain = io.eldeucebag
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 source.exclude_dirs = .git, .github, tests, __pycache__, build, dist, .buildozer
-version = 0.28
+version = 0.31.6
 # Bump version on every android-facing fix so the installed build can be
 # verified on-device (Settings > Apps > sHades) without adb.
+# wasmtime runs the micron applet sandbox on-device (applet_bridge.py).
+# DIAG BUILDS: set_env.RH_DEBUG = 1 turns RNS debug verbosity on for the
+# APK; `adb logcat -s python` then shows RNS's resource/link internals
+# during a failed upload (transfer timeouts, cancellations, probes).
+set_env.RH_DEBUG = 1
 # wasmtime runs the micron applet sandbox on-device (applet_bridge.py).
 # It publishes an Android wheel tagged android_26_<abi>, so the NDK API
 # must be 26+ for p4a to select it -- at android_24 pip silently falls
