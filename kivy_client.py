@@ -2839,10 +2839,20 @@ class sHadesClientApp(MDApp):
                     # the ingress limiter.
                     f.write("    ingress_control = no\n")
 
+            from RNS.vendor.platformutils import is_android as _is_android
+
+            def _android_diag_default():
+                # Diag builds: RNS debug verbosity ON by default on-device.
+                # buildozer set_env may not survive into the app's runtime
+                # environment, so the platform decides, not the env var;
+                # RH_DEBUG=1 still forces it anywhere, RH_DEBUG=0 silences.
+                return _is_android() and os.environ.get("RH_DEBUG") != "0"
+
             reticulum = RNS.Reticulum(
                 configdir=storage,
                 loglevel=(RNS.LOG_DEBUG
-                          if os.environ.get("RH_DEBUG") else None))
+                          if os.environ.get("RH_DEBUG") or
+                          _android_diag_default() else None))
             self.reticulum = reticulum
             if BOOT_DEBUG:
                 _boot_mark("RNS: instance up (config ok)")
