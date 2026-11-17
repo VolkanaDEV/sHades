@@ -65,6 +65,14 @@ def main():
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "kv_md.kv"))
 
+    # isolate the app data dir: the rail ingest writes icons + servers.json;
+    # without this the real ~/.sHades_client leaks between runs and a stale
+    # icon_path survives the _add_server preservation logic
+    import tempfile
+    data_base = tempfile.mkdtemp(prefix="rail_test_data_")
+    kc._app_data_dir = lambda: os.path.join(data_base, "sHades_client")
+    os.makedirs(kc._app_data_dir(), exist_ok=True)
+
     app = kc.sHadesClientApp()
     app.guild_api = FakeApi()
     app.i_am_admin = True

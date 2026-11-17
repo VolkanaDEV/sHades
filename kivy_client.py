@@ -728,6 +728,10 @@ class GuildAPI:
             data["manifest"] = manifest
         return self._request_json("/api/v1/channels/create", data)
 
+    def channels_reorder(self, order):
+        return self._request_json("/api/v1/channels/reorder",
+                                  {"order": order})
+
     def channels_info(self, channel):
         return self._request_json("/api/v1/channels/info", {"channel": channel})
 
@@ -980,7 +984,7 @@ class GuildAPI:
         return self._request_json("/api/v1/join", data)
 
     def invites(self, op="list", code=None, label=None, max_uses=None,
-                expires_in=None):
+                expires_in=None, channel=None):
         data = {"op": op}
         if code:
             data["code"] = code
@@ -990,6 +994,8 @@ class GuildAPI:
             data["max_uses"] = max_uses
         if expires_in is not None:
             data["expires_in"] = expires_in
+        if channel:
+            data["channel"] = channel
         return self._request_json("/api/v1/invites", data)
 
     def fetch_file(self, path):
@@ -1519,6 +1525,7 @@ class ChannelButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
     channel_name = StringProperty("")
     badge = NumericProperty(0)
     selected = BooleanProperty(False)
+    _dragging = False   # set True once a grabbed touch passes dp(8)
 
     def build_context_menu(self):
         app = App.get_running_app()
@@ -1530,6 +1537,9 @@ class ChannelButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
             actions.append(("create channel...", True,
                             lambda: app and app._open_create_channel_popup()))
         if cid:
+            if getattr(app, "i_am_admin", False):
+                actions.append(("invite to #%s..." % name, True,
+                                lambda: app and app._invite_to_channel(cid, name)))
             actions.append(("copy channel id", True,
                             lambda: app and app._copy_text(cid)))
             muted = cid in app._muted_channels
@@ -1539,6 +1549,86 @@ class ChannelButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
                 actions.append(("delete channel", True,
                                 lambda: app and app._delete_channel(name, cid)))
         return actions
+
+    # ---- drag reorder (task 7) --------------------------------------------
+    # A grabbed touch that moves more than dp(8) cancels the long-press
+    # clock (tay: presses over a channel label belong to the drag/menu
+    # logic, never to the drawer) and reorders the grid live; on release
+    # the final order goes to /api/v1/channels/reorder once.
+    def on_touch_down(self, touch):
+        touch.ud["shades_drag_origin"] = (touch.x, touch.y)
+        self._dragging = False
+        return super().on_touch_down(touch)
+
+    def _ch_drag_check(self, touch):
+        """One move step: threshold -> live reorder. Returns True when the
+        touch has become a drag."""
+        origin = touch.ud.get("shades_drag_origin")
+        if origin is None:
+            return False
+        dx, dy = touch.x - origin[0], touch.y - origin[1]
+        if not getattr(self, "_dragging", False):
+            if dx * dx + dy * dy < dp(8) * dp(8):
+                return False
+            self._dragging = True
+            clock = getattr(self, "_ctx_clock", None)
+            if clock:
+                clock.cancel()
+                self._ctx_clock = None
+        self._ch_drag_step(touch)
+        return True
+
+    def on_touch_move(self, touch):
+        if touch.grab_current is self:
+            self._ch_drag_check(touch)
+        return super().on_touch_move(touch)
+
+    def on_touch_up(self, touch):
+        was_dragging = getattr(self, "_dragging", False)
+        self._dragging = False
+        result = super().on_touch_up(touch)
+        if was_dragging:
+            app = App.get_running_app()
+            if app is not None:
+                app._post_channel_reorder()
+            return True  # a drag end is consumed, not a press
+        return result
+
+    def _ch_drag_step(self, touch):
+        """Swap with the neighbouring row when the pointer crosses it."""
+        grid = self.parent
+        if grid is None:
+            return
+        buttons = [w for w in reversed(grid.children)
+                   if isinstance(w, ChannelButton)]
+        if len(buttons) < 2:
+            return
+        rows = {}  # button -> visual row y-range center (children are
+        # laid out top row first by GridLayout; reversed(children) = top
+        # to bottom)
+        top = grid.top
+        row_h = 0.0
+        for b in buttons:
+            row_h = b.height
+        my_row = None
+        for i, b in enumerate(buttons):
+            y_mid = top - (i + 0.5) * row_h if row_h else b.center_y
+            if b is self:
+                my_row = i
+        if my_row is None or not row_h:
+            return
+        # which row does the pointer sit in?
+        offset = int(round((top - touch.y - row_h / 2.0) / row_h))
+        target = max(0, min(len(buttons) - 1, offset))
+        if target == my_row:
+            return
+        # move self within the children list so the visual order changes
+        children_idx = grid.children.index(self)
+        # GridLayout fills rows in reversed-children order: children index
+        # (len-1-row) is row 0 (top).
+        child_at_row = len(buttons) - 1 - target
+        grid.remove_widget(self)
+        grid.add_widget(self, index=child_at_row)
 
 
 if KIVY:
@@ -2116,6 +2206,8 @@ class sHadesClientApp(MDApp):
         # site channels: kind per cid, the rendered page stack, the page
         # currently shown, and the active theme from the manifest
         self._channel_kinds = {}     # cid -> chat|site|term
+        self._channel_pos = {}       # name -> position (task 7 ordering)
+        self._channel_order = {}     # cid -> position (server-side index)
         self._site_stack = []        # [(cid, path)] back stack
         self._site_current = None    # (cid, path)
         self._site_theme = {}
@@ -4422,9 +4514,13 @@ class sHadesClientApp(MDApp):
                     if not cid or not name:
                         continue
                     self._channel_kinds[cid] = c.get("kind", "chat")
+                    self._channel_order[cid] = c.get("position") or 0
+                    self._channel_pos[name] = c.get("position") or 0
                     if name not in self._channels:
                         self._channels[name] = cid
                         self._add_channel(name)
+                    else:
+                        self._channels[name] = cid
             self._channel_unread.update(
                 {c["id"]: c.get("unread", 0) for c in chans
                  if isinstance(c, dict) and c.get("id")})
@@ -5181,7 +5277,82 @@ class sHadesClientApp(MDApp):
         btn = ChannelButton(channel_name=name,
                             selected=name == main._current_channel)
         btn.bind(on_press=lambda inst: self._switch_channel(name))
-        grid.add_widget(btn)
+        # task 7: build in server order. channels/list carries position;
+        # Kivy layouts fill rows in reversed-children order, so the child
+        # index of visual row i is (visible_count - i). Insert into the
+        # first visual slot whose row holds a channel with a HIGHER position
+        # (or an unpositioned one), else the end.
+        my_pos = self._channel_pos.get(name)
+        if my_pos is None:
+            grid.add_widget(btn)
+            return
+        existing = [w for w in reversed(grid.children)
+                    if isinstance(w, ChannelButton)]
+        insert_at = None
+        for visual_row, b in enumerate(existing):
+            pos = self._channel_pos.get(b.channel_name)
+            if pos is None or pos > my_pos:
+                insert_at = len(existing) - visual_row
+                break
+        if insert_at is None:
+            grid.add_widget(btn)
+        else:
+            grid.add_widget(btn, index=insert_at)
+
+    def _post_channel_reorder(self):
+        """Send the visual order (top -> bottom) to the server once."""
+        try:
+            main = self.root.get_screen("main")
+            grid = main.ids.channel_grid
+        except Exception:
+            return
+        buttons = [w for w in reversed(grid.children)
+                   if isinstance(w, ChannelButton)]
+        order = []
+        for b in buttons:
+            cid = self._channels.get(b.channel_name)
+            if cid and cid not in order:
+                order.append(cid)
+        all_cids = [self._channels.get(n) for n in self._channels]
+
+        def work():
+            try:
+                res = self.guild_api.channels_reorder(order)
+            except Exception as e:
+                Clock.schedule_once(
+                    lambda dt: self._set_status("reorder failed: %r" % e), 0)
+                return
+            if res.get("ok"):
+                for i, cid in enumerate(res.get("order") or order, start=1):
+                    self._channel_order[cid] = i
+            else:
+                Clock.schedule_once(
+                    lambda dt: self._set_status("reorder: %s"
+                                                % res.get("error")), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _invite_to_channel(self, cid, name):
+        """Create a channel-targeted invite + copy the shades:// link."""
+        if not self.guild_api:
+            return
+
+        def work():
+            try:
+                res = self.guild_api.invites("create",
+                                             label="#%s" % name, channel=cid)
+            except Exception as e:
+                Clock.schedule_once(
+                    lambda dt: self._set_status("invite failed: %r" % e), 0)
+                return
+            if res.get("ok"):
+                link = "shades://join/%s" % res.get("code", "")
+                Clock.schedule_once(
+                    lambda dt: self._copy_text(link), 0)
+            else:
+                Clock.schedule_once(
+                    lambda dt: self._set_status("invite: %s"
+                                                % res.get("error")), 0)
+        threading.Thread(target=work, daemon=True).start()
 
     def _refresh_channels_ui(self):
         self._ensure_general_channel()

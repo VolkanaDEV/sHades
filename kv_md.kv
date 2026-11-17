@@ -523,15 +523,18 @@
                             valign: 'middle'
                             text_size: self.width, None
                         MDButton:
+                            id: add_channel_btn
                             style: 'outlined'
                             size_hint_y: None
                             height: scaled(dp(40))
                             width: dp(48)
                             theme_bg_color: 'Custom'
                             md_bg_color: app.theme_colors['sidebar_ctrl']
-                            on_press: app.open_config()
+                            opacity: 1 if app._can_create_channels() else 0
+                            disabled: not app._can_create_channels()
+                            on_press: app._open_create_channel_popup()
                             MDButtonText:
-                                text: 'Edit'
+                                text: '+'
                                 shorten: True
                     ScrollView:
                         do_scroll_x: False
