@@ -560,15 +560,39 @@ def dlog(msg):
 class GuildAPI:
     """Thin wrapper around an RNS Link to the sHades guild node."""
 
-    def __init__(self, reticulum, link, on_error=None):
+    def __init__(self, reticulum, link, on_error=None, on_dead=None):
         self.reticulum = reticulum
         self.link = link
         self.on_error = on_error or (lambda *a: None)
+        # v0.31.2 link self-heal: called when a request lands on a link
+        # that is no longer ACTIVE (or raises) -- the app re-establishes
+        # and re-primes in one place instead of dying until restart.
+        self.on_dead = on_dead or (lambda *a: None)
+
+    def _check_dead(self):
+        st = getattr(self.link, "status", None)
+        if st is not None and st != RNS.Link.ACTIVE:
+            try:
+                self.on_dead(st)
+            except Exception:
+                pass
+            return True
+        return False
 
     def _request(self, path, data, timeout=10):
         if not isinstance(data, dict):
             data = {}
-        receipt = self.link.request(path, data=data)
+        if self._check_dead():
+            return {"ok": 0, "error": "link dead"}
+        try:
+            receipt = self.link.request(path, data=data)
+        except Exception as e:
+            print("request on link failed: %r" % (e,))
+            try:
+                self.on_dead("raise")
+            except Exception:
+                pass
+            return {"ok": 0, "error": "link dead"}
         # link.request() may return a Receipt object (with .response) or
         # True/False (bool) depending on RNS version. Handle both.
         if isinstance(receipt, bool):
@@ -662,7 +686,17 @@ class GuildAPI:
 
     def _request_json(self, path, data, timeout=10.0):
         payload = json.dumps(data if data is not None else {}).encode("utf-8")
-        receipt = self.link.request(path, data=payload)
+        if self._check_dead():
+            return {"ok": 0, "error": "link dead"}
+        try:
+            receipt = self.link.request(path, data=payload)
+        except Exception as e:
+            print("json request on link failed: %r" % (e,))
+            try:
+                self.on_dead("raise")
+            except Exception:
+                pass
+            return {"ok": 0, "error": "link dead"}
         # link.request() may return a Receipt object or True/False depending
         # on the RNS version (see _request). Re-issue with the SAME payload.
         if isinstance(receipt, bool):
@@ -2778,6 +2812,99 @@ class sHadesClientApp(MDApp):
         popup = Popup(title="", content=box, size_hint=(0.8, 0.75), auto_dismiss=False)
         popup.open()
 
+    def _establish_guild_link(self):
+        """Establish the RNS link to the guild node; up to 3 attempts.
+
+        Extracted from _init_reticulum (v0.31.2) so boot and the
+        link self-heal both go through the identical routine: fresh
+        destination from the recalled hub identity, 20s wait for
+        ACTIVE per attempt, identify, closed-callback registration.
+        Raises RuntimeError when no attempt goes ACTIVE.
+        """
+        nh = bytes.fromhex(self.guild_node_hash)
+        nid = RNS.Identity.recall(nh)
+        if nid is None:
+            raise RuntimeError(
+                "RNS does not know identity for node_hash %s — "
+                "the guild's announce was not heard yet. Try again." % self.guild_node_hash)
+        link = None
+        for attempt in range(3):
+            nd = RNS.Destination(nid, RNS.Destination.OUT,
+                                 RNS.Destination.SINGLE, "nomadnetwork", "node")
+            link = RNS.Link(nd)
+            for _ in range(200):
+                if link.status == RNS.Link.ACTIVE:
+                    break
+                time.sleep(0.1)
+            if link.status == RNS.Link.ACTIVE:
+                break
+            print(f"Link attempt {attempt + 1} not ACTIVE, retrying...")
+            time.sleep(1.0)
+
+        if link.status != RNS.Link.ACTIVE:
+            raise RuntimeError(
+                "Could not establish RNS link to guild node — "
+                "link never went ACTIVE after 3 attempts.")
+        link.identify(self.client_identity)
+        # v0.31.2: the teardown event is the fastest dead signal we get.
+        try:
+            link.set_link_closed_callback(self._on_guild_link_closed)
+        except Exception as e:
+            print("link closed-callback registration failed: %s" % e)
+        return link
+
+    def _on_guild_link_closed(self, link, reason=None):
+        print("[link] guild link closed (%r) — scheduling re-establish" % (reason,))
+        Clock.schedule_once(self._do_reestablish, 1.0)
+
+    def _on_guild_link_dead(self, state=None):
+        # Request-path signal (GuildAPI saw a non-ACTIVE link or a raise).
+        print("[link] guild link dead (%r) — scheduling re-establish" % (state,))
+        Clock.schedule_once(self._do_reestablish, 0.5)
+
+    def _do_reestablish(self, dt=None):
+        """One guarded re-establish attempt; any caller can schedule it.
+
+        Idempotency: concurrent triggers (request-path on_dead, link
+        closed callback, keepalive zombie counter) all funnel here;
+        the flag guarantees a single in-flight attempt and a failure
+        reschedules once. On success the fresh link replaces the old
+        one everywhere (self.link, GuildAPI, push callback) and the
+        stream subscription is re-primed from the watermark (the
+        server binds one subscription per link; a new link has none).
+        """
+        if getattr(self, "_reestablishing", False):
+            return
+        self._reestablishing = True
+        try:
+            old = getattr(self, "link", None)
+            if old is not None and getattr(old, "status", None) == RNS.Link.ACTIVE:
+                # Someone already restored an ACTIVE link (or the signal
+                # was stale); only a non-ACTIVE link needs replacing.
+                Clock.schedule_once(
+                    lambda dt2: self._start_streamer(), 0)
+                return
+            print("[link] re-establishing guild link...")
+            try:
+                old.teardown()
+            except Exception:
+                pass
+            link = self._establish_guild_link()
+            self.link = link
+            self.guild_api = GuildAPI(self.reticulum, link,
+                                      on_dead=self._on_guild_link_dead)
+            try:
+                link.set_packet_callback(self._on_push_frame)
+            except Exception as e:
+                print("push callback registration failed: %s" % e)
+            print("[link] guild link re-established")
+            Clock.schedule_once(lambda dt2: self._start_streamer(), 0)
+        except Exception as e:
+            print("[link] re-establish failed: %r — retrying in 8s" % (e,))
+            Clock.schedule_once(self._do_reestablish, 8.0)
+        finally:
+            self._reestablishing = False
+
     def _init_reticulum(self):
         """Main thread only: create RNS instance (signal handlers), then
         spawn a background thread for the blocking link establishment."""
@@ -3028,29 +3155,12 @@ class sHadesClientApp(MDApp):
                     "the guild's announce was not heard yet. Try again." % self.guild_node_hash)
             print(f"RNS recalled identity for node_hash {self.guild_node_hash}")
 
-            # link to guild node — retry up to 3 times
-            link = None
-            for attempt in range(3):
-                nd = RNS.Destination(nid, RNS.Destination.OUT,
-                                     RNS.Destination.SINGLE, "nomadnetwork", "node")
-                link = RNS.Link(nd)
-                for _ in range(200):
-                    if link.status == RNS.Link.ACTIVE:
-                        break
-                    time.sleep(0.1)
-                if link.status == RNS.Link.ACTIVE:
-                    break
-                print(f"Link attempt {attempt + 1} not ACTIVE, retrying...")
-                time.sleep(1.0)
-
-            if link.status != RNS.Link.ACTIVE:
-                raise RuntimeError(
-                    "Could not establish RNS link to guild node — "
-                    "link never went ACTIVE after 3 attempts.")
-            link.identify(self.client_identity)
+            # link to guild node -- extracted so the self-heal path
+            # (v0.31.2) re-establishes through the exact same routine.
+            link = self._establish_guild_link()
             self.link = link
-
-            self.guild_api = GuildAPI(reticulum, link)
+            self.guild_api = GuildAPI(self.reticulum, link,
+                                      on_dead=self._on_guild_link_dead)
             # v0.28 push: stream frames arrive on this link the moment
             # events exist. The callback is the client's entire intake;
             # no polling loops exist anywhere in the client.
@@ -3256,8 +3366,10 @@ class sHadesClientApp(MDApp):
         try:
             res = api.stream_poll(cursor=self._stream_cursor, timeout_s=0)
         except Exception:
+            self._ka_miss()
             return
         if res.get("ok"):
+            self._ka_fail = 0
             self._stream_cursor = res.get("cursor", self._stream_cursor)
             events = res.get("events") or []
             if events:
@@ -3268,6 +3380,20 @@ class sHadesClientApp(MDApp):
             # subscription expired (two quiet minutes): re-subscribe from
             # the watermark so the TTL-eaten gap replays
             Clock.schedule_once(lambda dt: self._start_streamer(), 0)
+        else:
+            # v0.31.2 zombie detection: a non-ok poll that is NOT the 409
+            # subscribe-expiry is a dead-or-zombie link. One miss stays a
+            # miss (uploads can legitimately tie up a link); two in a row
+            # through the 45s keepalive = the link no longer answers.
+            self._ka_miss()
+
+    def _ka_miss(self):
+        misses = getattr(self, "_ka_fail", 0) + 1
+        self._ka_fail = misses
+        print("[link] keepalive miss %d/2" % misses)
+        if misses >= 2:
+            self._ka_fail = 0
+            Clock.schedule_once(self._do_reestablish, 0)
 
     def _release_stream(self):
         """Drop this link's stream subscription: switching to a push-less
