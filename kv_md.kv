@@ -417,6 +417,21 @@
             HamburgerIcon:
                 on_press: root.toggle_left()
                 color: app.theme_colors['primary'] if root.left_open else app.theme_colors['text_muted']
+            MeshPulse:
+                mode: app.mesh_mode
+                width: dp(40)
+            MeshConstellation:
+                mode: app.mesh_mode
+                hops: app.mesh_hops
+                width: dp(46)
+            Label:
+                text: app.mesh_label
+                color: app.theme_colors['accent'] if app.mesh_mode == 'direct' else app.theme_colors['primary'] if app.mesh_mode == 'relay' else app.theme_colors['text_dim']
+                bold: True
+                font_size: sp(9)
+                size_hint_x: None
+                width: dp(65)
+                shorten: True
             CtxHeaderLabel:
                 id: channel_header
                 text: '#' + (root._current_channel or 'general')

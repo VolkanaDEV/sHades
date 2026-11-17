@@ -27,6 +27,7 @@ from PIL import ImageDraw as PILImageDraw
 from PIL import ImageChops as PILImageChops
 
 from ui_scale import scaled
+from mesh_ui import link_state
 from ui_theme import preset_colors
 
 # ---------------------------------------------------------------------------
@@ -1518,6 +1519,72 @@ class ContextMenuOverlay(FloatLayout):
             Clock.schedule_once(lambda dt: self.dismiss_now(), 0.1)
 
 
+class MeshPulse(Widget):
+    """A path-state ring; pace and colour reflect the observed guild link."""
+    mode = StringProperty("offline")
+    phase = NumericProperty(0)
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.size_hint = (None, None)
+        self.size = (dp(40), dp(40))
+        self.bind(pos=self._draw, size=self._draw, mode=self._draw,
+                  phase=self._draw)
+        self._pulse_clock = Clock.schedule_interval(self._tick, 0.1)
+
+    def _tick(self, dt):
+        speed = 0.0 if self.mode == "offline" else (0.11 if self.mode == "relay" else 0.25)
+        self.phase = (self.phase + speed * dt) % 1.0
+
+    def _draw(self, *a):
+        from math import sin, pi
+        palette = {"direct": (0.35, 0.84, 0.77),
+                   "relay": (0.96, 0.72, 0.37),
+                   "offline": (0.38, 0.43, 0.48)}
+        rgb = palette.get(self.mode, palette["offline"])
+        wave = 0.0 if self.mode == "offline" else (sin(self.phase * 2 * pi) + 1) / 2
+        self.canvas.clear()
+        with self.canvas:
+            Color(*rgb, 0.17 + 0.20 * wave)
+            Line(circle=(self.center_x, self.center_y, min(self.width, self.height) * 0.42),
+                 width=dp(4))
+            Color(*rgb, 0.85)
+            Line(circle=(self.center_x, self.center_y, min(self.width, self.height) * 0.34),
+                 width=dp(1.4))
+            Color(*rgb, 0.8)
+            Ellipse(pos=(self.center_x - dp(3), self.center_y - dp(3)),
+                    size=(dp(6), dp(6)))
+
+
+class MeshConstellation(Widget):
+    """A compact path diagram. Dots are capped when the route is longer."""
+    mode = StringProperty("offline")
+    hops = NumericProperty(0)
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.size_hint = (None, None)
+        self.size = (dp(52), dp(20))
+        self.bind(pos=self._draw, size=self._draw, mode=self._draw,
+                  hops=self._draw)
+
+    def _draw(self, *a):
+        count = max(2, min(5, int(self.hops) + 1))
+        rgb = ((0.35, 0.84, 0.77) if self.mode == "direct"
+               else (0.96, 0.72, 0.37) if self.mode == "relay"
+               else (0.38, 0.43, 0.48))
+        points = [(self.x + dp(5) + i * (self.width - dp(10)) / (count - 1),
+                   self.center_y + (dp(3) if i % 2 else -dp(3)))
+                  for i in range(count)]
+        self.canvas.clear()
+        with self.canvas:
+            Color(*rgb, 0.4 if self.mode != "offline" else 0.2)
+            Line(points=[c for p in points for c in p], width=dp(1))
+            for i, (x, y) in enumerate(points):
+                Color(*rgb, 0.85 if self.mode != "offline" or i == 0 else 0.3)
+                Ellipse(pos=(x - dp(2.5), y - dp(2.5)), size=(dp(5), dp(5)))
+
+
 class CtxHeaderLabel(ContextMenuMixin, Label):
     """Guild header: right-click/long-press offers the invite share-link
     and (for admins) the server settings panel."""
@@ -2207,6 +2274,12 @@ class sHadesClientApp(MDApp):
     theme_colors = DictProperty({})
     # task 9: the composer rail's pfp; "" = letterless default disc
     composer_pfp_path = StringProperty("")
+    # path-state chip: the observed RNS path to the guild node
+    # (offline / direct / relay + hop count), rendered by MeshPulse,
+    # MeshConstellation and the header label in kv_md.kv
+    mesh_mode = StringProperty("offline")
+    mesh_hops = NumericProperty(0)
+    mesh_label = StringProperty("OFFLINE")
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -2960,6 +3033,7 @@ class sHadesClientApp(MDApp):
         if idx == self._active_server_idx:
             return
         self._set_active_server(idx)
+        self._update_mesh(False)
         self._refresh_server_sidebar()
         # Clear all channel/chat state for the new server
         self._channels.clear()
@@ -3166,12 +3240,27 @@ class sHadesClientApp(MDApp):
 
     def _on_guild_link_closed(self, link, reason=None):
         print("[link] guild link closed (%r) — scheduling re-establish" % (reason,))
+        Clock.schedule_once(lambda dt: self._update_mesh(False), 0)
         Clock.schedule_once(self._do_reestablish, 1.0)
 
     def _on_guild_link_dead(self, state=None):
         # Request-path signal (GuildAPI saw a non-ACTIVE link or a raise).
         print("[link] guild link dead (%r) — scheduling re-establish" % (state,))
+        Clock.schedule_once(lambda dt: self._update_mesh(False), 0)
         Clock.schedule_once(self._do_reestablish, 0.5)
+
+    def _update_mesh(self, active=None):
+        """Read the known RNS path. Unknown hop count stays a generic mesh link."""
+        if active is None:
+            active = (self.link is not None
+                      and getattr(self.link, "status", None) == RNS.Link.ACTIVE)
+        hops = None
+        if active and self.guild_node_hash:
+            try:
+                hops = RNS.Transport.hops_to(bytes.fromhex(self.guild_node_hash))
+            except (AttributeError, TypeError, ValueError):
+                pass
+        self.mesh_mode, self.mesh_label, self.mesh_hops = link_state(active, hops)
 
     def _do_reestablish(self, dt=None):
         """One guarded re-establish attempt; any caller can schedule it.
@@ -3210,6 +3299,7 @@ class sHadesClientApp(MDApp):
                 print("push callback registration failed: %s" % e)
             print("[link] guild link re-established")
             Clock.schedule_once(lambda dt2: self._start_streamer(), 0)
+            Clock.schedule_once(lambda dt2: self._update_mesh(), 0)
         except Exception as e:
             print("[link] re-establish failed: %r — retrying in 8s" % (e,))
             Clock.schedule_once(self._do_reestablish, 8.0)
@@ -3547,6 +3637,7 @@ class sHadesClientApp(MDApp):
             self.link = link
             self.guild_api = GuildAPI(self.reticulum, link,
                                       on_dead=self._on_guild_link_dead)
+            Clock.schedule_once(lambda dt: self._update_mesh(), 0)
             # v0.28 push: stream frames arrive on this link the moment
             # events exist. The callback is the client's entire intake;
             # no polling loops exist anywhere in the client.
@@ -3602,6 +3693,7 @@ class sHadesClientApp(MDApp):
 
     def _switch_main(self):
         self.root.current = "main"
+        self._update_mesh()
         # load channels (placeholder: general + anything discovered)
         self._refresh_channels_ui()
         self._refresh_server_sidebar()
