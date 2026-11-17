@@ -27,6 +27,7 @@ from PIL import ImageDraw as PILImageDraw
 from PIL import ImageChops as PILImageChops
 
 from ui_scale import scaled
+from ui_theme import preset_colors
 
 # ---------------------------------------------------------------------------
 # Kivy (guarded so the module can be imported for linting without Kivy present)
@@ -2137,6 +2138,31 @@ if KIVY:
                 self.ids["config_status"].text = "Theme reset to defaults."
             except Exception:
                 pass
+
+        def choose_preset(self, name):
+            """Apply a named palette from ui_theme.PRESETS.
+
+            Seeded from DEFAULT_THEME_COLORS (not the current per-key edits),
+            matching the reference client: a preset is a clean re-tint, and
+            the fine-tune rows then hold that palette for further edits.
+            """
+            from kivy.app import App as _App
+            app = _App.get_running_app()
+            if app is None:
+                return
+            try:
+                app.theme_colors = preset_colors(
+                    dict(DEFAULT_THEME_COLORS), name)
+            except ValueError:
+                status = self.ids.get("config_status")
+                if status:
+                    status.text = "Unknown preset."
+                return
+            app._save_ui_config()
+            self._prefill_fields()
+            status = self.ids.get("config_status")
+            if status:
+                status.text = "%s preset applied." % name
 
 
 # ---------------------------------------------------------------------------

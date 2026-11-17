@@ -912,7 +912,44 @@
                 padding: dp(12)
                 spacing: dp(8)
                 Label:
-                    text: 'Theme colors (hex #RRGGBB)'
+                    text: 'Theme presets'
+                    font_size: sp(16)
+                    bold: True
+                    color: app.theme_colors['text_muted']
+                    size_hint_y: None
+                    height: dp(28)
+                GridLayout:
+                    cols: 3
+                    size_hint_y: None
+                    height: dp(96)
+                    spacing: dp(6)
+                    MDButton:
+                        style: 'outlined'
+                        on_press: root.choose_preset('Midnight')
+                        MDButtonText:
+                            text: 'Midnight'
+                    MDButton:
+                        style: 'outlined'
+                        on_press: root.choose_preset('Ember')
+                        MDButtonText:
+                            text: 'Ember'
+                    MDButton:
+                        style: 'outlined'
+                        on_press: root.choose_preset('Mint')
+                        MDButtonText:
+                            text: 'Mint'
+                    MDButton:
+                        style: 'outlined'
+                        on_press: root.choose_preset('Mono')
+                        MDButtonText:
+                            text: 'Mono'
+                    MDButton:
+                        style: 'outlined'
+                        on_press: root.choose_preset('Daylight')
+                        MDButtonText:
+                            text: 'Daylight'
+                Label:
+                    text: 'Fine tune colors (hex #RRGGBB)'
                     font_size: sp(16)
                     bold: True
                     color: app.theme_colors['text_muted']
