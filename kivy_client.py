@@ -2206,6 +2206,13 @@ class sHadesClientApp(MDApp):
         sm.add_widget(MainScreen(name="main"))
         sm.add_widget(ProfileScreen(name="profile"))
         sm.add_widget(ConfigScreen(name="config"))
+        # Phase 1 task 5: the tabbed server-config screen replaces the U8
+        # popup; its tabs are keyed to the caller's roles on entry.
+        try:
+            from ui_server_config import ServerConfigScreen
+            sm.add_widget(ServerConfigScreen(name="server_config"))
+        except Exception as e:
+            print("server_config screen unavailable:", repr(e))
         # Plain Enter sends the message; Shift+Enter inserts a newline
         # (multiline input). Handled via _on_key_down below.
         Window.bind(on_key_down=self._on_key_down)
@@ -4710,301 +4717,20 @@ class sHadesClientApp(MDApp):
 
     # -- admin panel (U8) --------------------------------------------------
     def _open_admin_panel(self):
-        """Server settings panel: config values, moderator whitelist and
-        the audit log. Admin-only (the server enforces it regardless —
-        this panel just avoids showing admins a broken screen)."""
+        """Server config screen: tabs for General / Membership / Channels /
+        Roles / Invites, visible per the caller's roles (the server enforces
+        everything regardless -- the client gating is UX, not security)."""
         if not self.guild_api or not getattr(self, "i_am_admin", False):
             return
-        box = BoxLayout(orientation="vertical", spacing=4, padding=6)
-        tabs = BoxLayout(size_hint_y=None, height=32, spacing=4)
-        box.add_widget(tabs)
-        scroll = ScrollView(size_hint=(1, 1))
-        grid = GridLayout(cols=1, size_hint_y=None, spacing=3, padding=[2, 2])
-        grid.bind(minimum_height=grid.setter("height"))
-        scroll.add_widget(grid)
-        box.add_widget(scroll)
-        close = Button(text="close", size_hint_y=None, height=scaled(28))
-        box.add_widget(close)
-        popup = Popup(title="server settings", content=box, size_hint=(0.8, 0.8))
-        self._admin_popup = popup
-        close.bind(on_press=lambda inst: popup.dismiss())
+        try:
+            from ui_server_config import ServerConfigScreen
+            screen = self.root.get_screen("server_config")
+            screen.client = self
+            self.root.current = "server_config"
+        except Exception as e:
+            print("server_config screen failed:", repr(e))
+            return
 
-        def set_status(txt):
-            Clock.schedule_once(lambda dt: self._set_status(txt), 0)
-
-        # Every tab fetches from the guild. Those calls block on the RNS
-        # link for up to the request timeout (10s), so they must NOT run on
-        # the main thread — an unresponsive guild would freeze the whole UI.
-        # Each loader therefore fetches on a background thread and builds
-        # its widgets back on the main thread via Clock.schedule_once.
-        #
-        # load_gen guards against out-of-order responses: switching tabs
-        # quickly would otherwise let a slow earlier response append its
-        # rows to a grid the newer response already cleared.
-        load_gen = [0]
-
-        def fetch(view_fn, on_ok):
-            """Run view_fn() on a worker thread; call on_ok(res) on the
-            main thread with the result."""
-            gen = load_gen[0]
-
-            def work():
-                try:
-                    res = view_fn()
-                except Exception as e:
-                    set_status("%r" % e)
-                    return
-                if gen != load_gen[0]:
-                    return  # a newer tab superseded this response
-                Clock.schedule_once(lambda dt: on_ok(res), 0)
-            threading.Thread(target=work, daemon=True).start()
-
-        def load_config():
-            def render(res):
-                if not res.get("ok"):
-                    set_status("config: %s" % res.get("error", "failed"))
-                    return
-                cfg = res.get("config", {})
-                for key, val in sorted(cfg.items()):
-                    row = BoxLayout(size_hint_y=None, height=dp(32), spacing=4)
-                    row.add_widget(Label(text=key, size_hint_x=0.35,
-                                         halign="left", valign="middle",
-                                         font_size=sp(12)))
-                    entry = TextInput(text=str(val), multiline=False,
-                                      size_hint_x=0.45)
-                    row.add_widget(entry)
-                    save = Button(text="save", size_hint_x=None, width=60,
-                                  size_hint_y=None, height=scaled(dp(32)),
-                                  font_size=sp(11), pos_hint={"center_y": 0.5})
-                    row.add_widget(save)
-
-                    def do_save(k=key, e=entry):
-                        # Read the widget on the main thread; the worker
-                        # must not touch widget state.
-                        val = e.text
-
-                        def save_work():
-                            try:
-                                r = self.guild_api.admin_config(k, val)
-                            except Exception as ex:
-                                set_status("config: %r" % ex)
-                                return
-                            if r.get("ok"):
-                                set_status("%s saved" % k)
-                                Clock.schedule_once(lambda dt: refresh(), 0)
-                            else:
-                                set_status("config: %s" % r.get("error"))
-                        threading.Thread(target=save_work, daemon=True).start()
-                    save.bind(on_press=lambda inst, k=key, e=entry: do_save(k, e))
-                    grid.add_widget(row)
-            fetch(self.guild_api.admin_config, render)
-
-        def load_mods():
-            def render(res):
-                if not res.get("ok"):
-                    set_status("mods: %s" % res.get("error", "failed"))
-                    return
-                mods = res.get("mods") or []
-                admins = res.get("admins") or []
-                grid.add_widget(Label(
-                    text="moderators (%d)  admins (%d)" % (len(mods), len(admins)),
-                    size_hint_y=None, height=dp(22), font_size=sp(12),
-                    color=(0.85, 0.87, 0.9, 1), halign="left", valign="middle"))
-                row = BoxLayout(size_hint_y=None, height=dp(32), spacing=4)
-                entry = TextInput(hint_text="user hash (32 hex)",
-                                  multiline=False, size_hint_x=0.6)
-                row.add_widget(entry)
-                addm = Button(text="add mod", size_hint_x=None, width=80,
-                              size_hint_y=None, height=scaled(dp(32)),
-                              font_size=sp(11), pos_hint={"center_y": 0.5})
-                row.add_widget(addm)
-                adda = Button(text="add admin", size_hint_x=None, width=90,
-                              size_hint_y=None, height=scaled(dp(32)),
-                              font_size=sp(11), pos_hint={"center_y": 0.5})
-                row.add_widget(adda)
-                grid.add_widget(row)
-
-                def do_op(op, target_hash=None):
-                    h = (target_hash or (entry.text or "")).strip().lower()
-                    if not h:
-                        return
-
-                    def op_work():
-                        try:
-                            r = self.guild_api.admin_mods(op, h)
-                        except Exception as ex:
-                            set_status("mods: %r" % ex)
-                            return
-                        if r.get("ok"):
-                            Clock.schedule_once(
-                                lambda dt: setattr(entry, "text", ""), 0)
-                            set_status("%s %s" % (op, h[:12]))
-                            Clock.schedule_once(lambda dt: refresh(), 0)
-                        else:
-                            set_status("mods: %s" % r.get("error"))
-                    threading.Thread(target=op_work, daemon=True).start()
-                addm.bind(on_press=lambda inst: do_op("add"))
-                adda.bind(on_press=lambda inst: do_op("admin_add"))
-                for h in sorted(set(mods) | set(admins)):
-                    kind = ("admin" if h in admins else "mod")
-                    r = BoxLayout(size_hint_y=None, height=dp(26), spacing=4)
-                    r.add_widget(Label(text="%s %s" % (kind, h[:16]),
-                                       size_hint_x=0.7, halign="left",
-                                       valign="middle", font_size=sp(11)))
-                    rm = Button(text="remove", size_hint_x=None, width=70,
-                                size_hint_y=None, height=scaled(dp(26)),
-                                font_size=sp(10), pos_hint={"center_y": 0.5})
-                    rm.bind(on_press=lambda inst, hh=h, kk=kind: do_op(
-                        "admin_remove" if kk == "admin" else "remove", hh))
-                    r.add_widget(rm)
-                    grid.add_widget(r)
-            fetch(lambda: self.guild_api.admin_mods("list"), render)
-
-        def load_audit():
-            def render(res):
-                if not res.get("ok"):
-                    set_status("audit: %s" % res.get("error", "failed"))
-                    return
-                entries = res.get("entries") or []
-                grid.add_widget(Label(
-                    text="audit log (%d recent)" % len(entries),
-                    size_hint_y=None, height=dp(22), font_size=sp(12),
-                    color=(0.85, 0.87, 0.9, 1), halign="left", valign="middle"))
-                for e in entries:
-                    grid.add_widget(Label(
-                        text="%s  %s  %s" % (e.get("action", ""),
-                                             (e.get("target") or "")[:16],
-                                             (e.get("detail") or "")[:40]),
-                        size_hint_y=None, height=dp(22), font_size=sp(11),
-                        color=(0.8, 0.82, 0.86, 1), halign="left",
-                        valign="middle"))
-            fetch(lambda: self.guild_api.admin_audit(50), render)
-
-        def load_invites():
-            """Invite codes (U6b) — create, list, revoke."""
-            def render(res):
-                if not res.get("ok"):
-                    set_status("invites: %s" % res.get("error", "failed"))
-                    return
-                grid.add_widget(Label(
-                    text="invite codes (%d)" % len(res.get("invites") or []),
-                    size_hint_y=None, height=dp(22), font_size=sp(12),
-                    color=(0.85, 0.87, 0.9, 1), halign="left",
-                    valign="middle"))
-                row = BoxLayout(size_hint_y=None, height=dp(32), spacing=4)
-                label_in = TextInput(hint_text="label (optional)",
-                                     multiline=False, size_hint_x=0.45)
-                row.add_widget(label_in)
-                uses_in = TextInput(hint_text="max uses", multiline=False,
-                                    size_hint_x=0.2)
-                row.add_widget(uses_in)
-                exp_in = TextInput(hint_text="expires in s", multiline=False,
-                                   size_hint_x=0.2)
-                row.add_widget(exp_in)
-                mk = Button(text="create", size_hint_x=None, width=70,
-                            size_hint_y=None, height=scaled(dp(32)),
-                            font_size=sp(11), pos_hint={"center_y": 0.5})
-                row.add_widget(mk)
-                grid.add_widget(row)
-
-                def num(txt, default=0):
-                    try:
-                        return int((txt or "").strip() or default)
-                    except ValueError:
-                        return default
-
-                def do_create():
-                    # Read the widgets on the main thread; the worker must
-                    # not touch widget state.
-                    label = (label_in.text or "").strip()
-                    max_uses = num(uses_in.text)
-                    expires_in = num(exp_in.text)
-
-                    def work():
-                        try:
-                            r = self.guild_api.invites(
-                                "create", label=label,
-                                max_uses=max_uses,
-                                expires_in=expires_in)
-                        except Exception as ex:
-                            set_status("invites: %r" % ex)
-                            return
-                        if r.get("ok"):
-                            set_status("invite %s created" % r.get("code"))
-                            Clock.schedule_once(lambda dt: refresh(), 0)
-                        else:
-                            set_status("invites: %s" % r.get("error"))
-                    threading.Thread(target=work, daemon=True).start()
-                mk.bind(on_press=lambda inst: do_create())
-
-                for inv in res.get("invites") or []:
-                    ir = BoxLayout(size_hint_y=None, height=dp(26), spacing=4)
-                    expires = inv.get("expires_at") or 0
-                    exp_txt = "never" if not expires else time.strftime(
-                        "%Y-%m-%d %H:%M", time.localtime(expires))
-                    ir.add_widget(Label(
-                        text="%s  %s  uses %s/%s  exp %s" % (
-                            inv.get("code", ""), inv.get("label") or "-",
-                            inv.get("uses", 0),
-                            inv.get("max_uses") or "*", exp_txt),
-                        size_hint_x=0.8, halign="left", valign="middle",
-                        font_size=sp(10)))
-                    rm = Button(text="revoke", size_hint_x=None, width=70,
-                                size_hint_y=None, height=scaled(dp(26)),
-                                font_size=sp(10), pos_hint={"center_y": 0.5})
-
-                    def do_revoke(code=inv.get("code")):
-                        def work():
-                            try:
-                                r = self.guild_api.invites("revoke",
-                                                           code=code)
-                            except Exception as ex:
-                                set_status("invites: %r" % ex)
-                                return
-                            if r.get("ok"):
-                                set_status("revoked %s" % code)
-                                Clock.schedule_once(lambda dt: refresh(), 0)
-                            else:
-                                set_status("revoke: %s" % r.get("error"))
-                        threading.Thread(target=work, daemon=True).start()
-                    rm.bind(on_press=lambda inst: do_revoke())
-                    ir.add_widget(rm)
-                    grid.add_widget(ir)
-            fetch(lambda: self.guild_api.invites("list"), render)
-
-        views = [("config", load_config), ("moderators", load_mods),
-                 ("audit", load_audit), ("invites", load_invites)]
-        current = [0]
-
-        def show(idx):
-            current[0] = idx
-            # Invalidate any in-flight load from the previous tab so a slow
-            # response cannot append its rows to the newly-cleared grid.
-            load_gen[0] += 1
-            app = App.get_running_app()
-            active_bg = app.theme_colors['primary'] if app else (0.36, 0.41, 0.59, 1)
-            inactive_bg = app.theme_colors['sidebar_ctrl'] if app else (0.24, 0.26, 0.3, 1)
-            for i, btn in enumerate(tab_buttons):
-                btn.background_color = active_bg if i == idx else inactive_bg
-            grid.clear_widgets()
-            views[idx][1]()
-
-        def refresh():
-            """Reload the tab that is currently open."""
-            show(current[0])
-
-        tab_buttons = []
-        for i, (title, _) in enumerate(views):
-            app = App.get_running_app()
-            inactive_bg = app.theme_colors['sidebar_ctrl'] if app else (0.24, 0.26, 0.3, 1)
-            btn = Button(text=title, background_color=inactive_bg,
-                         size_hint_y=None, height=scaled(32),
-                         font_size=sp(12), pos_hint={"center_y": 0.5})
-            btn.bind(on_press=lambda inst, idx=i: show(idx))
-            tabs.add_widget(btn)
-            tab_buttons.append(btn)
-        show(0)
-        popup.open()
 
     def _open_join_prompt(self, on_done=None):
         """Join-code prompt (U6b): shown when the guild's registration
