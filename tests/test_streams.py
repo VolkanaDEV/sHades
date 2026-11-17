@@ -28,7 +28,7 @@ def check(name, cond, extra=""):
 # ---- harness -----------------------------------------------------------------------
 
 base = tempfile.mkdtemp(prefix="shades_streams_test_")
-sHades.db = sqlite3.connect(os.path.join(base, "sHades.db"))
+sHades.db = sqlite3.connect(os.path.join(base, "sHades.db"), check_same_thread=False)
 sHades.db.row_factory = sqlite3.Row
 sHades.db.executescript(sHades.SCHEMA)
 sHades._migrate_schema(sHades.db)

@@ -109,6 +109,19 @@ def main():
     data = bytes(range(256)) * 700          # ~175 KB, content known
     afname = sHades.store_attachment("big_note.txt", "text/plain", data)
     check("store_attachment returns a registered fname", bool(afname), afname)
+    # tier-1 gate (tay fork port): a stored attachment is readable only
+    # through a visible, non-deleted message. Mirror the shape ingest
+    # persists so this pin exercises the receive path, not the bare
+    # store primitive.
+    sHades.db.execute(
+        "INSERT INTO messages (msg_id, channel_id, ts, author_hash, content) "
+        "VALUES ('m_att', ?, 1.0, ?, 'with big note')",
+        (cid_chat, sHades.viewer_of(identity)))
+    sHades.db.execute(
+        "INSERT INTO attachments (msg_id, idx, name, mime, size, path) "
+        "VALUES ('m_att', 0, 'big_note.txt', 'text/plain', ?, ?)",
+        (len(data), afname))
+    sHades.db.commit()
     r0 = call("/api/v1/att/get", {"path": "/file/attachments/" + afname,
                                   "offset": 0, "len": 100000})
     r1 = call("/api/v1/att/get", {"path": "/file/attachments/" + afname,
