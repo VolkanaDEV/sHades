@@ -1125,6 +1125,12 @@ class ContextMenuMixin:
         self._open_ctx_menu(touch.ud.get("shades_ctx_pos")
                             or self.to_window(*self.center))
 
+    def _ctx_is_button(self):
+        # True when this widget is also ButtonBehavior-backed. Checked here
+        # and not at class definition so a non-kivy import (lint) survives.
+        from kivy.uix.behaviors.button import ButtonBehavior
+        return isinstance(self, ButtonBehavior)
+
     def on_touch_up(self, touch):
         clock = getattr(self, "_ctx_clock", None)
         if clock:
@@ -1134,8 +1140,30 @@ class ContextMenuMixin:
             # the long-press fired: swallow the corresponding up
             touch.ud["shades_ctx_fired"] = False
             touch.ungrab(self)
+            touch.ud["shades_ctx_up_done"] = True
             return True
-        return super().on_touch_up(touch)
+        if self._ctx_is_button() and self not in touch.ud:
+            # ButtonBehavior's on_touch_down was short-circuited (a child
+            # widget consumed the press), so only the mixin's grab entry
+            # exists. Forwarding this up would enter ButtonBehavior.on_touch_up
+            # through the grab pass without its down-state: `time() -
+            # self.__touch_time` at kivy/uix/behaviors/button.py:173 turns
+            # float - None (caught on-device as the 1137 crash; desktop asserts
+            # first). The consuming child receives its own up from its own
+            # grab entry, so swallowing here starves nothing.
+            touch.ungrab(self)
+            touch.ud["shades_ctx_up_done"] = True
+            return True
+        if touch.ud.get("shades_ctx_up_done"):
+            # The mixin grab plus ButtonBehavior's own grab put this widget in
+            # the touch's grab list twice, and kivy delivers the up once per
+            # entry (base.py post_dispatch_input). One release is the
+            # contract; the second delivery would double-fire on_release.
+            return True
+        result = super().on_touch_up(touch)
+        if result:
+            touch.ud["shades_ctx_up_done"] = True
+        return result
 
 
 if KIVY:
