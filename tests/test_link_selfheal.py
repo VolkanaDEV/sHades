@@ -192,6 +192,7 @@ def test_blob_upload_retries_timeout_then_posts():
     main_screen.ids = _Fakes()
     main_screen.ids.message_grid = object()
     main_screen.ids.msg_input = _Fakes()
+    main_screen.ids.msg_input.helper_text = None
 
     class _Root(object):
         def get_screen(self, *_a, **_k):
@@ -210,9 +211,11 @@ def test_blob_upload_retries_timeout_then_posts():
     class _API(object):
         link = object()  # plain stub: liveness unknown -> not dead
 
-        def blobs_put(self, name, mime, blob):
+        def blobs_put(self, name, mime, blob, on_progress=None):
             calls["blob"].append(name)
             calls["up_active"].append(app._up_active)
+            if on_progress is not None:
+                on_progress(100, 200)  # half done -> 50%
             if len(calls["blob"]) < 3:
                 return {"ok": 0, "error": "timeout"}
             return {"ok": 1, "blob_id": "b1"}
@@ -230,6 +233,12 @@ def test_blob_upload_retries_timeout_then_posts():
 
     real_threading = kc.threading
     real_time = kc.time
+    real_clock = kc.Clock
+
+    class _NowClock(object):
+        @staticmethod
+        def schedule_once(cb, dt=0):
+            cb(dt)
 
     import types as _t
 
@@ -249,12 +258,14 @@ def test_blob_upload_retries_timeout_then_posts():
     shim_time.sleep = lambda s: calls["sleep"].append(s)
     kc.threading = shim_threading
     kc.time = shim_time
+    kc.Clock = _NowClock
     try:
         app._send_with_attachment("hi", "f.bin", "application/octet-stream",
                                   b"data", kc.ATT_SERVER)
     finally:
         kc.threading = real_threading
         kc.time = real_time
+        kc.Clock = real_clock
 
     assert len(calls["blob"]) == 3, calls
     assert all(calls["up_active"]), "0.31.4 upload gate dropped on retry"
@@ -263,6 +274,16 @@ def test_blob_upload_retries_timeout_then_posts():
     assert calls["sleep"], "no backoff between retries"
     for s in calls["sleep"]:
         assert 0 < s <= 8.0, calls["sleep"]
+
+    # 0.31.10: the composer helper text must have shown the upload percent
+    # during the flow and be cleared when the message lands.
+    inp = main_screen.ids.msg_input
+
+    def seen_input():
+        return getattr(inp, "helper_text", None)
+
+    assert seen_input() == "", \
+        "composer not cleared after delivery: %r" % seen_input()
 
 
 def test_blob_retry_never_inlines_big_blob_on_timeout():
@@ -297,7 +318,7 @@ def test_blob_retry_never_inlines_big_blob_on_timeout():
     class _API(object):
         link = _DeadLink()
 
-        def blobs_put(self, name, mime, blob):
+        def blobs_put(self, name, mime, blob, on_progress=None):
             calls["blob"] += 1
             return {"ok": 0, "error": "timeout"}
 
@@ -392,7 +413,7 @@ def test_blob_linkdead_never_falls_through():
     class _API(object):
         link = object()  # plain stub: liveness unknown while retry rides
 
-        def blobs_put(self, name, mime, blob):
+        def blobs_put(self, name, mime, blob, on_progress=None):
             calls["blob"] += 1
             if calls["blob"] < 2:
                 return {"ok": 0, "error": "timeout"}

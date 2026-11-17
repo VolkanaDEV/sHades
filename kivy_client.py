@@ -6565,6 +6565,16 @@ class sHadesClientApp(MDApp):
                     Clock.schedule_once(
                         lambda dt, m=msg: self._set_status(m), 0)
 
+                def bstage(msg):
+                    # 0.31.10: stage onto the composer helper text -- the
+                    # only progress surface visible from inside a channel.
+                    Clock.schedule_once(
+                        lambda dt, m=msg: self._attach_composer_stage(m), 0)
+
+                def pstage(done, total):
+                    pct = int(100 * done / max(total, 1))
+                    bstage("attachment: uploading %s (%d%%)" % (name, pct))
+
                 # v1 path: upload the blob once, post by reference (no re-transfer
                 # on retry). Fall back to the legacy inline msgpack post when the
                 # guild predates /api/v1.
@@ -6577,19 +6587,24 @@ class sHadesClientApp(MDApp):
                 # retry the whole flow around the socket gap.
                 res = None
                 up = None
-                # 0.31.9 (boot_2 receipt 13:23:20): the gate must hold across
-                # the WHOLE retry window. Released between attempts, the
-                # keepalive reaper counted 3 misses and tore the guild link
-                # mid-retry ("guild link dead (3)"), so attempt 2 saw a dead
-                # link instead of the reconnected socket.
+                # 0.31.10 comment correction (boot_2 13:23:20 + boot_3
+                # 13:47:58 receipts): the "guild link dead (3)" during the
+                # window is the RNS link object reporting CLOSED -- the
+                # server's aftereffect of the SAF abort, ~15-25 s later --
+                # NOT our keepalive reaper (no "keepalive miss" lines fire
+                # while the gate is held). The gate's real job: keep OUR
+                # reaper from stacking a second tear, and hold the retry
+                # alive through the sleep so it lands on the re-established
+                # link (boot_3: the mp3 posted on attempt 2).
                 self._up_active = True
                 try:
                     for attempt in range(4):
-                        stage("attachment: uploading %s (%d KB)%s"
-                              % (name, len(blob) // 1024,
-                                 "" if attempt == 0 else " (attempt %d)" % (attempt + 1)))
+                        bstage("attachment: uploading %s (%d KB)%s"
+                               % (name, len(blob) // 1024,
+                                  "" if attempt == 0 else " (attempt %d)" % (attempt + 1)))
                         try:
-                            up = self.guild_api.blobs_put(name, mime, blob)
+                            up = self.guild_api.blobs_put(name, mime, blob,
+                                                          on_progress=pstage)
                         except Exception as e:
                             dlog("v1 blob path failed: %r" % (e,))
                             print("[TRACE] v1 blob path failed, falling back:",
@@ -6607,15 +6622,19 @@ class sHadesClientApp(MDApp):
                         if attempt < 3 and err == "timeout" and not dead:
                             # Only the receipted socket-gap timeout retries; a
                             # dead link is the re-establish path's job.
+                            bstage("attachment: waiting for the link (%s, "
+                                   "attempt %d) -- will not give up for "
+                                   "%d s" % (err, attempt + 1,
+                                             (3 - attempt) * 8))
                             time.sleep(8.0)
                             continue
-                        stage("attachment: upload failed (%s); link lost -- "
-                              "retry the attach" % err)
+                        bstage("attachment: upload failed (%s); link lost "
+                               "-- retry the attach" % err)
                         break
                 finally:
                     self._up_active = False
                 if up is not None and up.get("ok"):
-                    stage("attachment: blob ok, posting %s" % name)
+                    bstage("attachment: blob ok, posting %s" % name)
                     try:
                         res = self.guild_api.post_v1(
                             cid, text,
@@ -6630,10 +6649,8 @@ class sHadesClientApp(MDApp):
                         # receipted failure mode).
                         dlog("post_v1 raised after blob ok: %r" % (e,))
                         print("[TRACE] post_v1 raised after blob ok:", repr(e), flush=True)
-                        Clock.schedule_once(
-                            lambda dt, m=("attachment: %s uploaded, post failed "
-                                          "-- try again; blob may be reused")
-                            % name: self._set_status(m), 0)
+                        bstage("attachment: %s uploaded, post failed "
+                               "-- try again; blob may be reused" % name)
                         return
                 if res is None or not res.get("ok"):
                     # 0.31.9: the legacy inline post is the pre-/api/v1
@@ -6655,14 +6672,11 @@ class sHadesClientApp(MDApp):
                         # pre-v0.16 bug: a raise here killed the worker
                         # thread silently, leaving a spinner forever.
                         dlog("legacy attachment post raised: %r" % (e,))
-                        Clock.schedule_once(
-                            lambda dt, m="attach send failed: %s: %s"
-                            % (type(e).__name__, e): self._set_status(m), 0)
+                        bstage("attach send failed: %s: %s"
+                               % (type(e).__name__, e))
                         return
                 if res is None:
-                    Clock.schedule_once(
-                        lambda dt: self._set_status(
-                            "attach send failed: no response"), 0)
+                    bstage("attach send failed: no response")
                     return
                 print(
                     f"[TRACE] _send_with_attachment.work: post response "
@@ -6673,17 +6687,13 @@ class sHadesClientApp(MDApp):
                     f"ok={res.get('ok')} msg_id={res.get('msg_id')} "
                     f"attachment={res.get('attachment')}")
                 if not res.get("ok"):
-                    Clock.schedule_once(
-                        lambda dt, m="send failed: %s"
-                        % res.get("error", "unknown"): self._set_status(m), 0)
+                    bstage("send failed: %s" % res.get("error", "unknown"))
                     return
             except Exception as e:
                 import traceback
                 dlog("attachment send thread crashed: trace=%s"
                      % traceback.format_exc())
-                Clock.schedule_once(
-                    lambda dt, m="attachment send crashed: %s"
-                    % type(e).__name__: self._set_status(m), 0)
+                bstage("attachment send crashed: %s" % type(e).__name__)
                 return
             msg_id = res.get("msg_id")
             # The guild may ack with stored metadata (path) => server-stored.
@@ -6707,6 +6717,8 @@ class sHadesClientApp(MDApp):
                 main.ids.message_grid, m), 0)
             Clock.schedule_once(
                 lambda dt: setattr(main.ids.msg_input, "text", ""), 0)
+            # 0.31.10: the attach flow is done -- clear the progress channel.
+            Clock.schedule_once(lambda dt: self._attach_composer_stage(""), 0)
             self._add_to_history(m)
             self._save_history()
 
@@ -7402,6 +7414,19 @@ class sHadesClientApp(MDApp):
             lbl = ps.ids.get("profile_status")
             if lbl is not None:
                 lbl.text = str(text)
+        except Exception:
+            pass
+
+    def _attach_composer_stage(self, msg):
+        # 0.31.10 (tay's boot_3 receipt: "no 'uploading' animation"): the
+        # connect-screen status label is invisible from inside a channel,
+        # so the whole attach flow ran silent on his screen. The composer's
+        # helper text is the progress surface he actually sees: mirror
+        # every stage there (upload %, attempts, posting, failure).
+        self._set_status(msg)
+        try:
+            main = self.root.get_screen("main")
+            main.ids.msg_input.helper_text = msg
         except Exception:
             pass
 
