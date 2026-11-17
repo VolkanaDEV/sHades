@@ -1542,6 +1542,90 @@ class ChannelButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
 
 
 if KIVY:
+    class GuildRailButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
+        """Rail disc for one server (task 6): first-letter tile until an icon
+        path is ingested, active ring when selected, context menu with the
+        server actions. Icon files arrive through _ingest_guild_icon (the
+        whoami payload's blob id -> blob store -> local file)."""
+        display_name = StringProperty("")
+        icon_path = StringProperty("")
+        active = BooleanProperty(False)
+        index = NumericProperty(0)
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.orientation = "vertical"
+            self.size_hint = (None, None)
+            self.width = dp(56)
+            self.height = dp(60)
+            self.icon_widget = Image(size_hint=(None, None),
+                                     width=dp(44), height=dp(44),
+                                     allow_stretch=True, keep_ratio=True,
+                                     pos_hint={"center_x": 0.5})
+            self.letter_tile = Label(font_size=sp(20), bold=True,
+                                     pos_hint={"center_x": 0.5})
+            self.disc = Widget(size_hint=(None, None), size=(dp(48), dp(48)),
+                               pos_hint={"center_x": 0.5, "center_y": 0.5})
+            with self.disc.canvas.before:
+                self._bg_color = Color(rgba=self._rail_bg())
+                self._bg_ellipse = Ellipse(pos=(0, 0), size=(dp(48), dp(48)))
+            self._inner = BoxLayout(size_hint_y=None, height=dp(48),
+                                    padding=[dp(4)] * 2)
+            self._inner.add_widget(self.icon_widget)
+            self._inner.add_widget(self.letter_tile)
+            self.add_widget(self._inner)
+            self.bind(icon_path=self._apply_visual, active=self._apply_visual,
+                      display_name=self._apply_visual,
+                      size=self._sync_ellipse, pos=self._sync_ellipse)
+            self._apply_visual()
+
+        def _rail_bg(self):
+            app = App.get_running_app()
+            active = (app.theme_colors["primary"] if app
+                      else (0.36, 0.41, 0.59, 1))
+            idle = (app.theme_colors["sidebar_ctrl"] if app
+                    else (0.24, 0.26, 0.3, 1))
+            return list(active if self.active else idle) + [1]
+
+        def _sync_ellipse(self, *a):
+            x, y = self.disc.x, self.disc.y
+            w, h = self.disc.width, self.disc.height
+            self._bg_ellipse.pos = (x + dp(2), y + dp(2))
+            self._bg_ellipse.size = (w - dp(4), h - dp(4))
+
+        def _apply_visual(self, *a):
+            app = App.get_running_app()
+            self._bg_color.rgba = self._rail_bg()
+            if self.icon_path and os.path.isfile(self.icon_path):
+                self.icon_widget.source = self.icon_path
+                self.icon_widget.opacity = 1
+                self.letter_tile.opacity = 0
+            else:
+                self.icon_widget.source = ""
+                self.icon_widget.opacity = 0
+                self.letter_tile.text = (self.display_name or "S")[:1].upper()
+                self.letter_tile.color = (
+                    (1, 1, 1, 1) if self.active
+                    else (app.theme_colors["text"] if app else (0.9, 0.9, 0.9, 1)))
+                self.letter_tile.opacity = 1
+            self.letter_tile.font_size = sp(18)
+
+        def build_context_menu(self):
+            """open / copy invite / server settings (admins) / remove server."""
+            app = App.get_running_app()
+            name = self.display_name or ("server %d" % self.index)
+            actions = [("open " + name, True,
+                        lambda: app and app._select_server(self.index))]
+            if app and getattr(app, "guild_api", None):
+                actions.append(("copy invite link", True,
+                                lambda: app and app._copy_invite()))
+            if app and getattr(app, "i_am_admin", False):
+                actions.append(("server settings", True,
+                                lambda: app and app._open_admin_panel()))
+            actions.append(("remove server", True,
+                            lambda: app and app._remove_server(self.index)))
+            return actions
+
     class SitePage(BoxLayout):
         """One rendered micron page (site channels). bg_color paints the page
         canvas; the blocks are added as children by _render_site_page."""
@@ -2457,6 +2541,10 @@ class sHadesClientApp(MDApp):
                     entry["display_name"] = s["display_name"]
                 if avatar_path is None and s.get("avatar_path"):
                     entry["avatar_path"] = s["avatar_path"]
+                # rail icon state (task 6): an update must not wipe the icon
+                for key in ("icon_path", "icon_blob"):
+                    if s.get(key):
+                        entry[key] = s[key]
                 self._servers[i] = entry
                 self._active_server_idx = i
                 self._save_servers()
@@ -2656,7 +2744,7 @@ class sHadesClientApp(MDApp):
 
     # -- server sidebar ------------------------------------------------------
     def _refresh_server_sidebar(self):
-        """Populate the server grid with server buttons."""
+        """Populate the server grid with rail discs (task 6)."""
         try:
             main = self.root.get_screen("main")
             grid = main.ids.server_grid
@@ -2665,25 +2753,61 @@ class sHadesClientApp(MDApp):
         grid.clear_widgets()
         for idx, s in enumerate(self._servers):
             display_name = s.get("display_name", s.get("host", "Server"))
-            btn = Button(
-                text=display_name[:12],  # truncate long names
-                size_hint_y=None,
-                height=scaled(dp(48)),
-                font_size=sp(10),
-                background_color=(
-                    self.theme_colors['primary']
-                    if idx == self._active_server_idx
-                    else self.theme_colors['sidebar_ctrl']),
-                color=(
-                    self.theme_colors['btn_text']
-                    if idx == self._active_server_idx
-                    else self.theme_colors['text']),
-                halign='center',
-                valign='middle',
-            )
+            btn = GuildRailButton(display_name=display_name,
+                                  icon_path=s.get("icon_path") or "",
+                                  active=(idx == self._active_server_idx),
+                                  index=idx)
             btn.bind(on_press=lambda inst, i=idx: self._select_server(i))
-            btn.bind(size=lambda inst, val: setattr(inst, 'text_size', (inst.width, None)))
             grid.add_widget(btn)
+
+    def _ingest_guild_icon(self, blob_id, srv):
+        """whoami's guild icon (a blob id) -> blob store -> icons/<host>_<blob
+        head>.<ext> -> servers entry -> rail refresh. No-op when the server's
+        icon is already that blob; disk writes happen on the caller's worker
+        thread, only the widget refresh hops to the main thread."""
+        if not blob_id or not srv or not self.guild_api:
+            return
+        if srv.get("icon_blob") == blob_id and srv.get("icon_path"):
+            return  # unchanged
+        api = self.guild_api
+
+        def work():
+            try:
+                res = api.blobs_get(blob_id)
+            except Exception as e:
+                print("guild icon fetch failed:", repr(e))
+                return
+            if not res.get("ok"):
+                return
+            import base64 as _b64
+            raw = _b64.b64decode(res.get("data_b64") or b"")
+            if not raw:
+                return
+            ext = "png"
+            head = raw[:8]
+            if head == b"\x89PNG\r\n\x1a\n":
+                ext = "png"
+            elif raw[:2] == b"\xff\xd8":
+                ext = "jpg"
+            elif raw[:4] in (b"RIFF",):
+                ext = "webp"
+            try:
+                icons_dir = os.path.join(_app_data_dir(), "icons")
+                os.makedirs(icons_dir, exist_ok=True)
+                host = (srv.get("host") or "server").replace(":", "_")
+                path = os.path.join(
+                    icons_dir,
+                    "%s_%s.%s" % (host, blob_id[:12], ext))
+                with open(path, "wb") as f:
+                    f.write(raw)
+                srv["icon_blob"] = blob_id
+                srv["icon_path"] = path
+                self._save_servers()
+                Clock.schedule_once(
+                    lambda dt: self._refresh_server_sidebar(), 0)
+            except Exception as e:
+                print("guild icon save failed:", repr(e))
+        threading.Thread(target=work, daemon=True).start()
 
     def _select_server(self, idx):
         """Switch to a different server."""
@@ -4326,6 +4450,17 @@ class sHadesClientApp(MDApp):
                 self.i_am_moderator = bool(res.get("is_moderator"))
                 self.i_am_admin = bool(res.get("is_admin"))
                 self.my_roles = res.get("roles") or []
+                # task 6: the guild icon rides whoami; ingest it per server
+                guild = res.get("guild") or {}
+                icon_blob = (guild.get("icon") or "").strip()
+                if icon_blob:
+                    idx = self._active_server_idx
+                    if 0 <= idx < len(self._servers):
+                        srv = self._servers[idx]
+                        if srv.get("icon_blob") != icon_blob:
+                            Clock.schedule_once(
+                                lambda dt: self._ingest_guild_icon(
+                                    icon_blob, srv), 0)
         threading.Thread(target=work, daemon=True).start()
 
     def _can_manage_roles(self):
