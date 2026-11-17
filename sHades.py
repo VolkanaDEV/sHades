@@ -196,7 +196,7 @@ CREATE TABLE IF NOT EXISTS server_config (
 CREATE TABLE IF NOT EXISTS invites (
     code TEXT PRIMARY KEY, label TEXT, created_at REAL, expires_at REAL,
     max_uses INTEGER NOT NULL DEFAULT 0, uses INTEGER NOT NULL DEFAULT 0,
-    created_by TEXT);
+    created_by TEXT, channel_id TEXT);
 CREATE TABLE IF NOT EXISTS guild_joins (
     user_hash TEXT PRIMARY KEY, joined_at REAL, code TEXT);
 CREATE INDEX IF NOT EXISTS idx_reactions_msg ON reactions(msg_id);
@@ -214,6 +214,9 @@ def _migrate_schema(conn):
                       ("topic", "TEXT"), ("position", "INTEGER NOT NULL DEFAULT 0")):
         if col not in have:
             conn.execute("ALTER TABLE channels ADD COLUMN %s %s" % (col, decl))
+    have_inv = {r["name"] for r in conn.execute("PRAGMA table_info(invites)").fetchall()}
+    if "channel_id" not in have_inv:
+        conn.execute("ALTER TABLE invites ADD COLUMN channel_id TEXT")
 
 def open_db(path):
     conn = sqlite3.connect(path, check_same_thread=False)
@@ -3302,12 +3305,18 @@ def api_v1_join(viewer, data, link_id):
                 "policy": policy}
     if not required:
         # open guild: joining is implicit, but still record it so the state
-        # is consistent if the policy is tightened later
+        # is consistent if the policy is tightened later. A channel-targeted
+        # code still resolves its landing channel in an open guild.
+        channel_id = None
         with db_lock:
             db.execute("INSERT OR IGNORE INTO guild_joins (user_hash, joined_at, "
-                       "code) VALUES (?, ?, ?)", (viewer, now(), ""))
+                       "code) VALUES (?, ?, ?)", (viewer, now(), code))
             db.commit()
-        return {"ok": 1, "required": False, "joined": True, "policy": policy}
+            row = db.execute("SELECT channel_id FROM invites WHERE code=?",
+                             (code,)).fetchone()
+            channel_id = (row["channel_id"] or None) if row else None
+        return {"ok": 1, "required": False, "joined": True, "policy": policy,
+                "channel_id": channel_id}
     if not re.match(r"^[A-Z0-9]{6,16}$", code):
         return {"ok": 0, "error": "invalid code", "code": 400}
     with db_lock:
@@ -3323,7 +3332,11 @@ def api_v1_join(viewer, data, link_id):
                    "code) VALUES (?, ?, ?)", (viewer, now(), code))
         db.commit()
     _audit(viewer, "join", None, "code=%s" % code)
-    return {"ok": 1, "required": True, "joined": True, "policy": policy}
+    with db_lock:
+        row = db.execute("SELECT channel_id FROM invites WHERE code=?",
+                         (code,)).fetchone()
+    return {"ok": 1, "required": True, "joined": True, "policy": policy,
+            "channel_id": (row["channel_id"] or None) if row else None}
 
 @api_route("/api/v1/invites")
 @wrap_json_api
@@ -3342,7 +3355,8 @@ def api_v1_invites(viewer, data, link_id):
         return {"ok": 1, "invites": [
             {"code": r["code"], "label": r["label"], "created_at": r["created_at"],
              "expires_at": r["expires_at"], "max_uses": r["max_uses"],
-             "uses": r["uses"], "created_by": r["created_by"]} for r in rows]}
+             "uses": r["uses"], "created_by": r["created_by"],
+             "channel_id": r["channel_id"] or None} for r in rows]}
     if op == "create":
         try:
             max_uses = int(data.get("max_uses", 0))
@@ -3355,19 +3369,27 @@ def api_v1_invites(viewer, data, link_id):
         if expires_in < 0 or expires_in > 60 * 60 * 24 * 30:
             return {"ok": 0, "error": "expires_in must be 0-2592000", "code": 400}
         label = str(data.get("label") or "")[:64]
+        # optional channel target: the joiner is told which channel to open
+        channel = data.get("channel")
+        if channel:
+            with db_lock:
+                if not db.execute("SELECT 1 FROM channels WHERE id=?",
+                                  (channel,)).fetchone():
+                    return {"ok": 0, "error": "unknown channel", "code": 400}
         code = _new_invite_code()
         with db_lock:
             if db.execute("SELECT 1 FROM invites WHERE code=?", (code,)).fetchone():
                 code = _new_invite_code()
             expires_at = (now() + expires_in) if expires_in else 0
             db.execute("INSERT INTO invites (code, label, created_at, "
-                       "expires_at, max_uses, uses, created_by) "
-                       "VALUES (?, ?, ?, ?, ?, 0, ?)",
-                       (code, label, now(), expires_at, max_uses, viewer))
+                       "expires_at, max_uses, uses, created_by, channel_id) "
+                       "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+                       (code, label, now(), expires_at, max_uses, viewer,
+                        channel or None))
             db.commit()
         _audit(viewer, "invite.create", code, label)
         return {"ok": 1, "code": code, "label": label, "max_uses": max_uses,
-                "expires_at": expires_at}
+                "expires_at": expires_at, "channel_id": channel or None}
     if op == "revoke":
         code = (data.get("code") or "").strip().upper()
         if not re.match(r"^[A-Z0-9]{6,16}$", code):
