@@ -731,6 +731,32 @@ def test_resume_heal_rebuilds_lxmf_and_dead_links():
         kc.Clock = real_clock
 
 
+def test_channel_management_gates_and_kinds():
+    """v0.31.6 founder/channel work: the create-gate mirrors the server's
+    MANAGE_CHANNEL|ADMIN rule, and the kind chooser carries exactly tay's
+    three kinds (text / site (micron) / text stream -> chat / site / term)."""
+
+    kind_map = dict(kc.sHadesClientApp.CHANNEL_KIND_LABELS)
+    check("kind chooser: exactly tay's three kinds",
+          kind_map == {"text": "chat", "site (micron)": "site",
+                       "text stream": "term"}, kind_map)
+
+    class _App(object):
+        i_am_admin = False
+        my_roles = []
+        PERM_MANAGE_CHANNEL = 8
+        PERM_ADMIN = 32
+        _can_create_channels = kc.sHadesClientApp._can_create_channels
+
+    app = _App()
+    check("no powers: create gate closed", app._can_create_channels() is False)
+    app.my_roles = [{"perms": 8}]
+    check("MANAGE_CHANNEL role: gate open", app._can_create_channels() is True)
+    app.my_roles = [{"perms": 0}]
+    app.i_am_admin = True
+    check("admin flag: gate open", app._can_create_channels() is True)
+
+
 def main():
     for fn in (test_display_name_preserved,
                test_update_applied_once,
@@ -744,7 +770,8 @@ def main():
                test_periodic_dm_announce,
                test_dm_announce_interval_sane,
                test_keepalive_miss_not_counting_during_upload,
-               test_resume_heal_rebuilds_lxmf_and_dead_links):
+               test_resume_heal_rebuilds_lxmf_and_dead_links,
+               test_channel_management_gates_and_kinds):
         try:
             fn()
         except Exception as e:

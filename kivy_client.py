@@ -1533,6 +1533,9 @@ class ChannelButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
         cid = app._channels.get(name) if app else None
         actions = [("open #" + name, True,
                     lambda: app and app._switch_channel(name))]
+        if app and app._can_create_channels():
+            actions.append(("create channel...", True,
+                            lambda: app and app._open_create_channel_popup()))
         if cid:
             actions.append(("copy channel id", True,
                             lambda: app and app._copy_text(cid)))
@@ -4282,6 +4285,96 @@ class sHadesClientApp(MDApp):
         return any(r.get("perms", 0) & (self.PERM_MANAGE_ROLES |
                                         self.PERM_ADMIN)
                    for r in self.my_roles)
+
+    # tay (channel kinds): "Channels can be text, site (micron pages), or
+    # a text stream." Server CHANNEL_KINDS keys are stable ("chat", "site",
+    # "term") — existing channels keep working; the labels are the user's
+    # words. "term" IS the text-stream channel: text arrives as live
+    # pushed rows, no chat framing.
+    CHANNEL_KIND_LABELS = (
+        ("text", "chat"),
+        ("site (micron)", "site"),
+        ("text stream", "term"),
+    )
+
+    def _can_create_channels(self):
+        """UI gate: any of my roles carries MANAGE_CHANNEL or ADMIN (the
+        Founder role carries both; server enforces the same bits)."""
+        return bool(self.i_am_admin) or any(
+            r.get("perms", 0) & (self.PERM_MANAGE_CHANNEL | self.PERM_ADMIN)
+            for r in self.my_roles)
+
+    def _open_create_channel_popup(self):
+        """Add a channel (text / site / text stream) -- the add half of
+        tay's "the creator should be able to add/delete channels". The
+        delete half already exists in the channel context menu. Server
+        enforces MANAGE_CHANNEL/ADMIN; a successful create lands in the
+        sidebar through the channels_changed push."""
+        if not self.guild_api or not self._can_create_channels():
+            return
+        box = BoxLayout(orientation="vertical", spacing=4, padding=4)
+        title = Label(text="new channel", size_hint_y=None, height=22)
+        box.add_widget(title)
+        name_in = TextInput(hint_text="channel name (a-z 0-9 _ -)",
+                            multiline=False)
+        box.add_widget(name_in)
+        kind_box = BoxLayout(size_hint_y=None, height=scaled(30), spacing=4)
+        box.add_widget(kind_box)
+        kind_state = ["chat"]  # chosen server kind
+        kind_btns = {}
+
+        def make_pick(mine):
+            def pick(_btn):
+                kind_state[0] = mine
+                for key, cb in kind_btns.items():
+                    cb.background_color = ((0.2, 0.35, 0.2, 1) if key == mine
+                                           else (0.2, 0.2, 0.25, 1))
+            return pick
+
+        for label, k in self.CHANNEL_KIND_LABELS:
+            btn = Button(text=label, font_size=sp(13),
+                         background_color=((0.2, 0.35, 0.2, 1) if k == "chat"
+                                           else (0.2, 0.2, 0.25, 1)))
+            kind_btns[k] = btn
+            btn.bind(on_press=make_pick(k))
+            kind_box.add_widget(btn)
+        create_btn = Button(text="create", size_hint_y=None, height=scaled(30),
+                            font_size=sp(14))
+        box.add_widget(create_btn)
+        close = Button(text="close", size_hint_y=None, height=scaled(28))
+        box.add_widget(close)
+        popup = Popup(title="create channel", content=box,
+                      size_hint=(0.7, 0.5))
+        self._popup = popup
+
+        def do_create(_btn):
+            name = (name_in.text or "").strip()
+            if not name:
+                self._show_notice("channel name required")
+                return
+            kind = kind_state[0]
+
+            def work():
+                try:
+                    res = self.guild_api.channels_create(name, kind)
+                except Exception as e:
+                    err = "create: %r" % e
+                    Clock.schedule_once(
+                        lambda dt: self._show_notice(err), 0)
+                    return
+                ok = res.get("ok")
+                err = res.get("error", "failed")
+                Clock.schedule_once(
+                    lambda dt: ((popup.dismiss(),
+                                 self._set_status("#%s created" % name))
+                                if ok else
+                                self._show_notice("create: %s" % err)), 0)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        create_btn.bind(on_press=do_create)
+        close.bind(on_press=lambda _b: popup.dismiss())
+        popup.open()
 
     def _open_roles_popup(self, target_hash, target_name):
         """Role manager (U5): list roles, toggle assignment for one user,
@@ -7178,6 +7271,10 @@ class sHadesClientApp(MDApp):
                     except Exception:
                         pass
                     self._set_status("Profile saved: %s" % new_name)
+                # v0.31.6: a register can grant the Founder role (first
+                # member of a server) — refresh the role view so the
+                # channel-management affordances appear without a restart.
+                self._fetch_whoami()
                 Clock.schedule_once(apply, 0)
             else:
                 def fail(dt):
