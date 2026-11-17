@@ -13,8 +13,7 @@ import sys
 import tempfile
 import shutil
 
-os.environ.setdefault("KIVY_GL_BACKEND", "mock")
-os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+# Use the real SDL window on DISPLAY (including CI's Xvfb).
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

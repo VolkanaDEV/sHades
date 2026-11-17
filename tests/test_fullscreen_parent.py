@@ -7,8 +7,7 @@ ScreenManager which rejects non-Screen children
 parented to the current screen instead.
 """
 import os
-os.environ.setdefault("KIVY_GL_BACKEND", "mock")
-os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+# Use the real SDL window on DISPLAY (including CI's Xvfb).
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

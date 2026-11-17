@@ -17,8 +17,7 @@ save / add-mod paths resolve `refresh` without raising NameError.
 import os
 import sys
 
-os.environ.setdefault("KIVY_GL_BACKEND", "mock")
-os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+# Use the real SDL window on DISPLAY (including CI's Xvfb).
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -87,7 +86,6 @@ def main():
     from kivy.clock import Clock
     from kivy.lang import Builder
     from kivy.uix.button import Button
-    from kivy.uix.popup import Popup
 
     Builder.load_file(os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

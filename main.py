@@ -156,8 +156,8 @@ def main():
                 f.write("\n--- TRACEBACK ---\n" + tb)
         except Exception:
             pass
-        # Keep process alive so the on-screen console can be read.
-        time.sleep(30)
+        # Show the traceback immediately; the console itself remains open
+        # for five minutes. A delay here left a blank screen after a crash.
         _show_on_screen(tb)
         sys.exit(1)
 

@@ -22,8 +22,7 @@ import os
 import re
 import sys
 
-os.environ.setdefault("KIVY_GL_BACKEND", "mock")
-os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+# Use the real SDL window on DISPLAY (including CI's Xvfb).
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -79,14 +78,12 @@ def main():
         print("SKIP  Kivy not available")
         return 0
 
-    from kivy.lang import Builder
-    from kivy.metrics import dp
-
     # KV rules read app.theme_colors[...], which resolves through
     # App.get_running_app(); the KV proxy also calls app.bind(). With no app
     # running, building any themed widget raises
     # "'NoneType' object has no attribute 'bind'". sHadesClientApp is an MDApp
     # (KivyMD widgets refuse to build under a plain kivy.app.App), so use it.
+
     class _ThemeApp(kc.sHadesClientApp):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)

@@ -21,8 +21,7 @@ import functools
 import tempfile
 import base64
 
-os.environ.setdefault("KIVY_GL_BACKEND", "mock")
-os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+# Use the real SDL window on DISPLAY (including CI's Xvfb).
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -308,9 +307,15 @@ def main():
     kc.sHadesClientApp._render_message(app6, grid6, m6)
     row6 = grid6.children[0]
     deadline = time.time() + 5
+    saved = None
     while time.time() < deadline:
         Clock.tick()
-        if len(row6.ids.embed_container.children) == 1:
+        if os.path.isdir(app6._attach_dir):
+            for nm in os.listdir(app6._attach_dir):
+                if "big" in nm:
+                    saved = os.path.join(app6._attach_dir, nm)
+        if (saved and len(app6.guild_api.att_calls) >= 2
+                and len(row6.ids.embed_container.children) == 1):
             break
         time.sleep(0.02)
     check("large attachment walks att_get slice by slice",
@@ -318,11 +323,6 @@ def main():
           and app6.guild_api.att_calls[0][1] == 0
           and app6.guild_api.att_calls[1][1] == 100000,
           repr(app6.guild_api.att_calls))
-    saved = None
-    if os.path.isdir(app6._attach_dir):
-        for nm in os.listdir(app6._attach_dir):
-            if "big" in nm:
-                saved = os.path.join(app6._attach_dir, nm)
     check("chunked fetch assembles the full payload, byte-equal",
           bool(saved) and open(saved, "rb").read() == big,
           ("no saved file" if not saved else "mismatch"))
