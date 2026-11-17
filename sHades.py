@@ -2884,7 +2884,23 @@ def api_v1_term_close(viewer, data, link_id):
 # ---- receipts, reactions, search (phase 6) -----------------------------------------
 
 _EMOJI_RE = re.compile(r"^[a-z0-9_+\-]{1,16}$")
-MAX_EMOJI_PER_MSG = 16   # distinct shortcodes per message
+# Unicode emoji gate: BMP symbols (arrows/misc/dingbats incl 2705/2764) and
+# supplementary-plane atoms (1F000-1FAFF), with variation selectors / ZWJs as
+# joiners between-or-after atoms only. NOTE the 8-digit \U escapes: \u1F000
+# in a regex class is five hex digits (\u1F00 + "00"), which silently widens
+# the class to every codepoint below U+1FAF — accepted letters and punctuation.
+_EMOJI_CORE_RE = re.compile(
+    r"^(?:[\u2190-\u2BFF\U0001F000-\U0001FAFF]"
+    r"(?:[\uFE0F\u200D]*[\u2190-\u2BFF\U0001F000-\U0001FAFF])*)"
+    r"[\uFE0F\u200D]*$")
+MAX_EMOJI_PER_MSG = 16   # distinct shortcodes/emoji per message
+
+def _emoji_ok(emoji):
+    """"+1" and friends; or unicode emoji atoms with ZWJ/VS joiners;
+    byte-capped so nothing absurd reaches the PK column."""
+    if _EMOJI_RE.match(emoji):
+        return True
+    return len(emoji.encode("utf-8")) <= 32 and bool(_EMOJI_CORE_RE.match(emoji))
 
 def _receipt_last_id(cid, viewer):
     with db_lock:
@@ -2929,12 +2945,14 @@ def api_v1_receipts(viewer, data, link_id):
 @api_route("/api/v1/react")
 @wrap_json_api
 def api_v1_react(viewer, data, link_id):
-    """Toggle a reaction (one emoji per user per message). Emoji are ASCII
-    shortcodes ('+1', 'laugh', ...), never raw unicode from the wire."""
+    """Toggle a reaction (one emoji per user per message). Emoji are unicode
+    emoji characters (BMP symbols, supplementary plane, ZWJ composites) or
+    legacy ASCII shortcodes ('+1', 'laugh', ...) for older rows."""
     msg_id = data.get("msg")
     emoji = (data.get("emoji") or "").strip().lower()
-    if not _EMOJI_RE.match(emoji):
-        return {"ok": 0, "error": "emoji must be a shortcode (a-z0-9_+-)", "code": 400}
+    if not _emoji_ok(emoji):
+        return {"ok": 0, "error": "emoji must be an emoji or a shortcode (a-z0-9_+-)",
+                "code": 400}
     with db_lock:
         row = db.execute("SELECT channel_id, deleted_at FROM messages WHERE msg_id=?",
                          (msg_id,)).fetchone()
