@@ -3055,6 +3055,24 @@ class sHadesClientApp(MDApp):
 
         return None
 
+    _DMA_INTERVAL = 300.0  # seconds between client lxmf.delivery re-announces
+
+    def _announce_dm_once(self):
+        if self.lxmf_router and self.lxmf_delivery:
+            try:
+                self.lxmf_router.announce(self.lxmf_delivery.hash)
+            except Exception as e:
+                print("announce failed:", repr(e))
+        return True
+
+    def _dm_announce_loop(self):
+        # Runs on a daemon thread started by _init_identity_and_lxmf; the
+        # router and delivery destination persist across reconnects, so
+        # the loop only dies with the process. See v0.31.3 comment there.
+        while True:
+            time.sleep(self._DMA_INTERVAL)
+            self._announce_dm_once()
+
     def _init_identity_and_lxmf(self):
         """Main thread only: build the client identity, the lxmf.delivery
         destination and the LXMRouter.
@@ -3114,6 +3132,14 @@ class sHadesClientApp(MDApp):
                 self.lxmf_router.register_delivery_callback(self._on_dm_delivery)
                 # announce now so friends can hear our lxmf.delivery
                 self.lxmf_router.announce(self.lxmf_delivery.hash)
+                # v0.31.3: periodic re-announce (RNS practice for changing
+                # topologies). Mobile clients churn: reconnects change the
+                # hub-side interface and paths back to us age out, and a
+                # boot-time announce alone goes stale over a long session.
+                # The hub hears our delivery destination every _DMA_INTERVAL
+                # seconds, which also gives the server side a periodic
+                # liveness receipt per client.
+                threading.Thread(target=self._dm_announce_loop, daemon=True).start()
             except Exception as e:
                 print("LXMF router init failed (DMs disabled):", repr(e))
                 self.lxmf_router = None

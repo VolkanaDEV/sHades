@@ -543,6 +543,47 @@ def test_blobs_put_mobile_receipts():
           n_calls <= 11, (up3.get("phase"), n_calls))
 
 
+class _FakeRouter(object):
+    def __init__(self):
+        self.hash = b"delivery-hash"
+        self.announce_calls = 0
+
+    def announce(self, destination_hash=None, **kwargs):
+        assert destination_hash == self.hash, destination_hash
+        self.announce_calls += 1
+
+
+def test_periodic_dm_announce():
+    """v0.31.3: the client re-announces its lxmf.delivery destination on a
+    periodic _DMA_INTERVAL timer (RNS practice for changing topologies --
+    mobile churn and reconnects age out hub-side paths); one boot announce
+    (kivy_client.py, _init_identity_and_lxmf) is not enough for long
+    sessions. Pins: a router with a registered delivery destination gets
+    announce() called exactly on that hash, and nothing fires when no
+    router/delivery exists."""
+
+    class _App(object):
+        lxmf_router = None
+        lxmf_delivery = None
+        _DMA_INTERVAL = kc.sHadesClientApp._DMA_INTERVAL
+        _announce_dm_once = kc.sHadesClientApp._announce_dm_once
+
+    app = _App()
+    app.lxmf_router = _FakeRouter()
+    app.lxmf_delivery = app.lxmf_router
+    assert app._announce_dm_once() is True
+    assert app.lxmf_router.announce_calls == 1, app.lxmf_router.announce_calls
+
+    # missing router -> silent no-op, no exception
+    app.lxmf_router, app.lxmf_delivery = None, None
+    assert app._announce_dm_once() is True
+
+
+def test_dm_announce_interval_sane():
+    interval = kc.sHadesClientApp._DMA_INTERVAL
+    assert 60 <= interval <= 3600, interval
+
+
 def main():
     for fn in (test_display_name_preserved,
                test_update_applied_once,
@@ -552,7 +593,9 @@ def main():
                test_blobs_put_mobile_receipts,
                test_admin_panel_not_blocking,
                test_roles_popup_not_blocking,
-               test_shutdown_not_blocking):
+               test_shutdown_not_blocking,
+               test_periodic_dm_announce,
+               test_dm_announce_interval_sane):
         try:
             fn()
         except Exception as e:
