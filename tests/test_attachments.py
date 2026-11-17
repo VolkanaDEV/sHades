@@ -159,6 +159,10 @@ class StubApp:
             kivy_client.sHadesClientApp._refresh_avatar, self)
         self._add_loading_placeholder = functools.partial(
             kivy_client.sHadesClientApp._add_loading_placeholder, self)
+        # the placeholder wording classifier (staticmethod, per tay's
+        # 'loading image' for mp3's receipt)
+        self._loading_placeholder_text = (
+            kivy_client.sHadesClientApp._loading_placeholder_text)
         self._remove_placeholder = functools.partial(
             kivy_client.sHadesClientApp._remove_placeholder, self)
         # _render_message() ends by calling this to draw the reaction summary
@@ -329,6 +333,21 @@ def main():
     check("large attachment renders its embed",
           len(row6.ids.embed_container.children) == 1,
           "%d embeds in row6" % len(row6.ids.embed_container.children))
+
+    # tay v0.31.10 receipt: 'loading image' shown for mp3's -- the wording
+    # tracks the extension now
+    check("loading placeholder wording tracks the attachment kind",
+          app._loading_placeholder_text("taylor track.mp3") == "[loading audio…]"
+          and app._loading_placeholder_text("clip.webm") == "[loading video…]"
+          and app._loading_placeholder_text("cat.jpg") == "[loading image…]"
+          and app._loading_placeholder_text("notes.pdf") == "[loading file…]"
+          and app._loading_placeholder_text("") == "[loading file…]",
+          "mp3=%r webm=%r jpg=%r pdf=%r none=%r" % (
+              app._loading_placeholder_text("taylor track.mp3"),
+              app._loading_placeholder_text("clip.webm"),
+              app._loading_placeholder_text("cat.jpg"),
+              app._loading_placeholder_text("notes.pdf"),
+              app._loading_placeholder_text("")))
 
     print()
     print("%d passed, %d failed" % (len(PASS), len(FAIL)))

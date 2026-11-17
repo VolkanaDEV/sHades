@@ -4404,7 +4404,7 @@ class sHadesClientApp(MDApp):
             dlog("_fetch_attachment: no path, skipping")
             return
 
-        self._add_loading_placeholder(row)
+        self._add_loading_placeholder(row, name)
 
         def work():
             print(f"[TRACE] _fetch_attachment.work: fetching {path}", flush=True)
@@ -5909,14 +5909,29 @@ class sHadesClientApp(MDApp):
         return None
 
     # -- attachments: server-stored vs ephemeral (P2P) -------------------
-    def _add_loading_placeholder(self, row):
+    @staticmethod
+    def _loading_placeholder_text(name):
+        """Match tay's v0.31.10 receipt ('loading image' for mp3's): say
+        what the row is actually loading, judged by extension. Images keep
+        the original wording; everything else gets its own word."""
+        ext = (name.rsplit(".", 1)[-1].lower()
+               if (name or "").count(".") else "")
+        if ext in ("mp3", "wav", "ogg", "flac", "m4a", "opus", "aac", "wma"):
+            return "[loading audio…]"
+        if ext in ("mp4", "mov", "webm", "mkv", "avi"):
+            return "[loading video…]"
+        if ext in ("png", "jpg", "jpeg", "gif", "webp", "bmp"):
+            return "[loading image…]"
+        return "[loading file…]"
+
+    def _add_loading_placeholder(self, row, name=""):
         """Show a loading placeholder in the row's embed container."""
         print(
             f"[TRACE] _add_loading_placeholder: "
             f"row={row.msg_id[:12] if row.msg_id else '?'}", flush=True)
         dlog(f"_add_loading_placeholder: row={row.msg_id[:12] if row.msg_id else '?'}")
         lbl = Label(
-            text=ATT_PLACEHOLDER_TEXT,
+            text=self._loading_placeholder_text(name),
             size_hint_y=None,
             height=dp(200),
             color=(0.7, 0.73, 0.77, 1),
