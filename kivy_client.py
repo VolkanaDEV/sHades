@@ -2823,6 +2823,28 @@ class sHadesClientApp(MDApp):
         popup = Popup(title="", content=box, size_hint=(0.8, 0.75), auto_dismiss=False)
         popup.open()
 
+    @staticmethod
+    def _wait_path_mtu(nh, tries=15):
+        """Wait for a next-hop interface that exposes its hardware MTU.
+
+        0.31.8 (boot.log receipt): a re-establish right after an interface
+        abort ran against an invalidated path. RNS then signs the DEFAULT
+        link MTU (500 B) instead of the interface's 8192, and the server
+        confirms it ("Destination confirmed link MTU of 500 B"); resources
+        fail on such links ("Sending request ... failed with status: 07").
+        The hub re-announces every ~10 s, so a short bounded wait restores
+        full-MTU links after every abort.
+
+        Returns True when a live MTU-signalling path exists, False after
+        `tries` seconds (callers proceed regardless -- never worse than
+        the old unconditional establish).
+        """
+        for _ in range(tries):
+            if RNS.Transport.next_hop_interface_hw_mtu(nh) is not None:
+                return True
+            time.sleep(1.0)
+        return False
+
     def _establish_guild_link(self):
         """Establish the RNS link to the guild node; up to 3 attempts.
 
@@ -2838,6 +2860,7 @@ class sHadesClientApp(MDApp):
             raise RuntimeError(
                 "RNS does not know identity for node_hash %s — "
                 "the guild's announce was not heard yet. Try again." % self.guild_node_hash)
+        self._wait_path_mtu(nh)
         link = None
         for attempt in range(3):
             nd = RNS.Destination(nid, RNS.Destination.OUT,
@@ -3087,6 +3110,14 @@ class sHadesClientApp(MDApp):
         retries here on every resume instead of disabling DMs for good.
         """
         if self.client_identity is None:
+            return
+        if self.lxmf_router is not None and self.lxmf_delivery is not None:
+            # 0.31.8 (boot.log receipt): the resume heal fires exactly when
+            # tay returns from a SAF pick -- while the FIRST router is still
+            # healthy. Rebuilding then raised KeyError('Attempt to register
+            # an already registered destination.') and the except nulled the
+            # router: the healer itself disabled DMs for the rest of the
+            # session, on every pick. A healthy router needs no repair.
             return
         try:
             import LXMF
@@ -6537,32 +6568,75 @@ class sHadesClientApp(MDApp):
                 # v1 path: upload the blob once, post by reference (no re-transfer
                 # on retry). Fall back to the legacy inline msgpack post when the
                 # guild predates /api/v1.
+                # 0.31.8 (boot.log receipt): the SAF picker stop aborts the TCP
+                # interface ([Errno 103]) for ~5 s; RNS silently reconnects, but
+                # a chunk request already in flight is lost and blobs_put
+                # reports "timeout". One shot meant every attach died there,
+                # then fell through to the legacy inline post, which also
+                # failed. Chunk uploads are idempotent (offset-addressed), so
+                # retry the whole flow around the socket gap.
                 res = None
-                try:
-                    stage("attachment: uploading %s (%d KB)"
-                          % (name, len(blob) // 1024))
-                    self._up_active = True
+                up = None
+                for attempt in range(4):
+                    stage("attachment: uploading %s (%d KB)%s"
+                          % (name, len(blob) // 1024,
+                             "" if attempt == 0 else " (attempt %d)" % (attempt + 1)))
                     try:
-                        up = self.guild_api.blobs_put(name, mime, blob)
-                    finally:
-                        self._up_active = False
+                        self._up_active = True
+                        try:
+                            up = self.guild_api.blobs_put(name, mime, blob)
+                        finally:
+                            self._up_active = False
+                    except Exception as e:
+                        dlog("v1 blob path failed: %r" % (e,))
+                        print("[TRACE] v1 blob path failed, falling back:",
+                              repr(e), flush=True)
+                        break
                     if up.get("ok"):
-                        stage("attachment: blob ok, posting %s" % name)
+                        break
+                    err = up.get("error", "unknown")
+                    print("[TRACE] blob upload attempt %d failed: %s"
+                          % (attempt + 1, err), flush=True)
+                    link = getattr(getattr(self, "guild_api", None), "link", None)
+                    dead = link is None or getattr(
+                        link, "status", None) not in (None, RNS.Link.ACTIVE)
+                    if attempt < 3 and err == "timeout" and not dead:
+                        # Only the receipted socket-gap timeout retries; a
+                        # dead link is the re-establish path's job.
+                        time.sleep(8.0)
+                        continue
+                    if err == "timeout":
+                        stage("attachment: upload timed out; link lost -- retry the attach")
+                    break
+                if up is not None and up.get("ok"):
+                    stage("attachment: blob ok, posting %s" % name)
+                    try:
                         res = self.guild_api.post_v1(
                             cid, text,
                             attachments=[{"name": name, "mime": mime,
                                           "blob_id": up["blob_id"]}])
                         dlog("send.post_v1 response: %r" % (res,))
-                    else:
-                        stage("attachment: blob failed (%s), legacy ..."
-                              % up.get("error", "unknown"))
-                        print("[TRACE] blob upload failed: %s"
-                              % up.get("error"), flush=True)
-                except Exception as e:
-                    dlog("v1 blob path failed: %r" % (e,))
-                    print("[TRACE] v1 blob path failed, falling back:",
-                          repr(e), flush=True)
+                    except Exception as e:
+                        # The blob itself is already uploaded; a raise here is
+                        # the link/receipt layer, not the upload. Do NOT fall
+                        # through to the legacy inline post (it would push the
+                        # full blob again over a flapping link -- the
+                        # receipted failure mode).
+                        dlog("post_v1 raised after blob ok: %r" % (e,))
+                        print("[TRACE] post_v1 raised after blob ok:", repr(e), flush=True)
+                        Clock.schedule_once(
+                            lambda dt, m=("attachment: %s uploaded, post failed "
+                                          "-- try again; blob may be reused")
+                            % name: self._set_status(m), 0)
+                        return
                 if res is None or not res.get("ok"):
+                    # 0.31.8: the legacy inline post is the pre-/api/v1
+                    # fallback only. With blobs retried above, a timeout
+                    # never reaches here; do not push a multi-megabyte
+                    # inline blob at a flapping link.
+                    if res is None and up is not None and not up.get("ok") \
+                            and up.get("error") == "timeout":
+                        return
                     try:
                         stage("attachment: posting inline %s ..." % name)
                         legacy = self.guild_api.post(
