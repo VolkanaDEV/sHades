@@ -6547,6 +6547,12 @@ class sHadesClientApp(MDApp):
         if cmd == "invite":
             self._copy_invite()
             return
+        if cmd == "commands":
+            # tay's palette correction: /commands opens the slash-command
+            # palette itself - the discovery surface for the dispatcher
+            # and any future bot/script verbs.
+            self.open_command_palette()
+            return
         if not self.guild_api:
             return
 
@@ -6562,7 +6568,7 @@ class sHadesClientApp(MDApp):
                 return
             out = res.get("output") or "(no output)"
             if cmd == "help":
-                out = ("client: /me /join /search /invite\n" + out)
+                out = ("client: /me /join /search /invite /commands\n" + out)
             Clock.schedule_once(lambda dt: self._show_notice(out), 0)
         threading.Thread(target=work, daemon=True).start()
 
