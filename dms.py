@@ -92,12 +92,22 @@ def load_dm_history(path):
             and e.get("dir") in ("in", "out")]
 
 
-def append_dm(path, direction, text, cap=HISTORY_CAP):
-    """Append one DM row atomically, trimming to the newest `cap` rows."""
+def append_dm(path, direction, text, cap=HISTORY_CAP, state=None):
+    """Append one DM row atomically, trimming to the newest `cap` rows.
+
+    state: optional delivery state for "out" rows (queued/delivered/
+    failed) — tier-2 delivery-state lane. Every stateful row carries a
+    uid so set_dm_state/remove_dm_row can find it across attempts.
+    """
     if direction not in ("in", "out"):
         raise ValueError("direction must be 'in' or 'out'")
     row = {"ts": __import__("time").time(), "dir": direction,
            "text": str(text)[:4000]}
+    if state:
+        if direction != "out":
+            raise ValueError("state applies only to 'out' rows")
+        row["state"] = str(state)
+        row["uid"] = __import__("uuid").uuid4().hex[:12]
     with _lock:
         d = os.path.dirname(path)
         if d:
@@ -110,3 +120,40 @@ def append_dm(path, direction, text, cap=HISTORY_CAP):
             json.dump(rows, f, indent=1)
         os.replace(tmp, path)
     return row
+
+
+def set_dm_state(path, uid, state):
+    """Update one stateful out-row's delivery state atomically.
+
+    No-op when uid has vanished (history trimmed/removed between the
+    send and the callback — the callback races are expected threads).
+    """
+    with _lock:
+        rows = load_dm_history(path)
+        hit = False
+        for row in rows:
+            if row.get("uid") == uid:
+                row["state"] = str(state)
+                hit = True
+                break
+        if not hit:
+            return False
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(rows, f, indent=1)
+        os.replace(tmp, path)
+    return True
+
+
+def remove_dm_row(path, uid):
+    """Remove one row (a replaced attempt, e.g. the retry path)."""
+    with _lock:
+        rows = load_dm_history(path)
+        kept = [row for row in rows if row.get("uid") != uid]
+        if len(kept) == len(rows):
+            return False
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(kept, f, indent=1)
+        os.replace(tmp, path)
+    return True

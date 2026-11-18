@@ -102,6 +102,35 @@ class TestDMHistory(unittest.TestCase):
         dms.append_dm(self.path, "out", "x" * 5000)
         self.assertEqual(len(dms.load_dm_history(self.path)[0]["text"]), 4000)
 
+    # tier-2 delivery-state lane
+
+    def test_state_row_carries_uid(self):
+        row = dms.append_dm(self.path, "out", "ping", state="queued")
+        self.assertTrue(row.get("uid"))
+        self.assertEqual(row.get("state"), "queued")
+        rows = dms.load_dm_history(self.path)
+        self.assertEqual(rows[0]["state"], "queued")
+        self.assertEqual(rows[0]["uid"], row["uid"])
+
+    def test_state_rejected_on_incoming(self):
+        with self.assertRaises(ValueError):
+            dms.append_dm(self.path, "in", "no", state="queued")
+
+    def test_set_state(self):
+        row = dms.append_dm(self.path, "out", "ping", state="queued")
+        self.assertTrue(dms.set_dm_state(self.path, row["uid"], "delivered"))
+        self.assertEqual(
+            dms.load_dm_history(self.path)[0]["state"], "delivered")
+        self.assertFalse(dms.set_dm_state(self.path, "missing", "failed"))
+
+    def test_remove_row(self):
+        row = dms.append_dm(self.path, "out", "stale", state="failed")
+        dms.append_dm(self.path, "in", "keep me")
+        self.assertTrue(dms.remove_dm_row(self.path, row["uid"]))
+        rows = dms.load_dm_history(self.path)
+        self.assertEqual([r["text"] for r in rows], ["keep me"])
+        self.assertFalse(dms.remove_dm_row(self.path, "nope"))
+
 
 class TestLXMFPlumbing(unittest.TestCase):
     """Guard the exact LXMRouter API the client calls, without needing a live

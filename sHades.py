@@ -162,6 +162,9 @@ CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT, msg_id TEXT UNIQUE,
     channel_id TEXT, ts REAL, author_hash TEXT, content TEXT,
     edited_at REAL, deleted_at REAL);
+CREATE TABLE IF NOT EXISTS message_edits (
+    msg_id TEXT NOT NULL, edited_at REAL NOT NULL, prior_content TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_message_edits ON message_edits(msg_id, edited_at);
 CREATE TABLE IF NOT EXISTS attachments (
     msg_id TEXT, idx INTEGER, name TEXT, mime TEXT, size INTEGER, path TEXT,
     PRIMARY KEY (msg_id, idx));
@@ -1103,8 +1106,11 @@ def page_save_edit(path, data, request_id, link_id, remote_identity, requested_a
     if not isinstance(content, str) or not content.strip():
         return (page_header() + "> Empty edit\ncUse delete instead.\n").encode("utf-8")
     with db_lock:
+        edited_at = now()
+        db.execute("INSERT INTO message_edits (msg_id, edited_at, prior_content) "
+                   "VALUES (?, ?, ?)", (msg_id, edited_at, row["content"]))
         db.execute("UPDATE messages SET content=?, edited_at=? WHERE msg_id=?",
-                   (content.strip()[:MAX_CONTENT_LEN], now(), msg_id))
+                   (content.strip()[:MAX_CONTENT_LEN], edited_at, msg_id))
         bump_seq(row["channel_id"])
         db.commit()
     return page_messages(path, {"var_channel": row["channel_id"]},
@@ -1524,6 +1530,8 @@ def _mutate_msg(viewer, data, action):
                 return api_error("empty content", 400)
             new_content = content.strip()[:MAX_CONTENT_LEN]
             edited_at = now()
+            db.execute("INSERT INTO message_edits (msg_id, edited_at, prior_content) "
+                       "VALUES (?, ?, ?)", (msg_id, edited_at, row["content"]))
             db.execute("UPDATE messages SET content=?, edited_at=? WHERE msg_id=?",
                        (new_content, edited_at, msg_id))
             event = {"msg_id": msg_id, "content": new_content,
@@ -1532,6 +1540,7 @@ def _mutate_msg(viewer, data, action):
             deleted_at = now()
             db.execute("UPDATE messages SET deleted_at=? WHERE msg_id=?", (deleted_at, msg_id))
             db.execute("DELETE FROM reactions WHERE msg_id=?", (msg_id,))
+            db.execute("DELETE FROM message_edits WHERE msg_id=?", (msg_id,))
             event = {"msg_id": msg_id, "content": "", "edited_at": None,
                      "deleted_at": deleted_at}
         bump_seq(row["channel_id"])
@@ -3621,6 +3630,206 @@ def api_v1_roles_create(viewer, data, link_id):
         role_id = cur.lastrowid
     return {"ok": 1, "role": {"role_id": role_id, "name": name, "perms": perms,
                               "color": color or None, "position": position}}
+
+@api_route("/api/v1/messages/edits")
+@wrap_json_api
+def api_v1_message_edits(viewer, data, link_id):
+    """Prior versions are visible only to viewers of this channel."""
+    msg_id = data.get("msg")
+    with db_lock:
+        row = db.execute("SELECT channel_id, deleted_at FROM messages WHERE msg_id=?",
+                         (msg_id,)).fetchone()
+        if row is None or row["deleted_at"]:
+            return {"ok": 0, "error": "message unavailable", "code": 404}
+        if not has_perm(viewer, row["channel_id"], PERMS["VIEW"]):
+            return {"ok": 0, "error": "view permission required", "code": 403}
+        edits = db.execute("SELECT edited_at, prior_content FROM message_edits "
+                           "WHERE msg_id=? ORDER BY edited_at DESC LIMIT 50",
+                           (msg_id,)).fetchall()
+    return {"ok": 1, "edits": [dict(r) for r in edits]}
+
+
+@api_route("/api/v1/account/export")
+@wrap_json_api
+def api_v1_account_export(viewer, data, link_id):
+    """Paginate this identity's own posts, including edits and tombstones."""
+    try:
+        after = max(0, int(data.get("after", 0)))
+        limit = max(1, min(100, int(data.get("limit", 100))))
+    except (TypeError, ValueError):
+        return {"ok": 0, "error": "invalid cursor", "code": 400}
+    with db_lock:
+        rows = db.execute("SELECT * FROM messages WHERE author_hash=? AND id>? "
+                          "ORDER BY id LIMIT ?", (viewer, after, limit)).fetchall()
+        messages = []
+        for row in rows:
+            msg = msg_row_json(row)
+            msg["edits"] = [dict(e) for e in db.execute(
+                "SELECT edited_at, prior_content FROM message_edits WHERE msg_id=? "
+                "ORDER BY edited_at ASC", (row["msg_id"],)).fetchall()]
+            messages.append(msg)
+    return {"ok": 1, "messages": messages,
+            "next_after": rows[-1]["id"] if len(rows) == limit else None,
+            "scope": "own guild posts and attachment metadata; no attachment bytes"}
+
+
+@api_route("/api/v1/account/delete-posts")
+@wrap_json_api
+def api_v1_account_delete_posts(viewer, data, link_id):
+    """Erase this identity's ledger text and references; retain tombstones."""
+    if data.get("confirm") != "DELETE MY POSTS":
+        return {"ok": 0, "error": "confirmation required", "code": 400}
+    with db_lock:
+        rows = db.execute("SELECT msg_id, channel_id FROM messages WHERE "
+                          "author_hash=? AND deleted_at IS NULL", (viewer,)).fetchall()
+        all_ids = [r["msg_id"] for r in db.execute(
+            "SELECT msg_id FROM messages WHERE author_hash=?", (viewer,)).fetchall()]
+        paths = set()
+        for msg_id in all_ids:
+            paths.update(r["path"] for r in db.execute(
+                "SELECT path FROM attachments WHERE msg_id=?", (msg_id,)).fetchall())
+            db.execute("DELETE FROM attachments WHERE msg_id=?", (msg_id,))
+            db.execute("DELETE FROM reactions WHERE msg_id=?", (msg_id,))
+            db.execute("DELETE FROM message_edits WHERE msg_id=?", (msg_id,))
+        deleted_at = now()
+        db.execute("UPDATE messages SET content='', deleted_at=coalesce(deleted_at, ?) "
+                   "WHERE author_hash=?", (deleted_at, viewer))
+        channels = {r["channel_id"] for r in rows}
+        for cid in channels:
+            bump_seq(cid)
+        db.commit()
+        orphaned = [path for path in paths if not db.execute(
+            "SELECT 1 FROM attachments WHERE path=? LIMIT 1", (path,)).fetchone()]
+        orphaned_blobs = []
+        for path in orphaned:
+            if not re.fullmatch(r"[0-9a-f]{32}\.[a-z0-9]{1,8}", path):
+                continue
+            digest = path.split(".", 1)[0]
+            record = db.execute("SELECT path FROM blobs WHERE id=? AND by=?",
+                                (digest, viewer)).fetchone()
+            if record and not db.execute(
+                    "SELECT 1 FROM attachments WHERE path LIKE ? LIMIT 1",
+                    (digest + ".%",)).fetchone():
+                orphaned_blobs.append(record["path"])
+                db.execute("DELETE FROM blobs WHERE id=?", (digest,))
+        db.commit()
+        # Clear the live WAL and compact historical page versions where possible.
+        try:
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            db.execute("VACUUM")
+        except sqlite3.Error as exc:
+            RNS.log("post compaction deferred: %s" % exc, RNS.LOG_WARNING)
+    for path in orphaned:
+        if re.fullmatch(r"[0-9a-f]{32}\.[a-z0-9]{1,8}", path):
+            for directory, name in (("attachments", path),
+                                    ("previews", path + ".jpg")):
+                try:
+                    os.unlink(os.path.join(STORAGE, directory, name))
+                except OSError:
+                    pass
+    for path in orphaned_blobs:
+        if re.fullmatch(r"[0-9a-f]{32}\.[a-z0-9]{1,8}", path):
+            try:
+                os.unlink(os.path.join(_blob_dir(), path))
+            except OSError:
+                pass
+    for cid in channels:
+        _emit_event(cid, "posts_purged", {"author_hash": viewer})
+    _audit(viewer, "account.delete_posts", None, "posts=%d" % len(all_ids))
+    return {"ok": 1, "deleted": len(all_ids), "deleted_at": deleted_at,
+            "scope": "ledger content, edit history, reactions and attachment references; "
+                     "audit metadata and external backups may remain"}
+
+
+@api_route("/api/v1/account/leave")
+@wrap_json_api
+def api_v1_account_leave(viewer, data, link_id):
+    """Release registration and roles without silently deleting messages."""
+    if data.get("confirm") != "LEAVE GUILD":
+        return {"ok": 0, "error": "confirmation required", "code": 400}
+    with db_lock:
+        avatar = db.execute("SELECT avatar_path FROM users WHERE dest_hash=?",
+                            (viewer,)).fetchone()
+        db.execute("DELETE FROM guild_joins WHERE user_hash=?", (viewer,))
+        db.execute("DELETE FROM user_roles WHERE user_hash=?", (viewer,))
+        db.execute("DELETE FROM receipts WHERE user_hash=?", (viewer,))
+        db.execute("DELETE FROM members WHERE member_hash=?", (viewer,))
+        db.execute("DELETE FROM users WHERE dest_hash=?", (viewer,))
+        db.commit()
+    with NODE_REGISTRY_LOCK:
+        for node, record in list(NODE_REGISTRY.items()):
+            if record.get("user_hash") == viewer:
+                del NODE_REGISTRY[node]
+    if viewer in MODERATORS:
+        MODERATORS.discard(viewer)
+        _write_hash_file(os.path.join(STORAGE, "moderators.txt"), sorted(MODERATORS))
+    if viewer in ADMIN_USERS:
+        ADMIN_USERS.discard(viewer)
+        _write_hash_file(os.path.join(STORAGE, "admin.txt"), sorted(ADMIN_USERS))
+    if avatar and avatar["avatar_path"] == viewer + ".img":
+        try:
+            os.unlink(os.path.join(STORAGE, "avatars", viewer + ".img"))
+        except OSError:
+            pass
+    _audit(viewer, "account.leave")
+    return {"ok": 1, "scope": "guild membership, roles and profile removed; posts remain "
+            "unless deleted separately"}
+
+
+@api_route("/api/v1/catchup")
+@wrap_json_api
+def api_v1_catchup(viewer, data, link_id):
+    """Small per-channel summary after the member's own read watermark."""
+    with db_lock:
+        channels = db.execute("SELECT id, name FROM channels ORDER BY name").fetchall()
+        result = []
+        for channel in channels:
+            cid = channel["id"]
+            if not has_perm(viewer, cid, PERMS["VIEW"]):
+                continue
+            receipt = db.execute("SELECT last_id FROM receipts WHERE channel_id=? "
+                                 "AND user_hash=?", (cid, viewer)).fetchone()
+            if receipt is None:
+                continue
+            last_id = receipt["last_id"]
+            count = db.execute("SELECT count(*) FROM messages WHERE channel_id=? "
+                               "AND id>? AND author_hash!=? AND deleted_at IS NULL",
+                               (cid, last_id, viewer)).fetchone()[0]
+            if not count:
+                continue
+            samples = db.execute("SELECT author_hash, content, ts FROM messages "
+                                 "WHERE channel_id=? AND id>? AND author_hash!=? "
+                                 "AND deleted_at IS NULL ORDER BY id DESC LIMIT 3",
+                                 (cid, last_id, viewer)).fetchall()
+            result.append({"channel": cid, "name": channel["name"], "count": count,
+                           "recent": [{"username": get_username(r["author_hash"]),
+                                       "content": r["content"][:100], "ts": r["ts"]}
+                                      for r in reversed(samples)]})
+    return {"ok": 1, "channels": result[:100]}
+
+
+@api_route("/api/v1/moderation/public")
+@wrap_json_api
+def api_v1_moderation_public(viewer, data, link_id):
+    """Read-only member log of moderation, omitting reasons and private config."""
+    if not _has_joined(viewer):
+        return {"ok": 0, "error": "guild membership required", "code": 403}
+    try:
+        limit = max(1, min(int(data.get("limit", 50)), 100))
+    except (TypeError, ValueError):
+        limit = 50
+    actions = ("mod.muted", "mod.unmuted", "mod.banned", "mod.unbanned",
+               "mods.add", "mods.remove", "admins.add", "admins.remove",
+               "channel.delete", "role.assign", "role.unassign")
+    with db_lock:
+        rows = db.execute(
+            "SELECT ts, actor, action, target FROM audit_log WHERE action IN "
+            "(%s) ORDER BY id DESC LIMIT ?" % ",".join("?" for _ in actions),
+            (*actions, limit)).fetchall()
+    return {"ok": 1, "entries": [
+        {"ts": r["ts"], "actor": r["actor"], "action": r["action"],
+         "target": r["target"]} for r in rows]}
+
 
 @api_route("/api/v1/roles/delete")
 @wrap_json_api

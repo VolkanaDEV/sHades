@@ -18,6 +18,8 @@ import json
 import time
 import base64
 import hashlib
+import shutil
+import tempfile
 import threading
 import random
 from collections import OrderedDict
@@ -305,6 +307,10 @@ import RNS  # noqa: E402  (after the guarded kivy/diagnostics block, by design)
 from RNS.vendor import umsgpack as msgpack  # noqa: E402
 import invite  # noqa: E402
 import dms  # noqa: E402
+import recovery  # noqa: E402
+import qr_tools  # noqa: E402
+import offline_store  # noqa: E402
+import profile_card  # noqa: E402
 import ui_geom  # noqa: E402
 from micron import (micron_parse, micron_page_bg, micron_media_target,  # noqa: E402
                     runs_to_markup)
@@ -348,6 +354,9 @@ DEFAULT_THEME_COLORS = {
     "btn_text": (0.063, 0.090, 0.133, 1),
     "border": (0.388, 0.478, 0.529, 1),       # #637A87 visible outline
     "border_subtle": (0.165, 0.231, 0.286, 1),
+    "aurora_a": (0.96, 0.72, 0.37, 0.22),     # amber orb (fork merge)
+    "aurora_b": (0.35, 0.84, 0.77, 0.18),     # teal orb (fork merge)
+    "aurora_c": (0.50, 0.40, 0.95, 0.20),     # violet orb (fork merge)
 }
 
 THEME_KEYS = (
@@ -355,6 +364,7 @@ THEME_KEYS = (
     "topbar", "primary", "accent", "text", "text_muted", "text_dim",
     "input_bg", "input_bg_focus", "msg_own", "btn_text", "border",
     "border_subtle",
+    "aurora_a", "aurora_b", "aurora_c",
 )
 
 # Human-readable label for each THEME_KEYS entry, rendered by the config
@@ -446,6 +456,34 @@ def cached_path(key):
     return os.path.join(cache_dir(), hashlib.sha256(key.encode()).hexdigest()[:32])
 
 
+def parse_slash_help(text):
+    """Parse the hub dispatcher's /help output into (cmd, usage) rows.
+
+    Lines look like "  msg <channel> <text>   post <text> to..." —
+    the first token after the indent is the command, the remainder
+    (with run-length whitespace collapsed) is the usage string. The
+    "commands:" header and empty lines are dropped. This must track
+    sHades.py's help table by construction: the palette is the
+    discovery surface for bot & script integration.
+    """
+    rows = []
+    if not text:
+        return rows
+    for raw in str(text).splitlines():
+        if not raw.startswith("  "):
+            continue  # the dispatcher's table is indented exactly two
+        line = raw.strip()
+        if not line or line == "commands:":
+            continue
+        parts = line.split(None, 1)
+        cmd = parts[0]
+        usage = re.sub(r"\s+", " ", parts[1].strip()) if len(parts) > 1 else ""
+        if cmd in ("help", "?"):
+            usage = "this list"
+        rows.append(("/" + cmd, usage))
+    return rows
+
+
 def _app_data_dir():
     """Cross-platform writable app data directory.
 
@@ -473,6 +511,30 @@ def _app_dir():
     if meipass:
         return meipass
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def _register_ui_fonts():
+    """Fork merge: font registration for the ported kv faces (MeshDisplay,
+    MeshBody, MeshMono, MeshIcons). No-op without kivy; the fonts ride the
+    fonts/ directory next to kv_md.kv."""
+    if "kivy" not in sys.modules:
+        return
+    from kivy.core.text import LabelBase
+    fonts = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+    body = os.path.join(fonts, "SourceSans3-400.ttf")
+    body_bold = os.path.join(fonts, "SourceSans3-700.ttf")
+    LabelBase.register(name="MeshBody", fn_regular=body, fn_bold=body_bold)
+    # NOTE (fork merge decision): the fork also rebinds Roboto to the body
+    # face. We deliberately do NOT: our connect-form geometry checks (and
+    # several fixed-width controls) were designed against KivyMD's default
+    # Roboto metrics, and rebinding shifts every built-in widget's width.
+    LabelBase.register(name="MeshDisplay",
+                       fn_regular=os.path.join(fonts, "SpaceGrotesk-400.ttf"),
+                       fn_bold=os.path.join(fonts, "SpaceGrotesk-700.ttf"))
+    LabelBase.register(name="MeshMono",
+                       fn_regular=os.path.join(fonts, "IBMPlexMono-400.ttf"))
+    LabelBase.register(name="MeshIcons",
+                       fn_regular=os.path.join(fonts, "Phosphor.ttf"))
 
 
 def rgba_to_hex(rgba):
@@ -971,6 +1033,27 @@ class GuildAPI:
 
     def admin_audit(self, limit=100):
         return self._request_json("/api/v1/admin/audit", {"limit": limit})
+
+    def member_moderation(self, limit=50):
+        return self._request_json("/api/v1/moderation/public", {"limit": limit})
+
+    def message_edits(self, msg_id):
+        return self._request_json("/api/v1/messages/edits", {"msg": msg_id})
+
+    def account_export(self, after=0, limit=100):
+        return self._request_json("/api/v1/account/export",
+                                  {"after": after, "limit": limit})
+
+    def account_delete_posts(self):
+        return self._request_json("/api/v1/account/delete-posts",
+                                  {"confirm": "DELETE MY POSTS"})
+
+    def account_leave(self):
+        return self._request_json("/api/v1/account/leave",
+                                  {"confirm": "LEAVE GUILD"})
+
+    def catchup(self):
+        return self._request_json("/api/v1/catchup", {})
 
     def admin_mods(self, op="list", user=None):
         data = {"op": op}
@@ -2034,6 +2117,35 @@ if KIVY:
                 box.opacity = 1
                 label.text = "Advanced: guild hashes (hide)"
 
+    class OnboardingScreen(Screen):
+        stage = NumericProperty(0)
+        titles = ("Your identity", "Your guilds", "Your mesh")
+        descriptions = (
+            "Your keys live on this device. Your name and avatar travel with you.",
+            "Gather in channels, open NomadNet sites and talk directly with friends.",
+            "Messages can wait for a path. The app shows when the guild accepts them.",
+        )
+
+        def advance(self):
+            if self.stage < 2:
+                if App.get_running_app().reduced_motion:
+                    self._next_card(self.ids.intro_card)
+                    return
+                from kivy.animation import Animation
+                card = self.ids.intro_card
+                Animation.cancel_all(card)
+                fade = Animation(opacity=0, duration=0.12)
+                fade.bind(on_complete=lambda *_: self._next_card(card))
+                fade.start(card)
+            else:
+                App.get_running_app().open_recovery_sheet(
+                    onboarding_name=self.ids.welcome_name.text)
+
+        def _next_card(self, card):
+            self.stage += 1
+            from kivy.animation import Animation
+            Animation(opacity=1, duration=0.28, t="out_cubic").start(card)
+
     class ProfileScreen(Screen):
         """Profile view: avatar, username, identity hashes, edit controls."""
         target_hash = StringProperty("")
@@ -2094,6 +2206,16 @@ if KIVY:
         def on_left_open(self, instance, opened):
             if opened:
                 self.right_open = False
+                Clock.schedule_once(self._log_left_panel_width, 0.2)
+
+        def _log_left_panel_width(self, *_dt):
+            try:
+                left = self.ids["left_sidebar"]
+                _boot_file("SWIPE panel left_open=%s left.x=%s %s"
+                           % (self.left_open, round(left.x, 1),
+                              round(left.width, 1)))
+            except Exception:
+                _boot_file("SWIPE panel width log failed")
 
         def on_right_open(self, instance, opened):
             if opened:
@@ -2138,9 +2260,17 @@ if KIVY:
             self._SWIPE_EDGE = self._swipe_plan(touch)
             self._SWIPE_FIRE = False
             self._swipe_x = touch.x
+            _boot_file("SWIPE down x=%s edge=%s" % (
+                round(touch.x, 1), self._SWIPE_EDGE))
             return super().on_touch_down(touch)
 
         def on_touch_move(self, touch):
+            if self._SWIPE_EDGE and not self._SWIPE_FIRE and \
+                    abs(touch.x - self._swipe_x) >= dp(24):
+                _boot_file("SWIPE move x=%s dx=%s edge=%s" % (
+                    round(touch.x, 1),
+                    round(touch.x - self._swipe_x, 1),
+                    self._SWIPE_EDGE))
             if self._SWIPE_EDGE and not self._SWIPE_FIRE and \
                     abs(touch.x - self._swipe_x) >= dp(48):
                 self._SWIPE_FIRE = True
@@ -2150,8 +2280,9 @@ if KIVY:
                 # open = drag toward center; close = drag away
                 if (rightward if not on_right else not rightward):
                     if opening:
-                        setattr(self, "left_open" if not on_right
-                                else "right_open", True)
+                        target = ("right_open" if on_right else "left_open")
+                        _boot_file("SWIPE firing %s=True (dir ok)" % target)
+                        setattr(self, target, True)
                 else:
                     closing_left = self._SWIPE_EDGE == "left_close"
                     closing_right = self._SWIPE_EDGE == "right_close"
@@ -2162,6 +2293,9 @@ if KIVY:
             return super().on_touch_move(touch)
 
         def on_touch_up(self, touch):
+            if self._SWIPE_EDGE:
+                _boot_file("SWIPE up x=%s fired=%s" % (
+                    round(touch.x, 1), self._SWIPE_FIRE))
             self._SWIPE_EDGE = None
             self._SWIPE_FIRE = False
             return super().on_touch_up(touch)
@@ -2331,6 +2465,10 @@ class sHadesClientApp(MDApp):
     # MeshConstellation and the header label in kv_md.kv
     mesh_mode = StringProperty("offline")
     mesh_hops = NumericProperty(0)
+    # fork merge (recovery/onboarding): motion preference +
+    # staged onboarding name
+    reduced_motion = BooleanProperty(False)
+    onboarding_name = StringProperty("")
     mesh_label = StringProperty("OFFLINE")
     # reply staging: the composer's "Replying to @x" card + wire prefix
     reply_draft = StringProperty("")
@@ -2354,6 +2492,12 @@ class sHadesClientApp(MDApp):
         # _init_identity_and_lxmf). Until then no guild call can be
         # made anyway -- every API call needs an identified link.
         self.username = "user"
+        # Contact-card alias. No setter exists yet; the card payload
+        # falls back to username. Initialised here, same law as above:
+        # reads fire before any session exists (device receipt, 184a4f9:
+        # AttributeError 'display_name' in _contact_card_payload the
+        # moment an identity was live).
+        self.display_name = ""
         self.my_hash = None
         # Which guild we are pointed at. These are plain attributes (not
         # properties), so they MUST be initialised here: on a fresh install
@@ -2436,11 +2580,20 @@ class sHadesClientApp(MDApp):
         # Chat pagination: per channel, oldest loaded message id + whether
         # older messages remain. Used by scroll-triggered loading.
         self._older = {}          # cid -> {oldest_id, has_older, loading}
+        # fork merge (offline cache): pending rows queue on the UI clock,
+        # writes flush in a thread; purge/forgotten state keeps erased
+        # identities from re-entering the store.
+        self._cache_write_lock = threading.RLock()
+        self._cache_pending = {}
+        self._cache_event = None
+        self._purged_before = {}
+        self._forgotten_cache_guilds = set()
         self._pending_reply = None
         self._scroll_bound = False
 
         # Banner images - random selection from media folder on startup.
         self.banner_config_path = None
+        self.onboarding_name = "wanderer-%04x" % random.getrandbits(16)
         self.banner_channel_path = None
         self._select_random_banners()
 
@@ -2472,29 +2625,17 @@ class sHadesClientApp(MDApp):
         self._admin_popup = None
 
     def _select_random_banners(self):
-        """Pick random banner images from media/ folder on startup.
-        One for the connect screen, one for the channel header."""
-        media_dir = os.path.join(_app_dir(), "media")
-        if not os.path.isdir(media_dir):
-            return
-        images = [
-            f for f in os.listdir(media_dir)
-            if f.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
-            and f != "1793645765.png"   # client icon/logo — not a banner
-        ]
-        if not images:
-            return
-        if len(images) == 1:
-            self.banner_config_path = os.path.join(media_dir, images[0])
-            self.banner_channel_path = os.path.join(media_dir, images[0])
-        else:
-            chosen = random.sample(images, 2)
-            self.banner_config_path = os.path.join(media_dir, chosen[0])
-            self.banner_channel_path = os.path.join(media_dir, chosen[1])
-            print("Banner images: config=%s channel=%s" % (
-                os.path.basename(self.banner_config_path),
-                os.path.basename(self.banner_channel_path),
-            ))
+        """No-op kept for the banner kv bindings (app.banner_*_path).
+
+        tay (receipt 2026-11-19): "cull the media images, it's bloating
+        the repo and they are random placeholders" - the fork's 18 MB
+        z-image-turbo set is gone from the tree and the APK. The kv
+        widgets tolerate the None source (source: app.banner_... or '').
+        If real banners ever return, land them as vetted assets, not
+        an 18 MB placeholder folder that ships in every binary.
+        """
+        self.banner_config_path = None
+        self.banner_channel_path = None
 
     # -- UI theme / config ----------------------------------------------
 
@@ -2558,9 +2699,11 @@ class sHadesClientApp(MDApp):
         from kivymd.uix.textfield import MDTextField  # noqa: F401
         from kivymd.uix.appbar import MDTopAppBar  # noqa: F401
         from kivy.lang import Builder
+        _register_ui_fonts()
         Builder.load_file(os.path.join(_app_dir(), "kv_md.kv"))
         sm = ScreenManager()
         sm.add_widget(ConnectScreen(name="connect"))
+        sm.add_widget(OnboardingScreen(name="onboarding"))
         sm.add_widget(MainScreen(name="main"))
         sm.add_widget(ProfileScreen(name="profile"))
         sm.add_widget(ConfigScreen(name="config"))
@@ -2579,11 +2722,68 @@ class sHadesClientApp(MDApp):
             _boot_install(sm.get_screen(sm.current))
         return sm
 
+    def _apply_system_gesture_exclusions(self, *_args):
+        """Exclude our drawer edge bands from the Android system back
+        gesture (Android 10+).
+
+        Without this, the OS intercepts swipes that start on the outer
+        ~24dp of the screen, and the app never sees them: the left
+        (server/channels) drawer becomes unreachable because it has no
+        tap affordance by design, and the right members drawer loses its
+        swipe too. The system honours at most 200dp of exclusion
+        height per edge; we request the full screen height and let it
+        cap, which still covers any practical swipe. No-op on desktop.
+        """
+        from kivy.utils import platform
+        if platform != "android":
+            return
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            Rect = autoclass("android.graphics.Rect")
+            Rects = autoclass("java.util.ArrayList")
+            activity = PythonActivity.mActivity
+            decor = activity.getWindow().getDecorView()
+            metrics = activity.getResources().getDisplayMetrics()
+            band_px = int(dp(24) + dp(8))
+            metrics = activity.getResources().getDisplayMetrics()
+            w_px = int(metrics.widthPixels)
+            h_px = int(metrics.heightPixels)
+            left = Rect(0, 0, band_px, h_px)
+            right = Rect(w_px - band_px, 0, w_px, h_px)
+            rects = Rects()
+            rects.add(left)
+            rects.add(right)
+        except Exception as e:
+            _boot_file("GESTURE unavailable: %s" % e)
+            return
+
+        def _set(*_dt):
+            try:
+                decor.setSystemGestureExclusionRects(rects)
+            except Exception as e:
+                _boot_file("GESTURE failed: %s" % e)
+                return
+            _boot_file("GESTURE exclusions set: band %dpx "
+                       "%dx%d" % (band_px, w_px, h_px))
+        Clock.schedule_once(_set, 0.5)
+        Clock.schedule_once(_set, 2.5)
+
     def on_start(self):
         if BOOT_DEBUG:
             _boot_mark("on_start")
+        self._apply_system_gesture_exclusions()
         # Try to resume a saved session
         sess = self._load_session()
+        # fork merge: the identity file is the sole carrier of
+        # the member's key. If a session or onboarding record
+        # exists but the key file is gone, require a restore
+        # instead of silently minting a new identity.
+        if (sess or os.path.isfile(self._onboarding_path())) and not os.path.isfile(
+                self._identity_file()):
+            self.root.current = "connect"
+            self._set_status("Identity missing. Restore your recovery kit or start fresh.")
+            return
         if sess and sess.get("hub_address"):
             self.guild_node_hash = sess.get("node_hash")
             self.node_hash = self.guild_node_hash
@@ -2619,6 +2819,647 @@ class sHadesClientApp(MDApp):
             if BOOT_DEBUG:
                 _boot_mark("fresh install -> default hub")
             self._auto_connect_default_hub()
+
+    def _onboarding_path(self):
+        return os.path.join(_app_data_dir(), "onboarding.json")
+
+    def _portable_profile_path(self):
+        return os.path.join(_app_data_dir(), "portable_profile.json")
+
+    def _load_portable_profile(self):
+        try:
+            with open(self._portable_profile_path()) as source:
+                data = json.load(source)
+            if isinstance(data.get("name"), str):
+                self._portable_name = data["name"][:24]
+                self.username = self._portable_name or self.username
+            avatar = data.get("avatar")
+            if isinstance(avatar, str) and avatar.startswith(_app_data_dir()) \
+                    and os.path.isfile(avatar):
+                self.my_avatar_small = avatar
+                self.avatar_preview = avatar
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def _save_portable_profile(self):
+        path = self._portable_profile_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temp = path + ".tmp"
+        with open(temp, "w") as stream:
+            json.dump({"name": self._portable_name,
+                       "avatar": getattr(self, "my_avatar_small", None)}, stream)
+        os.replace(temp, path)
+
+    def complete_onboarding(self, name):
+        """Create a durable local identity before the first connection."""
+        cleaned = re.sub(r"[^a-zA-Z0-9_. -]", "", name or "").strip()[:24]
+        self.username = cleaned or self.onboarding_name
+        self._portable_name = self.username
+        os.makedirs(_app_data_dir(), exist_ok=True)
+        try:
+            self._ensure_identity_file()
+        except Exception as exc:
+            self._set_status("Identity creation failed: %s" % exc)
+            return
+        try:
+            self._create_generated_avatar(self.username)
+        except (OSError, ValueError) as e:
+            print("avatar preview unavailable:", repr(e))
+        self._save_portable_profile()
+        with open(self._onboarding_path(), "w", encoding="utf-8") as f:
+            json.dump({"name": self.username, "completed": True}, f)
+        # card slice 2 (tay-approved): the moment the keyset exists, the
+        # user gets their collectible card - the blank card (fresh
+        # generated avatar, chosen name, identity now on disk). The
+        # popup rides the fork's show_qr pattern; the boot's
+        # client_identity lifecycle is untouched (read-only from_file).
+        Clock.schedule_once(lambda dt: self.show_blank_card(), 0.4)
+        self._auto_connect_default_hub()
+
+    def _blank_card_payload(self, ident):
+        """Payload for the onboarding blank card; None if unusable.
+
+        ident: an RNS.Identity (read-only handle; never assigned).
+        """
+        try:
+            return profile_card.build_payload(
+                ident.get_public_key(), self.username)
+        except profile_card.CardPayloadError as e:
+            print("blank card payload error:", e)
+            return None
+        except Exception as exc:
+            print("blank card payload unavailable:", repr(exc))
+            return None
+
+    def show_blank_card(self):
+        """Display the onboarding blank card QR (card slice 2).
+
+        Loads the on-disk identity READ-ONLY to build the payload - the
+        router boot reloads the same file later, so no lifecycle clash.
+        """
+        if not os.path.isfile(self._identity_file()):
+            return
+        ident = RNS.Identity.from_file(self._identity_file())
+        if ident is None:
+            return
+        payload = self._blank_card_payload(ident)
+        if payload is None:
+            return
+        self.show_qr(payload, "Your card",
+                     "Anyone who scans this can reach you by mesh - "
+                     "the card carries your keyset, not your location.")
+
+    def _identity_file(self):
+        return os.path.join(_app_data_dir(), "rns", "identity")
+
+    def _ensure_identity_file(self):
+        path = self._identity_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if not os.path.isfile(path):
+            RNS.Identity().to_file(path)
+            os.chmod(path, 0o600)
+        elif RNS.Identity.from_file(path) is None:
+            raise ValueError("identity is damaged; restore a recovery kit")
+        return path
+
+    def start_fresh_identity(self):
+        """Explicit path when a previous install has no recoverable key."""
+        if os.path.exists(self._identity_file()):
+            self._set_status("An identity is already installed on this device.")
+            return
+        self.root.current = "onboarding"
+        self.root.get_screen("onboarding").stage = 0
+
+    def _create_generated_avatar(self, name):
+        """A deterministic node pattern, unique to the chosen local name."""
+        digest = hashlib.sha256(name.encode("utf-8")).digest()
+        image = PILImage.new("RGB", (128, 128), (12, 26, 33))
+        draw = PILImageDraw.Draw(image)
+        nodes = [(24 + digest[i] % 75, 24 + digest[i + 1] % 75)
+                 for i in (0, 2, 4)]
+        draw.line(nodes + nodes[:1], fill=(76, 205, 179), width=3)
+        for i, (x, y) in enumerate(nodes):
+            color = (251, 183, 99) if i == 0 else (89, 224, 191)
+            draw.ellipse((x - 7, y - 7, x + 7, y + 7), fill=color)
+        path = os.path.join(_app_data_dir(), "avatar_generated.jpg")
+        image.save(path, "JPEG", quality=82)
+        self.my_avatar_small = path
+        self.avatar_preview = path
+        self._generated_avatar_pending = True
+
+    def _upload_generated_avatar(self):
+        if not getattr(self, "_generated_avatar_pending", False):
+            return
+        path = getattr(self, "my_avatar_small", "")
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "rb") as f:
+                result = self.guild_api.avatar_upload(f.read())
+            if result and result.get("ok") and not result.get("unconfirmed"):
+                self._generated_avatar_pending = False
+        except Exception as e:
+            print("generated avatar upload pending:", repr(e))
+
+    def open_command_palette(self):
+        """Tier-2 command palette (tay's correction 2026-11): the
+        slash-command surface for bot & script integration.
+
+        Lists the client-local verbs plus the hub dispatcher's table
+        (the /help text, fetched through /api/v1/command like sHades.py
+        2733-2751 renders it). A pick prefills msg_input with the
+        command so the argument is completed by the user and the send
+        path stays exactly the existing slash behavior.
+        """
+        from kivymd.uix.button import MDButton, MDButtonText
+        from kivymd.uix.textfield import MDTextField, MDTextFieldHintText
+        self._slash_hub_rows = getattr(self, "_slash_hub_rows", None)
+
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
+        note = Label(text="", color=self.theme_colors["text_muted"],
+                     font_size=sp(11), size_hint_y=None, height=dp(18))
+        grid = BoxLayout(orientation="vertical", size_hint_y=None,
+                         spacing=dp(6))
+        grid.bind(minimum_height=grid.setter("height"))
+        sv = ScrollView()
+        sv.add_widget(grid)
+
+        filt = MDTextField(mode="filled", size_hint_y=None, height=dp(56),
+                           fill_color_normal=self.theme_colors["input_bg"],
+                           fill_color_focus=self.theme_colors["input_bg_focus"],
+                           text_color_normal=self.theme_colors["text"],
+                           text_color_focus=self.theme_colors["text"],
+                           cursor_color=self.theme_colors["text"])
+        filt.add_widget(MDTextFieldHintText(text="Type to filter commands"))
+        box.add_widget(filt)
+        box.add_widget(sv)
+        box.add_widget(note)
+
+        popup = Popup(title="Slash commands", content=box,
+                      size_hint=(0.9, 0.75))
+        self._palette_popup = popup
+
+        def _prefill(inst=None, cmd=""):
+            popup.dismiss()
+            try:
+                main = self.root.get_screen("main")
+                inp = main.ids.msg_input
+            except Exception:
+                return
+            inp.text = cmd + " "
+
+            def focus(dt):
+                try:
+                    inp.focus = True
+                except Exception:
+                    pass
+            Clock.schedule_once(focus, 0)
+
+        def render(*_):
+            query = (filt.text or "").strip().lower()
+            grid.clear_widgets()
+            for cmd, desc in list(self._slash_client_rows()) + \
+                    list(self._slash_hub_rows or []):
+                if query and query not in cmd.lower() \
+                        and query not in (desc or "").lower():
+                    continue
+                btn = MDButton(style="tonal")
+                btn.size_hint = (1, None)
+                btn.height = dp(40)
+                btn.bind(on_press=lambda inst, c=cmd: _prefill(inst, c))
+                btn.add_widget(MDButtonText(
+                    text=("%s %s" % (cmd, desc)).strip() if desc else cmd,
+                    font_size=sp(12),
+                    text_color=self.theme_colors["text"]))
+                grid.add_widget(btn)
+
+        def fetch_hub(*_):
+            if self._slash_hub_rows is not None or not self.guild_api:
+                return
+
+            def work():
+                try:
+                    res = self.guild_api.command("help")
+                    out = (res or {}).get("output") if res.get("ok") else ""
+                    Clock.schedule_once(lambda dt: self._accept_hub_rows(
+                        parse_slash_help(out or ""), render), 0)
+                except Exception:
+                    Clock.schedule_once(
+                        lambda dt: self._accept_hub_rows([], render), 0)
+            threading.Thread(target=work, daemon=True).start()
+
+        filt.bind(text=render)
+        render(filt, None)
+        popup.open()
+        note.text = "client commands + hub dispatcher (fetching...)"
+        Clock.schedule_once(lambda dt: fetch_hub(), 0)
+
+    def _accept_hub_rows(self, rows, rerender):
+        """Apply the fetched /help table to the palette (and drop the
+        fetching note on the next render)."""
+        self._slash_hub_rows = rows or []
+        try:
+            note_lbl = self._palette_popup.content.children[0]
+            if isinstance(note_lbl, Label):
+                note_lbl.text = ("" if rows else
+                                 "hub unreachable - client commands only")
+        except Exception:
+            pass
+        if callable(rerender):
+            rerender()
+
+    def _slash_client_rows(self):
+        """The client-local slash verbs (kivy_client._handle_slash)."""
+        return [("/me", "emote an action line"),
+                ("/join", "switch to a channel"),
+                ("/search", "search channel history"),
+                ("/invite", "copy this guild's invite")]
+
+    def open_recovery_sheet(self, onboarding_name=None):
+        """Make an encrypted kit before first connection or from Profile."""
+        box = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
+        hint = Label(text="Save this kit somewhere outside your phone. The phrase "
+                          "is never stored; losing both means losing your identity.",
+                     color=self.theme_colors["text_muted"], font_size=sp(13),
+                     size_hint_y=None, height=dp(64), halign="center",
+                     valign="middle")
+        hint.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+        box.add_widget(hint)
+
+        def field(label):
+            widget = TextInput(password=True, multiline=False, hint_text=label,
+                               font_name="MeshBody", font_size=sp(16),
+                               foreground_color=self.theme_colors["text"],
+                               hint_text_color=self.theme_colors["text_muted"],
+                               background_normal="", background_active="",
+                               background_color=self.theme_colors["input_bg"],
+                               size_hint_y=None, height=dp(46))
+            box.add_widget(widget)
+            return widget
+
+        phrase = field("Recovery phrase (12+ characters)")
+        confirm = field("Repeat recovery phrase")
+        status = Label(text="", color=self.theme_colors["accent"],
+                       font_size=sp(12), size_hint_y=None, height=dp(44))
+        status.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+        box.add_widget(status)
+        actions = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        save = Button(text="Save kit", background_normal="",
+                      background_color=self.theme_colors["primary"],
+                      color=self.theme_colors["btn_text"])
+        later = Button(text="Skip for now" if onboarding_name is not None else "Close",
+                       background_normal="", background_color=self.theme_colors["sidebar_ctrl"],
+                       color=self.theme_colors["text"])
+        actions.add_widget(save)
+        actions.add_widget(later)
+        box.add_widget(actions)
+        sheet = Popup(title="Protect your identity", content=box,
+                      size_hint=(0.86, 0.60), auto_dismiss=False)
+
+        def done(success, detail):
+            status.text = detail
+            save.disabled = False
+            if success and onboarding_name is not None:
+                sheet.dismiss()
+                self.complete_onboarding(onboarding_name)
+                self._set_status(detail)
+
+        def save_kit(*_):
+            if phrase.text != confirm.text:
+                status.text = "The phrases do not match."
+                return
+            try:
+                identity_path = self._ensure_identity_file()
+                with open(identity_path, "rb") as stream:
+                    key_bytes = stream.read(4097)
+                profile = {"username": (onboarding_name or self.username or "")[:32],
+                           "friends": self._friends[:200],
+                           "servers": self._servers[:50]}
+                kit = recovery.create_kit(key_bytes, phrase.text, profile)
+            except Exception as exc:
+                status.text = "Kit could not be made: %s" % exc
+                return
+            save.disabled = True
+            self._export_recovery_bytes(kit, done)
+
+        save.bind(on_press=save_kit)
+        later.bind(on_press=lambda *_: (sheet.dismiss(),
+                   self.complete_onboarding(onboarding_name)) if onboarding_name is not None
+                   else sheet.dismiss())
+        sheet.open()
+
+    def show_qr(self, payload, title, note=""):
+        """Display a scannable QR without exposing the payload as plain text."""
+        fd, path = tempfile.mkstemp(prefix="shades-qr-", suffix=".png",
+                                    dir=_app_data_dir())
+        os.close(fd)
+        try:
+            qr_tools.make_qr(payload, path)
+        except Exception:
+            os.unlink(path)
+            raise
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
+        box.add_widget(Image(source=path, allow_stretch=True))
+        if note:
+            box.add_widget(Label(text=note, color=self.theme_colors["text_muted"],
+                                 font_size=sp(12), size_hint_y=None, height=dp(46)))
+        popup = Popup(title=title, content=box, size_hint=(0.9, 0.72))
+        popup.bind(on_dismiss=lambda *_: os.path.exists(path) and os.unlink(path))
+        popup.open()
+
+    def show_invite_qr(self):
+        host, port = getattr(self, "hub_host", None), getattr(self, "hub_port", None)
+        node = getattr(self, "guild_node_hash", None)
+        if not (host and port and node):
+            self._set_status("Connect to a guild to display its invite QR.")
+            return
+        self.show_qr(invite.build_invite(host, port, node), "Guild invite",
+                     "Scan with sHades or a device camera.")
+
+    def open_transfer_qr(self):
+        """One QR carries the encrypted key and local name, no chat or friends."""
+        box = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(14))
+        box.add_widget(Label(text="Choose a 12+ character phrase. The QR contains "
+                             "your encrypted identity. Only show it to your second device.",
+                             color=self.theme_colors["text"], font_size=sp(14),
+                             text_size=(dp(280), None)))
+        phrase = TextInput(password=True, multiline=False, hint_text="Transfer phrase",
+                           size_hint_y=None, height=dp(44))
+        box.add_widget(phrase)
+        show = Button(text="Show transfer QR", size_hint_y=None, height=dp(46))
+        box.add_widget(show)
+        sheet = Popup(title="Transfer identity", content=box, size_hint=(0.86, 0.4))
+
+        def create(*_):
+            try:
+                with open(self._ensure_identity_file(), "rb") as source:
+                    identity = source.read(4097)
+                kit = recovery.create_kit(
+                    identity, phrase.text,
+                    {"username": self.username or "",
+                     "friends": [], "servers": []})
+                payload = qr_tools.encode_kit(kit)
+                sheet.dismiss()
+                self.show_qr(payload, "Encrypted identity",
+                             "Scan on your second device, then enter the phrase there.")
+            except Exception as exc:
+                self._set_status("Transfer QR failed: %s" % exc)
+        show.bind(on_press=create)
+        sheet.open()
+
+    def scan_qr(self, on_value):
+        """Open a camera QR scanner where its native decoder is installed."""
+        if self._android_platform():
+            try:
+                from android.permissions import request_permissions, Permission
+
+                def ready(_permissions, grants):
+                    if all(grants):
+                        Clock.schedule_once(lambda _dt: self._open_qr_scanner(on_value), 0)
+                    else:
+                        Clock.schedule_once(lambda _dt: self._set_status(
+                            "Camera permission is needed to scan a QR."), 0)
+                request_permissions([Permission.CAMERA], ready)
+            except Exception as exc:
+                self._set_status("Camera permission request failed: %s" % exc)
+            return
+        self._open_qr_scanner(on_value)
+
+    def _open_qr_scanner(self, on_value):
+        try:
+            from kivy_garden.zbarcam import ZBarCam
+            scanner = ZBarCam()
+        except Exception as exc:
+            self._set_status("Camera scanner unavailable: %s" % exc)
+            return
+        box = BoxLayout(orientation="vertical", padding=dp(8))
+        box.add_widget(scanner)
+        sheet = Popup(title="Scan a sHades QR", content=box, size_hint=(0.95, 0.8))
+        seen = {"done": False}
+
+        def decoded(_scanner, symbols):
+            if seen["done"] or not symbols:
+                return
+            try:
+                value = symbols[0].data.decode("utf-8")
+            except (UnicodeError, AttributeError):
+                self._set_status("QR is not text")
+                return
+            seen["done"] = True
+            sheet.dismiss()
+            on_value(value)
+        scanner.bind(symbols=decoded)
+        sheet.open()
+
+    def scan_invite_qr(self):
+        def apply(value):
+            if not invite.parse_invite(value):
+                self._set_status("This QR is not a guild invite.")
+                return
+            self.root.current = "connect"
+            self.root.get_screen("connect").ids.hub_address.text = value
+            self._set_status("Invite scanned. Choose your name and connect.")
+        self.scan_qr(apply)
+
+    def _export_recovery_bytes(self, kit, done, filename="sHades-recovery.shades",
+                               description="Encrypted kit"):
+        """Use the system picker or Downloads; kit may be bytes or a file path."""
+        if self._android_platform():
+            try:
+                from jnius import autoclass
+                from android import activity as android_activity
+                if not getattr(self, "_recovery_export_bound", False):
+                    android_activity.bind(on_activity_result=self._recovery_export_result)
+                    self._recovery_export_bound = True
+                self._recovery_export_pending = (kit, done, description)
+                Intent = autoclass("android.content.Intent")
+                activity = autoclass("org.kivy.android.PythonActivity").mActivity
+                intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
+                intent.addCategory(Intent.CATEGORY_OPENABLE)
+                intent.setType("application/octet-stream")
+                intent.putExtra(Intent.EXTRA_TITLE, filename)
+                activity.startActivityForResult(intent, 0x5A1A)
+            except Exception as exc:
+                self._recovery_export_pending = None
+                done(False, "Document picker failed: %s" % exc)
+            return
+        folder = os.path.join(os.path.expanduser("~"), "Downloads")
+        if not os.path.isdir(folder):
+            folder = os.path.expanduser("~")
+        stem, extension = os.path.splitext(filename)
+        filename = "%s-%s%s" % (stem, time.strftime("%Y%m%d-%H%M%S"), extension)
+        path = os.path.join(folder, filename)
+        try:
+            if isinstance(kit, str):
+                if os.path.exists(path):
+                    raise FileExistsError(path)
+                shutil.copyfile(kit, path)
+                os.chmod(path, 0o600)
+            else:
+                recovery.write_private(path, kit)
+            done(True, "%s saved to %s" % (description, path))
+        except Exception as exc:
+            done(False, "Save failed: %s" % exc)
+
+    def _recovery_export_result(self, request_code, result_code, intent):
+        if request_code != 0x5A1A:
+            return
+        pending = getattr(self, "_recovery_export_pending", None)
+        self._recovery_export_pending = None
+        if pending is None:
+            return
+
+        def finish(_dt):
+            kit, done, description = pending
+            if result_code != -1 or intent is None:
+                done(False, "Kit save canceled.")
+                return
+            try:
+                from jnius import autoclass
+                activity = autoclass("org.kivy.android.PythonActivity").mActivity
+                uri = intent.getData()
+                pfd = activity.getContentResolver().openFileDescriptor(uri, "w")
+                fd = pfd.detachFd()
+                with os.fdopen(fd, "wb") as stream:
+                    if isinstance(kit, str):
+                        with open(kit, "rb") as source:
+                            shutil.copyfileobj(source, stream)
+                    else:
+                        stream.write(kit)
+                    stream.flush()
+                pfd.close()
+                done(True, "%s saved." % description)
+            except Exception as exc:
+                done(False, "Kit write failed: %s" % exc)
+        Clock.schedule_once(finish, 0)
+
+    def open_restore_sheet(self):
+        """Choose an encrypted kit and restore only onto a device with no key."""
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
+        phrase = TextInput(password=True, multiline=False,
+                           hint_text="Recovery phrase", font_name="MeshBody",
+                           foreground_color=self.theme_colors["text"],
+                           hint_text_color=self.theme_colors["text_muted"],
+                           background_normal="", background_active="",
+                           background_color=self.theme_colors["input_bg"],
+                           size_hint_y=None, height=dp(46))
+        box.add_widget(phrase)
+        status = Label(text="Choose the encrypted .shades kit.",
+                       color=self.theme_colors["text_muted"],
+                       size_hint_y=None, height=dp(44), font_size=sp(12))
+        box.add_widget(status)
+        chooser = None
+        if not self._android_platform():
+            chooser = FileChooserListView(path=os.path.join(
+                os.path.expanduser("~"), "Downloads"))
+            if not os.path.isdir(chooser.path):
+                chooser.path = os.path.expanduser("~")
+            box.add_widget(chooser)
+        actions = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        restore_btn = Button(text="Choose kit" if self._android_platform() else "Restore selected",
+                             background_normal="", background_color=self.theme_colors["primary"],
+                             color=self.theme_colors["btn_text"])
+        cancel = Button(text="Cancel", background_normal="",
+                        background_color=self.theme_colors["sidebar_ctrl"],
+                        color=self.theme_colors["text"])
+        actions.add_widget(restore_btn)
+        actions.add_widget(cancel)
+        box.add_widget(actions)
+        sheet = Popup(title="Restore identity", content=box,
+                      size_hint=(0.9, 0.75), auto_dismiss=False)
+
+        def restore(path):
+            try:
+                complete = self._restore_recovery_file(path, phrase.text)
+            except Exception as exc:
+                status.text = "Restore failed: %s" % exc
+                return
+            sheet.dismiss()
+            self.root.current = "connect"
+            if complete:
+                self._set_status("Identity recovered. Connect to a saved guild.")
+            else:
+                self._set_status(
+                    "Identity recovered, but some profile details could not be saved.")
+
+        def pick(*_):
+            if self._android_platform():
+                self._saf_pick(0x5A19, restore,
+                               lambda reason: setattr(status, "text", reason))
+            elif chooser and chooser.selection:
+                restore(chooser.selection[0])
+            else:
+                status.text = "Select a kit file first."
+
+        scan_btn = Button(text="Scan transfer QR",
+                          size_hint_y=None, height=dp(44))
+
+        def accept_qr(value):
+            try:
+                payload = qr_tools.decode_kit(value)
+                fd, temp = tempfile.mkstemp(
+                    prefix="shades-scan-", suffix=".shades",
+                    dir=_app_data_dir())
+                with os.fdopen(fd, "wb") as target:
+                    target.write(payload)
+                try:
+                    restore(temp)
+                finally:
+                    os.unlink(temp)
+            except Exception as exc:
+                status.text = "QR restore failed: %s" % exc
+        scan_btn.bind(on_press=lambda *_: self.scan_qr(accept_qr))
+        box.add_widget(scan_btn)
+
+        restore_btn.bind(on_press=pick)
+        cancel.bind(on_press=lambda *_: sheet.dismiss())
+        sheet.open()
+
+    def _restore_recovery_file(self, path, passphrase):
+        if os.path.exists(self._identity_file()):
+            raise FileExistsError("an identity is already installed")
+        if os.path.getsize(path) > recovery.MAX_KIT_BYTES:
+            raise ValueError("kit is too large")
+        with open(path, "rb") as stream:
+            identity, profile = recovery.open_kit(stream.read(), passphrase)
+        # Verify RNS understands the key before installing it permanently.
+        folder = os.path.dirname(self._identity_file())
+        os.makedirs(folder, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".verify-", dir=folder)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(identity)
+            if RNS.Identity.from_file(tmp) is None:
+                raise ValueError("kit contains an invalid identity")
+        finally:
+            os.unlink(tmp)
+        recovery.write_private(self._identity_file(), identity)
+        metadata_ok = True
+        name = profile.get("username")
+        if isinstance(name, str):
+            self.username = re.sub(r"[^a-zA-Z0-9_. -]", "", name).strip()[:24]
+        friends = profile.get("friends")
+        if isinstance(friends, list):
+            self._friends = [f for f in friends[:200] if isinstance(f, dict)
+                             and dms.is_user_hash(f.get("user_hash"))]
+            try:
+                dms.save_friends(self._friends_path, self._friends)
+            except OSError:
+                metadata_ok = False
+        servers = profile.get("servers")
+        if isinstance(servers, list):
+            self._servers = [s for s in servers[:50] if isinstance(s, dict)
+                             and isinstance(s.get("hub_address"), str)
+                             and 0 < len(s["hub_address"]) <= 256]
+            metadata_ok = self._save_servers() and metadata_ok
+            self._active_server_idx = 0 if self._servers else -1
+        try:
+            recovery.write_private(self._onboarding_path(),
+                                   json.dumps({"name": self.username,
+                                               "completed": True}).encode(), replace=True)
+        except OSError:
+            metadata_ok = False
+        return metadata_ok
 
     def _auto_connect_default_hub(self):
         """Connect to the default community hub on a fresh install.
@@ -2763,14 +3604,24 @@ class sHadesClientApp(MDApp):
         return []
 
     def _save_servers(self):
+        # fork merge: explicit success return (adopted from the fork's
+        # portability contract); existing fire-and-forget callers ignore it.
+        tmp = None
         try:
             os.makedirs(_app_data_dir(), exist_ok=True)
             tmp = self._servers_path + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(self._servers, f, indent=2)
             os.replace(tmp, self._servers_path)
+            return True
         except Exception as e:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
             print("save servers failed:", repr(e))
+            return False
 
     def _add_server(self, hub_address, username, node_hash="",
                     delivery_hash="", display_name=None, avatar_path=None):
@@ -2871,6 +3722,84 @@ class sHadesClientApp(MDApp):
         except Exception:
             return None
         return fpath
+
+    def _offline_path(self):
+        return os.path.join(_app_data_dir(), "offline.sqlite3")
+
+    def _cache_guild(self):
+        node = getattr(self, "guild_node_hash", None)
+        address = getattr(self, "hub_address", None)
+        return ("node:" + str(node)) if node else (
+            "hub:" + str(address) if address else "")
+
+    def _post_was_purged(self, guild, message):
+        author, cutoff = self._purged_before.get(guild, (None, 0))
+        return (message.get("deleted_at") or
+                (author and message.get("author_hash") == author and
+                 float(message.get("ts") or 0) <= cutoff))
+
+    def _queue_cache(self, message):
+        guild = self._cache_guild()
+        if not guild or guild in self._forgotten_cache_guilds:
+            return
+        if self._post_was_purged(guild, message):
+            return
+        try:
+            channel = (message.get("channel_id") or
+                       self._channel_cid(getattr(
+                           self.root.get_screen("main"), "_current_channel",
+                           "general")))
+            msg_id = message.get("msg_id")
+            if not guild or not channel or not msg_id or \
+                    str(msg_id).startswith("pending:"):
+                return
+            self._cache_pending[(guild, channel, msg_id)] = dict(message)
+            if not getattr(self, "_cache_event", None):
+                self._cache_event = Clock.schedule_once(self._flush_cache, 0.4)
+        except Exception:
+            pass
+
+    def _flush_cache(self, _dt):
+        pending = getattr(self, "_cache_pending", {})
+        self._cache_pending, self._cache_event = {}, None
+        batches = {}
+        for (guild, channel, _msg_id), message in pending.items():
+            batches.setdefault((guild, channel), []).append(message)
+
+        def work():
+            for (guild, channel), messages in batches.items():
+                try:
+                    with self._cache_write_lock:
+                        if guild not in self._forgotten_cache_guilds:
+                            offline_store.put(
+                                self._offline_path(), guild, channel,
+                                [m for m in messages
+                                 if not self._post_was_purged(guild, m)])
+                except Exception as exc:
+                    print("offline cache write failed:", repr(exc))
+        if batches:
+            threading.Thread(target=work, daemon=True).start()
+
+    def _show_cached_channel(self, grid, cid):
+        """Fork merge: render the offline cache before the network answers.
+        _render_message dedupes by msg_id and the fetch path refreshes edited
+        rows from the server copy, so the server still wins on conflicts."""
+        try:
+            messages = offline_store.recent(self._offline_path(),
+                                            self._cache_guild(), cid)
+        except Exception as exc:
+            print("offline cache read failed:", repr(exc))
+            return False
+        rendered = 0
+        for m in messages:
+            try:
+                self._render_message(grid, m)
+                rendered += 1
+            except Exception:
+                pass
+        if rendered:
+            self._regroup_messages(grid)
+        return rendered > 0
 
     def _add_to_history(self, m):
         if not hasattr(self, "_history"):
@@ -3682,9 +4611,26 @@ class sHadesClientApp(MDApp):
             nh = bytes.fromhex(self.guild_node_hash)
             nid = RNS.Identity.recall(nh)
             if nid is None:
+                # Boot-race fix (v0.33.9, tay's t_4 launches 2/3): a resumed
+                # boot carries guild_node_hash in the saved session and the
+                # discovery wait is skipped, so the recall ran ~2s after TCP
+                # came up — before the hub's announce landed (the guild
+                # re-announces every 10s). One failed recall parked the
+                # client on the connect screen until the user killed it.
+                # Instead: wait for the announce we need, up to 30s
+                # (three re-announce windows); only then fail.
+                print("connect: identity not known yet; waiting for the "
+                      "hub's announce (re-announces every 10s, up to 30s)")
+                for _ in range(60):
+                    time.sleep(0.5)
+                    nid = RNS.Identity.recall(nh)
+                    if nid is not None:
+                        break
+            if nid is None:
                 raise RuntimeError(
                     "RNS does not know identity for node_hash %s — "
-                    "the guild's announce was not heard yet. Try again." % self.guild_node_hash)
+                    "the guild's announce was not heard within 30s. "
+                    "Try again." % self.guild_node_hash)
             print(f"RNS recalled identity for node_hash {self.guild_node_hash}")
 
             # link to guild node -- extracted so the self-heal path
@@ -3969,6 +4915,8 @@ class sHadesClientApp(MDApp):
             if kind == "msg":
                 if (data.get("msg") or {}).get("channel_id") == cid:
                     touched = True
+                if isinstance(data.get("msg"), dict):
+                    self._queue_cache(data["msg"])
             elif kind in ("edit", "del"):
                 touched = True
             elif kind == "presence":
@@ -4080,6 +5028,16 @@ class sHadesClientApp(MDApp):
                     lambda dt: self._remove_skeleton(cid), 0)
                 return
             msgs = res.get("messages", []) or []
+            try:
+                guild = self._cache_guild()
+                if guild:
+                    with self._cache_write_lock:
+                        offline_store.put(
+                            self._offline_path(), guild, cid,
+                            [m for m in msgs
+                             if not self._post_was_purged(guild, m)])
+            except Exception as exc:
+                print("offline cache write failed:", repr(exc))
             updates = res.get("updates", []) or []
             # reading the channel: mark the newest message read (never for
             # pagination prepends — those are older than the watermark)
@@ -4132,6 +5090,13 @@ class sHadesClientApp(MDApp):
                         st["loading"] = False
                     else:
                         for m in msgs:
+                            if m.get("edited_at"):
+                                row = self._msg_widgets.get(m.get("msg_id"))
+                                if row is not None:
+                                    # cached copy rendered first: the server
+                                    # row is newer, refresh its content
+                                    self._do_update(row, m.get("content") or "",
+                                                    False)
                             self._render_message(grid, m)
                         self._regroup_messages(grid)
                         Clock.schedule_once(
@@ -4729,6 +5694,18 @@ class sHadesClientApp(MDApp):
         msg_id = u.get("msg_id")
         content = u.get("content", "")
         deleted = bool(u.get("deleted_at"))
+        # fork merge: mirror the delta into the offline cache
+        try:
+            c_cid = u.get("channel_id") or self._channel_cid(getattr(
+                self.root.get_screen("main"), "_current_channel", "general"))
+            guild = self._cache_guild()
+            if guild and c_cid and msg_id:
+                threading.Thread(target=offline_store.apply_update,
+                                 args=(self._offline_path(), guild, c_cid,
+                                       msg_id, content, deleted),
+                                 daemon=True).start()
+        except Exception:
+            pass
         # find widget
         row = self._msg_widgets.get(msg_id)
         if not row:
@@ -5126,12 +6103,29 @@ class sHadesClientApp(MDApp):
             rows = []
         for r in rows:
             who = "me" if r["dir"] == "out" else "them"
+            state = r.get("state") if r["dir"] == "out" else None
+            mark = (" (%s)" % state) if state else ""
             grid.add_widget(Label(
-                text="%s: %s" % (who, r["text"][:200]),
+                text="%s: %s%s" % (who, r["text"][:200], mark),
                 size_hint_y=None, height=dp(24),
                 color=(0.85, 0.87, 0.9, 1) if r["dir"] == "out"
                 else (1, 1, 1, 1),
                 font_size=sp(12), halign="left", valign="middle"))
+            if state == "failed":
+                uid = r.get("uid")
+                if uid:
+                    from kivymd.uix.button import \
+                        MDButton, MDButtonText  # noqa: F401
+                    btn = MDButton(style="tonal")
+                    btn.size_hint_y = None
+                    btn.height = dp(24)
+                    btn.bind(
+                        on_press=lambda inst, u=uid, p=peer:
+                        self.retry_dm(p, u))
+                    btn.add_widget(MDButtonText(
+                        text="Retry", font_size=sp(11),
+                        text_color=self.theme_colors["text"]))
+                    grid.add_widget(btn)
         if not rows:
             grid.add_widget(Label(text="no messages yet",
                                   size_hint_y=None, height=dp(24),
@@ -5176,19 +6170,65 @@ class sHadesClientApp(MDApp):
                 lxm = LXMF.LXMessage(dest, self.lxmf_delivery, text,
                                      title="sHades dm",
                                      desired_method=LXMF.LXMessage.DIRECT)
+                # tier-2 delivery-state lane: the queued row becomes the
+                # source of truth for this attempt; the LXMF callbacks
+                # (verified in lxmf 0.9.4: LXMRouter.py:2401 calls
+                # failed_callback(lxmessage), LXMessage.__mark_delivered
+                # calls the registered delivery callback with the lxm)
+                # flip it delivered/failed on the router thread via Clock.
+                # Registration happens BEFORE handle_outbound: the router
+                # spawns process_outbound synchronously, so a late
+                # registration can miss the deliver attempt.
+                path = dms.dm_history_path(_app_data_dir(), peer_hash)
+                row = {}
+                try:
+                    row = dms.append_dm(path, "out", text, state="queued")
+                except ValueError:
+                    pass
+                if row.get("uid"):
+                    uid = row["uid"]
+
+                    def _flip(new_state):
+                        def cb(_lxm):
+                            try:
+                                dms.set_dm_state(path, uid, new_state)
+                            except Exception as exc:
+                                print("dm state write failed:", repr(exc))
+                            Clock.schedule_once(
+                                lambda dt: self._refresh_dm_popup(), 0)
+                        return cb
+
+                    lxm.register_delivery_callback(_flip("delivered"))
+                    lxm.register_failed_callback(_flip("failed"))
+                    Clock.schedule_once(
+                        lambda dt: self._refresh_dm_popup(), 0)
                 self.lxmf_router.handle_outbound(lxm)
             except Exception as e:
                 err = repr(e)
                 Clock.schedule_once(lambda dt: self._set_status(
                     "dm send failed: %s" % err), 0)
                 return
-            try:
-                dms.append_dm(dms.dm_history_path(_app_data_dir(), peer_hash),
-                              "out", text)
-            except ValueError:
-                pass
             Clock.schedule_once(lambda dt: self._refresh_dm_popup(), 0)
         threading.Thread(target=work, daemon=True).start()
+
+    def retry_dm(self, peer_hash, uid):
+        """tier-2 retry lane: resend a failed DM attempt in place.
+
+        The failed row (uid) is removed and the same text is queued as
+        a fresh attempt; the delivery-state callbacks follow the new
+        row the same way _send_dm wires them.
+        """
+        path = dms.dm_history_path(_app_data_dir(), peer_hash)
+        text = None
+        for row in dms.load_dm_history(path):
+            if row.get("uid") == uid:
+                text = row.get("text")
+                break
+        if not text:
+            return
+        dms.remove_dm_row(path, uid)
+        Clock.schedule_once(lambda dt: self._refresh_dm_popup(), 0)
+        self._send_dm(peer_hash, text)
 
     def _on_dm_delivery(self, lxm):
         """LXMF delivery callback: everything arriving at our lxmf.delivery
@@ -5507,6 +6547,12 @@ class sHadesClientApp(MDApp):
         if cmd == "invite":
             self._copy_invite()
             return
+        if cmd == "commands":
+            # tay's palette correction: /commands opens the slash-command
+            # palette itself - the discovery surface for the dispatcher
+            # and any future bot/script verbs.
+            self.open_command_palette()
+            return
         if not self.guild_api:
             return
 
@@ -5522,7 +6568,7 @@ class sHadesClientApp(MDApp):
                 return
             out = res.get("output") or "(no output)"
             if cmd == "help":
-                out = ("client: /me /join /search /invite\n" + out)
+                out = ("client: /me /join /search /invite /commands\n" + out)
             Clock.schedule_once(lambda dt: self._show_notice(out), 0)
         threading.Thread(target=work, daemon=True).start()
 
@@ -5690,8 +6736,13 @@ class sHadesClientApp(MDApp):
             return
         self._older.setdefault(cid, {"oldest_id": None, "has_older": True,
                                      "loading": False})
-        self._show_skeleton(cid)
-        self._fetch_messages(name)
+        cached = self._show_cached_channel(grid, cid)
+        if self.guild_api:
+            if not cached:
+                self._show_skeleton(cid)
+            self._fetch_messages(name)
+        elif not cached:
+            self._set_status("No cached messages for #%s yet." % name)
         self._refresh_members_ui(name)
         # v0.31: re-subscribe NOW. The server binds the channel at
         # subscribe time; setting _stream_cid alone changed nothing on
@@ -6147,6 +7198,12 @@ class sHadesClientApp(MDApp):
         to the next input field on the connect screen. Returns True to
         claim the key when we handled it.
         """
+        # Ctrl+K opens the tier-2 command palette (desktop)
+        if key == 107 and isinstance(modifier, (list, tuple)) and any(
+                str(m).lower() in ("ctrl", "lctrl", "rctrl")
+                for m in modifier):
+            self.open_command_palette()
+            return True
         # Tab focus traversal on the connect screen
         if key == 9:
             try:
@@ -7066,6 +8123,7 @@ class sHadesClientApp(MDApp):
             # 0.31.10: the attach flow is done -- clear the progress channel.
             Clock.schedule_once(lambda dt: self._attach_composer_stage(""), 0)
             self._add_to_history(m)
+            self._queue_cache(m)
             self._save_history()
 
         threading.Thread(target=work, daemon=True).start()
@@ -7191,6 +8249,91 @@ class sHadesClientApp(MDApp):
                     lambda dt: self._set_status(err), 0)
         threading.Thread(target=work, daemon=True).start()
 
+    def _contact_card_payload(self):
+        """v0.34 contact card payload (profile_card v1 spec).
+
+        The pubkey comes from the client identity, so a card never
+        leaks private key data; the alias rides the display name the
+        user already owns. Returns None on a fresh run where the router
+        (and with it the identity) has not been built yet.
+        """
+        ident = getattr(self, "client_identity", None)
+        if ident is None:
+            return None
+        alias = (self.display_name
+                 or getattr(self, "username", "") or "").strip()
+        if not alias:
+            return None
+        try:
+            return profile_card.build_payload(
+                ident.get_public_key(), alias)
+        except profile_card.CardPayloadError as e:
+            print("contact card payload error:", e)
+            return None
+
+    def render_contact_card(self):
+        """Render the card QR (avatar composited mid-code) into the
+        image cache; returns the cached file path or None."""
+        payload = self._contact_card_payload()
+        if payload is None:
+            return None
+        try:
+            avatar = None
+            av_path = getattr(self, "my_avatar_small", "") or ""
+            from os.path import isfile as _isfile
+            if av_path and _isfile(av_path):
+                with open(av_path, "rb") as f:
+                    avatar = f.read()
+        except Exception:
+            avatar = None
+        try:
+            qr = profile_card.render_qr_png(payload)
+            comp = profile_card.composite_center(qr, avatar, out_px=512)
+        except profile_card.CardPayloadError as e:
+            print("contact card render error:", e)
+            return None
+        return IMAGE_CACHE.set_bytes("card:qr", comp)
+
+    def share_contact_card(self):
+        """Copy the card payload as text (v1 import path: the scanner
+        pastes it into their card import field)."""
+        payload = self._contact_card_payload()
+        if payload is None:
+            self._set_status("Card unavailable until the connection starts")
+            return
+        try:
+            from kivy.core.clipboard import Clipboard
+            Clipboard.copy(payload)
+            self._set_status("Card payload copied — send it to a friend")
+        except Exception as e:
+            self._set_status("Could not copy card: %s" % repr(e))
+
+    def import_contact_card(self):
+        """Card slice 3 (tay-approved): paste a shades-contact1 payload
+        from the clipboard - parse it, derive the canonical DM address
+        offline, and save the member as a friend. No hub needed; the
+        payload carries no address to dial, only a keyset to derive
+        from (profile_card.derive_user_hash == lxmf.delivery hash)."""
+        try:
+            from kivy.core.clipboard import Clipboard
+            text = Clipboard.paste() or ""
+        except Exception as e:
+            self._set_status("Clipboard unavailable: %s" % repr(e))
+            return
+        try:
+            pub, alias = profile_card.parse_payload(text)
+        except profile_card.CardPayloadError as e:
+            self._set_status(
+                "Clipboard is not a contact card: %s" % e)
+            return
+        uh = profile_card.derive_user_hash(pub)
+        if uh == self.my_hash:
+            self._set_status("That's your own card.")
+            return
+        self._friends = dms.add_friend(self._friends, uh, alias)
+        dms.save_friends(self._friends_path, self._friends)
+        self._set_status("Card imported: %s is in your friends list." % alias)
+
     def _show_own_profile(self):
         """Show own profile locally."""
         try:
@@ -7207,6 +8350,20 @@ class sHadesClientApp(MDApp):
         self.profile_screen.target_avatar = getattr(
             self, "my_avatar_small", ""
         ) or ""
+        # v0.34 contact card: render the QR into the cache and bind it
+        qr_widget = self.profile_screen.ids.get("profile_card_qr")
+        alias_label = self.profile_screen.ids.get("profile_card_alias")
+        qr_path = self.render_contact_card()
+        if qr_widget is not None:
+            if qr_path is not None:
+                qr_widget.source = qr_path
+                if alias_label is not None:
+                    alias_label.text = (
+                        self.display_name or self.username or "user")
+            else:
+                qr_widget.source = ""
+                if alias_label is not None:
+                    alias_label.text = ""
         try:
             self.root.current = "profile"
         except Exception:

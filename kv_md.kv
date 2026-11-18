@@ -3,6 +3,7 @@
 #:import get_color_from_hex kivy.utils.get_color_from_hex
 #:import MDApp kivymd.app.MDApp
 #:import scaled ui_scale.scaled
+#:import AuroraBackground ui_fx.AuroraBackground
 
 # Button heights are written literally as dp(N) so they read at their
 # nominal size. They used to be scaled by 2/3, which drew a 40dp button
@@ -383,6 +384,68 @@
             halign: 'center'
             text_size: self.width, None
             shorten: True
+        Label:
+            id: profile_card_alias
+            text: ''
+            font_size: sp(14)
+            bold: True
+            color: app.theme_colors['text']
+            size_hint_y: None
+            height: dp(24)
+            halign: 'center'
+            text_size: self.width, None
+        # ---- contact card QR (v0.34, tay: collectible profile card) ----
+        # the QR carries the public keyset only; tap copy below to hand
+        # the payload to someone as text (v1 import path)
+        Image:
+            id: profile_card_qr
+            size_hint: None, None
+            size: dp(180), dp(180)
+            source: ''
+            allow_stretch: True
+            pos_hint: {'center_x': 0.5}
+            canvas.after:
+                Color:
+                    rgba: app.theme_colors['text']
+                Line:
+                    rounded_rectangle: self.x - dp(6), self.y - dp(6), self.width + dp(12), self.height + dp(12), dp(10)
+                    width: 1.5
+        MDButton:
+            style: 'outlined'
+            size_hint_x: None
+            width: dp(230)
+            pos_hint: {'center_x': 0.5}
+            on_press: app.share_contact_card()
+            MDButtonText:
+                text: 'Copy card payload'
+                text_color: app.theme_colors['text']
+        MDButton:
+            style: 'outlined'
+            size_hint_x: None
+            width: dp(230)
+            pos_hint: {'center_x': 0.5}
+            on_press: app.import_contact_card()
+            MDButtonText:
+                text: 'Import card from clipboard'
+                text_color: app.theme_colors['text']
+        MDButton:
+            style: 'outlined'
+            size_hint_x: None
+            width: dp(230)
+            pos_hint: {'center_x': 0.5}
+            on_press: app.open_recovery_sheet()
+            MDButtonText:
+                text: 'Save recovery kit'
+                text_color: app.theme_colors['text']
+        MDButton:
+            style: 'outlined'
+            size_hint_x: None
+            width: dp(230)
+            pos_hint: {'center_x': 0.5}
+            on_press: app.open_command_palette()
+            MDButtonText:
+                text: 'Slash commands'
+                text_color: app.theme_colors['text']
         BoxLayout:
             size_hint_y: None
             height: dp(50)
@@ -495,109 +558,6 @@
             # added after the chat body, so an open drawer paints
             # over the composer instead of squeezing it.
 
-            # -------- left: servers + channels in ONE swipe drawer --------
-            # The server rail lives INSIDE the drawer so closing the drawer
-            # hides the '+' button too (receipt: the rail held the pane
-            # open). Open width 284 = 64 rail + 220 channels.
-            BoxLayout:
-                id: left_sidebar
-                size_hint: None, 1
-                width: min(dp(284), root.width * 0.8) if root.left_open else 0
-                orientation: 'horizontal'
-                pos_hint: {'x': 0}
-                canvas.before:
-                    Color:
-                        rgba: app.theme_colors['bg_sidebar']
-                    Rectangle:
-                        pos: self.pos
-                        size: self.size
-
-                StencilView:
-                    id: left_clip
-                    size_hint: 1, 1
-                    # ---- server rail (guild list) ----
-                    BoxLayout:
-                        id: server_sidebar
-                        size_hint_x: None
-                        width: dp(64)
-                        orientation: 'vertical'
-                        canvas.before:
-                            Color:
-                                rgba: app.theme_colors['bg_sidebar']
-                            Rectangle:
-                                pos: self.pos
-                                size: self.size
-                        ScrollView:
-                            do_scroll_x: False
-                            GridLayout:
-                                id: server_grid
-                                cols: 1
-                                size_hint_y: None
-                                height: self.minimum_height
-                                spacing: dp(4)
-                                padding: [dp(4), dp(8)]
-                        # Add server button at bottom
-                        MDButton:
-                            id: add_server_btn
-                            style: 'filled'
-                            size_hint_y: None
-                            height: scaled(dp(40))
-                            theme_bg_color: 'Custom'
-                            md_bg_color: app.theme_colors['primary']
-                            on_press: app._open_add_server_popup()
-                            MDButtonText:
-                                text: '+'
-                                text_color: app.theme_colors['btn_text']
-                                font_size: sp(24)
-
-                    # ---- channels column ----
-                    BoxLayout:
-                        orientation: 'vertical'
-                        Image:
-                            id: banner_channel
-                            source: app.banner_channel_path or ''
-                            size_hint_y: None
-                            height: dp(96)
-                            size_hint_x: None
-                            width: dp(200)
-                            allow_stretch: False
-                            keep_ratio: True
-                            pos_hint: {'center_x': 0.5}
-                        BoxLayout:
-                            size_hint_y: None
-                            height: dp(52)
-                            padding: [dp(12), dp(6)]
-                            Label:
-                                text: 'CHANNELS'
-                                color: app.theme_colors['text_dim']
-                                bold: True
-                                font_size: sp(11)
-                                halign: 'left'
-                                valign: 'middle'
-                                text_size: self.width, None
-                            MDButton:
-                                id: add_channel_btn
-                                style: 'outlined'
-                                size_hint_y: None
-                                height: scaled(dp(40))
-                                width: dp(48)
-                                theme_bg_color: 'Custom'
-                                md_bg_color: app.theme_colors['sidebar_ctrl']
-                                opacity: 1 if app._can_create_channels() else 0
-                                disabled: not app._can_create_channels()
-                                on_press: app._open_create_channel_popup()
-                                MDButtonText:
-                                    text: '+'
-                                    shorten: True
-                        ScrollView:
-                            do_scroll_x: False
-                            GridLayout:
-                                id: channel_grid
-                                cols: 1
-                                size_hint_y: None
-                                height: self.minimum_height
-                                spacing: dp(2)
-                                padding: [dp(6), dp(6)]
 
             # ---------------- center: chat ----------------
             BoxLayout:
@@ -739,6 +699,114 @@
                             text: 'Send'
                             text_color: app.theme_colors['btn_text']
 
+            # -------- left: servers + channels in ONE swipe drawer --------
+            # The server rail lives INSIDE the drawer so closing the drawer
+            # hides the '+' button too (receipt: the rail held the pane
+            # open). Open width 284 = 64 rail + 220 channels.
+            BoxLayout:
+                id: left_sidebar
+                size_hint: None, 1
+                width: min(dp(284), root.width * 0.8) if root.left_open else 0
+                orientation: 'horizontal'
+                pos_hint: {'x': 0}
+                canvas.before:
+                    Color:
+                        rgba: app.theme_colors['bg_sidebar']
+                    Rectangle:
+                        pos: self.pos
+                        size: self.size
+
+                StencilView:
+                    id: left_clip
+                    size_hint: 1, 1
+                    BoxLayout:
+                        id: left_pane
+                        orientation: 'horizontal'
+                        pos: self.parent.pos
+                        size: self.parent.size
+                        # ---- server rail (guild list) ----
+                        BoxLayout:
+                            id: server_sidebar
+                            size_hint_x: None
+                            width: dp(64)
+                            orientation: 'vertical'
+                            canvas.before:
+                                Color:
+                                    rgba: app.theme_colors['bg_sidebar']
+                                Rectangle:
+                                    pos: self.pos
+                                    size: self.size
+                            ScrollView:
+                                do_scroll_x: False
+                                GridLayout:
+                                    id: server_grid
+                                    cols: 1
+                                    size_hint_y: None
+                                    height: self.minimum_height
+                                    spacing: dp(4)
+                                    padding: [dp(4), dp(8)]
+                            # Add server button at bottom
+                            MDButton:
+                                id: add_server_btn
+                                style: 'filled'
+                                size_hint_y: None
+                                height: scaled(dp(40))
+                                theme_bg_color: 'Custom'
+                                md_bg_color: app.theme_colors['primary']
+                                on_press: app._open_add_server_popup()
+                                MDButtonText:
+                                    text: '+'
+                                    text_color: app.theme_colors['btn_text']
+                                    font_size: sp(24)
+
+                        # ---- channels column ----
+                        BoxLayout:
+                            orientation: 'vertical'
+                            Image:
+                                id: banner_channel
+                                source: app.banner_channel_path or ''
+                                size_hint_y: None
+                                height: dp(96)
+                                size_hint_x: None
+                                width: dp(200)
+                                allow_stretch: False
+                                keep_ratio: True
+                                pos_hint: {'center_x': 0.5}
+                            BoxLayout:
+                                size_hint_y: None
+                                height: dp(52)
+                                padding: [dp(12), dp(6)]
+                                Label:
+                                    text: 'CHANNELS'
+                                    color: app.theme_colors['text_dim']
+                                    bold: True
+                                    font_size: sp(11)
+                                    halign: 'left'
+                                    valign: 'middle'
+                                    text_size: self.width, None
+                                MDButton:
+                                    id: add_channel_btn
+                                    style: 'outlined'
+                                    size_hint_y: None
+                                    height: scaled(dp(40))
+                                    width: dp(48)
+                                    theme_bg_color: 'Custom'
+                                    md_bg_color: app.theme_colors['sidebar_ctrl']
+                                    opacity: 1 if app._can_create_channels() else 0
+                                    disabled: not app._can_create_channels()
+                                    on_press: app._open_create_channel_popup()
+                                    MDButtonText:
+                                        text: '+'
+                                        shorten: True
+                            ScrollView:
+                                do_scroll_x: False
+                                GridLayout:
+                                    id: channel_grid
+                                    cols: 1
+                                    size_hint_y: None
+                                    height: self.minimum_height
+                                    spacing: dp(2)
+                                    padding: [dp(6), dp(6)]
             # right: members drawer (swipe from the right edge opens)
             BoxLayout:
                 id: right_sidebar
@@ -755,25 +823,116 @@
                 StencilView:
                     id: right_clip
                     size_hint: 1, 1
-                    Label:
-                        text: 'PEOPLE'
-                        color: app.theme_colors['text_dim']
-                        bold: True
-                        font_size: sp(11)
-                        size_hint_y: None
-                        height: dp(48)
-                        halign: 'left'
-                        valign: 'middle'
-                        text_size: max(0, self.width - dp(24)), self.height
-                    ScrollView:
-                        do_scroll_x: False
-                        GridLayout:
-                            id: member_grid
-                            cols: 1
+                    BoxLayout:
+                        id: right_pane
+                        orientation: 'vertical'
+                        pos: self.parent.pos
+                        size: self.parent.size
+                        Label:
+                            text: 'PEOPLE'
+                            color: app.theme_colors['text_dim']
+                            bold: True
+                            font_size: sp(11)
                             size_hint_y: None
-                            height: self.minimum_height
-                            spacing: dp(2)
-                            padding: [dp(6), dp(6)]
+                            height: dp(48)
+                            halign: 'left'
+                            valign: 'middle'
+                            text_size: max(0, self.width - dp(24)), self.height
+                        ScrollView:
+                            do_scroll_x: False
+                            GridLayout:
+                                id: member_grid
+                                cols: 1
+                                size_hint_y: None
+                                height: self.minimum_height
+                                spacing: dp(2)
+                                padding: [dp(6), dp(6)]
+<OnboardingScreen>:
+    FloatLayout:
+        canvas.before:
+            Color:
+                rgba: app.theme_colors['bg_main']
+            Rectangle:
+                pos: self.pos
+                size: self.size
+        AuroraBackground:
+            size_hint: 1, 1
+            colors: [app.theme_colors['aurora_a'], app.theme_colors['aurora_b'], app.theme_colors['aurora_c']]
+        BoxLayout:
+            id: intro_card
+            orientation: 'vertical'
+            size_hint: None, None
+            width: min(dp(420), root.width - dp(32))
+            height: min(dp(560), root.height - dp(32))
+            pos_hint: {'center_x': 0.5, 'center_y': 0.5}
+            padding: [dp(24), dp(28)]
+            spacing: dp(16)
+            canvas.before:
+                Color:
+                    rgba: app.theme_colors['panel']
+                RoundedRectangle:
+                    pos: self.pos
+                    size: self.size
+                    radius: [dp(24), dp(24), dp(24), dp(24)]
+            Image:
+                source: app.banner_config_path or ''
+                size_hint_y: None
+                height: dp(122)
+                allow_stretch: False
+                keep_ratio: True
+            Label:
+                text: '0%d  /  03' % (root.stage + 1)
+                color: app.theme_colors['accent']
+                font_size: sp(12)
+                size_hint_y: None
+                height: dp(24)
+            Label:
+                text: root.titles[root.stage]
+                font_name: 'MeshDisplay'
+                color: app.theme_colors['text']
+                bold: True
+                font_size: sp(28)
+                size_hint_y: None
+                height: dp(48)
+            Label:
+                text: root.descriptions[root.stage]
+                color: app.theme_colors['text_muted']
+                font_size: sp(15)
+                text_size: self.width, None
+                halign: 'center'
+                valign: 'middle'
+                size_hint_y: 1
+            MDTextField:
+                id: welcome_name
+                text: app.onboarding_name
+                hint_text: 'Your name on the mesh'
+                mode: 'filled'
+                multiline: False
+                size_hint_y: None
+                height: dp(44) if root.stage == 2 else 0
+                opacity: 1 if root.stage == 2 else 0
+                fill_color_normal: app.theme_colors['input_bg']
+                text_color_normal: app.theme_colors['text']
+            MDButton:
+                style: 'filled'
+                size_hint_y: None
+                height: dp(46)
+                theme_bg_color: 'Custom'
+                md_bg_color: app.theme_colors['primary']
+                on_press: root.advance()
+                MDButtonText:
+                    text: 'Protect identity' if root.stage == 2 else 'Continue'
+                    text_color: app.theme_colors['btn_text']
+            MDButton:
+                style: 'outlined'
+                size_hint_y: None
+                height: dp(44) if root.stage == 0 else 0
+                opacity: 1 if root.stage == 0 else 0
+                disabled: root.stage != 0
+                on_press: app.open_restore_sheet()
+                MDButtonText:
+                    text: 'Restore an identity'
+                    text_color: app.theme_colors['text']
 
 <ConnectScreen>:
     BoxLayout:
