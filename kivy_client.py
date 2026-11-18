@@ -2725,6 +2725,7 @@ class sHadesClientApp(MDApp):
             from jnius import autoclass
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
             Rect = autoclass("android.graphics.Rect")
+            Rects = autoclass("java.util.ArrayList")
             activity = PythonActivity.mActivity
             decor = activity.getWindow().getDecorView()
             density = float(activity.getResources().getDisplayMetrics()                 .density)
@@ -2734,13 +2735,16 @@ class sHadesClientApp(MDApp):
             h_px = int(metrics.heightPixels)
             left = Rect(0, 0, band_px, h_px)
             right = Rect(w_px - band_px, 0, w_px, h_px)
+            rects = Rects()
+            rects.add(left)
+            rects.add(right)
         except Exception as e:
             _boot_file("GESTURE unavailable: %s" % e)
             return
 
         def _set(*_dt):
             try:
-                decor.setSystemGestureExclusionRects([left, right])
+                decor.setSystemGestureExclusionRects(rects)
             except Exception as e:
                 _boot_file("GESTURE failed: %s" % e)
                 return
