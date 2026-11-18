@@ -5961,12 +5961,29 @@ class sHadesClientApp(MDApp):
             rows = []
         for r in rows:
             who = "me" if r["dir"] == "out" else "them"
+            state = r.get("state") if r["dir"] == "out" else None
+            mark = (" (%s)" % state) if state else ""
             grid.add_widget(Label(
-                text="%s: %s" % (who, r["text"][:200]),
+                text="%s: %s%s" % (who, r["text"][:200], mark),
                 size_hint_y=None, height=dp(24),
                 color=(0.85, 0.87, 0.9, 1) if r["dir"] == "out"
                 else (1, 1, 1, 1),
                 font_size=sp(12), halign="left", valign="middle"))
+            if state == "failed":
+                uid = r.get("uid")
+                if uid:
+                    from kivymd.uix.button import \
+                        MDButton, MDButtonText  # noqa: F401
+                    btn = MDButton(style="tonal")
+                    btn.size_hint_y = None
+                    btn.height = dp(24)
+                    btn.bind(
+                        on_press=lambda inst, u=uid, p=peer:
+                        self.retry_dm(p, u))
+                    btn.add_widget(MDButtonText(
+                        text="Retry", font_size=sp(11),
+                        text_color=self.theme_colors["text"]))
+                    grid.add_widget(btn)
         if not rows:
             grid.add_widget(Label(text="no messages yet",
                                   size_hint_y=None, height=dp(24),
@@ -6011,19 +6028,65 @@ class sHadesClientApp(MDApp):
                 lxm = LXMF.LXMessage(dest, self.lxmf_delivery, text,
                                      title="sHades dm",
                                      desired_method=LXMF.LXMessage.DIRECT)
+                # tier-2 delivery-state lane: the queued row becomes the
+                # source of truth for this attempt; the LXMF callbacks
+                # (verified in lxmf 0.9.4: LXMRouter.py:2401 calls
+                # failed_callback(lxmessage), LXMessage.__mark_delivered
+                # calls the registered delivery callback with the lxm)
+                # flip it delivered/failed on the router thread via Clock.
+                # Registration happens BEFORE handle_outbound: the router
+                # spawns process_outbound synchronously, so a late
+                # registration can miss the deliver attempt.
+                path = dms.dm_history_path(_app_data_dir(), peer_hash)
+                row = {}
+                try:
+                    row = dms.append_dm(path, "out", text, state="queued")
+                except ValueError:
+                    pass
+                if row.get("uid"):
+                    uid = row["uid"]
+
+                    def _flip(new_state):
+                        def cb(_lxm):
+                            try:
+                                dms.set_dm_state(path, uid, new_state)
+                            except Exception as exc:
+                                print("dm state write failed:", repr(exc))
+                            Clock.schedule_once(
+                                lambda dt: self._refresh_dm_popup(), 0)
+                        return cb
+
+                    lxm.register_delivery_callback(_flip("delivered"))
+                    lxm.register_failed_callback(_flip("failed"))
+                    Clock.schedule_once(
+                        lambda dt: self._refresh_dm_popup(), 0)
                 self.lxmf_router.handle_outbound(lxm)
             except Exception as e:
                 err = repr(e)
                 Clock.schedule_once(lambda dt: self._set_status(
                     "dm send failed: %s" % err), 0)
                 return
-            try:
-                dms.append_dm(dms.dm_history_path(_app_data_dir(), peer_hash),
-                              "out", text)
-            except ValueError:
-                pass
             Clock.schedule_once(lambda dt: self._refresh_dm_popup(), 0)
         threading.Thread(target=work, daemon=True).start()
+
+    def retry_dm(self, peer_hash, uid):
+        """tier-2 retry lane: resend a failed DM attempt in place.
+
+        The failed row (uid) is removed and the same text is queued as
+        a fresh attempt; the delivery-state callbacks follow the new
+        row the same way _send_dm wires them.
+        """
+        path = dms.dm_history_path(_app_data_dir(), peer_hash)
+        text = None
+        for row in dms.load_dm_history(path):
+            if row.get("uid") == uid:
+                text = row.get("text")
+                break
+        if not text:
+            return
+        dms.remove_dm_row(path, uid)
+        Clock.schedule_once(lambda dt: self._refresh_dm_popup(), 0)
+        self._send_dm(peer_hash, text)
 
     def _on_dm_delivery(self, lxm):
         """LXMF delivery callback: everything arriving at our lxmf.delivery
