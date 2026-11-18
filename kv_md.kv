@@ -437,6 +437,15 @@
             MDButtonText:
                 text: 'Save recovery kit'
                 text_color: app.theme_colors['text']
+        MDButton:
+            style: 'outlined'
+            size_hint_x: None
+            width: dp(230)
+            pos_hint: {'center_x': 0.5}
+            on_press: app.open_command_palette()
+            MDButtonText:
+                text: 'Command palette'
+                text_color: app.theme_colors['text']
         BoxLayout:
             size_hint_y: None
             height: dp(50)

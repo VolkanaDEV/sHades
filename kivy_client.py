@@ -2933,6 +2933,71 @@ class sHadesClientApp(MDApp):
         except Exception as e:
             print("generated avatar upload pending:", repr(e))
 
+    def open_command_palette(self):
+        """Tier-2 command palette: one searchable sheet of app verbs.
+
+        Plain Kivy Popup + MDTextField filter, like show_qr — no new
+        KivyMD sheet dependency. Ctrl+K on desktop; the profile menu
+        carries the touch entry point.
+        """
+        from kivymd.uix.button import MDButton, MDButtonText
+        from kivymd.uix.textfield import MDTextField, MDTextFieldHintText
+        rows = self._palette_commands()
+
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
+        grid = BoxLayout(orientation="vertical", size_hint_y=None,
+                         spacing=dp(6))
+        grid.bind(minimum_height=grid.setter("height"))
+        sv = ScrollView()
+        sv.add_widget(grid)
+
+        filt = MDTextField(mode="filled", size_hint_y=None, height=dp(56),
+                           fill_color_normal=self.theme_colors["input_bg"],
+                           fill_color_focus=self.theme_colors["input_bg_focus"],
+                           text_color_normal=self.theme_colors["text"],
+                           text_color_focus=self.theme_colors["text"],
+                           cursor_color=self.theme_colors["text"])
+        filt.add_widget(MDTextFieldHintText(text="Type to filter commands"))
+        box.add_widget(filt)
+        box.add_widget(sv)
+
+        popup = Popup(title="Commands", content=box, size_hint=(0.9, 0.75))
+
+        def render(*_):
+            query = (filt.text or "").strip().lower()
+            grid.clear_widgets()
+            for label, fn in rows:
+                if query and query not in label.lower():
+                    continue
+                btn = MDButton(style="tonal")
+                btn.size_hint = (1, None)
+                btn.height = dp(40)
+                btn.bind(on_press=lambda inst, f=fn:
+                         (popup.dismiss(), f()))
+                btn.add_widget(MDButtonText(
+                    text=label, font_size=sp(12),
+                    text_color=self.theme_colors["text"]))
+                grid.add_widget(btn)
+
+        filt.bind(text=render)
+        render(filt, None)
+        popup.open()
+
+    def _palette_commands(self):
+        """The palette registry: (label, callable) pairs, all existing."""
+        go = lambda name: lambda: setattr(self.root, "current", name)  # noqa: E731
+        return [
+            ("Connect to a guild/server", go("connect")),
+            ("Open channel view", go("main")),
+            ("Open my profile", go("profile")),
+            ("Share my invite QR", self.show_invite_qr),
+            ("Scan an invite QR (camera)", self.scan_invite_qr),
+            ("Show my contact card", self.share_contact_card),
+            ("Import a contact card (clipboard)",
+             self.import_contact_card),
+            ("Open recovery sheet", self.open_recovery_sheet),
+        ]
+
     def open_recovery_sheet(self, onboarding_name=None):
         """Make an encrypted kit before first connection or from Profile."""
         box = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
@@ -7050,6 +7115,12 @@ class sHadesClientApp(MDApp):
         to the next input field on the connect screen. Returns True to
         claim the key when we handled it.
         """
+        # Ctrl+K opens the tier-2 command palette (desktop)
+        if key == 107 and isinstance(modifier, (list, tuple)) and any(
+                str(m).lower() in ("ctrl", "lctrl", "rctrl")
+                for m in modifier):
+            self.open_command_palette()
+            return True
         # Tab focus traversal on the connect screen
         if key == 9:
             try:
