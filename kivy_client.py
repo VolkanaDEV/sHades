@@ -4442,9 +4442,26 @@ class sHadesClientApp(MDApp):
             nh = bytes.fromhex(self.guild_node_hash)
             nid = RNS.Identity.recall(nh)
             if nid is None:
+                # Boot-race fix (v0.33.9, tay's t_4 launches 2/3): a resumed
+                # boot carries guild_node_hash in the saved session and the
+                # discovery wait is skipped, so the recall ran ~2s after TCP
+                # came up — before the hub's announce landed (the guild
+                # re-announces every 10s). One failed recall parked the
+                # client on the connect screen until the user killed it.
+                # Instead: wait for the announce we need, up to 30s
+                # (three re-announce windows); only then fail.
+                print("connect: identity not known yet; waiting for the "
+                      "hub's announce (re-announces every 10s, up to 30s)")
+                for _ in range(60):
+                    time.sleep(0.5)
+                    nid = RNS.Identity.recall(nh)
+                    if nid is not None:
+                        break
+            if nid is None:
                 raise RuntimeError(
                     "RNS does not know identity for node_hash %s — "
-                    "the guild's announce was not heard yet. Try again." % self.guild_node_hash)
+                    "the guild's announce was not heard within 30s. "
+                    "Try again." % self.guild_node_hash)
             print(f"RNS recalled identity for node_hash {self.guild_node_hash}")
 
             # link to guild node -- extracted so the self-heal path
