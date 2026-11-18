@@ -305,6 +305,7 @@ import RNS  # noqa: E402  (after the guarded kivy/diagnostics block, by design)
 from RNS.vendor import umsgpack as msgpack  # noqa: E402
 import invite  # noqa: E402
 import dms  # noqa: E402
+import profile_card  # noqa: E402
 import ui_geom  # noqa: E402
 from micron import (micron_parse, micron_page_bg, micron_media_target,  # noqa: E402
                     runs_to_markup)
@@ -7191,6 +7192,65 @@ class sHadesClientApp(MDApp):
                     lambda dt: self._set_status(err), 0)
         threading.Thread(target=work, daemon=True).start()
 
+    def _contact_card_payload(self):
+        """v0.34 contact card payload (profile_card v1 spec).
+
+        The pubkey comes from the client identity, so a card never
+        leaks private key data; the alias rides the display name the
+        user already owns. Returns None on a fresh run where the router
+        (and with it the identity) has not been built yet.
+        """
+        ident = getattr(self, "client_identity", None)
+        if ident is None:
+            return None
+        alias = (self.display_name
+                 or getattr(self, "username", "") or "").strip()
+        if not alias:
+            return None
+        try:
+            return profile_card.build_payload(
+                ident.get_public_key(), alias)
+        except profile_card.CardPayloadError as e:
+            print("contact card payload error:", e)
+            return None
+
+    def render_contact_card(self):
+        """Render the card QR (avatar composited mid-code) into the
+        image cache; returns the cached file path or None."""
+        payload = self._contact_card_payload()
+        if payload is None:
+            return None
+        try:
+            avatar = None
+            av_path = getattr(self, "my_avatar_small", "") or ""
+            from os.path import isfile as _isfile
+            if av_path and _isfile(av_path):
+                with open(av_path, "rb") as f:
+                    avatar = f.read()
+        except Exception:
+            avatar = None
+        try:
+            qr = profile_card.render_qr_png(payload)
+            comp = profile_card.composite_center(qr, avatar, out_px=512)
+        except profile_card.CardPayloadError as e:
+            print("contact card render error:", e)
+            return None
+        return IMAGE_CACHE.set_bytes("card:qr", comp)
+
+    def share_contact_card(self):
+        """Copy the card payload as text (v1 import path: the scanner
+        pastes it into their card import field)."""
+        payload = self._contact_card_payload()
+        if payload is None:
+            self._set_status("Card unavailable until the connection starts")
+            return
+        try:
+            from kivy.core.clipboard import Clipboard
+            Clipboard.copy(payload)
+            self._set_status("Card payload copied — send it to a friend")
+        except Exception as e:
+            self._set_status("Could not copy card: %s" % repr(e))
+
     def _show_own_profile(self):
         """Show own profile locally."""
         try:
@@ -7207,6 +7267,20 @@ class sHadesClientApp(MDApp):
         self.profile_screen.target_avatar = getattr(
             self, "my_avatar_small", ""
         ) or ""
+        # v0.34 contact card: render the QR into the cache and bind it
+        qr_widget = self.profile_screen.ids.get("profile_card_qr")
+        alias_label = self.profile_screen.ids.get("profile_card_alias")
+        qr_path = self.render_contact_card()
+        if qr_widget is not None:
+            if qr_path is not None:
+                qr_widget.source = qr_path
+                if alias_label is not None:
+                    alias_label.text = (
+                        self.display_name or self.username or "user")
+            else:
+                qr_widget.source = ""
+                if alias_label is not None:
+                    alias_label.text = ""
         try:
             self.root.current = "profile"
         except Exception:

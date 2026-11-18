@@ -383,6 +383,41 @@
             halign: 'center'
             text_size: self.width, None
             shorten: True
+        Label:
+            id: profile_card_alias
+            text: ''
+            font_size: sp(14)
+            bold: True
+            color: app.theme_colors['text']
+            size_hint_y: None
+            height: dp(24)
+            halign: 'center'
+            text_size: self.width, None
+        # ---- contact card QR (v0.34, tay: collectible profile card) ----
+        # the QR carries the public keyset only; tap copy below to hand
+        # the payload to someone as text (v1 import path)
+        Image:
+            id: profile_card_qr
+            size_hint: None, None
+            size: dp(180), dp(180)
+            source: ''
+            allow_stretch: True
+            pos_hint: {'center_x': 0.5}
+            canvas.after:
+                Color:
+                    rgba: app.theme_colors['text']
+                Line:
+                    rounded_rectangle: self.x - dp(6), self.y - dp(6), self.width + dp(12), self.height + dp(12), dp(10)
+                    width: 1.5
+        MDButton:
+            style: 'outlined'
+            size_hint_x: None
+            width: dp(230)
+            pos_hint: {'center_x': 0.5}
+            on_press: app.share_contact_card()
+            MDButtonText:
+                text: 'Copy card payload'
+                text_color: app.theme_colors['text']
         BoxLayout:
             size_hint_y: None
             height: dp(50)
