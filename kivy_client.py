@@ -2138,8 +2138,13 @@ if KIVY:
                 fade.bind(on_complete=lambda *_: self._next_card(card))
                 fade.start(card)
             else:
+                name = (self.ids.welcome_name.text or "").strip()
+                if not name:
+                    # tay (2026-11): a username is required before the
+                    # first connection; the hint stays until one is typed.
+                    return
                 App.get_running_app().open_recovery_sheet(
-                    onboarding_name=self.ids.welcome_name.text)
+                    onboarding_name=name)
 
         def _next_card(self, card):
             self.stage += 1
@@ -2460,6 +2465,12 @@ class sHadesClientApp(MDApp):
     theme_colors = DictProperty({})
     # task 9: the composer rail's pfp; "" = letterless default disc
     composer_pfp_path = StringProperty("")
+    # tay (2026-11): the onboarding avatar slot and the connect-screen
+    # username gate bind to these; preview mirrors my_avatar_small so
+    # the onboarding card shows the pick (or the generated pattern)
+    # live.
+    avatar_preview = StringProperty("")
+    connect_username_required = BooleanProperty(True)
     # path-state chip: the observed RNS path to the guild node
     # (offline / direct / relay + hop count), rendered by MeshPulse,
     # MeshConstellation and the header label in kv_md.kv
@@ -2851,9 +2862,19 @@ class sHadesClientApp(MDApp):
         os.replace(temp, path)
 
     def complete_onboarding(self, name):
-        """Create a durable local identity before the first connection."""
+        """Create a durable local identity before the first connection.
+
+        tay (2026-11): a username is required before the first hub
+        connection -- the staged "wanderer-hex" name is only a prefilled
+        hint; if the user clears it the flow stops before identity
+        creation rather than silently minting a name.
+        """
         cleaned = re.sub(r"[^a-zA-Z0-9_. -]", "", name or "").strip()[:24]
-        self.username = cleaned or self.onboarding_name
+        if not cleaned:
+            self._set_status("A username is required before connecting.")
+            self.root.current = "onboarding"
+            return
+        self.username = cleaned
         self._portable_name = self.username
         os.makedirs(_app_data_dir(), exist_ok=True)
         try:
@@ -2861,10 +2882,14 @@ class sHadesClientApp(MDApp):
         except Exception as exc:
             self._set_status("Identity creation failed: %s" % exc)
             return
-        try:
-            self._create_generated_avatar(self.username)
-        except (OSError, ValueError) as e:
-            print("avatar preview unavailable:", repr(e))
+        if not (getattr(self, "my_avatar_small", None)
+                and os.path.isfile(str(self.my_avatar_small))):
+            # tay (2026-11): cheaply generated from the username when the
+            # user did not pick a photo during onboarding.
+            try:
+                self._create_generated_avatar(self.username)
+            except (OSError, ValueError) as e:
+                print("avatar preview unavailable:", repr(e))
         self._save_portable_profile()
         with open(self._onboarding_path(), "w", encoding="utf-8") as f:
             json.dump({"name": self.username, "completed": True}, f)
@@ -3879,8 +3904,15 @@ class sHadesClientApp(MDApp):
             node_widget.text = inv["node_hash"]
 
     def connect_to_guild(self, hub_address, username, node_hash="", delivery_hash=""):
-        hub_address = (hub_address or "").strip()
-        username = (username or "user").strip() or "user"
+        if not (hub_address or "").strip():
+            self._set_status("Hub address required.")
+            return
+        # tay (2026-11): a username is required before connecting to a
+        # hub for the first time; no silent "user" fallback.
+        username = (username or "").strip()
+        if not username:
+            self._set_status("A username is required before connecting.")
+            return
         node_hash = (node_hash or "").strip().lower()
         delivery_hash = (delivery_hash or "").strip().lower()
 
@@ -8631,6 +8663,7 @@ class sHadesClientApp(MDApp):
             return
         newest = max(candidates, key=os.path.getmtime)
         self.my_avatar_small = newest
+        self.avatar_preview = newest
         self.composer_pfp_path = newest
 
     def _save_pfp_crop(self, path, crop_cx=0, crop_cy=0, crop_r=0,
@@ -8827,6 +8860,9 @@ class sHadesClientApp(MDApp):
         # the files are saved to disk even if guild upload fails.
         self.my_avatar_orig = orig_path
         self.my_avatar_small = small_path
+        # tay (2026-11): the onboarding slot and the connect gate bind
+        # to avatar_preview.
+        self.avatar_preview = small_path
 
         # Apply to profile screen if it exists
         if hasattr(self, "profile_screen"):

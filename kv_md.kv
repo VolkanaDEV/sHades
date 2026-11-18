@@ -902,6 +902,26 @@
                 halign: 'center'
                 valign: 'middle'
                 size_hint_y: 1
+            BoxLayout:
+                spacing: dp(10)
+                size_hint_y: None
+                height: dp(52) if root.stage == 2 else 0
+                opacity: 1 if root.stage == 2 else 0
+                PfpImage:
+                    size_hint_x: None
+                    width: dp(44)
+                    source: app.avatar_preview or ""
+                    allow_stretch: False
+                    keep_ratio: True
+                MDButton:
+                    style: 'outlined'
+                    size_hint_x: None
+                    width: dp(160)
+                    height: dp(40)
+                    on_press: app.open_file_chooser(avatar=True)
+                    MDButtonText:
+                        text: 'Choose photo'
+                        text_color: app.theme_colors['text']
             MDTextField:
                 id: welcome_name
                 text: app.onboarding_name
@@ -921,6 +941,7 @@
                 md_bg_color: app.theme_colors['primary']
                 on_press: root.advance()
                 MDButtonText:
+                    disabled: root.stage == 2 and not welcome_name.text.strip()
                     text: 'Protect identity' if root.stage == 2 else 'Continue'
                     text_color: app.theme_colors['btn_text']
             MDButton:
@@ -1015,6 +1036,7 @@
                                 text_color_focus: app.theme_colors['text']
                         MDTextField:
                             id: username
+                            text: app.username
                             multiline: False
                             size_hint_y: None
                             height: dp(44)
@@ -1052,6 +1074,7 @@
                             height: scaled(dp(40))
                             theme_bg_color: 'Custom'
                             md_bg_color: app.theme_colors['primary']
+                            disabled: app.connect_username_required and not username.text.strip()
                             on_press: app.connect_to_guild(hub_address.text, username.text, node_hash.text, delivery_hash.text)
                             MDButtonText:
                                 text: 'Connect'
