@@ -3556,12 +3556,425 @@ class sHadesClientApp(MDApp):
             self._regroup_messages(grid)
         return rendered > 0
 
+    def open_account_actions_sheet(self):
+        """Export / erase / leave, plus the public moderation record."""
+        box = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(14))
+        caption = Label(
+            text="Your identity's ledger on this guild", font_size=sp(14),
+            color=self.theme_colors["text"], size_hint_y=None, height=dp(26),
+            halign="center", valign="middle")
+        box.add_widget(caption)
+        actions = GridLayout(cols=2, size_hint_y=None, height=dp(150),
+                             spacing=dp(8))
+        export = Button(text="Export my posts", background_normal="",
+                        color=self.theme_colors["text"],
+                        background_color=self.theme_colors["sidebar_ctrl"])
+        cached = Button(text="Export local cache", background_normal="",
+                        color=self.theme_colors["text"],
+                        background_color=self.theme_colors["sidebar_ctrl"])
+        actions_view = Button(text="Guild actions", background_normal="",
+                              color=self.theme_colors["text"],
+                              background_color=self.theme_colors["sidebar_ctrl"])
+        erase = Button(text="Delete my posts", background_normal="",
+                       color=self.theme_colors["text"],
+                       background_color=self.theme_colors["sidebar_ctrl"])
+        leave = Button(text="Leave guild", background_normal="",
+                       color=self.theme_colors["text"],
+                       background_color=self.theme_colors["sidebar_ctrl"])
+        actions.add_widget(export)
+        actions.add_widget(cached)
+        actions.add_widget(actions_view)
+        actions.add_widget(erase)
+        actions.add_widget(leave)
+        close = Button(text="Close", background_normal="",
+                       color=self.theme_colors["btn_text"],
+                       background_color=self.theme_colors["primary"])
+        actions.add_widget(close)
+        box.add_widget(actions)
+        sheet = Popup(title="Account actions", content=box,
+                      size_hint=(0.85, 0.5))
+        export.bind(on_press=lambda *_: self.export_server_posts())
+        cached.bind(on_press=lambda *_: self.export_cached_posts())
+        erase.bind(on_press=lambda *_:
+                   (sheet.dismiss(), self.open_delete_posts_sheet()))
+        actions_view.bind(on_press=lambda *_:
+                          (sheet.dismiss(), self.open_member_actions()))
+        leave.bind(on_press=lambda *_:
+                   (sheet.dismiss(), self.open_leave_sheet()))
+        close.bind(on_press=lambda *_: sheet.dismiss())
+        sheet.open()
+
+    def open_member_actions(self):
+        """A public, read-only record of moderation without private reasons."""
+        if not self.guild_api:
+            self._set_status("Connect to a guild to see its actions.")
+            return
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
+        scroll = ScrollView()
+        rows = GridLayout(cols=1, size_hint_y=None, spacing=dp(6))
+        rows.bind(minimum_height=rows.setter("height"))
+        scroll.add_widget(rows)
+        box.add_widget(scroll)
+        close = Button(text="Close", size_hint_y=None, height=dp(44),
+                       background_normal="",
+                       background_color=self.theme_colors["primary"],
+                       color=self.theme_colors["btn_text"])
+        box.add_widget(close)
+        sheet = Popup(title="Guild actions", content=box, size_hint=(0.85, 0.7))
+        close.bind(on_press=lambda *_: sheet.dismiss())
+
+        def show(value):
+            rows.clear_widgets()
+            if not value.get("ok"):
+                lines = ["Could not load actions: %s" % value.get(
+                    "error", "unknown error")]
+            else:
+                entries = value.get("entries") or []
+                lines = ["Recent moderation actions (reasons stay private)"]
+                lines += ["%s  %s  by %s" % (
+                    str(entry.get("action", ""))[:32].replace("mod.", ""),
+                    str(entry.get("target") or "guild")[:12],
+                    str(entry.get("actor") or "-")[:12]) for entry in entries]
+                if not entries:
+                    lines.append("No recent moderation actions.")
+            for line in lines:
+                row = Label(text=line, font_size=sp(13),
+                            color=self.theme_colors["text"], halign="left",
+                            valign="middle", size_hint_y=None, height=dp(40))
+                row.bind(width=lambda w, width: setattr(w,
+                                                        "text_size",
+                                                        (width, None)))
+                rows.add_widget(row)
+
+        show({"ok": 1, "entries": []})
+        sheet.open()
+        api = self.guild_api
+
+        def fetch():
+            try:
+                result = api.member_moderation(50)
+            except Exception as exc:
+                result = {"ok": 0, "error": str(exc)}
+            Clock.schedule_once(
+                lambda dt: show(result) if sheet.parent else None, 0)
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def open_catchup(self, auto=False):
+        api = self.guild_api
+        if api is None:
+            if not auto:
+                self._set_status("Connect to catch up on your guild.")
+            return
+
+        def work():
+            try:
+                result = api.catchup()
+            except Exception as exc:
+                result = {"ok": 0, "error": str(exc)}
+
+            def show(_dt):
+                if not result.get("ok"):
+                    if not auto:
+                        self._set_status(
+                            "Catch-up failed: %s" % result.get("error"))
+                    return
+                channels = result.get("channels") or []
+                if not channels and auto:
+                    return
+                box = BoxLayout(orientation="vertical", padding=dp(12),
+                                spacing=dp(8))
+                scroll = ScrollView()
+                grid = GridLayout(cols=1, size_hint_y=None, spacing=dp(6))
+                grid.bind(minimum_height=grid.setter("height"))
+                scroll.add_widget(grid)
+                box.add_widget(scroll)
+                sheet = Popup(title="Catch me up", content=box,
+                              size_hint=(0.85, 0.72))
+                if not channels:
+                    grid.add_widget(Label(text="All caught up.",
+                                          size_hint_y=None, height=dp(48)))
+                for item in channels:
+                    name = item.get("name", "channel")
+                    lines = ["#%s - %s new" % (name, item.get("count", 0))]
+                    lines += ["%s: %s" % (row.get("username", "?"),
+                                          row.get("content", "")[:80])
+                              for row in item.get("recent") or []]
+                    button = Button(
+                        text="\n".join(lines), size_hint_y=None,
+                        height=dp(36 + 20 * (len(lines) - 1)),
+                        halign="left", valign="middle")
+                    button.bind(on_press=lambda inst, n=name:
+                                (sheet.dismiss(), self._switch_channel(n)))
+                    grid.add_widget(button)
+                sheet.open()
+            Clock.schedule_once(show, 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def export_cached_posts(self):
+        """Export only this device's cached own posts, labelled as partial."""
+        guild = self._cache_guild()
+        if not guild or not self.my_hash:
+            self._set_status("No active guild identity to export.")
+            return
+        messages = [m for m in offline_store.all_messages(
+            self._offline_path(), guild) if m.get("author_hash") == self.my_hash]
+        payload = json.dumps({
+            "format": "shades-local-export-v1", "guild": guild,
+            "scope": "locally cached own posts only; older guild history "
+                     "may be missing",
+            "exported_at": time.time(), "messages": messages,
+        }, ensure_ascii=False, indent=2).encode("utf-8")
+        self._export_recovery_bytes(
+            payload, lambda ok, detail: self._set_status(detail),
+            filename="sHades-cached-posts.json",
+            description="Cached post export")
+
+    def export_server_posts(self):
+        """Page the guild's complete own-post ledger to a streamed JSON file."""
+        api = self.guild_api
+        if not api:
+            self._set_status("Connect to the guild to export all your posts.")
+            return
+        guild = self._cache_guild()
+        self._set_status("Exporting posts from the guild...")
+
+        def work():
+            os.makedirs(_app_data_dir(), exist_ok=True)
+            fd, path = tempfile.mkstemp(prefix="shades-export-",
+                                        suffix=".json", dir=_app_data_dir())
+            try:
+                count, after = 0, 0
+                with os.fdopen(fd, "w", encoding="utf-8") as output:
+                    output.write('{"format":"shades-guild-export-v1",'
+                                 '"guild":')
+                    json.dump(guild, output)
+                    output.write(
+                        ',"scope":"own guild posts and attachment metadata; '
+                        'no bytes","messages":[')
+                    while True:
+                        res = api.account_export(after, 100)
+                        if not res.get("ok"):
+                            raise RuntimeError(
+                                res.get("error", "export failed"))
+                        batch = res.get("messages") or []
+                        for msg in batch:
+                            if count:
+                                output.write(",")
+                            json.dump(msg, output, ensure_ascii=False)
+                            count += 1
+                        next_after = res.get("next_after")
+                        if next_after is None:
+                            break
+                        if not isinstance(next_after, int) or \
+                                next_after <= after:
+                            raise ValueError(
+                                "guild sent an invalid export cursor")
+                        after = next_after
+                    output.write("]}")
+
+                def save(_dt):
+                    def done(ok, detail):
+                        try:
+                            os.unlink(path)
+                        except OSError:
+                            pass
+                        self._set_status(
+                            detail if ok else "Export failed: " + detail)
+                    self._export_recovery_bytes(path, done,
+                                                filename="sHades-guild-posts.json",
+                                                description="%d guild posts" % count)
+                Clock.schedule_once(save, 0)
+            except Exception as exc:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                Clock.schedule_once(
+                    lambda dt, error=str(exc): self._set_status(
+                        "Guild export failed: %s" % error), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def open_delete_posts_sheet(self):
+        if not self.guild_api:
+            self._set_status("Connect to the guild before deleting posts.")
+            return
+        box = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(10))
+        box.add_widget(Label(
+            text="Delete every post by this identity in this guild? "
+                 "The guild will erase text, edits and attachment links. "
+                 "Export first if you need a copy. Backups and audit "
+                 "metadata may remain.",
+            color=self.theme_colors["text"], font_size=sp(14),
+            text_size=(dp(290), None), valign="middle"))
+        confirm = Button(text="Delete my posts", size_hint_y=None,
+                         height=dp(46))
+        box.add_widget(confirm)
+        sheet = Popup(title="Erase guild posts", content=box,
+                      size_hint=(0.85, 0.48), auto_dismiss=True)
+
+        def erase(*_):
+            sheet.dismiss()
+            api, guild, author = self.guild_api, self._cache_guild(), \
+                self.my_hash
+
+            def work():
+                try:
+                    res = api.account_delete_posts()
+                except Exception as exc:
+                    res = {"ok": 0, "error": str(exc)}
+
+                def apply(_dt):
+                    if not res.get("ok"):
+                        self._set_status(
+                            "Erase failed: %s" % res.get("error"))
+                        return
+                    with self._cache_write_lock:
+                        self._purged_before[guild] = (author, float(
+                            res.get("deleted_at") or time.time()))
+                        self._cache_pending = {
+                            key: value for key, value in
+                            getattr(self, "_cache_pending", {}).items()
+                            if not (key[0] == guild and
+                                    value.get("author_hash") == author)}
+                        offline_store.forget_author(self._offline_path(),
+                                                    guild, author)
+                    self._history = [m for m in getattr(self, "_history", [])
+                                     if not (m.get("guild_key") == guild and
+                                             m.get("author_hash") == author)]
+                    self._save_history()
+                    self._set_status("Guild erased %d of your posts. "
+                                     "Backups may remain." % res.get("deleted", 0))
+                    self._switch_channel(self.root.get_screen(
+                        "main")._current_channel)
+                Clock.schedule_once(apply, 0)
+            threading.Thread(target=work, daemon=True).start()
+        confirm.bind(on_press=erase)
+        sheet.open()
+
+    def open_leave_sheet(self):
+        if self._active_server_idx < 0:
+            self._set_status("No guild is selected.")
+            return
+        box = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(12))
+        label = Label(
+            text="Leave this guild and remove its local cache? "
+                 "Your posts remain on the guild unless you delete them "
+                 "first. Export anything you need before leaving.",
+            color=self.theme_colors["text"], halign="center",
+            valign="middle", font_size=sp(14))
+        label.bind(size=lambda w, v: setattr(w, "text_size", v))
+        box.add_widget(label)
+        actions = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        confirm = Button(text="Leave guild", background_normal="",
+                         background_color=self.theme_colors["primary"],
+                         color=self.theme_colors["btn_text"])
+        local = Button(text="Remove locally", background_normal="",
+                       background_color=self.theme_colors["sidebar_ctrl"],
+                       color=self.theme_colors["text"])
+        cancel = Button(text="Cancel", background_normal="",
+                        background_color=self.theme_colors["sidebar_ctrl"],
+                        color=self.theme_colors["text"])
+        actions.add_widget(cancel)
+        actions.add_widget(local)
+        actions.add_widget(confirm)
+        box.add_widget(actions)
+        sheet = Popup(title="Leave guild", content=box,
+                      size_hint=(0.85, 0.38), auto_dismiss=False)
+        cancel.bind(on_press=lambda *_: sheet.dismiss())
+        local.bind(on_press=lambda *_:
+                   (sheet.dismiss(), self._leave_current_guild()))
+        confirm.bind(on_press=lambda *_:
+                     (sheet.dismiss(), self.leave_guild_on_server()))
+        sheet.open()
+
+    def leave_guild_on_server(self):
+        api = self.guild_api
+        if api is None:
+            self._set_status("Connect to the guild to release your membership.")
+            return
+        self._set_status("Leaving guild...")
+
+        def work():
+            try:
+                res = api.account_leave()
+            except Exception as exc:
+                res = {"ok": 0, "error": str(exc)}
+
+            def apply(_dt):
+                if res.get("ok"):
+                    self._leave_current_guild()
+                    self._set_status("Left guild. Your posts remain until "
+                                     "erased separately.")
+                else:
+                    self._set_status(
+                        "Leave failed: %s" % res.get("error"))
+            Clock.schedule_once(apply, 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _leave_current_guild(self):
+        """Forget local membership without claiming server-side erasure."""
+        guild = self._cache_guild()
+        index = self._active_server_idx
+        if not 0 <= index < len(self._servers):
+            return
+        try:
+            if self.link is not None:
+                self.link.teardown()
+        except Exception:
+            pass
+        self.guild_api = None
+        self.link = None
+        self._stream_cid = None
+        if getattr(self, "_cache_event", None):
+            self._cache_event.cancel()
+            self._cache_event = None
+        self._cache_pending = {key: value for key, value in
+                               getattr(self, "_cache_pending", {}).items()
+                               if key[0] != guild}
+        with self._cache_write_lock:
+            self._forgotten_cache_guilds.add(guild)
+            offline_store.forget_guild(self._offline_path(), guild)
+        self._history = [m for m in getattr(self, "_history", [])
+                         if m.get("guild_key") != guild]
+        self._save_history()
+        self._remove_server(index)
+        self._active_server_idx = 0 if self._servers else -1
+        self.guild_node_hash = None
+        self.hub_address = None
+        self.hub_host = None
+        self.hub_port = None
+        self.delivery_hash = None
+        self._channels.clear()
+        self._channel_kinds.clear()
+        self._channel_unread.clear()
+        self._msg_widgets.clear()
+        try:
+            main = self.root.get_screen("main")
+            main.ids.message_grid.clear_widgets()
+            main.ids.channel_grid.clear_widgets()
+            main._current_channel = "general"
+            self.root.current = "connect"
+        except Exception:
+            pass
+        try:
+            os.unlink(self._session_path())
+        except FileNotFoundError:
+            pass
+        self._set_status("Guild removed from this device. "
+                         "Its server still has your posts.")
+
     def _add_to_history(self, m):
         if not hasattr(self, "_history"):
             self._history = []
         self._history = [x for x in self._history if x.get("msg_id") != m.get("msg_id")]
         if m.get("msg_id"):
-            self._history.append(m)
+            # fork merge: rows without a guild_key are legacy rows from the
+            # pre-tag history; erase/leave filters scope only stamped rows.
+            entry = dict(m)
+            guild = self._cache_guild()
+            if guild:
+                entry["guild_key"] = guild
+            self._history.append(entry)
         if len(self._history) > 500:
             self._history = self._history[-500:]
 
