@@ -2442,6 +2442,12 @@ class sHadesClientApp(MDApp):
         # _init_identity_and_lxmf). Until then no guild call can be
         # made anyway -- every API call needs an identified link.
         self.username = "user"
+        # Contact-card alias. No setter exists yet; the card payload
+        # falls back to username. Initialised here, same law as above:
+        # reads fire before any session exists (device receipt, 184a4f9:
+        # AttributeError 'display_name' in _contact_card_payload the
+        # moment an identity was live).
+        self.display_name = ""
         self.my_hash = None
         # Which guild we are pointed at. These are plain attributes (not
         # properties), so they MUST be initialised here: on a fresh install
