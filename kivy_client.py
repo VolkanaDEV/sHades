@@ -2183,11 +2183,11 @@ if KIVY:
         def _log_left_panel_width(self, *_dt):
             try:
                 left = self.ids["left_sidebar"]
-                dlog("SWIPE panel left_open=%s left.x=%s "
-                     "left.width=%s" % (self.left_open, round(left.x, 1),
-                                        round(left.width, 1)))
+                _boot_file("SWIPE panel left_open=%s left.x=%s %s"
+                           % (self.left_open, round(left.x, 1),
+                              round(left.width, 1)))
             except Exception:
-                dlog("SWIPE panel width log failed")
+                _boot_file("SWIPE panel width log failed")
 
         def on_right_open(self, instance, opened):
             if opened:
@@ -2232,14 +2232,14 @@ if KIVY:
             self._SWIPE_EDGE = self._swipe_plan(touch)
             self._SWIPE_FIRE = False
             self._swipe_x = touch.x
-            dlog("SWIPE down x=%s edge=%s" % (
+            _boot_file("SWIPE down x=%s edge=%s" % (
                 round(touch.x, 1), self._SWIPE_EDGE))
             return super().on_touch_down(touch)
 
         def on_touch_move(self, touch):
             if self._SWIPE_EDGE and not self._SWIPE_FIRE and \
                     abs(touch.x - self._swipe_x) >= dp(24):
-                dlog("SWIPE move x=%s dx=%s edge=%s" % (
+                _boot_file("SWIPE move x=%s dx=%s edge=%s" % (
                     round(touch.x, 1),
                     round(touch.x - self._swipe_x, 1),
                     self._SWIPE_EDGE))
@@ -2253,7 +2253,7 @@ if KIVY:
                 if (rightward if not on_right else not rightward):
                     if opening:
                         target = ("right_open" if on_right else "left_open")
-                        dlog("SWIPE firing %s=True (dir ok)" % target)
+                        _boot_file("SWIPE firing %s=True (dir ok)" % target)
                         setattr(self, target, True)
                 else:
                     closing_left = self._SWIPE_EDGE == "left_close"
@@ -2266,7 +2266,7 @@ if KIVY:
 
         def on_touch_up(self, touch):
             if self._SWIPE_EDGE:
-                dlog("SWIPE up x=%s fired=%s" % (
+                _boot_file("SWIPE up x=%s fired=%s" % (
                     round(touch.x, 1), self._SWIPE_FIRE))
             self._SWIPE_EDGE = None
             self._SWIPE_FIRE = False
@@ -2728,8 +2728,8 @@ class sHadesClientApp(MDApp):
             Rects = autoclass("java.util.ArrayList")
             activity = PythonActivity.mActivity
             decor = activity.getWindow().getDecorView()
-            density = float(activity.getResources().getDisplayMetrics()                 .density)
-            band_px = int((dp(24) + dp(8)) * density)
+            metrics = activity.getResources().getDisplayMetrics()
+            band_px = int(dp(24) + dp(8))
             metrics = activity.getResources().getDisplayMetrics()
             w_px = int(metrics.widthPixels)
             h_px = int(metrics.heightPixels)
