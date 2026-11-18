@@ -168,7 +168,11 @@ def erase_test():
     app._purged_before[GUILD] = ("a" * 32, time.time())
     keep = dict(MSGS[0])
     keep["author_hash"] = "a" * 32
-    app._queue_cache(dict(keep, deleted_at=None, ts=time.time()))
+    # A stale burst redelivers PRE-erasure rows: their ts sits at or below
+    # the purge cutoff, and the marker is what keeps them out of the cache.
+    # Fresh post-erasure rows (ts above the cutoff) SHOULD be cached - the
+    # identity posting again after a clean slate is a new identity's feed.
+    app._queue_cache(dict(keep, deleted_at=None, ts=0.0))
     from kivy.clock import Clock
     for _ in range(20):
         Clock.tick()
