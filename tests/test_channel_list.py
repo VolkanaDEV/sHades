@@ -11,7 +11,9 @@ Pins down:
     (kv: opacity+disabled) while admins keep it;
   - invite-to-channel posts a channel-targeted invite and copies the link.
 """
-import os, sys, time
+import os
+import sys
+import time
 
 os.environ.setdefault("KIVY_GL_BACKEND", "mock")
 os.environ.setdefault("KIVY_NO_ARGS", "1")
@@ -79,10 +81,13 @@ class FakeApi:
 
 class FakeClock:
     """Stand-in for the context-menu clock (cancel marker)."""
+
     def __init__(self):
         self.cancelled = False
+
     def cancel(self):
         self.cancelled = True
+
 
 def main():
     try:
@@ -192,7 +197,7 @@ def main():
     saved_ok = True
     try:
         saved_ok = b_tre.on_touch_up(step)  # consumed + posts
-    except Exception as e:
+    except Exception:
         import traceback
         traceback.print_exc()
         saved_ok = False
@@ -213,6 +218,49 @@ def main():
           inv and inv[0][0] == "create"
           and inv[0][1].get("channel") == "t" * 32, inv)
 
+    # ---------- v0.32: real device path — the ScrollView owns the touch ----
+    # On the device the channels ScrollView grabs every press, so touch
+    # grab_current is the SCROLL, never the button (that is why reorder
+    # starved). Replay exactly that condition against the real ancestor.
+    scroll = grid.parent
+    while scroll is not None and scroll.__class__.__name__ != "ScrollView":
+        scroll = scroll.parent
+    check("channel grid descends from a ScrollView", scroll is not None, "")
+
+    down = FakeTouch(x=b_dos.center_x, y=b_dos.center_y)
+    down.grab_current = scroll  # the scroll claimed the touch first
+    scroll._touch = down        # as ScrollView.on_touch_down would
+    b_dos.on_touch_down(down)
+    step = FakeTouch(x=b_dos.center_x, y=b_uno.center_y)
+    step.ud = dict(down.ud)
+    step.grab_current = scroll  # still the scroll's touch, not the button
+    dragged = b_dos.on_touch_move(step)  # REAL entry, not _ch_drag_check
+    check("drag proceeds while the scroll holds the grab",
+          dragged and b_dos._dragging, dict(dragged=dragged))
+    check("scroll declaimed the touch on drag start",
+          scroll._touch is None, scroll._touch)
+    buttons = [w for w in reversed(grid.children)]
+    check("live reorder moved the row (device path)",
+          [b.channel_name for b in buttons] == ["zero", "tre", "dos", "uno"],
+          [b.channel_name for b in buttons])
+
+    # ---------- release on the stolen touch posts the order ----------
+    saved_ok = True
+    try:
+        saved_ok = b_dos.on_touch_up(step)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        saved_ok = False
+    pump()
+    check("stolen drag end returns True (consumed)", saved_ok is True, "")
+    posted = app.guild_api.reorder_calls
+    check("device-path reorder posted once more",
+          len(posted) == 2, len(posted))
+    check("posted device-path order is the visual order as cids",
+          len(posted) >= 2
+          and posted[1] == ["z" * 32, "t" * 32, "d" * 32, "u" * 32], posted)
+
     # ---------- '+' gate ----------
     app.i_am_admin = False
     app.my_roles = []
@@ -225,6 +273,7 @@ def main():
     print()
     print("PASS: %d  FAIL: %d" % (len(PASS), len(FAIL)))
     return 1 if FAIL else 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

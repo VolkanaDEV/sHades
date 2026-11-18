@@ -1707,11 +1707,27 @@ class ChannelButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
             if clock:
                 clock.cancel()
                 self._ctx_clock = None
+            # The owning ScrollView has the touch: take it back so the
+            # list stops panning under the drag (v0.32 device note).
+            node = self.parent
+            while node is not None \
+                    and node.__class__.__name__ != "ScrollView":
+                node = node.parent
+            if node is not None:
+                node._touch = None
+                try:
+                    touch.ungrab(node)
+                except Exception:
+                    pass
         self._ch_drag_step(touch)
         return True
 
     def on_touch_move(self, touch):
-        if touch.grab_current is self:
+        # v0.32 (tay device note): the channel list's ScrollView grabs
+        # every press, so grab_current never names the button and this
+        # branch never delivered moves; the origin stamp on the touch is
+        # ours (set in on_touch_down), accept moves on that instead.
+        if touch.ud.get("shades_drag_origin") is not None:
             self._ch_drag_check(touch)
         return super().on_touch_move(touch)
 
@@ -2663,6 +2679,7 @@ class sHadesClientApp(MDApp):
         """Switch to the main chat screen."""
         try:
             self.root.current = "main"
+            self._restore_avatar_from_disk()
             self._refresh_channels_ui()
             self._refresh_server_sidebar()
         except Exception as e:
@@ -7434,6 +7451,30 @@ class sHadesClientApp(MDApp):
                 self._set_status("editor: image not loaded: %s"
                                  % os.path.basename(path))
         Clock.schedule_once(_check_image, 2.0)
+
+    def _restore_avatar_from_disk(self):
+        """Bind the newest saved pfp after a restart (tay: profile pfp
+        changes did not survive a client restart on Android). The crop
+        files were written to pfps/ but nothing ever re-read them, so
+        the last session's avatar vanished until a fresh upload.
+        """
+        if getattr(self, "my_avatar_small", None):
+            return
+        try:
+            pfp_dir = os.path.join(_app_data_dir(), "pfps")
+            candidates = [
+                os.path.join(pfp_dir, name)
+                for name in os.listdir(pfp_dir)
+                if name.startswith("small_") and name.endswith(".png")
+            ]
+            candidates = [c for c in candidates if os.path.isfile(c)]
+        except Exception:
+            return
+        if not candidates:
+            return
+        newest = max(candidates, key=os.path.getmtime)
+        self.my_avatar_small = newest
+        self.composer_pfp_path = newest
 
     def _save_pfp_crop(self, path, crop_cx=0, crop_cy=0, crop_r=0,
                        image_pos=None, image_size=None):
