@@ -5,9 +5,9 @@ title = sHades
 package.name = shades
 package.domain = io.eldeucebag
 source.dir = .
-source.include_exts = py,png,jpg,kv,atlas
+source.include_exts = py,png,jpg,kv,atlas,ttf,otf
 source.exclude_dirs = .git, .github, tests, __pycache__, build, dist, .buildozer
-version = 0.33.0
+version = 0.33.1
 # Bump version on every android-facing fix so the installed build can be
 # verified on-device (Settings > Apps > sHades) without adb.
 # wasmtime runs the micron applet sandbox on-device (applet_bridge.py).
