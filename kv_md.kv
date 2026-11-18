@@ -3,6 +3,7 @@
 #:import get_color_from_hex kivy.utils.get_color_from_hex
 #:import MDApp kivymd.app.MDApp
 #:import scaled ui_scale.scaled
+#:import AuroraBackground ui_fx.AuroraBackground
 
 # Button heights are written literally as dp(N) so they read at their
 # nominal size. They used to be scaled by 2/3, which drew a 40dp button
@@ -418,6 +419,15 @@
             MDButtonText:
                 text: 'Copy card payload'
                 text_color: app.theme_colors['text']
+        MDButton:
+            style: 'outlined'
+            size_hint_x: None
+            width: dp(230)
+            pos_hint: {'center_x': 0.5}
+            on_press: app.open_recovery_sheet()
+            MDButtonText:
+                text: 'Save recovery kit'
+                text_color: app.theme_colors['text']
         BoxLayout:
             size_hint_y: None
             height: dp(50)
@@ -809,6 +819,93 @@
                             height: self.minimum_height
                             spacing: dp(2)
                             padding: [dp(6), dp(6)]
+
+<OnboardingScreen>:
+    FloatLayout:
+        canvas.before:
+            Color:
+                rgba: app.theme_colors['bg_main']
+            Rectangle:
+                pos: self.pos
+                size: self.size
+        AuroraBackground:
+            size_hint: 1, 1
+            colors: [app.theme_colors['aurora_a'], app.theme_colors['aurora_b'], app.theme_colors['aurora_c']]
+        BoxLayout:
+            id: intro_card
+            orientation: 'vertical'
+            size_hint: None, None
+            width: min(dp(420), root.width - dp(32))
+            height: min(dp(560), root.height - dp(32))
+            pos_hint: {'center_x': 0.5, 'center_y': 0.5}
+            padding: [dp(24), dp(28)]
+            spacing: dp(16)
+            canvas.before:
+                Color:
+                    rgba: app.theme_colors['panel']
+                RoundedRectangle:
+                    pos: self.pos
+                    size: self.size
+                    radius: [dp(24), dp(24), dp(24), dp(24)]
+            Image:
+                source: app.banner_config_path or ''
+                size_hint_y: None
+                height: dp(122)
+                allow_stretch: False
+                keep_ratio: True
+            Label:
+                text: '0%d  /  03' % (root.stage + 1)
+                color: app.theme_colors['accent']
+                font_size: sp(12)
+                size_hint_y: None
+                height: dp(24)
+            Label:
+                text: root.titles[root.stage]
+                font_name: 'MeshDisplay'
+                color: app.theme_colors['text']
+                bold: True
+                font_size: sp(28)
+                size_hint_y: None
+                height: dp(48)
+            Label:
+                text: root.descriptions[root.stage]
+                color: app.theme_colors['text_muted']
+                font_size: sp(15)
+                text_size: self.width, None
+                halign: 'center'
+                valign: 'middle'
+                size_hint_y: 1
+            MDTextField:
+                id: welcome_name
+                text: app.onboarding_name
+                hint_text: 'Your name on the mesh'
+                mode: 'filled'
+                multiline: False
+                size_hint_y: None
+                height: dp(44) if root.stage == 2 else 0
+                opacity: 1 if root.stage == 2 else 0
+                fill_color_normal: app.theme_colors['input_bg']
+                text_color_normal: app.theme_colors['text']
+            MDButton:
+                style: 'filled'
+                size_hint_y: None
+                height: dp(46)
+                theme_bg_color: 'Custom'
+                md_bg_color: app.theme_colors['primary']
+                on_press: root.advance()
+                MDButtonText:
+                    text: 'Protect identity' if root.stage == 2 else 'Continue'
+                    text_color: app.theme_colors['btn_text']
+            MDButton:
+                style: 'outlined'
+                size_hint_y: None
+                height: dp(44) if root.stage == 0 else 0
+                opacity: 1 if root.stage == 0 else 0
+                disabled: root.stage != 0
+                on_press: app.open_restore_sheet()
+                MDButtonText:
+                    text: 'Restore an identity'
+                    text_color: app.theme_colors['text']
 
 <ConnectScreen>:
     BoxLayout:

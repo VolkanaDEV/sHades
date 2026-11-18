@@ -18,6 +18,8 @@ import json
 import time
 import base64
 import hashlib
+import shutil
+import tempfile
 import threading
 import random
 from collections import OrderedDict
@@ -305,6 +307,8 @@ import RNS  # noqa: E402  (after the guarded kivy/diagnostics block, by design)
 from RNS.vendor import umsgpack as msgpack  # noqa: E402
 import invite  # noqa: E402
 import dms  # noqa: E402
+import recovery  # noqa: E402
+import qr_tools  # noqa: E402
 import profile_card  # noqa: E402
 import ui_geom  # noqa: E402
 from micron import (micron_parse, micron_page_bg, micron_media_target,  # noqa: E402
@@ -349,6 +353,9 @@ DEFAULT_THEME_COLORS = {
     "btn_text": (0.063, 0.090, 0.133, 1),
     "border": (0.388, 0.478, 0.529, 1),       # #637A87 visible outline
     "border_subtle": (0.165, 0.231, 0.286, 1),
+    "aurora_a": (0.96, 0.72, 0.37, 0.22),     # amber orb (fork merge)
+    "aurora_b": (0.35, 0.84, 0.77, 0.18),     # teal orb (fork merge)
+    "aurora_c": (0.50, 0.40, 0.95, 0.20),     # violet orb (fork merge)
 }
 
 THEME_KEYS = (
@@ -356,6 +363,7 @@ THEME_KEYS = (
     "topbar", "primary", "accent", "text", "text_muted", "text_dim",
     "input_bg", "input_bg_focus", "msg_own", "btn_text", "border",
     "border_subtle",
+    "aurora_a", "aurora_b", "aurora_c",
 )
 
 # Human-readable label for each THEME_KEYS entry, rendered by the config
@@ -474,6 +482,30 @@ def _app_dir():
     if meipass:
         return meipass
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def _register_ui_fonts():
+    """Fork merge: font registration for the ported kv faces (MeshDisplay,
+    MeshBody, MeshMono, MeshIcons). No-op without kivy; the fonts ride the
+    fonts/ directory next to kv_md.kv."""
+    if "kivy" not in sys.modules:
+        return
+    from kivy.core.text import LabelBase
+    fonts = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+    body = os.path.join(fonts, "SourceSans3-400.ttf")
+    body_bold = os.path.join(fonts, "SourceSans3-700.ttf")
+    LabelBase.register(name="MeshBody", fn_regular=body, fn_bold=body_bold)
+    # NOTE (fork merge decision): the fork also rebinds Roboto to the body
+    # face. We deliberately do NOT: our connect-form geometry checks (and
+    # several fixed-width controls) were designed against KivyMD's default
+    # Roboto metrics, and rebinding shifts every built-in widget's width.
+    LabelBase.register(name="MeshDisplay",
+                       fn_regular=os.path.join(fonts, "SpaceGrotesk-400.ttf"),
+                       fn_bold=os.path.join(fonts, "SpaceGrotesk-700.ttf"))
+    LabelBase.register(name="MeshMono",
+                       fn_regular=os.path.join(fonts, "IBMPlexMono-400.ttf"))
+    LabelBase.register(name="MeshIcons",
+                       fn_regular=os.path.join(fonts, "Phosphor.ttf"))
 
 
 def rgba_to_hex(rgba):
@@ -2035,6 +2067,35 @@ if KIVY:
                 box.opacity = 1
                 label.text = "Advanced: guild hashes (hide)"
 
+    class OnboardingScreen(Screen):
+        stage = NumericProperty(0)
+        titles = ("Your identity", "Your guilds", "Your mesh")
+        descriptions = (
+            "Your keys live on this device. Your name and avatar travel with you.",
+            "Gather in channels, open NomadNet sites and talk directly with friends.",
+            "Messages can wait for a path. The app shows when the guild accepts them.",
+        )
+
+        def advance(self):
+            if self.stage < 2:
+                if App.get_running_app().reduced_motion:
+                    self._next_card(self.ids.intro_card)
+                    return
+                from kivy.animation import Animation
+                card = self.ids.intro_card
+                Animation.cancel_all(card)
+                fade = Animation(opacity=0, duration=0.12)
+                fade.bind(on_complete=lambda *_: self._next_card(card))
+                fade.start(card)
+            else:
+                App.get_running_app().open_recovery_sheet(
+                    onboarding_name=self.ids.welcome_name.text)
+
+        def _next_card(self, card):
+            self.stage += 1
+            from kivy.animation import Animation
+            Animation(opacity=1, duration=0.28, t="out_cubic").start(card)
+
     class ProfileScreen(Screen):
         """Profile view: avatar, username, identity hashes, edit controls."""
         target_hash = StringProperty("")
@@ -2332,6 +2393,10 @@ class sHadesClientApp(MDApp):
     # MeshConstellation and the header label in kv_md.kv
     mesh_mode = StringProperty("offline")
     mesh_hops = NumericProperty(0)
+    # fork merge (recovery/onboarding): motion preference +
+    # staged onboarding name
+    reduced_motion = BooleanProperty(False)
+    onboarding_name = StringProperty("")
     mesh_label = StringProperty("OFFLINE")
     # reply staging: the composer's "Replying to @x" card + wire prefix
     reply_draft = StringProperty("")
@@ -2442,6 +2507,7 @@ class sHadesClientApp(MDApp):
 
         # Banner images - random selection from media folder on startup.
         self.banner_config_path = None
+        self.onboarding_name = "wanderer-%04x" % random.getrandbits(16)
         self.banner_channel_path = None
         self._select_random_banners()
 
@@ -2559,9 +2625,11 @@ class sHadesClientApp(MDApp):
         from kivymd.uix.textfield import MDTextField  # noqa: F401
         from kivymd.uix.appbar import MDTopAppBar  # noqa: F401
         from kivy.lang import Builder
+        _register_ui_fonts()
         Builder.load_file(os.path.join(_app_dir(), "kv_md.kv"))
         sm = ScreenManager()
         sm.add_widget(ConnectScreen(name="connect"))
+        sm.add_widget(OnboardingScreen(name="onboarding"))
         sm.add_widget(MainScreen(name="main"))
         sm.add_widget(ProfileScreen(name="profile"))
         sm.add_widget(ConfigScreen(name="config"))
@@ -2585,6 +2653,15 @@ class sHadesClientApp(MDApp):
             _boot_mark("on_start")
         # Try to resume a saved session
         sess = self._load_session()
+        # fork merge: the identity file is the sole carrier of
+        # the member's key. If a session or onboarding record
+        # exists but the key file is gone, require a restore
+        # instead of silently minting a new identity.
+        if (sess or os.path.isfile(self._onboarding_path())) and not os.path.isfile(
+                self._identity_file()):
+            self.root.current = "connect"
+            self._set_status("Identity missing. Restore your recovery kit or start fresh.")
+            return
         if sess and sess.get("hub_address"):
             self.guild_node_hash = sess.get("node_hash")
             self.node_hash = self.guild_node_hash
@@ -2620,6 +2697,494 @@ class sHadesClientApp(MDApp):
             if BOOT_DEBUG:
                 _boot_mark("fresh install -> default hub")
             self._auto_connect_default_hub()
+
+    def _onboarding_path(self):
+        return os.path.join(_app_data_dir(), "onboarding.json")
+
+    def _portable_profile_path(self):
+        return os.path.join(_app_data_dir(), "portable_profile.json")
+
+    def _load_portable_profile(self):
+        try:
+            with open(self._portable_profile_path()) as source:
+                data = json.load(source)
+            if isinstance(data.get("name"), str):
+                self._portable_name = data["name"][:24]
+                self.username = self._portable_name or self.username
+            avatar = data.get("avatar")
+            if isinstance(avatar, str) and avatar.startswith(_app_data_dir()) \
+                    and os.path.isfile(avatar):
+                self.my_avatar_small = avatar
+                self.avatar_preview = avatar
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def _save_portable_profile(self):
+        path = self._portable_profile_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temp = path + ".tmp"
+        with open(temp, "w") as stream:
+            json.dump({"name": self._portable_name,
+                       "avatar": getattr(self, "my_avatar_small", None)}, stream)
+        os.replace(temp, path)
+
+    def complete_onboarding(self, name):
+        """Create a durable local identity before the first connection."""
+        cleaned = re.sub(r"[^a-zA-Z0-9_. -]", "", name or "").strip()[:24]
+        self.username = cleaned or self.onboarding_name
+        self._portable_name = self.username
+        os.makedirs(_app_data_dir(), exist_ok=True)
+        try:
+            self._ensure_identity_file()
+        except Exception as exc:
+            self._set_status("Identity creation failed: %s" % exc)
+            return
+        try:
+            self._create_generated_avatar(self.username)
+        except (OSError, ValueError) as e:
+            print("avatar preview unavailable:", repr(e))
+        self._save_portable_profile()
+        with open(self._onboarding_path(), "w", encoding="utf-8") as f:
+            json.dump({"name": self.username, "completed": True}, f)
+        self._auto_connect_default_hub()
+
+    def _identity_file(self):
+        return os.path.join(_app_data_dir(), "rns", "identity")
+
+    def _ensure_identity_file(self):
+        path = self._identity_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if not os.path.isfile(path):
+            RNS.Identity().to_file(path)
+            os.chmod(path, 0o600)
+        elif RNS.Identity.from_file(path) is None:
+            raise ValueError("identity is damaged; restore a recovery kit")
+        return path
+
+    def start_fresh_identity(self):
+        """Explicit path when a previous install has no recoverable key."""
+        if os.path.exists(self._identity_file()):
+            self._set_status("An identity is already installed on this device.")
+            return
+        self.root.current = "onboarding"
+        self.root.get_screen("onboarding").stage = 0
+
+    def _create_generated_avatar(self, name):
+        """A deterministic node pattern, unique to the chosen local name."""
+        digest = hashlib.sha256(name.encode("utf-8")).digest()
+        image = PILImage.new("RGB", (128, 128), (12, 26, 33))
+        draw = PILImageDraw.Draw(image)
+        nodes = [(24 + digest[i] % 75, 24 + digest[i + 1] % 75)
+                 for i in (0, 2, 4)]
+        draw.line(nodes + nodes[:1], fill=(76, 205, 179), width=3)
+        for i, (x, y) in enumerate(nodes):
+            color = (251, 183, 99) if i == 0 else (89, 224, 191)
+            draw.ellipse((x - 7, y - 7, x + 7, y + 7), fill=color)
+        path = os.path.join(_app_data_dir(), "avatar_generated.jpg")
+        image.save(path, "JPEG", quality=82)
+        self.my_avatar_small = path
+        self.avatar_preview = path
+        self._generated_avatar_pending = True
+
+    def _upload_generated_avatar(self):
+        if not getattr(self, "_generated_avatar_pending", False):
+            return
+        path = getattr(self, "my_avatar_small", "")
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "rb") as f:
+                result = self.guild_api.avatar_upload(f.read())
+            if result and result.get("ok") and not result.get("unconfirmed"):
+                self._generated_avatar_pending = False
+        except Exception as e:
+            print("generated avatar upload pending:", repr(e))
+
+    def open_recovery_sheet(self, onboarding_name=None):
+        """Make an encrypted kit before first connection or from Profile."""
+        box = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
+        hint = Label(text="Save this kit somewhere outside your phone. The phrase "
+                          "is never stored; losing both means losing your identity.",
+                     color=self.theme_colors["text_muted"], font_size=sp(13),
+                     size_hint_y=None, height=dp(64), halign="center",
+                     valign="middle")
+        hint.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+        box.add_widget(hint)
+
+        def field(label):
+            widget = TextInput(password=True, multiline=False, hint_text=label,
+                               font_name="MeshBody", font_size=sp(16),
+                               foreground_color=self.theme_colors["text"],
+                               hint_text_color=self.theme_colors["text_muted"],
+                               background_normal="", background_active="",
+                               background_color=self.theme_colors["input_bg"],
+                               size_hint_y=None, height=dp(46))
+            box.add_widget(widget)
+            return widget
+
+        phrase = field("Recovery phrase (12+ characters)")
+        confirm = field("Repeat recovery phrase")
+        status = Label(text="", color=self.theme_colors["accent"],
+                       font_size=sp(12), size_hint_y=None, height=dp(44))
+        status.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+        box.add_widget(status)
+        actions = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        save = Button(text="Save kit", background_normal="",
+                      background_color=self.theme_colors["primary"],
+                      color=self.theme_colors["btn_text"])
+        later = Button(text="Skip for now" if onboarding_name is not None else "Close",
+                       background_normal="", background_color=self.theme_colors["sidebar_ctrl"],
+                       color=self.theme_colors["text"])
+        actions.add_widget(save)
+        actions.add_widget(later)
+        box.add_widget(actions)
+        sheet = Popup(title="Protect your identity", content=box,
+                      size_hint=(0.86, 0.60), auto_dismiss=False)
+
+        def done(success, detail):
+            status.text = detail
+            save.disabled = False
+            if success and onboarding_name is not None:
+                sheet.dismiss()
+                self.complete_onboarding(onboarding_name)
+                self._set_status(detail)
+
+        def save_kit(*_):
+            if phrase.text != confirm.text:
+                status.text = "The phrases do not match."
+                return
+            try:
+                identity_path = self._ensure_identity_file()
+                with open(identity_path, "rb") as stream:
+                    key_bytes = stream.read(4097)
+                profile = {"username": (onboarding_name or self.username or "")[:32],
+                           "friends": self._friends[:200],
+                           "servers": self._servers[:50]}
+                kit = recovery.create_kit(key_bytes, phrase.text, profile)
+            except Exception as exc:
+                status.text = "Kit could not be made: %s" % exc
+                return
+            save.disabled = True
+            self._export_recovery_bytes(kit, done)
+
+        save.bind(on_press=save_kit)
+        later.bind(on_press=lambda *_: (sheet.dismiss(),
+                   self.complete_onboarding(onboarding_name)) if onboarding_name is not None
+                   else sheet.dismiss())
+        sheet.open()
+
+    def show_qr(self, payload, title, note=""):
+        """Display a scannable QR without exposing the payload as plain text."""
+        fd, path = tempfile.mkstemp(prefix="shades-qr-", suffix=".png",
+                                    dir=_app_data_dir())
+        os.close(fd)
+        try:
+            qr_tools.make_qr(payload, path)
+        except Exception:
+            os.unlink(path)
+            raise
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
+        box.add_widget(Image(source=path, allow_stretch=True))
+        if note:
+            box.add_widget(Label(text=note, color=self.theme_colors["text_muted"],
+                                 font_size=sp(12), size_hint_y=None, height=dp(46)))
+        popup = Popup(title=title, content=box, size_hint=(0.9, 0.72))
+        popup.bind(on_dismiss=lambda *_: os.path.exists(path) and os.unlink(path))
+        popup.open()
+
+    def show_invite_qr(self):
+        host, port = getattr(self, "hub_host", None), getattr(self, "hub_port", None)
+        node = getattr(self, "guild_node_hash", None)
+        if not (host and port and node):
+            self._set_status("Connect to a guild to display its invite QR.")
+            return
+        self.show_qr(invite.build_invite(host, port, node), "Guild invite",
+                     "Scan with sHades or a device camera.")
+
+    def open_transfer_qr(self):
+        """One QR carries the encrypted key and local name, no chat or friends."""
+        box = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(14))
+        box.add_widget(Label(text="Choose a 12+ character phrase. The QR contains "
+                             "your encrypted identity. Only show it to your second device.",
+                             color=self.theme_colors["text"], font_size=sp(14),
+                             text_size=(dp(280), None)))
+        phrase = TextInput(password=True, multiline=False, hint_text="Transfer phrase",
+                           size_hint_y=None, height=dp(44))
+        box.add_widget(phrase)
+        show = Button(text="Show transfer QR", size_hint_y=None, height=dp(46))
+        box.add_widget(show)
+        sheet = Popup(title="Transfer identity", content=box, size_hint=(0.86, 0.4))
+
+        def create(*_):
+            try:
+                with open(self._ensure_identity_file(), "rb") as source:
+                    identity = source.read(4097)
+                kit = recovery.create_kit(
+                    identity, phrase.text,
+                    {"username": self.username or "",
+                     "friends": [], "servers": []})
+                payload = qr_tools.encode_kit(kit)
+                sheet.dismiss()
+                self.show_qr(payload, "Encrypted identity",
+                             "Scan on your second device, then enter the phrase there.")
+            except Exception as exc:
+                self._set_status("Transfer QR failed: %s" % exc)
+        show.bind(on_press=create)
+        sheet.open()
+
+    def scan_qr(self, on_value):
+        """Open a camera QR scanner where its native decoder is installed."""
+        if self._android_platform():
+            try:
+                from android.permissions import request_permissions, Permission
+
+                def ready(_permissions, grants):
+                    if all(grants):
+                        Clock.schedule_once(lambda _dt: self._open_qr_scanner(on_value), 0)
+                    else:
+                        Clock.schedule_once(lambda _dt: self._set_status(
+                            "Camera permission is needed to scan a QR."), 0)
+                request_permissions([Permission.CAMERA], ready)
+            except Exception as exc:
+                self._set_status("Camera permission request failed: %s" % exc)
+            return
+        self._open_qr_scanner(on_value)
+
+    def _open_qr_scanner(self, on_value):
+        try:
+            from kivy_garden.zbarcam import ZBarCam
+            scanner = ZBarCam()
+        except Exception as exc:
+            self._set_status("Camera scanner unavailable: %s" % exc)
+            return
+        box = BoxLayout(orientation="vertical", padding=dp(8))
+        box.add_widget(scanner)
+        sheet = Popup(title="Scan a sHades QR", content=box, size_hint=(0.95, 0.8))
+        seen = {"done": False}
+
+        def decoded(_scanner, symbols):
+            if seen["done"] or not symbols:
+                return
+            try:
+                value = symbols[0].data.decode("utf-8")
+            except (UnicodeError, AttributeError):
+                self._set_status("QR is not text")
+                return
+            seen["done"] = True
+            sheet.dismiss()
+            on_value(value)
+        scanner.bind(symbols=decoded)
+        sheet.open()
+
+    def scan_invite_qr(self):
+        def apply(value):
+            if not invite.parse_invite(value):
+                self._set_status("This QR is not a guild invite.")
+                return
+            self.root.current = "connect"
+            self.root.get_screen("connect").ids.hub_address.text = value
+            self._set_status("Invite scanned. Choose your name and connect.")
+        self.scan_qr(apply)
+
+    def _export_recovery_bytes(self, kit, done, filename="sHades-recovery.shades",
+                               description="Encrypted kit"):
+        """Use the system picker or Downloads; kit may be bytes or a file path."""
+        if self._android_platform():
+            try:
+                from jnius import autoclass
+                from android import activity as android_activity
+                if not getattr(self, "_recovery_export_bound", False):
+                    android_activity.bind(on_activity_result=self._recovery_export_result)
+                    self._recovery_export_bound = True
+                self._recovery_export_pending = (kit, done, description)
+                Intent = autoclass("android.content.Intent")
+                activity = autoclass("org.kivy.android.PythonActivity").mActivity
+                intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
+                intent.addCategory(Intent.CATEGORY_OPENABLE)
+                intent.setType("application/octet-stream")
+                intent.putExtra(Intent.EXTRA_TITLE, filename)
+                activity.startActivityForResult(intent, 0x5A1A)
+            except Exception as exc:
+                self._recovery_export_pending = None
+                done(False, "Document picker failed: %s" % exc)
+            return
+        folder = os.path.join(os.path.expanduser("~"), "Downloads")
+        if not os.path.isdir(folder):
+            folder = os.path.expanduser("~")
+        stem, extension = os.path.splitext(filename)
+        filename = "%s-%s%s" % (stem, time.strftime("%Y%m%d-%H%M%S"), extension)
+        path = os.path.join(folder, filename)
+        try:
+            if isinstance(kit, str):
+                if os.path.exists(path):
+                    raise FileExistsError(path)
+                shutil.copyfile(kit, path)
+                os.chmod(path, 0o600)
+            else:
+                recovery.write_private(path, kit)
+            done(True, "%s saved to %s" % (description, path))
+        except Exception as exc:
+            done(False, "Save failed: %s" % exc)
+
+    def _recovery_export_result(self, request_code, result_code, intent):
+        if request_code != 0x5A1A:
+            return
+        pending = getattr(self, "_recovery_export_pending", None)
+        self._recovery_export_pending = None
+        if pending is None:
+            return
+
+        def finish(_dt):
+            kit, done, description = pending
+            if result_code != -1 or intent is None:
+                done(False, "Kit save canceled.")
+                return
+            try:
+                from jnius import autoclass
+                activity = autoclass("org.kivy.android.PythonActivity").mActivity
+                uri = intent.getData()
+                pfd = activity.getContentResolver().openFileDescriptor(uri, "w")
+                fd = pfd.detachFd()
+                with os.fdopen(fd, "wb") as stream:
+                    if isinstance(kit, str):
+                        with open(kit, "rb") as source:
+                            shutil.copyfileobj(source, stream)
+                    else:
+                        stream.write(kit)
+                    stream.flush()
+                pfd.close()
+                done(True, "%s saved." % description)
+            except Exception as exc:
+                done(False, "Kit write failed: %s" % exc)
+        Clock.schedule_once(finish, 0)
+
+    def open_restore_sheet(self):
+        """Choose an encrypted kit and restore only onto a device with no key."""
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
+        phrase = TextInput(password=True, multiline=False,
+                           hint_text="Recovery phrase", font_name="MeshBody",
+                           foreground_color=self.theme_colors["text"],
+                           hint_text_color=self.theme_colors["text_muted"],
+                           background_normal="", background_active="",
+                           background_color=self.theme_colors["input_bg"],
+                           size_hint_y=None, height=dp(46))
+        box.add_widget(phrase)
+        status = Label(text="Choose the encrypted .shades kit.",
+                       color=self.theme_colors["text_muted"],
+                       size_hint_y=None, height=dp(44), font_size=sp(12))
+        box.add_widget(status)
+        chooser = None
+        if not self._android_platform():
+            chooser = FileChooserListView(path=os.path.join(
+                os.path.expanduser("~"), "Downloads"))
+            if not os.path.isdir(chooser.path):
+                chooser.path = os.path.expanduser("~")
+            box.add_widget(chooser)
+        actions = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        restore_btn = Button(text="Choose kit" if self._android_platform() else "Restore selected",
+                             background_normal="", background_color=self.theme_colors["primary"],
+                             color=self.theme_colors["btn_text"])
+        cancel = Button(text="Cancel", background_normal="",
+                        background_color=self.theme_colors["sidebar_ctrl"],
+                        color=self.theme_colors["text"])
+        actions.add_widget(restore_btn)
+        actions.add_widget(cancel)
+        box.add_widget(actions)
+        sheet = Popup(title="Restore identity", content=box,
+                      size_hint=(0.9, 0.75), auto_dismiss=False)
+
+        def restore(path):
+            try:
+                complete = self._restore_recovery_file(path, phrase.text)
+            except Exception as exc:
+                status.text = "Restore failed: %s" % exc
+                return
+            sheet.dismiss()
+            self.root.current = "connect"
+            if complete:
+                self._set_status("Identity recovered. Connect to a saved guild.")
+            else:
+                self._set_status(
+                    "Identity recovered, but some profile details could not be saved.")
+
+        def pick(*_):
+            if self._android_platform():
+                self._saf_pick(0x5A19, restore,
+                               lambda reason: setattr(status, "text", reason))
+            elif chooser and chooser.selection:
+                restore(chooser.selection[0])
+            else:
+                status.text = "Select a kit file first."
+
+        scan_btn = Button(text="Scan transfer QR",
+                          size_hint_y=None, height=dp(44))
+
+        def accept_qr(value):
+            try:
+                payload = qr_tools.decode_kit(value)
+                fd, temp = tempfile.mkstemp(
+                    prefix="shades-scan-", suffix=".shades",
+                    dir=_app_data_dir())
+                with os.fdopen(fd, "wb") as target:
+                    target.write(payload)
+                try:
+                    restore(temp)
+                finally:
+                    os.unlink(temp)
+            except Exception as exc:
+                status.text = "QR restore failed: %s" % exc
+        scan_btn.bind(on_press=lambda *_: self.scan_qr(accept_qr))
+        box.add_widget(scan_btn)
+
+        restore_btn.bind(on_press=pick)
+        cancel.bind(on_press=lambda *_: sheet.dismiss())
+        sheet.open()
+
+    def _restore_recovery_file(self, path, passphrase):
+        if os.path.exists(self._identity_file()):
+            raise FileExistsError("an identity is already installed")
+        if os.path.getsize(path) > recovery.MAX_KIT_BYTES:
+            raise ValueError("kit is too large")
+        with open(path, "rb") as stream:
+            identity, profile = recovery.open_kit(stream.read(), passphrase)
+        # Verify RNS understands the key before installing it permanently.
+        folder = os.path.dirname(self._identity_file())
+        os.makedirs(folder, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".verify-", dir=folder)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(identity)
+            if RNS.Identity.from_file(tmp) is None:
+                raise ValueError("kit contains an invalid identity")
+        finally:
+            os.unlink(tmp)
+        recovery.write_private(self._identity_file(), identity)
+        metadata_ok = True
+        name = profile.get("username")
+        if isinstance(name, str):
+            self.username = re.sub(r"[^a-zA-Z0-9_. -]", "", name).strip()[:24]
+        friends = profile.get("friends")
+        if isinstance(friends, list):
+            self._friends = [f for f in friends[:200] if isinstance(f, dict)
+                             and dms.is_user_hash(f.get("user_hash"))]
+            try:
+                dms.save_friends(self._friends_path, self._friends)
+            except OSError:
+                metadata_ok = False
+        servers = profile.get("servers")
+        if isinstance(servers, list):
+            self._servers = [s for s in servers[:50] if isinstance(s, dict)
+                             and isinstance(s.get("hub_address"), str)
+                             and 0 < len(s["hub_address"]) <= 256]
+            metadata_ok = self._save_servers() and metadata_ok
+            self._active_server_idx = 0 if self._servers else -1
+        try:
+            recovery.write_private(self._onboarding_path(),
+                                   json.dumps({"name": self.username,
+                                               "completed": True}).encode(), replace=True)
+        except OSError:
+            metadata_ok = False
+        return metadata_ok
 
     def _auto_connect_default_hub(self):
         """Connect to the default community hub on a fresh install.
@@ -2764,14 +3329,24 @@ class sHadesClientApp(MDApp):
         return []
 
     def _save_servers(self):
+        # fork merge: explicit success return (adopted from the fork's
+        # portability contract); existing fire-and-forget callers ignore it.
+        tmp = None
         try:
             os.makedirs(_app_data_dir(), exist_ok=True)
             tmp = self._servers_path + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(self._servers, f, indent=2)
             os.replace(tmp, self._servers_path)
+            return True
         except Exception as e:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
             print("save servers failed:", repr(e))
+            return False
 
     def _add_server(self, hub_address, username, node_hash="",
                     delivery_hash="", display_name=None, avatar_path=None):

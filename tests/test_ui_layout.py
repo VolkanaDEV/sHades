@@ -16,7 +16,12 @@ from kivy_client import sHadesClientApp  # noqa: E402
 class LayoutProbe(sHadesClientApp):
     def on_start(self):
         self.failures = []
-        Clock.schedule_once(self.check_connect, 1.2)
+        # 2.2s, not 1.2s: the fork-merge boot adds one screen + four real
+        # font loads, and KivyMD textfields width-settle ~1s after the
+        # first frame (probed at 52 -> 420 at dt=1.0). The check samples
+        # the SETTLED geometry either way; it still fails on real width
+        # regressions.
+        Clock.schedule_once(self.check_connect, 2.2)
 
     def check(self, condition, message):
         print(("PASS " if condition else "FAIL ") + message, flush=True)
