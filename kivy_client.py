@@ -456,6 +456,34 @@ def cached_path(key):
     return os.path.join(cache_dir(), hashlib.sha256(key.encode()).hexdigest()[:32])
 
 
+def parse_slash_help(text):
+    """Parse the hub dispatcher's /help output into (cmd, usage) rows.
+
+    Lines look like "  msg <channel> <text>   post <text> to..." —
+    the first token after the indent is the command, the remainder
+    (with run-length whitespace collapsed) is the usage string. The
+    "commands:" header and empty lines are dropped. This must track
+    sHades.py's help table by construction: the palette is the
+    discovery surface for bot & script integration.
+    """
+    rows = []
+    if not text:
+        return rows
+    for raw in str(text).splitlines():
+        if not raw.startswith("  "):
+            continue  # the dispatcher's table is indented exactly two
+        line = raw.strip()
+        if not line or line == "commands:":
+            continue
+        parts = line.split(None, 1)
+        cmd = parts[0]
+        usage = re.sub(r"\s+", " ", parts[1].strip()) if len(parts) > 1 else ""
+        if cmd in ("help", "?"):
+            usage = "this list"
+        rows.append(("/" + cmd, usage))
+    return rows
+
+
 def _app_data_dir():
     """Cross-platform writable app data directory.
 
@@ -2934,17 +2962,22 @@ class sHadesClientApp(MDApp):
             print("generated avatar upload pending:", repr(e))
 
     def open_command_palette(self):
-        """Tier-2 command palette: one searchable sheet of app verbs.
+        """Tier-2 command palette (tay's correction 2026-11): the
+        slash-command surface for bot & script integration.
 
-        Plain Kivy Popup + MDTextField filter, like show_qr — no new
-        KivyMD sheet dependency. Ctrl+K on desktop; the profile menu
-        carries the touch entry point.
+        Lists the client-local verbs plus the hub dispatcher's table
+        (the /help text, fetched through /api/v1/command like sHades.py
+        2733-2751 renders it). A pick prefills msg_input with the
+        command so the argument is completed by the user and the send
+        path stays exactly the existing slash behavior.
         """
         from kivymd.uix.button import MDButton, MDButtonText
         from kivymd.uix.textfield import MDTextField, MDTextFieldHintText
-        rows = self._palette_commands()
+        self._slash_hub_rows = getattr(self, "_slash_hub_rows", None)
 
         box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
+        note = Label(text="", color=self.theme_colors["text_muted"],
+                     font_size=sp(11), size_hint_y=None, height=dp(18))
         grid = BoxLayout(orientation="vertical", size_hint_y=None,
                          spacing=dp(6))
         grid.bind(minimum_height=grid.setter("height"))
@@ -2960,43 +2993,87 @@ class sHadesClientApp(MDApp):
         filt.add_widget(MDTextFieldHintText(text="Type to filter commands"))
         box.add_widget(filt)
         box.add_widget(sv)
+        box.add_widget(note)
 
-        popup = Popup(title="Commands", content=box, size_hint=(0.9, 0.75))
+        popup = Popup(title="Slash commands", content=box,
+                      size_hint=(0.9, 0.75))
+        self._palette_popup = popup
+
+        def _prefill(inst=None, cmd=""):
+            popup.dismiss()
+            try:
+                main = self.root.get_screen("main")
+                inp = main.ids.msg_input
+            except Exception:
+                return
+            inp.text = cmd + " "
+
+            def focus(dt):
+                try:
+                    inp.focus = True
+                except Exception:
+                    pass
+            Clock.schedule_once(focus, 0)
 
         def render(*_):
             query = (filt.text or "").strip().lower()
             grid.clear_widgets()
-            for label, fn in rows:
-                if query and query not in label.lower():
+            for cmd, desc in list(self._slash_client_rows()) + \
+                    list(self._slash_hub_rows or []):
+                if query and query not in cmd.lower() \
+                        and query not in (desc or "").lower():
                     continue
                 btn = MDButton(style="tonal")
                 btn.size_hint = (1, None)
                 btn.height = dp(40)
-                btn.bind(on_press=lambda inst, f=fn:
-                         (popup.dismiss(), f()))
+                btn.bind(on_press=lambda inst, c=cmd: _prefill(inst, c))
                 btn.add_widget(MDButtonText(
-                    text=label, font_size=sp(12),
+                    text=("%s %s" % (cmd, desc)).strip() if desc else cmd,
+                    font_size=sp(12),
                     text_color=self.theme_colors["text"]))
                 grid.add_widget(btn)
+
+        def fetch_hub(*_):
+            if self._slash_hub_rows is not None or not self.guild_api:
+                return
+
+            def work():
+                try:
+                    res = self.guild_api.command("help")
+                    out = (res or {}).get("output") if res.get("ok") else ""
+                    Clock.schedule_once(lambda dt: self._accept_hub_rows(
+                        parse_slash_help(out or ""), render), 0)
+                except Exception:
+                    Clock.schedule_once(
+                        lambda dt: self._accept_hub_rows([], render), 0)
+            threading.Thread(target=work, daemon=True).start()
 
         filt.bind(text=render)
         render(filt, None)
         popup.open()
+        note.text = "client commands + hub dispatcher (fetching...)"
+        Clock.schedule_once(lambda dt: fetch_hub(), 0)
 
-    def _palette_commands(self):
-        """The palette registry: (label, callable) pairs, all existing."""
-        go = lambda name: lambda: setattr(self.root, "current", name)  # noqa: E731
-        return [
-            ("Connect to a guild/server", go("connect")),
-            ("Open channel view", go("main")),
-            ("Open my profile", go("profile")),
-            ("Share my invite QR", self.show_invite_qr),
-            ("Scan an invite QR (camera)", self.scan_invite_qr),
-            ("Show my contact card", self.share_contact_card),
-            ("Import a contact card (clipboard)",
-             self.import_contact_card),
-            ("Open recovery sheet", self.open_recovery_sheet),
-        ]
+    def _accept_hub_rows(self, rows, rerender):
+        """Apply the fetched /help table to the palette (and drop the
+        fetching note on the next render)."""
+        self._slash_hub_rows = rows or []
+        try:
+            note_lbl = self._palette_popup.content.children[0]
+            if isinstance(note_lbl, Label):
+                note_lbl.text = ("" if rows else
+                                 "hub unreachable - client commands only")
+        except Exception:
+            pass
+        if callable(rerender):
+            rerender()
+
+    def _slash_client_rows(self):
+        """The client-local slash verbs (kivy_client._handle_slash)."""
+        return [("/me", "emote an action line"),
+                ("/join", "switch to a channel"),
+                ("/search", "search channel history"),
+                ("/invite", "copy this guild's invite")]
 
     def open_recovery_sheet(self, onboarding_name=None):
         """Make an encrypted kit before first connection or from Profile."""
