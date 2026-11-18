@@ -487,9 +487,13 @@
             GearIcon:
                 on_press: app.open_profile(app.my_hash or '', app.username or '')
                 color: app.theme_colors['text']
-        BoxLayout:
-            orientation: 'horizontal'
+        FloatLayout:
+            id: chat_body
             size_hint_y: 1
+            # v0.32 (tay device note): the drawers become overlay
+            # windows that slide OVER the chat screen; they are
+            # added after the chat body, so an open drawer paints
+            # over the composer instead of squeezing it.
 
             # -------- left: servers + channels in ONE swipe drawer --------
             # The server rail lives INSIDE the drawer so closing the drawer
@@ -497,9 +501,10 @@
             # open). Open width 284 = 64 rail + 220 channels.
             BoxLayout:
                 id: left_sidebar
-                size_hint_x: None
+                size_hint: None, 1
                 width: min(dp(284), root.width * 0.8) if root.left_open else 0
                 orientation: 'horizontal'
+                pos_hint: {'x': 0}
                 canvas.before:
                     Color:
                         rgba: app.theme_colors['bg_sidebar']
@@ -507,94 +512,99 @@
                         pos: self.pos
                         size: self.size
 
-                # ---- server rail (guild list) ----
-                BoxLayout:
-                    id: server_sidebar
-                    size_hint_x: None
-                    width: dp(64)
-                    orientation: 'vertical'
-                    canvas.before:
-                        Color:
-                            rgba: app.theme_colors['bg_sidebar']
-                        Rectangle:
-                            pos: self.pos
-                            size: self.size
-                    ScrollView:
-                        do_scroll_x: False
-                        GridLayout:
-                            id: server_grid
-                            cols: 1
-                            size_hint_y: None
-                            height: self.minimum_height
-                            spacing: dp(4)
-                            padding: [dp(4), dp(8)]
-                    # Add server button at bottom
-                    MDButton:
-                        id: add_server_btn
-                        style: 'filled'
-                        size_hint_y: None
-                        height: scaled(dp(40))
-                        theme_bg_color: 'Custom'
-                        md_bg_color: app.theme_colors['primary']
-                        on_press: app._open_add_server_popup()
-                        MDButtonText:
-                            text: '+'
-                            text_color: app.theme_colors['btn_text']
-                            font_size: sp(24)
-
-                # ---- channels column ----
-                BoxLayout:
-                    orientation: 'vertical'
-                    Image:
-                        id: banner_channel
-                        source: app.banner_channel_path or ''
-                        size_hint_y: None
-                        height: dp(96)
-                        size_hint_x: None
-                        width: dp(200)
-                        allow_stretch: False
-                        keep_ratio: True
-                        pos_hint: {'center_x': 0.5}
+                StencilView:
+                    id: left_clip
+                    size_hint: 1, 1
+                    # ---- server rail (guild list) ----
                     BoxLayout:
-                        size_hint_y: None
-                        height: dp(52)
-                        padding: [dp(12), dp(6)]
-                        Label:
-                            text: 'CHANNELS'
-                            color: app.theme_colors['text_dim']
-                            bold: True
-                            font_size: sp(11)
-                            halign: 'left'
-                            valign: 'middle'
-                            text_size: self.width, None
+                        id: server_sidebar
+                        size_hint_x: None
+                        width: dp(64)
+                        orientation: 'vertical'
+                        canvas.before:
+                            Color:
+                                rgba: app.theme_colors['bg_sidebar']
+                            Rectangle:
+                                pos: self.pos
+                                size: self.size
+                        ScrollView:
+                            do_scroll_x: False
+                            GridLayout:
+                                id: server_grid
+                                cols: 1
+                                size_hint_y: None
+                                height: self.minimum_height
+                                spacing: dp(4)
+                                padding: [dp(4), dp(8)]
+                        # Add server button at bottom
                         MDButton:
-                            id: add_channel_btn
-                            style: 'outlined'
+                            id: add_server_btn
+                            style: 'filled'
                             size_hint_y: None
                             height: scaled(dp(40))
-                            width: dp(48)
                             theme_bg_color: 'Custom'
-                            md_bg_color: app.theme_colors['sidebar_ctrl']
-                            opacity: 1 if app._can_create_channels() else 0
-                            disabled: not app._can_create_channels()
-                            on_press: app._open_create_channel_popup()
+                            md_bg_color: app.theme_colors['primary']
+                            on_press: app._open_add_server_popup()
                             MDButtonText:
                                 text: '+'
-                                shorten: True
-                    ScrollView:
-                        do_scroll_x: False
-                        GridLayout:
-                            id: channel_grid
-                            cols: 1
+                                text_color: app.theme_colors['btn_text']
+                                font_size: sp(24)
+
+                    # ---- channels column ----
+                    BoxLayout:
+                        orientation: 'vertical'
+                        Image:
+                            id: banner_channel
+                            source: app.banner_channel_path or ''
                             size_hint_y: None
-                            height: self.minimum_height
-                            spacing: dp(2)
-                            padding: [dp(6), dp(6)]
+                            height: dp(96)
+                            size_hint_x: None
+                            width: dp(200)
+                            allow_stretch: False
+                            keep_ratio: True
+                            pos_hint: {'center_x': 0.5}
+                        BoxLayout:
+                            size_hint_y: None
+                            height: dp(52)
+                            padding: [dp(12), dp(6)]
+                            Label:
+                                text: 'CHANNELS'
+                                color: app.theme_colors['text_dim']
+                                bold: True
+                                font_size: sp(11)
+                                halign: 'left'
+                                valign: 'middle'
+                                text_size: self.width, None
+                            MDButton:
+                                id: add_channel_btn
+                                style: 'outlined'
+                                size_hint_y: None
+                                height: scaled(dp(40))
+                                width: dp(48)
+                                theme_bg_color: 'Custom'
+                                md_bg_color: app.theme_colors['sidebar_ctrl']
+                                opacity: 1 if app._can_create_channels() else 0
+                                disabled: not app._can_create_channels()
+                                on_press: app._open_create_channel_popup()
+                                MDButtonText:
+                                    text: '+'
+                                    shorten: True
+                        ScrollView:
+                            do_scroll_x: False
+                            GridLayout:
+                                id: channel_grid
+                                cols: 1
+                                size_hint_y: None
+                                height: self.minimum_height
+                                spacing: dp(2)
+                                padding: [dp(6), dp(6)]
 
             # ---------------- center: chat ----------------
             BoxLayout:
+                id: chat_screen
                 orientation: 'vertical'
-                size_hint_x: 1
+                size_hint: (1, 1)
+                pos_hint: {'x': 0, 'y': 0}
                 canvas.before:
                     Color:
                         rgba: app.theme_colors['panel']
@@ -732,34 +742,38 @@
             # right: members drawer (swipe from the right edge opens)
             BoxLayout:
                 id: right_sidebar
-                size_hint_x: None
+                size_hint: None, 1
                 width: min(dp(200), root.width * 0.72) if root.right_open else 0
                 orientation: 'vertical'
+                pos_hint: {'right': 1}
                 canvas.before:
                     Color:
                         rgba: app.theme_colors['bg_sidebar']
                     Rectangle:
                         pos: self.pos
                         size: self.size
-                Label:
-                    text: 'PEOPLE'
-                    color: app.theme_colors['text_dim']
-                    bold: True
-                    font_size: sp(11)
-                    size_hint_y: None
-                    height: dp(48)
-                    halign: 'left'
-                    valign: 'middle'
-                    text_size: max(0, self.width - dp(24)), self.height
-                ScrollView:
-                    do_scroll_x: False
-                    GridLayout:
-                        id: member_grid
-                        cols: 1
+                StencilView:
+                    id: right_clip
+                    size_hint: 1, 1
+                    Label:
+                        text: 'PEOPLE'
+                        color: app.theme_colors['text_dim']
+                        bold: True
+                        font_size: sp(11)
                         size_hint_y: None
-                        height: self.minimum_height
-                        spacing: dp(2)
-                        padding: [dp(6), dp(6)]
+                        height: dp(48)
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: max(0, self.width - dp(24)), self.height
+                    ScrollView:
+                        do_scroll_x: False
+                        GridLayout:
+                            id: member_grid
+                            cols: 1
+                            size_hint_y: None
+                            height: self.minimum_height
+                            spacing: dp(2)
+                            padding: [dp(6), dp(6)]
 
 <ConnectScreen>:
     BoxLayout:

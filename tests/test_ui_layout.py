@@ -103,6 +103,31 @@ class LayoutProbe(sHadesClientApp):
                    and glyph.top <= flat.top + 1,
                    "attach '+' glyph stays inside its plate")
 
+        # ---- v0.32: drawers are overlay windows on one body ----
+        # (kivy ids return WeakProxy handles: compare with ==, never is)
+        body = main.ids.chat_body
+        chat = main.ids.chat_screen
+        self.check(chat.parent == body
+                   and main.ids.left_sidebar.parent == body
+                   and main.ids.right_sidebar.parent == body,
+                   "drawers and the chat share one overlay body")
+        chain = []
+        node = main.ids.add_server_btn
+        while node is not None and len(chain) < 40:
+            chain.append(node)
+            node = node.parent
+        self.check(any(w == main.ids.left_clip for w in chain),
+                   "server rail is clipped inside the drawer")
+        drawer = main.ids.left_sidebar
+        overlay_width = drawer.width
+        main.left_open = True
+        self.check(abs(chat.width - main.width) <= 1,
+                   "chat stays full width under the open drawer")
+        self.check(drawer.width >= overlay_width
+                   and drawer.x >= 0 and drawer.right >= pfp.x,
+                   "open drawer covers the composer rail")
+        main.left_open = False
+
         self.root.current = "config"
         Clock.schedule_once(self.check_config, 0.3)
 
