@@ -2597,29 +2597,17 @@ class sHadesClientApp(MDApp):
         self._admin_popup = None
 
     def _select_random_banners(self):
-        """Pick random banner images from media/ folder on startup.
-        One for the connect screen, one for the channel header."""
-        media_dir = os.path.join(_app_dir(), "media")
-        if not os.path.isdir(media_dir):
-            return
-        images = [
-            f for f in os.listdir(media_dir)
-            if f.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
-            and f != "1793645765.png"   # client icon/logo — not a banner
-        ]
-        if not images:
-            return
-        if len(images) == 1:
-            self.banner_config_path = os.path.join(media_dir, images[0])
-            self.banner_channel_path = os.path.join(media_dir, images[0])
-        else:
-            chosen = random.sample(images, 2)
-            self.banner_config_path = os.path.join(media_dir, chosen[0])
-            self.banner_channel_path = os.path.join(media_dir, chosen[1])
-            print("Banner images: config=%s channel=%s" % (
-                os.path.basename(self.banner_config_path),
-                os.path.basename(self.banner_channel_path),
-            ))
+        """No-op kept for the banner kv bindings (app.banner_*_path).
+
+        tay (receipt 2026-11-19): "cull the media images, it's bloating
+        the repo and they are random placeholders" - the fork's 18 MB
+        z-image-turbo set is gone from the tree and the APK. The kv
+        widgets tolerate the None source (source: app.banner_... or '').
+        If real banners ever return, land them as vetted assets, not
+        an 18 MB placeholder folder that ships in every binary.
+        """
+        self.banner_config_path = None
+        self.banner_channel_path = None
 
     # -- UI theme / config ----------------------------------------------
 
