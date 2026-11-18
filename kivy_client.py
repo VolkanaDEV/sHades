@@ -2852,7 +2852,46 @@ class sHadesClientApp(MDApp):
         self._save_portable_profile()
         with open(self._onboarding_path(), "w", encoding="utf-8") as f:
             json.dump({"name": self.username, "completed": True}, f)
+        # card slice 2 (tay-approved): the moment the keyset exists, the
+        # user gets their collectible card - the blank card (fresh
+        # generated avatar, chosen name, identity now on disk). The
+        # popup rides the fork's show_qr pattern; the boot's
+        # client_identity lifecycle is untouched (read-only from_file).
+        Clock.schedule_once(lambda dt: self.show_blank_card(), 0.4)
         self._auto_connect_default_hub()
+
+    def _blank_card_payload(self, ident):
+        """Payload for the onboarding blank card; None if unusable.
+
+        ident: an RNS.Identity (read-only handle; never assigned).
+        """
+        try:
+            return profile_card.build_payload(
+                ident.get_public_key(), self.username)
+        except profile_card.CardPayloadError as e:
+            print("blank card payload error:", e)
+            return None
+        except Exception as exc:
+            print("blank card payload unavailable:", repr(exc))
+            return None
+
+    def show_blank_card(self):
+        """Display the onboarding blank card QR (card slice 2).
+
+        Loads the on-disk identity READ-ONLY to build the payload - the
+        router boot reloads the same file later, so no lifecycle clash.
+        """
+        if not os.path.isfile(self._identity_file()):
+            return
+        ident = RNS.Identity.from_file(self._identity_file())
+        if ident is None:
+            return
+        payload = self._blank_card_payload(ident)
+        if payload is None:
+            return
+        self.show_qr(payload, "Your card",
+                     "Anyone who scans this can reach you by mesh - "
+                     "the card carries your keyset, not your location.")
 
     def _identity_file(self):
         return os.path.join(_app_data_dir(), "rns", "identity")
@@ -8063,6 +8102,32 @@ class sHadesClientApp(MDApp):
             self._set_status("Card payload copied — send it to a friend")
         except Exception as e:
             self._set_status("Could not copy card: %s" % repr(e))
+
+    def import_contact_card(self):
+        """Card slice 3 (tay-approved): paste a shades-contact1 payload
+        from the clipboard - parse it, derive the canonical DM address
+        offline, and save the member as a friend. No hub needed; the
+        payload carries no address to dial, only a keyset to derive
+        from (profile_card.derive_user_hash == lxmf.delivery hash)."""
+        try:
+            from kivy.core.clipboard import Clipboard
+            text = Clipboard.paste() or ""
+        except Exception as e:
+            self._set_status("Clipboard unavailable: %s" % repr(e))
+            return
+        try:
+            pub, alias = profile_card.parse_payload(text)
+        except profile_card.CardPayloadError as e:
+            self._set_status(
+                "Clipboard is not a contact card: %s" % e)
+            return
+        uh = profile_card.derive_user_hash(pub)
+        if uh == self.my_hash:
+            self._set_status("That's your own card.")
+            return
+        self._friends = dms.add_friend(self._friends, uh, alias)
+        dms.save_friends(self._friends_path, self._friends)
+        self._set_status("Card imported: %s is in your friends list." % alias)
 
     def _show_own_profile(self):
         """Show own profile locally."""

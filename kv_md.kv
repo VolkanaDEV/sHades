@@ -424,6 +424,15 @@
             size_hint_x: None
             width: dp(230)
             pos_hint: {'center_x': 0.5}
+            on_press: app.import_contact_card()
+            MDButtonText:
+                text: 'Import card from clipboard'
+                text_color: app.theme_colors['text']
+        MDButton:
+            style: 'outlined'
+            size_hint_x: None
+            width: dp(230)
+            pos_hint: {'center_x': 0.5}
             on_press: app.open_recovery_sheet()
             MDButtonText:
                 text: 'Save recovery kit'
