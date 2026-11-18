@@ -309,6 +309,7 @@ import invite  # noqa: E402
 import dms  # noqa: E402
 import recovery  # noqa: E402
 import qr_tools  # noqa: E402
+import offline_store  # noqa: E402
 import profile_card  # noqa: E402
 import ui_geom  # noqa: E402
 from micron import (micron_parse, micron_page_bg, micron_media_target,  # noqa: E402
@@ -2523,6 +2524,14 @@ class sHadesClientApp(MDApp):
         # Chat pagination: per channel, oldest loaded message id + whether
         # older messages remain. Used by scroll-triggered loading.
         self._older = {}          # cid -> {oldest_id, has_older, loading}
+        # fork merge (offline cache): pending rows queue on the UI clock,
+        # writes flush in a thread; purge/forgotten state keeps erased
+        # identities from re-entering the store.
+        self._cache_write_lock = threading.RLock()
+        self._cache_pending = {}
+        self._cache_event = None
+        self._purged_before = {}
+        self._forgotten_cache_guilds = set()
         self._pending_reply = None
         self._scroll_bound = False
 
@@ -3468,6 +3477,84 @@ class sHadesClientApp(MDApp):
         except Exception:
             return None
         return fpath
+
+    def _offline_path(self):
+        return os.path.join(_app_data_dir(), "offline.sqlite3")
+
+    def _cache_guild(self):
+        node = getattr(self, "guild_node_hash", None)
+        address = getattr(self, "hub_address", None)
+        return ("node:" + str(node)) if node else (
+            "hub:" + str(address) if address else "")
+
+    def _post_was_purged(self, guild, message):
+        author, cutoff = self._purged_before.get(guild, (None, 0))
+        return (message.get("deleted_at") or
+                (author and message.get("author_hash") == author and
+                 float(message.get("ts") or 0) <= cutoff))
+
+    def _queue_cache(self, message):
+        guild = self._cache_guild()
+        if not guild or guild in self._forgotten_cache_guilds:
+            return
+        if self._post_was_purged(guild, message):
+            return
+        try:
+            channel = (message.get("channel_id") or
+                       self._channel_cid(getattr(
+                           self.root.get_screen("main"), "_current_channel",
+                           "general")))
+            msg_id = message.get("msg_id")
+            if not guild or not channel or not msg_id or \
+                    str(msg_id).startswith("pending:"):
+                return
+            self._cache_pending[(guild, channel, msg_id)] = dict(message)
+            if not getattr(self, "_cache_event", None):
+                self._cache_event = Clock.schedule_once(self._flush_cache, 0.4)
+        except Exception:
+            pass
+
+    def _flush_cache(self, _dt):
+        pending = getattr(self, "_cache_pending", {})
+        self._cache_pending, self._cache_event = {}, None
+        batches = {}
+        for (guild, channel, _msg_id), message in pending.items():
+            batches.setdefault((guild, channel), []).append(message)
+
+        def work():
+            for (guild, channel), messages in batches.items():
+                try:
+                    with self._cache_write_lock:
+                        if guild not in self._forgotten_cache_guilds:
+                            offline_store.put(
+                                self._offline_path(), guild, channel,
+                                [m for m in messages
+                                 if not self._post_was_purged(guild, m)])
+                except Exception as exc:
+                    print("offline cache write failed:", repr(exc))
+        if batches:
+            threading.Thread(target=work, daemon=True).start()
+
+    def _show_cached_channel(self, grid, cid):
+        """Fork merge: render the offline cache before the network answers.
+        _render_message dedupes by msg_id and the fetch path refreshes edited
+        rows from the server copy, so the server still wins on conflicts."""
+        try:
+            messages = offline_store.recent(self._offline_path(),
+                                            self._cache_guild(), cid)
+        except Exception as exc:
+            print("offline cache read failed:", repr(exc))
+            return False
+        rendered = 0
+        for m in messages:
+            try:
+                self._render_message(grid, m)
+                rendered += 1
+            except Exception:
+                pass
+        if rendered:
+            self._regroup_messages(grid)
+        return rendered > 0
 
     def _add_to_history(self, m):
         if not hasattr(self, "_history"):
@@ -4566,6 +4653,8 @@ class sHadesClientApp(MDApp):
             if kind == "msg":
                 if (data.get("msg") or {}).get("channel_id") == cid:
                     touched = True
+                if isinstance(data.get("msg"), dict):
+                    self._queue_cache(data["msg"])
             elif kind in ("edit", "del"):
                 touched = True
             elif kind == "presence":
@@ -4677,6 +4766,16 @@ class sHadesClientApp(MDApp):
                     lambda dt: self._remove_skeleton(cid), 0)
                 return
             msgs = res.get("messages", []) or []
+            try:
+                guild = self._cache_guild()
+                if guild:
+                    with self._cache_write_lock:
+                        offline_store.put(
+                            self._offline_path(), guild, cid,
+                            [m for m in msgs
+                             if not self._post_was_purged(guild, m)])
+            except Exception as exc:
+                print("offline cache write failed:", repr(exc))
             updates = res.get("updates", []) or []
             # reading the channel: mark the newest message read (never for
             # pagination prepends — those are older than the watermark)
@@ -4729,6 +4828,13 @@ class sHadesClientApp(MDApp):
                         st["loading"] = False
                     else:
                         for m in msgs:
+                            if m.get("edited_at"):
+                                row = self._msg_widgets.get(m.get("msg_id"))
+                                if row is not None:
+                                    # cached copy rendered first: the server
+                                    # row is newer, refresh its content
+                                    self._do_update(row, m.get("content") or "",
+                                                    False)
                             self._render_message(grid, m)
                         self._regroup_messages(grid)
                         Clock.schedule_once(
@@ -5326,6 +5432,18 @@ class sHadesClientApp(MDApp):
         msg_id = u.get("msg_id")
         content = u.get("content", "")
         deleted = bool(u.get("deleted_at"))
+        # fork merge: mirror the delta into the offline cache
+        try:
+            c_cid = u.get("channel_id") or self._channel_cid(getattr(
+                self.root.get_screen("main"), "_current_channel", "general"))
+            guild = self._cache_guild()
+            if guild and c_cid and msg_id:
+                threading.Thread(target=offline_store.apply_update,
+                                 args=(self._offline_path(), guild, c_cid,
+                                       msg_id, content, deleted),
+                                 daemon=True).start()
+        except Exception:
+            pass
         # find widget
         row = self._msg_widgets.get(msg_id)
         if not row:
@@ -6287,8 +6405,13 @@ class sHadesClientApp(MDApp):
             return
         self._older.setdefault(cid, {"oldest_id": None, "has_older": True,
                                      "loading": False})
-        self._show_skeleton(cid)
-        self._fetch_messages(name)
+        cached = self._show_cached_channel(grid, cid)
+        if self.guild_api:
+            if not cached:
+                self._show_skeleton(cid)
+            self._fetch_messages(name)
+        elif not cached:
+            self._set_status("No cached messages for #%s yet." % name)
         self._refresh_members_ui(name)
         # v0.31: re-subscribe NOW. The server binds the channel at
         # subscribe time; setting _stream_cid alone changed nothing on
@@ -7663,6 +7786,7 @@ class sHadesClientApp(MDApp):
             # 0.31.10: the attach flow is done -- clear the progress channel.
             Clock.schedule_once(lambda dt: self._attach_composer_stage(""), 0)
             self._add_to_history(m)
+            self._queue_cache(m)
             self._save_history()
 
         threading.Thread(target=work, daemon=True).start()
