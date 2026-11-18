@@ -2684,9 +2684,53 @@ class sHadesClientApp(MDApp):
             _boot_install(sm.get_screen(sm.current))
         return sm
 
+    def _apply_system_gesture_exclusions(self, *_args):
+        """Exclude our drawer edge bands from the Android system back
+        gesture (Android 10+).
+
+        Without this, the OS intercepts swipes that start on the outer
+        ~24dp of the screen, and the app never sees them: the left
+        (server/channels) drawer becomes unreachable because it has no
+        tap affordance by design, and the right members drawer loses its
+        swipe too. The system honours at most 200dp of exclusion
+        height per edge; we request the full screen height and let it
+        cap, which still covers any practical swipe. No-op on desktop.
+        """
+        from kivy.utils import platform
+        if platform != "android":
+            return
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            Rect = autoclass("android.graphics.Rect")
+            activity = PythonActivity.mActivity
+            decor = activity.getWindow().getDecorView()
+            density = float(activity.getResources().getDisplayMetrics()                 .density)
+            band_px = int((dp(24) + dp(8)) * density)
+            metrics = activity.getResources().getDisplayMetrics()
+            w_px = int(metrics.widthPixels)
+            h_px = int(metrics.heightPixels)
+            left = Rect(0, 0, band_px, h_px)
+            right = Rect(w_px - band_px, 0, w_px, h_px)
+        except Exception as e:
+            _boot_file("GESTURE unavailable: %s" % e)
+            return
+
+        def _set(*_dt):
+            try:
+                decor.setSystemGestureExclusionRects([left, right])
+            except Exception as e:
+                _boot_file("GESTURE failed: %s" % e)
+                return
+            _boot_file("GESTURE exclusions set: band %dpx "
+                       "%dx%d" % (band_px, w_px, h_px))
+        Clock.schedule_once(_set, 0.5)
+        Clock.schedule_once(_set, 2.5)
+
     def on_start(self):
         if BOOT_DEBUG:
             _boot_mark("on_start")
+        self._apply_system_gesture_exclusions()
         # Try to resume a saved session
         sess = self._load_session()
         # fork merge: the identity file is the sole carrier of
