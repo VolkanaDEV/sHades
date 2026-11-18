@@ -1005,6 +1005,27 @@ class GuildAPI:
     def admin_audit(self, limit=100):
         return self._request_json("/api/v1/admin/audit", {"limit": limit})
 
+    def member_moderation(self, limit=50):
+        return self._request_json("/api/v1/moderation/public", {"limit": limit})
+
+    def message_edits(self, msg_id):
+        return self._request_json("/api/v1/messages/edits", {"msg": msg_id})
+
+    def account_export(self, after=0, limit=100):
+        return self._request_json("/api/v1/account/export",
+                                  {"after": after, "limit": limit})
+
+    def account_delete_posts(self):
+        return self._request_json("/api/v1/account/delete-posts",
+                                  {"confirm": "DELETE MY POSTS"})
+
+    def account_leave(self):
+        return self._request_json("/api/v1/account/leave",
+                                  {"confirm": "LEAVE GUILD"})
+
+    def catchup(self):
+        return self._request_json("/api/v1/catchup", {})
+
     def admin_mods(self, op="list", user=None):
         data = {"op": op}
         if user:
