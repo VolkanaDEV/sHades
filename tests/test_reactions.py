@@ -32,29 +32,26 @@ sHades.db.commit()
 sHades.STORAGE = base
 sHades.DEBUG = False
 
-USER = sHades.hexstr(RNS.Destination(RNS.Identity(), RNS.Destination.OUT,
-                                     RNS.Destination.SINGLE,
-                                     "lxmf", "delivery").hash)
-OTHER = sHades.hexstr(RNS.Destination(RNS.Identity(), RNS.Destination.OUT,
-                                      RNS.Destination.SINGLE,
-                                      "lxmf", "delivery").hash)
+def _mk_user(name):
+    i = RNS.Identity()
+    return i, sHades.hexstr(RNS.Destination(i, RNS.Destination.OUT,
+                                            RNS.Destination.SINGLE,
+                                            "lxmf", "delivery").hash)
+
+reader_ident, USER = _mk_user("reader")
+other_ident, OTHER = _mk_user("second")
 sHades.db.execute("INSERT INTO users (dest_hash, username, registered_at) VALUES (?,?,?)",
                   (USER, "reader", sHades.now()))
 sHades.db.execute("INSERT OR IGNORE INTO users (dest_hash, username, registered_at) VALUES (?,?,?)",
                   (OTHER, "second", sHades.now()))
 sHades.db.commit()
-_ident = {}
 
-def ident_for(user):
-    """Bare identity stubs: the API routes hash the identity for the viewer."""
-    if user not in _ident:
-        _ident[user] = RNS.Identity()
-    return _ident[user]
+_idents = {USER: reader_ident, OTHER: other_ident}
 
 def call(path, data=None, user=USER):
     payload = json.dumps(data if data is not None else {}).encode("utf-8")
     raw = sHades.API_ROUTES[path]("/api/v1/x", payload, "req-1", "L1",
-                                  ident_for(user), sHades.now())
+                                  _idents[user], sHades.now())
     return json.loads(raw.decode("utf-8"))
 
 def main():

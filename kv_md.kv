@@ -40,7 +40,7 @@
     orientation: 'horizontal'
     size_hint_y: None
     height: self.minimum_height
-    padding: [dp(12), dp(10)]
+    padding: [dp(12), dp(5) if root.grouped else dp(10)]
     spacing: dp(10)
     canvas.before:
         Color:
@@ -59,7 +59,8 @@
     PfpImage:
         id: pfp
         size_hint: None, None
-        size: dp(32), dp(32)
+        size: dp(32), 0 if root.grouped else dp(32)
+        opacity: 0 if root.grouped else 1
         source: root.avatar_source or ""
         allow_stretch: False
         keep_ratio: True
@@ -73,7 +74,8 @@
         BoxLayout:
             orientation: 'horizontal'
             size_hint_y: None
-            height: dp(18)
+            height: 0 if root.grouped else dp(18)
+            opacity: 0 if root.grouped else 1
             ClickableLabel:
                 text: root.username
                 target_hash: root.author_hash
@@ -97,6 +99,34 @@
                 width: dp(50)
                 halign: 'right'
                 valign: 'middle'
+
+        BoxLayout:
+            orientation: 'vertical'
+            size_hint_y: None
+            height: dp(44) if root.reply_author else 0
+            opacity: 1 if root.reply_author else 0
+            padding: [dp(10), dp(4)]
+            canvas.before:
+                Color:
+                    rgba: app.theme_colors['border_subtle']
+                RoundedRectangle:
+                    pos: self.pos
+                    size: self.size
+                    radius: [dp(10), dp(10), dp(10), dp(10)]
+            Label:
+                text: '↳ @' + root.reply_author
+                color: app.theme_colors['accent']
+                bold: True
+                font_size: sp(11)
+                text_size: self.width, None
+                halign: 'left'
+            Label:
+                text: root.reply_excerpt
+                color: app.theme_colors['text_muted']
+                font_size: sp(11)
+                shorten: True
+                text_size: self.width, None
+                halign: 'left'
 
         # Embed container - holds image embeds for this message.
         # Placed directly under the username header so embeds are top-left,
@@ -417,6 +447,21 @@
             HamburgerIcon:
                 on_press: root.toggle_left()
                 color: app.theme_colors['primary'] if root.left_open else app.theme_colors['text_muted']
+            MeshPulse:
+                mode: app.mesh_mode
+                width: dp(40)
+            MeshConstellation:
+                mode: app.mesh_mode
+                hops: app.mesh_hops
+                width: dp(46)
+            Label:
+                text: app.mesh_label
+                color: app.theme_colors['accent'] if app.mesh_mode == 'direct' else app.theme_colors['primary'] if app.mesh_mode == 'relay' else app.theme_colors['text_dim']
+                bold: True
+                font_size: sp(9)
+                size_hint_x: None
+                width: dp(65)
+                shorten: True
             CtxHeaderLabel:
                 id: channel_header
                 text: '#' + (root._current_channel or 'general')
@@ -523,15 +568,18 @@
                             valign: 'middle'
                             text_size: self.width, None
                         MDButton:
+                            id: add_channel_btn
                             style: 'outlined'
                             size_hint_y: None
                             height: scaled(dp(40))
                             width: dp(48)
                             theme_bg_color: 'Custom'
                             md_bg_color: app.theme_colors['sidebar_ctrl']
-                            on_press: app.open_config()
+                            opacity: 1 if app._can_create_channels() else 0
+                            disabled: not app._can_create_channels()
+                            on_press: app._open_create_channel_popup()
                             MDButtonText:
-                                text: 'Edit'
+                                text: '+'
                                 shorten: True
                     ScrollView:
                         do_scroll_x: False
@@ -566,12 +614,31 @@
                         spacing: dp(2)
                         padding: [dp(8), dp(8)]
                 BoxLayout:
-                    # 48px: the bar must CONTAIN the field and the buttons.
-                    # At 24px a 35px field and 26.7px buttons overflowed
-                    # upward into the message list.
                     size_hint_y: None
-                    height: dp(48)
-                    padding: [dp(4), dp(4)]
+                    height: dp(32) if app.reply_draft else 0
+                    opacity: 1 if app.reply_draft else 0
+                    padding: [dp(16), dp(2)]
+                    Label:
+                        text: app.reply_draft
+                        color: app.theme_colors['accent']
+                        shorten: True
+                        text_size: self.width, None
+                        halign: 'left'
+                        font_size: sp(11)
+                    MDButton:
+                        style: 'text'
+                        size_hint_x: None
+                        width: dp(38)
+                        on_press: app.cancel_reply()
+                        MDButtonText:
+                            text: '×'
+                BoxLayout:
+                    # 56px (task 9): the bar contains the pfp (dp(42)) and
+                    # the field. At 48px a dp(42) pfp plus padding
+                    # overflowed upward into the message list.
+                    size_hint_y: None
+                    height: dp(56)
+                    padding: [dp(4), dp(6)]
                     spacing: dp(4)
                     canvas.before:
                         Color:
@@ -579,24 +646,71 @@
                         Rectangle:
                             pos: self.pos
                             size: self.size
+                    Button:
+                        id: composer_pfp_holder
+                        background_normal: ''
+                        background_down: ''
+                        background_color: [0, 0, 0, 0]
+                        size_hint_x: None
+                        width: dp(46)
+                        on_press: app.open_file_chooser(avatar=True)
+                        PfpImage:
+                            id: composer_pfp
+                            source: app.composer_pfp_path or ''
+                            size: dp(42), dp(42)
+                            center: self.parent.center if self.parent else (0, 0)
+                            allow_stretch: True
+                            keep_ratio: True
+                    Widget:
+                        # task 9 (tay): the flat attach '+' reads as a
+                        # delimited extension of the field, not a second
+                        # button: body = input_bg, left corners rounded.
+                        # Height matches the field (v0.32 tay device note:
+                        # 'attach plate overlaps the pfp at 44px next to
+                        # a 40px field'); the glyph is pinned to the plate
+                        # because an unbound Label defaults to a 100x100
+                        # box and its '+' floats past the plate edge.
+                        size_hint: None, None
+                        width: dp(38)
+                        height: dp(40)
+                        canvas.before:
+                            Color:
+                                rgba: app.theme_colors['input_bg']
+                            RoundedRectangle:
+                                pos: self.pos
+                                size: self.size
+                                radius: [dp(6), 0, 0, dp(6)]
+                        on_touch_down:
+                            app.open_attach_dialog() if self.collide_point(*args[1].pos) else None
+                        Label:
+                            text: '+'
+                            color: app.theme_colors['text']
+                            font_size: sp(18)
+                            pos: self.parent.pos
+                            size: self.parent.size
                     MDTextField:
                         id: msg_input
                         mode: 'filled'
                         multiline: True
                         size_hint_x: 1
                         size_hint_y: None
-                        # max_height caps the field at one line inside a
-                        # 48px bar; adjust_height() otherwise balloons it
-                        # to dp(56) and it overflows the bar.
+                        # max_height caps the field at one line inside the
+                        # bar; adjust_height() otherwise balloons it to
+                        # dp(56) and it overflows the bar.
                         height: dp(40)
                         min_height: dp(40)
                         max_height: dp(40)
-                        radius: [dp(6), dp(6), dp(6), dp(6)]
+                        radius: [0, dp(6), dp(6), 0]
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
                         text_color_normal: app.theme_colors['text']
                         text_color_focus: app.theme_colors['text']
                         cursor_color: app.theme_colors['text']
+                        # v0.31.10: the helper line carries the attach
+                        # progress; persistent keeps it visible unfocused
+                        helper_text_mode: 'persistent'
+                        helper_text: ''
+                        helper_text_color: app.theme_colors['text_dim']
                         on_text_validate: app.send_message()
                         MDTextFieldHintText:
                             text: 'Message...'
@@ -613,21 +727,6 @@
                         on_press: app.send_message()
                         MDButtonText:
                             text: 'Send'
-                            text_color: app.theme_colors['btn_text']
-                    Widget:
-                        size_hint_x: None
-                        width: dp(3)
-                    MDButton:
-                        style: 'filled'
-                        size_hint_x: None
-                        width: dp(48)
-                        size_hint_y: None
-                        height: scaled(dp(40))
-                        theme_bg_color: 'Custom'
-                        md_bg_color: app.theme_colors['primary']
-                        on_press: app.open_attach_dialog()
-                        MDButtonText:
-                            text: '+'
                             text_color: app.theme_colors['btn_text']
 
             # right: members drawer (swipe from the right edge opens)
@@ -885,7 +984,44 @@
                 padding: dp(12)
                 spacing: dp(8)
                 Label:
-                    text: 'Theme colors (hex #RRGGBB)'
+                    text: 'Theme presets'
+                    font_size: sp(16)
+                    bold: True
+                    color: app.theme_colors['text_muted']
+                    size_hint_y: None
+                    height: dp(28)
+                GridLayout:
+                    cols: 3
+                    size_hint_y: None
+                    height: dp(96)
+                    spacing: dp(6)
+                    MDButton:
+                        style: 'outlined'
+                        on_press: root.choose_preset('Midnight')
+                        MDButtonText:
+                            text: 'Midnight'
+                    MDButton:
+                        style: 'outlined'
+                        on_press: root.choose_preset('Ember')
+                        MDButtonText:
+                            text: 'Ember'
+                    MDButton:
+                        style: 'outlined'
+                        on_press: root.choose_preset('Mint')
+                        MDButtonText:
+                            text: 'Mint'
+                    MDButton:
+                        style: 'outlined'
+                        on_press: root.choose_preset('Mono')
+                        MDButtonText:
+                            text: 'Mono'
+                    MDButton:
+                        style: 'outlined'
+                        on_press: root.choose_preset('Daylight')
+                        MDButtonText:
+                            text: 'Daylight'
+                Label:
+                    text: 'Fine tune colors (hex #RRGGBB)'
                     font_size: sp(16)
                     bold: True
                     color: app.theme_colors['text_muted']

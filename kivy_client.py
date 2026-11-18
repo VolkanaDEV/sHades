@@ -27,6 +27,8 @@ from PIL import ImageDraw as PILImageDraw
 from PIL import ImageChops as PILImageChops
 
 from ui_scale import scaled
+from mesh_ui import grouped_with, link_state, reply_wire, split_reply
+from ui_theme import preset_colors
 
 # ---------------------------------------------------------------------------
 # Kivy (guarded so the module can be imported for linting without Kivy present)
@@ -72,7 +74,8 @@ try:
     from kivy.uix.textinput import TextInput
     from kivy.uix.widget import Widget
     from kivy.uix.slider import Slider
-    from kivy.graphics import Color, Ellipse, Line, Rectangle
+    from kivy.graphics import Color, Ellipse, Line, Rectangle, \
+        RoundedRectangle
     from kivy.metrics import dp, sp
     KIVY = True
 except Exception as _e:  # pragma: no cover - Kivy missing at import time
@@ -728,6 +731,10 @@ class GuildAPI:
             data["manifest"] = manifest
         return self._request_json("/api/v1/channels/create", data)
 
+    def channels_reorder(self, order):
+        return self._request_json("/api/v1/channels/reorder",
+                                  {"order": order})
+
     def channels_info(self, channel):
         return self._request_json("/api/v1/channels/info", {"channel": channel})
 
@@ -980,7 +987,7 @@ class GuildAPI:
         return self._request_json("/api/v1/join", data)
 
     def invites(self, op="list", code=None, label=None, max_uses=None,
-                expires_in=None):
+                expires_in=None, channel=None):
         data = {"op": op}
         if code:
             data["code"] = code
@@ -990,6 +997,8 @@ class GuildAPI:
             data["max_uses"] = max_uses
         if expires_in is not None:
             data["expires_in"] = expires_in
+        if channel:
+            data["channel"] = channel
         return self._request_json("/api/v1/invites", data)
 
     def fetch_file(self, path):
@@ -1118,6 +1127,12 @@ class ContextMenuMixin:
         self._open_ctx_menu(touch.ud.get("shades_ctx_pos")
                             or self.to_window(*self.center))
 
+    def _ctx_is_button(self):
+        # True when this widget is also ButtonBehavior-backed. Checked here
+        # and not at class definition so a non-kivy import (lint) survives.
+        from kivy.uix.behaviors.button import ButtonBehavior
+        return isinstance(self, ButtonBehavior)
+
     def on_touch_up(self, touch):
         clock = getattr(self, "_ctx_clock", None)
         if clock:
@@ -1127,8 +1142,30 @@ class ContextMenuMixin:
             # the long-press fired: swallow the corresponding up
             touch.ud["shades_ctx_fired"] = False
             touch.ungrab(self)
+            touch.ud["shades_ctx_up_done"] = True
             return True
-        return super().on_touch_up(touch)
+        if self._ctx_is_button() and self not in touch.ud:
+            # ButtonBehavior's on_touch_down was short-circuited (a child
+            # widget consumed the press), so only the mixin's grab entry
+            # exists. Forwarding this up would enter ButtonBehavior.on_touch_up
+            # through the grab pass without its down-state: `time() -
+            # self.__touch_time` at kivy/uix/behaviors/button.py:173 turns
+            # float - None (caught on-device as the 1137 crash; desktop asserts
+            # first). The consuming child receives its own up from its own
+            # grab entry, so swallowing here starves nothing.
+            touch.ungrab(self)
+            touch.ud["shades_ctx_up_done"] = True
+            return True
+        if touch.ud.get("shades_ctx_up_done"):
+            # The mixin grab plus ButtonBehavior's own grab put this widget in
+            # the touch's grab list twice, and kivy delivers the up once per
+            # entry (base.py post_dispatch_input). One release is the
+            # contract; the second delivery would double-fire on_release.
+            return True
+        result = super().on_touch_up(touch)
+        if result:
+            touch.ud["shades_ctx_up_done"] = True
+        return result
 
 
 if KIVY:
@@ -1377,6 +1414,10 @@ if KIVY:
         avatar_source = StringProperty("")
         msg_id = StringProperty("")
         is_own = BooleanProperty(False)
+        # message grouping + reply cards (tier 2, drop parity)
+        grouped = BooleanProperty(False)
+        reply_author = StringProperty("")
+        reply_excerpt = StringProperty("")
 
         def build_context_menu(self):
             app = App.get_running_app()
@@ -1483,6 +1524,103 @@ class ContextMenuOverlay(FloatLayout):
             Clock.schedule_once(lambda dt: self.dismiss_now(), 0.1)
 
 
+class MeshPulse(Widget):
+    """A path-state ring; pace and colour reflect the observed guild link."""
+    mode = StringProperty("offline")
+    phase = NumericProperty(0)
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.size_hint = (None, None)
+        self.size = (dp(40), dp(40))
+        self.bind(pos=self._draw, size=self._draw, mode=self._draw,
+                  phase=self._draw)
+        self._pulse_clock = Clock.schedule_interval(self._tick, 0.1)
+
+    def _tick(self, dt):
+        speed = 0.0 if self.mode == "offline" else (0.11 if self.mode == "relay" else 0.25)
+        self.phase = (self.phase + speed * dt) % 1.0
+
+    def _draw(self, *a):
+        from math import sin, pi
+        palette = {"direct": (0.35, 0.84, 0.77),
+                   "relay": (0.96, 0.72, 0.37),
+                   "offline": (0.38, 0.43, 0.48)}
+        rgb = palette.get(self.mode, palette["offline"])
+        wave = 0.0 if self.mode == "offline" else (sin(self.phase * 2 * pi) + 1) / 2
+        self.canvas.clear()
+        with self.canvas:
+            Color(*rgb, 0.17 + 0.20 * wave)
+            Line(circle=(self.center_x, self.center_y, min(self.width, self.height) * 0.42),
+                 width=dp(4))
+            Color(*rgb, 0.85)
+            Line(circle=(self.center_x, self.center_y, min(self.width, self.height) * 0.34),
+                 width=dp(1.4))
+            Color(*rgb, 0.8)
+            Ellipse(pos=(self.center_x - dp(3), self.center_y - dp(3)),
+                    size=(dp(6), dp(6)))
+
+
+class MeshConstellation(Widget):
+    """A compact path diagram. Dots are capped when the route is longer."""
+    mode = StringProperty("offline")
+    hops = NumericProperty(0)
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.size_hint = (None, None)
+        self.size = (dp(52), dp(20))
+        self.bind(pos=self._draw, size=self._draw, mode=self._draw,
+                  hops=self._draw)
+
+    def _draw(self, *a):
+        count = max(2, min(5, int(self.hops) + 1))
+        rgb = ((0.35, 0.84, 0.77) if self.mode == "direct"
+               else (0.96, 0.72, 0.37) if self.mode == "relay"
+               else (0.38, 0.43, 0.48))
+        points = [(self.x + dp(5) + i * (self.width - dp(10)) / (count - 1),
+                   self.center_y + (dp(3) if i % 2 else -dp(3)))
+                  for i in range(count)]
+        self.canvas.clear()
+        with self.canvas:
+            Color(*rgb, 0.4 if self.mode != "offline" else 0.2)
+            Line(points=[c for p in points for c in p], width=dp(1))
+            for i, (x, y) in enumerate(points):
+                Color(*rgb, 0.85 if self.mode != "offline" or i == 0 else 0.3)
+                Ellipse(pos=(x - dp(2.5), y - dp(2.5)), size=(dp(5), dp(5)))
+
+
+class SkeletonRow(Widget):
+    """Two quiet shimmer bars while a history page is on its way."""
+    phase = NumericProperty(0)
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.size_hint_y = None
+        self.height = dp(70)
+        self.bind(pos=self._draw, size=self._draw, phase=self._draw)
+        from kivy.animation import Animation
+        self._anim = Animation(phase=1, duration=1.6, t="linear")
+        self._anim.repeat = True
+        self._anim.start(self)
+
+    def _draw(self, *a):
+        self.canvas.clear()
+        width = max(dp(40), self.width - dp(72))
+        with self.canvas:
+            Color(0.64, 0.75, 0.76, 0.12)
+            Ellipse(pos=(self.x + dp(12), self.y + dp(18)), size=(dp(34), dp(34)))
+            RoundedRectangle(pos=(self.x + dp(58), self.y + dp(44)),
+                             size=(width * 0.45, dp(10)), radius=[dp(5)] * 4)
+            RoundedRectangle(pos=(self.x + dp(58), self.y + dp(21)),
+                             size=(width * 0.8, dp(10)), radius=[dp(5)] * 4)
+            # Short highlight moves within the body bar.
+            Color(0.70, 0.92, 0.89, 0.13)
+            RoundedRectangle(pos=(self.x + dp(58) + width * 0.64 * self.phase,
+                                  self.y + dp(21)),
+                             size=(width * 0.16, dp(10)), radius=[dp(5)] * 4)
+
+
 class CtxHeaderLabel(ContextMenuMixin, Label):
     """Guild header: right-click/long-press offers the invite share-link
     and (for admins) the server settings panel."""
@@ -1519,6 +1657,7 @@ class ChannelButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
     channel_name = StringProperty("")
     badge = NumericProperty(0)
     selected = BooleanProperty(False)
+    _dragging = False   # set True once a grabbed touch passes dp(8)
 
     def build_context_menu(self):
         app = App.get_running_app()
@@ -1530,6 +1669,9 @@ class ChannelButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
             actions.append(("create channel...", True,
                             lambda: app and app._open_create_channel_popup()))
         if cid:
+            if getattr(app, "i_am_admin", False):
+                actions.append(("invite to #%s..." % name, True,
+                                lambda: app and app._invite_to_channel(cid, name)))
             actions.append(("copy channel id", True,
                             lambda: app and app._copy_text(cid)))
             muted = cid in app._muted_channels
@@ -1540,8 +1682,167 @@ class ChannelButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
                                 lambda: app and app._delete_channel(name, cid)))
         return actions
 
+    # ---- drag reorder (task 7) --------------------------------------------
+    # A grabbed touch that moves more than dp(8) cancels the long-press
+    # clock (tay: presses over a channel label belong to the drag/menu
+    # logic, never to the drawer) and reorders the grid live; on release
+    # the final order goes to /api/v1/channels/reorder once.
+    def on_touch_down(self, touch):
+        touch.ud["shades_drag_origin"] = (touch.x, touch.y)
+        self._dragging = False
+        return super().on_touch_down(touch)
+
+    def _ch_drag_check(self, touch):
+        """One move step: threshold -> live reorder. Returns True when the
+        touch has become a drag."""
+        origin = touch.ud.get("shades_drag_origin")
+        if origin is None:
+            return False
+        dx, dy = touch.x - origin[0], touch.y - origin[1]
+        if not getattr(self, "_dragging", False):
+            if dx * dx + dy * dy < dp(8) * dp(8):
+                return False
+            self._dragging = True
+            clock = getattr(self, "_ctx_clock", None)
+            if clock:
+                clock.cancel()
+                self._ctx_clock = None
+        self._ch_drag_step(touch)
+        return True
+
+    def on_touch_move(self, touch):
+        if touch.grab_current is self:
+            self._ch_drag_check(touch)
+        return super().on_touch_move(touch)
+
+    def on_touch_up(self, touch):
+        was_dragging = getattr(self, "_dragging", False)
+        self._dragging = False
+        result = super().on_touch_up(touch)
+        if was_dragging:
+            app = App.get_running_app()
+            if app is not None:
+                app._post_channel_reorder()
+            return True  # a drag end is consumed, not a press
+        return result
+
+    def _ch_drag_step(self, touch):
+        """Swap with the neighbouring row when the pointer crosses it."""
+        grid = self.parent
+        if grid is None:
+            return
+        buttons = [w for w in reversed(grid.children)
+                   if isinstance(w, ChannelButton)]
+        if len(buttons) < 2:
+            return
+        top = grid.top
+        row_h = 0.0
+        for b in buttons:
+            row_h = b.height
+        my_row = None
+        for i, b in enumerate(buttons):
+            if b is self:
+                my_row = i
+        if my_row is None or not row_h:
+            return
+        # which row does the pointer sit in?
+        offset = int(round((top - touch.y - row_h / 2.0) / row_h))
+        target = max(0, min(len(buttons) - 1, offset))
+        if target == my_row:
+            return
+        # move self within the children list so the visual order changes
+        # GridLayout fills rows in reversed-children order: children index
+        # (len-1-row) is row 0 (top).
+        child_at_row = len(buttons) - 1 - target
+        grid.remove_widget(self)
+        grid.add_widget(self, index=child_at_row)
+
 
 if KIVY:
+    class GuildRailButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
+        """Rail disc for one server (task 6): first-letter tile until an icon
+        path is ingested, active ring when selected, context menu with the
+        server actions. Icon files arrive through _ingest_guild_icon (the
+        whoami payload's blob id -> blob store -> local file)."""
+        display_name = StringProperty("")
+        icon_path = StringProperty("")
+        active = BooleanProperty(False)
+        index = NumericProperty(0)
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.orientation = "vertical"
+            self.size_hint = (None, None)
+            self.width = dp(56)
+            self.height = dp(60)
+            self.icon_widget = Image(size_hint=(None, None),
+                                     width=dp(44), height=dp(44),
+                                     allow_stretch=True, keep_ratio=True,
+                                     pos_hint={"center_x": 0.5})
+            self.letter_tile = Label(font_size=sp(20), bold=True,
+                                     pos_hint={"center_x": 0.5})
+            self.disc = Widget(size_hint=(None, None), size=(dp(48), dp(48)),
+                               pos_hint={"center_x": 0.5, "center_y": 0.5})
+            with self.disc.canvas.before:
+                self._bg_color = Color(rgba=self._rail_bg())
+                self._bg_ellipse = Ellipse(pos=(0, 0), size=(dp(48), dp(48)))
+            self._inner = BoxLayout(size_hint_y=None, height=dp(48),
+                                    padding=[dp(4)] * 2)
+            self._inner.add_widget(self.icon_widget)
+            self._inner.add_widget(self.letter_tile)
+            self.add_widget(self._inner)
+            self.bind(icon_path=self._apply_visual, active=self._apply_visual,
+                      display_name=self._apply_visual,
+                      size=self._sync_ellipse, pos=self._sync_ellipse)
+            self._apply_visual()
+
+        def _rail_bg(self):
+            app = App.get_running_app()
+            active = (app.theme_colors["primary"] if app
+                      else (0.36, 0.41, 0.59, 1))
+            idle = (app.theme_colors["sidebar_ctrl"] if app
+                    else (0.24, 0.26, 0.3, 1))
+            return list(active if self.active else idle) + [1]
+
+        def _sync_ellipse(self, *a):
+            x, y = self.disc.x, self.disc.y
+            w, h = self.disc.width, self.disc.height
+            self._bg_ellipse.pos = (x + dp(2), y + dp(2))
+            self._bg_ellipse.size = (w - dp(4), h - dp(4))
+
+        def _apply_visual(self, *a):
+            app = App.get_running_app()
+            self._bg_color.rgba = self._rail_bg()
+            if self.icon_path and os.path.isfile(self.icon_path):
+                self.icon_widget.source = self.icon_path
+                self.icon_widget.opacity = 1
+                self.letter_tile.opacity = 0
+            else:
+                self.icon_widget.source = ""
+                self.icon_widget.opacity = 0
+                self.letter_tile.text = (self.display_name or "S")[:1].upper()
+                self.letter_tile.color = (
+                    (1, 1, 1, 1) if self.active
+                    else (app.theme_colors["text"] if app else (0.9, 0.9, 0.9, 1)))
+                self.letter_tile.opacity = 1
+            self.letter_tile.font_size = sp(18)
+
+        def build_context_menu(self):
+            """open / copy invite / server settings (admins) / remove server."""
+            app = App.get_running_app()
+            name = self.display_name or ("server %d" % self.index)
+            actions = [("open " + name, True,
+                        lambda: app and app._select_server(self.index))]
+            if app and getattr(app, "guild_api", None):
+                actions.append(("copy invite link", True,
+                                lambda: app and app._copy_invite()))
+            if app and getattr(app, "i_am_admin", False):
+                actions.append(("server settings", True,
+                                lambda: app and app._open_admin_panel()))
+            actions.append(("remove server", True,
+                            lambda: app and app._remove_server(self.index)))
+            return actions
+
     class SitePage(BoxLayout):
         """One rendered micron page (site channels). bg_color paints the page
         canvas; the blocks are added as children by _render_site_page."""
@@ -1969,6 +2270,31 @@ if KIVY:
             except Exception:
                 pass
 
+        def choose_preset(self, name):
+            """Apply a named palette from ui_theme.PRESETS.
+
+            Seeded from DEFAULT_THEME_COLORS (not the current per-key edits),
+            matching the reference client: a preset is a clean re-tint, and
+            the fine-tune rows then hold that palette for further edits.
+            """
+            from kivy.app import App as _App
+            app = _App.get_running_app()
+            if app is None:
+                return
+            try:
+                app.theme_colors = preset_colors(
+                    dict(DEFAULT_THEME_COLORS), name)
+            except ValueError:
+                status = self.ids.get("config_status")
+                if status:
+                    status.text = "Unknown preset."
+                return
+            app._save_ui_config()
+            self._prefill_fields()
+            status = self.ids.get("config_status")
+            if status:
+                status.text = "%s preset applied." % name
+
 
 # ---------------------------------------------------------------------------
 # Main app
@@ -1982,6 +2308,16 @@ class sHadesClientApp(MDApp):
     # Unified UI palette: edited in the config screen, persisted to
     # ui_config.json, referenced by kv_md.kv as app.theme_colors['key'].
     theme_colors = DictProperty({})
+    # task 9: the composer rail's pfp; "" = letterless default disc
+    composer_pfp_path = StringProperty("")
+    # path-state chip: the observed RNS path to the guild node
+    # (offline / direct / relay + hop count), rendered by MeshPulse,
+    # MeshConstellation and the header label in kv_md.kv
+    mesh_mode = StringProperty("offline")
+    mesh_hops = NumericProperty(0)
+    mesh_label = StringProperty("OFFLINE")
+    # reply staging: the composer's "Replying to @x" card + wire prefix
+    reply_draft = StringProperty("")
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -2032,6 +2368,8 @@ class sHadesClientApp(MDApp):
         # site channels: kind per cid, the rendered page stack, the page
         # currently shown, and the active theme from the manifest
         self._channel_kinds = {}     # cid -> chat|site|term
+        self._channel_pos = {}       # name -> position (task 7 ordering)
+        self._channel_order = {}     # cid -> position (server-side index)
         self._site_stack = []        # [(cid, path)] back stack
         self._site_current = None    # (cid, path)
         self._site_theme = {}
@@ -2082,6 +2420,7 @@ class sHadesClientApp(MDApp):
         # Chat pagination: per channel, oldest loaded message id + whether
         # older messages remain. Used by scroll-triggered loading.
         self._older = {}          # cid -> {oldest_id, has_older, loading}
+        self._pending_reply = None
         self._scroll_bound = False
 
         # Banner images - random selection from media folder on startup.
@@ -2092,6 +2431,9 @@ class sHadesClientApp(MDApp):
         # Avatar pfp paths (set by _save_pfp_crop)
         self.my_avatar_orig = None
         self.my_avatar_small = None
+        # task 9: the composer's pfp live-binds to the kv bar; the class
+        # property is declared next to the other app properties
+        self.composer_pfp_path = ""
 
         # Friends roster + DM state (U7, client-local; the guild never sees
         # either). DM transport is a direct LXMRouter exchange, initialised
@@ -2206,6 +2548,13 @@ class sHadesClientApp(MDApp):
         sm.add_widget(MainScreen(name="main"))
         sm.add_widget(ProfileScreen(name="profile"))
         sm.add_widget(ConfigScreen(name="config"))
+        # Phase 1 task 5: the tabbed server-config screen replaces the U8
+        # popup; its tabs are keyed to the caller's roles on entry.
+        try:
+            from ui_server_config import ServerConfigScreen
+            sm.add_widget(ServerConfigScreen(name="server_config"))
+        except Exception as e:
+            print("server_config screen unavailable:", repr(e))
         # Plain Enter sends the message; Shift+Enter inserts a newline
         # (multiline input). Handled via _on_key_down below.
         Window.bind(on_key_down=self._on_key_down)
@@ -2450,6 +2799,10 @@ class sHadesClientApp(MDApp):
                     entry["display_name"] = s["display_name"]
                 if avatar_path is None and s.get("avatar_path"):
                     entry["avatar_path"] = s["avatar_path"]
+                # rail icon state (task 6): an update must not wipe the icon
+                for key in ("icon_path", "icon_blob"):
+                    if s.get(key):
+                        entry[key] = s[key]
                 self._servers[i] = entry
                 self._active_server_idx = i
                 self._save_servers()
@@ -2649,7 +3002,7 @@ class sHadesClientApp(MDApp):
 
     # -- server sidebar ------------------------------------------------------
     def _refresh_server_sidebar(self):
-        """Populate the server grid with server buttons."""
+        """Populate the server grid with rail discs (task 6)."""
         try:
             main = self.root.get_screen("main")
             grid = main.ids.server_grid
@@ -2658,31 +3011,68 @@ class sHadesClientApp(MDApp):
         grid.clear_widgets()
         for idx, s in enumerate(self._servers):
             display_name = s.get("display_name", s.get("host", "Server"))
-            btn = Button(
-                text=display_name[:12],  # truncate long names
-                size_hint_y=None,
-                height=scaled(dp(48)),
-                font_size=sp(10),
-                background_color=(
-                    self.theme_colors['primary']
-                    if idx == self._active_server_idx
-                    else self.theme_colors['sidebar_ctrl']),
-                color=(
-                    self.theme_colors['btn_text']
-                    if idx == self._active_server_idx
-                    else self.theme_colors['text']),
-                halign='center',
-                valign='middle',
-            )
+            btn = GuildRailButton(display_name=display_name,
+                                  icon_path=s.get("icon_path") or "",
+                                  active=(idx == self._active_server_idx),
+                                  index=idx)
             btn.bind(on_press=lambda inst, i=idx: self._select_server(i))
-            btn.bind(size=lambda inst, val: setattr(inst, 'text_size', (inst.width, None)))
             grid.add_widget(btn)
+
+    def _ingest_guild_icon(self, blob_id, srv):
+        """whoami's guild icon (a blob id) -> blob store -> icons/<host>_<blob
+        head>.<ext> -> servers entry -> rail refresh. No-op when the server's
+        icon is already that blob; disk writes happen on the caller's worker
+        thread, only the widget refresh hops to the main thread."""
+        if not blob_id or not srv or not self.guild_api:
+            return
+        if srv.get("icon_blob") == blob_id and srv.get("icon_path"):
+            return  # unchanged
+        api = self.guild_api
+
+        def work():
+            try:
+                res = api.blobs_get(blob_id)
+            except Exception as e:
+                print("guild icon fetch failed:", repr(e))
+                return
+            if not res.get("ok"):
+                return
+            import base64 as _b64
+            raw = _b64.b64decode(res.get("data_b64") or b"")
+            if not raw:
+                return
+            ext = "png"
+            head = raw[:8]
+            if head == b"\x89PNG\r\n\x1a\n":
+                ext = "png"
+            elif raw[:2] == b"\xff\xd8":
+                ext = "jpg"
+            elif raw[:4] in (b"RIFF",):
+                ext = "webp"
+            try:
+                icons_dir = os.path.join(_app_data_dir(), "icons")
+                os.makedirs(icons_dir, exist_ok=True)
+                host = (srv.get("host") or "server").replace(":", "_")
+                path = os.path.join(
+                    icons_dir,
+                    "%s_%s.%s" % (host, blob_id[:12], ext))
+                with open(path, "wb") as f:
+                    f.write(raw)
+                srv["icon_blob"] = blob_id
+                srv["icon_path"] = path
+                self._save_servers()
+                Clock.schedule_once(
+                    lambda dt: self._refresh_server_sidebar(), 0)
+            except Exception as e:
+                print("guild icon save failed:", repr(e))
+        threading.Thread(target=work, daemon=True).start()
 
     def _select_server(self, idx):
         """Switch to a different server."""
         if idx == self._active_server_idx:
             return
         self._set_active_server(idx)
+        self._update_mesh(False)
         self._refresh_server_sidebar()
         # Clear all channel/chat state for the new server
         self._channels.clear()
@@ -2889,12 +3279,27 @@ class sHadesClientApp(MDApp):
 
     def _on_guild_link_closed(self, link, reason=None):
         print("[link] guild link closed (%r) — scheduling re-establish" % (reason,))
+        Clock.schedule_once(lambda dt: self._update_mesh(False), 0)
         Clock.schedule_once(self._do_reestablish, 1.0)
 
     def _on_guild_link_dead(self, state=None):
         # Request-path signal (GuildAPI saw a non-ACTIVE link or a raise).
         print("[link] guild link dead (%r) — scheduling re-establish" % (state,))
+        Clock.schedule_once(lambda dt: self._update_mesh(False), 0)
         Clock.schedule_once(self._do_reestablish, 0.5)
+
+    def _update_mesh(self, active=None):
+        """Read the known RNS path. Unknown hop count stays a generic mesh link."""
+        if active is None:
+            active = (self.link is not None
+                      and getattr(self.link, "status", None) == RNS.Link.ACTIVE)
+        hops = None
+        if active and self.guild_node_hash:
+            try:
+                hops = RNS.Transport.hops_to(bytes.fromhex(self.guild_node_hash))
+            except (AttributeError, TypeError, ValueError):
+                pass
+        self.mesh_mode, self.mesh_label, self.mesh_hops = link_state(active, hops)
 
     def _do_reestablish(self, dt=None):
         """One guarded re-establish attempt; any caller can schedule it.
@@ -2933,6 +3338,7 @@ class sHadesClientApp(MDApp):
                 print("push callback registration failed: %s" % e)
             print("[link] guild link re-established")
             Clock.schedule_once(lambda dt2: self._start_streamer(), 0)
+            Clock.schedule_once(lambda dt2: self._update_mesh(), 0)
         except Exception as e:
             print("[link] re-establish failed: %r — retrying in 8s" % (e,))
             Clock.schedule_once(self._do_reestablish, 8.0)
@@ -3270,6 +3676,7 @@ class sHadesClientApp(MDApp):
             self.link = link
             self.guild_api = GuildAPI(self.reticulum, link,
                                       on_dead=self._on_guild_link_dead)
+            Clock.schedule_once(lambda dt: self._update_mesh(), 0)
             # v0.28 push: stream frames arrive on this link the moment
             # events exist. The callback is the client's entire intake;
             # no polling loops exist anywhere in the client.
@@ -3325,6 +3732,7 @@ class sHadesClientApp(MDApp):
 
     def _switch_main(self):
         self.root.current = "main"
+        self._update_mesh()
         # load channels (placeholder: general + anything discovered)
         self._refresh_channels_ui()
         self._refresh_server_sidebar()
@@ -3651,6 +4059,8 @@ class sHadesClientApp(MDApp):
                 err = res.get("error", "unknown")
                 Clock.schedule_once(
                     lambda dt: self._set_status("fetch failed: %s" % err), 0)
+                Clock.schedule_once(
+                    lambda dt: self._remove_skeleton(cid), 0)
                 return
             msgs = res.get("messages", []) or []
             updates = res.get("updates", []) or []
@@ -3668,6 +4078,7 @@ class sHadesClientApp(MDApp):
                 try:
                     main = self.root.get_screen("main")
                     grid = main.ids.message_grid
+                    self._remove_skeleton(cid)
                     if prepend:
                         if not msgs:
                             # Server has no older pages; stop trying.
@@ -3705,6 +4116,7 @@ class sHadesClientApp(MDApp):
                     else:
                         for m in msgs:
                             self._render_message(grid, m)
+                        self._regroup_messages(grid)
                         Clock.schedule_once(
                             lambda dt: self._scroll_to_bottom(), 0.1)
                     for u in updates:
@@ -3713,6 +4125,29 @@ class sHadesClientApp(MDApp):
                     print("render messages error:", e)
             Clock.schedule_once(apply, 0)
         threading.Thread(target=work, daemon=True).start()
+
+    def _show_skeleton(self, cid):
+        main = self.root.get_screen("main")
+        grid = main.ids.message_grid
+        self._skeleton_cid = cid
+        self._skeleton_rows = [SkeletonRow() for _ in range(4)]
+        for row in self._skeleton_rows:
+            grid.add_widget(row)
+
+    def _remove_skeleton(self, cid):
+        if getattr(self, "_skeleton_cid", None) != cid:
+            return
+        try:
+            grid = self.root.get_screen("main").ids.message_grid
+            for row in getattr(self, "_skeleton_rows", []):
+                from kivy.animation import Animation
+                Animation.cancel_all(row)
+                if row.parent is grid:
+                    grid.remove_widget(row)
+        except Exception:
+            pass
+        self._skeleton_rows = []
+        self._skeleton_cid = None
 
     def _on_scroll_y(self, value):
         """Scroll-triggered pagination: when the user reaches the top of the
@@ -3742,6 +4177,7 @@ class sHadesClientApp(MDApp):
         uname = m.get("username") or ("user-" + author[:6])
         self._record_member(author, uname)
         content = m.get("content") or ""
+        reply_author, reply_excerpt, body = split_reply(content)
         ts = time.strftime("%H:%M", time.localtime(m.get("ts", 0)))
         is_own = (author == self.my_hash)
 
@@ -3773,13 +4209,17 @@ class sHadesClientApp(MDApp):
             username=uname,
             ts=ts,
             content=content,
-            content_markup=md_to_kivy(content),
+            content_markup=md_to_kivy(body),
             avatar_source=avatar_source,
             msg_id=msg_id,
             is_own=is_own,
+            reply_author=reply_author,
+            reply_excerpt=reply_excerpt,
         )
+        row._message_meta = {"author_hash": author, "ts": m.get("ts", 0)}
         self._msg_widgets[msg_id] = row
         grid.add_widget(row)
+        sHadesClientApp._regroup_messages(grid)
 
         # attachment embeds (files uploaded with the message)
         for att in m.get("attachments") or []:
@@ -3822,8 +4262,25 @@ class sHadesClientApp(MDApp):
         # reaction summary line (tappable: toggles that emoji for me)
         self._set_row_reactions(msg_id, m.get("reactions") or [])
 
+    @staticmethod
+    def _regroup_messages(grid):
+        """Recompute after history prepends and live arrivals, including boundaries."""
+        previous = None
+        for row in reversed(grid.children):
+            if not isinstance(row, MessageRow):
+                previous = None
+                continue
+            meta = getattr(row, "_message_meta", None)
+            row.grouped = grouped_with(previous, meta)
+            previous = meta
+
     # -- reactions (phase 6) ----------------------------------------------
-    REACTION_PRESETS = ("+1", "-1", "laugh", "heart", "eyes", "question")
+    # tay (task 8): "reactions use emojis". Unicode chips render the char
+    # as-is; old rows carry ascii aliases and stay renderable (they show as
+    # :name). The presets are the picker's face; the server accepts any
+    # gated emoji (phase 1 unicode gate).
+    REACTION_PRESETS = ("👍", "👎", "😂", "❤️", "👀", "❓", "😮", "🙃",
+                        "🎉", "🔥", "🙏", "👏", "💯", "🤔", "😭", "💀")
 
     def _set_row_reactions(self, msg_id, reactions):
         """Replace a row's reaction chips with the given summary. Safe to
@@ -3843,21 +4300,33 @@ class sHadesClientApp(MDApp):
         if not reactions:
             return
         line = BoxLayout(orientation="horizontal", size_hint_y=None,
-                         height=dp(20), spacing=dp(6))
+                         height=dp(22), spacing=dp(6))
         for e in reactions:
             if not isinstance(e, dict) or not e.get("emoji"):
                 continue
-            chip = ClickableLabel(text=":%s %d" % (e["emoji"], e.get("count", 0)),
-                                  color=(0.75, 0.78, 0.85, 1), font_size=sp(12))
+            if ord(e["emoji"][0]) < 128:
+                # legacy ascii alias row: render the old :name chips
+                chip = ClickableLabel(
+                    text=":%s %d" % (e["emoji"], e.get("count", 0)),
+                    color=(0.75, 0.78, 0.85, 1), font_size=sp(12))
+                chip.size_hint_x = None
+                chip.width = dp(24 + 9 * len(e["emoji"]))
+                chip.bind(on_press=lambda inst, m=msg_id, em=e["emoji"]:
+                          self._toggle_reaction(m, em))
+                line.add_widget(chip)
+                continue
+            chip = ClickableLabel(text="%s %d" % (e["emoji"],
+                                                  e.get("count", 0)),
+                                  color=(0.75, 0.78, 0.85, 1), font_size=sp(13))
             chip.size_hint_x = None
-            chip.width = dp(24 + 9 * len(e["emoji"]))
+            chip.width = dp(34 + 12 * (e.get("count", 0) >= 10))
             chip.bind(on_press=lambda inst, m=msg_id, em=e["emoji"]:
                       self._toggle_reaction(m, em))
             line.add_widget(chip)
         plus = ClickableLabel(text="[+]", color=(0.5, 0.53, 0.6, 1), font_size=sp(12))
         plus.size_hint_x = None
         plus.width = dp(30)
-        plus.bind(on_press=lambda inst, m=msg_id: self._open_reaction_popup(m))
+        plus.bind(on_press=lambda inst, m=msg_id: self._open_emoji_picker(m))
         line.add_widget(plus)
         row._reaction_widgets.append(line)
         container.add_widget(line)
@@ -3884,25 +4353,33 @@ class sHadesClientApp(MDApp):
         return [{"emoji": e, "count": n, "users": []}
                 for e, n in sorted(counts.items())]
 
-    def _open_reaction_popup(self, msg_id):
+    def _open_emoji_picker(self, msg_id):
+        """Emoji picker (task 8): a grid of the 16 presets; picking one
+        toggles the reaction and closes the picker."""
         try:
             self.root.get_screen("main")
         except Exception:
             return
         box = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(10))
-        line = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint_y=None,
-                         height=dp(40))
+        grid = GridLayout(cols=8, size_hint_y=None, spacing=dp(6),
+                          padding=[dp(2)] * 2)
+        grid.bind(minimum_height=grid.setter("height"))
         for emoji in self.REACTION_PRESETS:
-            btn = Button(text=":%s" % emoji, size_hint_x=None, width=dp(70),
-                         size_hint_y=None, height=scaled(dp(40)),
-                         pos_hint={"center_y": 0.5})
+            btn = Button(text=emoji, font_size=sp(18),
+                         size_hint_y=None, height=scaled(dp(44)))
             btn.bind(on_press=lambda inst, m=msg_id, em=emoji:
                      (self._toggle_reaction(m, em), popup.dismiss()))
-            line.add_widget(btn)
-        box.add_widget(line)
-        popup = Popup(title="react", content=box, size_hint=(0.7, 0.25))
+            grid.add_widget(btn)
+        scroll = ScrollView(size_hint=(1, 1))
+        scroll.add_widget(grid)
+        box.add_widget(scroll)
+        popup = Popup(title="react", content=box, size_hint=(0.7, 0.5))
         self._popup = popup
         popup.open()
+
+    def _open_reaction_popup(self, msg_id):
+        """Backward-compatible alias for the emoji picker."""
+        self._open_emoji_picker(msg_id)
 
     # -- search (phase 6) --------------------------------------------------
     def open_search(self, prefill=""):
@@ -4151,7 +4628,7 @@ class sHadesClientApp(MDApp):
             dlog("_fetch_attachment: no path, skipping")
             return
 
-        self._add_loading_placeholder(row)
+        self._add_loading_placeholder(row, name)
 
         def work():
             print(f"[TRACE] _fetch_attachment.work: fetching {path}", flush=True)
@@ -4291,9 +4768,13 @@ class sHadesClientApp(MDApp):
                     if not cid or not name:
                         continue
                     self._channel_kinds[cid] = c.get("kind", "chat")
+                    self._channel_order[cid] = c.get("position") or 0
+                    self._channel_pos[name] = c.get("position") or 0
                     if name not in self._channels:
                         self._channels[name] = cid
                         self._add_channel(name)
+                    else:
+                        self._channels[name] = cid
             self._channel_unread.update(
                 {c["id"]: c.get("unread", 0) for c in chans
                  if isinstance(c, dict) and c.get("id")})
@@ -4319,6 +4800,17 @@ class sHadesClientApp(MDApp):
                 self.i_am_moderator = bool(res.get("is_moderator"))
                 self.i_am_admin = bool(res.get("is_admin"))
                 self.my_roles = res.get("roles") or []
+                # task 6: the guild icon rides whoami; ingest it per server
+                guild = res.get("guild") or {}
+                icon_blob = (guild.get("icon") or "").strip()
+                if icon_blob:
+                    idx = self._active_server_idx
+                    if 0 <= idx < len(self._servers):
+                        srv = self._servers[idx]
+                        if srv.get("icon_blob") != icon_blob:
+                            Clock.schedule_once(
+                                lambda dt: self._ingest_guild_icon(
+                                    icon_blob, srv), 0)
         threading.Thread(target=work, daemon=True).start()
 
     def _can_manage_roles(self):
@@ -4710,301 +5202,33 @@ class sHadesClientApp(MDApp):
 
     # -- admin panel (U8) --------------------------------------------------
     def _open_admin_panel(self):
-        """Server settings panel: config values, moderator whitelist and
-        the audit log. Admin-only (the server enforces it regardless —
-        this panel just avoids showing admins a broken screen)."""
+        """Server config screen: tabs for General / Membership / Channels /
+        Roles / Invites, visible per the caller's roles (the server enforces
+        everything regardless -- the client gating is UX, not security)."""
         if not self.guild_api or not getattr(self, "i_am_admin", False):
             return
-        box = BoxLayout(orientation="vertical", spacing=4, padding=6)
-        tabs = BoxLayout(size_hint_y=None, height=32, spacing=4)
-        box.add_widget(tabs)
-        scroll = ScrollView(size_hint=(1, 1))
-        grid = GridLayout(cols=1, size_hint_y=None, spacing=3, padding=[2, 2])
-        grid.bind(minimum_height=grid.setter("height"))
-        scroll.add_widget(grid)
-        box.add_widget(scroll)
-        close = Button(text="close", size_hint_y=None, height=scaled(28))
-        box.add_widget(close)
-        popup = Popup(title="server settings", content=box, size_hint=(0.8, 0.8))
-        self._admin_popup = popup
-        close.bind(on_press=lambda inst: popup.dismiss())
+        try:
+            from ui_server_config import ServerConfigScreen
+            if self.root is not None:
+                screen = self.root.get_screen("server_config")
+                screen.client = self
+                self.root.current = "server_config"
+                self._admin_popup = None
+                return
+            # kv ScreenManager not bound yet (pre-boot, tests, applets):
+            # host the same tabbed screen in a popup so the panel opens
+            # on every invocation path.
+            from kivy.uix.popup import Popup
+            screen = ServerConfigScreen(client=self, name="server_config")
+            screen.build_tabs()
+            popup = Popup(title="server settings", content=screen,
+                          size_hint=(0.9, 0.9))
+            popup.open()
+            self._admin_popup = popup
+        except Exception as e:
+            print("server_config screen failed:", repr(e))
+            return
 
-        def set_status(txt):
-            Clock.schedule_once(lambda dt: self._set_status(txt), 0)
-
-        # Every tab fetches from the guild. Those calls block on the RNS
-        # link for up to the request timeout (10s), so they must NOT run on
-        # the main thread — an unresponsive guild would freeze the whole UI.
-        # Each loader therefore fetches on a background thread and builds
-        # its widgets back on the main thread via Clock.schedule_once.
-        #
-        # load_gen guards against out-of-order responses: switching tabs
-        # quickly would otherwise let a slow earlier response append its
-        # rows to a grid the newer response already cleared.
-        load_gen = [0]
-
-        def fetch(view_fn, on_ok):
-            """Run view_fn() on a worker thread; call on_ok(res) on the
-            main thread with the result."""
-            gen = load_gen[0]
-
-            def work():
-                try:
-                    res = view_fn()
-                except Exception as e:
-                    set_status("%r" % e)
-                    return
-                if gen != load_gen[0]:
-                    return  # a newer tab superseded this response
-                Clock.schedule_once(lambda dt: on_ok(res), 0)
-            threading.Thread(target=work, daemon=True).start()
-
-        def load_config():
-            def render(res):
-                if not res.get("ok"):
-                    set_status("config: %s" % res.get("error", "failed"))
-                    return
-                cfg = res.get("config", {})
-                for key, val in sorted(cfg.items()):
-                    row = BoxLayout(size_hint_y=None, height=dp(32), spacing=4)
-                    row.add_widget(Label(text=key, size_hint_x=0.35,
-                                         halign="left", valign="middle",
-                                         font_size=sp(12)))
-                    entry = TextInput(text=str(val), multiline=False,
-                                      size_hint_x=0.45)
-                    row.add_widget(entry)
-                    save = Button(text="save", size_hint_x=None, width=60,
-                                  size_hint_y=None, height=scaled(dp(32)),
-                                  font_size=sp(11), pos_hint={"center_y": 0.5})
-                    row.add_widget(save)
-
-                    def do_save(k=key, e=entry):
-                        # Read the widget on the main thread; the worker
-                        # must not touch widget state.
-                        val = e.text
-
-                        def save_work():
-                            try:
-                                r = self.guild_api.admin_config(k, val)
-                            except Exception as ex:
-                                set_status("config: %r" % ex)
-                                return
-                            if r.get("ok"):
-                                set_status("%s saved" % k)
-                                Clock.schedule_once(lambda dt: refresh(), 0)
-                            else:
-                                set_status("config: %s" % r.get("error"))
-                        threading.Thread(target=save_work, daemon=True).start()
-                    save.bind(on_press=lambda inst, k=key, e=entry: do_save(k, e))
-                    grid.add_widget(row)
-            fetch(self.guild_api.admin_config, render)
-
-        def load_mods():
-            def render(res):
-                if not res.get("ok"):
-                    set_status("mods: %s" % res.get("error", "failed"))
-                    return
-                mods = res.get("mods") or []
-                admins = res.get("admins") or []
-                grid.add_widget(Label(
-                    text="moderators (%d)  admins (%d)" % (len(mods), len(admins)),
-                    size_hint_y=None, height=dp(22), font_size=sp(12),
-                    color=(0.85, 0.87, 0.9, 1), halign="left", valign="middle"))
-                row = BoxLayout(size_hint_y=None, height=dp(32), spacing=4)
-                entry = TextInput(hint_text="user hash (32 hex)",
-                                  multiline=False, size_hint_x=0.6)
-                row.add_widget(entry)
-                addm = Button(text="add mod", size_hint_x=None, width=80,
-                              size_hint_y=None, height=scaled(dp(32)),
-                              font_size=sp(11), pos_hint={"center_y": 0.5})
-                row.add_widget(addm)
-                adda = Button(text="add admin", size_hint_x=None, width=90,
-                              size_hint_y=None, height=scaled(dp(32)),
-                              font_size=sp(11), pos_hint={"center_y": 0.5})
-                row.add_widget(adda)
-                grid.add_widget(row)
-
-                def do_op(op, target_hash=None):
-                    h = (target_hash or (entry.text or "")).strip().lower()
-                    if not h:
-                        return
-
-                    def op_work():
-                        try:
-                            r = self.guild_api.admin_mods(op, h)
-                        except Exception as ex:
-                            set_status("mods: %r" % ex)
-                            return
-                        if r.get("ok"):
-                            Clock.schedule_once(
-                                lambda dt: setattr(entry, "text", ""), 0)
-                            set_status("%s %s" % (op, h[:12]))
-                            Clock.schedule_once(lambda dt: refresh(), 0)
-                        else:
-                            set_status("mods: %s" % r.get("error"))
-                    threading.Thread(target=op_work, daemon=True).start()
-                addm.bind(on_press=lambda inst: do_op("add"))
-                adda.bind(on_press=lambda inst: do_op("admin_add"))
-                for h in sorted(set(mods) | set(admins)):
-                    kind = ("admin" if h in admins else "mod")
-                    r = BoxLayout(size_hint_y=None, height=dp(26), spacing=4)
-                    r.add_widget(Label(text="%s %s" % (kind, h[:16]),
-                                       size_hint_x=0.7, halign="left",
-                                       valign="middle", font_size=sp(11)))
-                    rm = Button(text="remove", size_hint_x=None, width=70,
-                                size_hint_y=None, height=scaled(dp(26)),
-                                font_size=sp(10), pos_hint={"center_y": 0.5})
-                    rm.bind(on_press=lambda inst, hh=h, kk=kind: do_op(
-                        "admin_remove" if kk == "admin" else "remove", hh))
-                    r.add_widget(rm)
-                    grid.add_widget(r)
-            fetch(lambda: self.guild_api.admin_mods("list"), render)
-
-        def load_audit():
-            def render(res):
-                if not res.get("ok"):
-                    set_status("audit: %s" % res.get("error", "failed"))
-                    return
-                entries = res.get("entries") or []
-                grid.add_widget(Label(
-                    text="audit log (%d recent)" % len(entries),
-                    size_hint_y=None, height=dp(22), font_size=sp(12),
-                    color=(0.85, 0.87, 0.9, 1), halign="left", valign="middle"))
-                for e in entries:
-                    grid.add_widget(Label(
-                        text="%s  %s  %s" % (e.get("action", ""),
-                                             (e.get("target") or "")[:16],
-                                             (e.get("detail") or "")[:40]),
-                        size_hint_y=None, height=dp(22), font_size=sp(11),
-                        color=(0.8, 0.82, 0.86, 1), halign="left",
-                        valign="middle"))
-            fetch(lambda: self.guild_api.admin_audit(50), render)
-
-        def load_invites():
-            """Invite codes (U6b) — create, list, revoke."""
-            def render(res):
-                if not res.get("ok"):
-                    set_status("invites: %s" % res.get("error", "failed"))
-                    return
-                grid.add_widget(Label(
-                    text="invite codes (%d)" % len(res.get("invites") or []),
-                    size_hint_y=None, height=dp(22), font_size=sp(12),
-                    color=(0.85, 0.87, 0.9, 1), halign="left",
-                    valign="middle"))
-                row = BoxLayout(size_hint_y=None, height=dp(32), spacing=4)
-                label_in = TextInput(hint_text="label (optional)",
-                                     multiline=False, size_hint_x=0.45)
-                row.add_widget(label_in)
-                uses_in = TextInput(hint_text="max uses", multiline=False,
-                                    size_hint_x=0.2)
-                row.add_widget(uses_in)
-                exp_in = TextInput(hint_text="expires in s", multiline=False,
-                                   size_hint_x=0.2)
-                row.add_widget(exp_in)
-                mk = Button(text="create", size_hint_x=None, width=70,
-                            size_hint_y=None, height=scaled(dp(32)),
-                            font_size=sp(11), pos_hint={"center_y": 0.5})
-                row.add_widget(mk)
-                grid.add_widget(row)
-
-                def num(txt, default=0):
-                    try:
-                        return int((txt or "").strip() or default)
-                    except ValueError:
-                        return default
-
-                def do_create():
-                    # Read the widgets on the main thread; the worker must
-                    # not touch widget state.
-                    label = (label_in.text or "").strip()
-                    max_uses = num(uses_in.text)
-                    expires_in = num(exp_in.text)
-
-                    def work():
-                        try:
-                            r = self.guild_api.invites(
-                                "create", label=label,
-                                max_uses=max_uses,
-                                expires_in=expires_in)
-                        except Exception as ex:
-                            set_status("invites: %r" % ex)
-                            return
-                        if r.get("ok"):
-                            set_status("invite %s created" % r.get("code"))
-                            Clock.schedule_once(lambda dt: refresh(), 0)
-                        else:
-                            set_status("invites: %s" % r.get("error"))
-                    threading.Thread(target=work, daemon=True).start()
-                mk.bind(on_press=lambda inst: do_create())
-
-                for inv in res.get("invites") or []:
-                    ir = BoxLayout(size_hint_y=None, height=dp(26), spacing=4)
-                    expires = inv.get("expires_at") or 0
-                    exp_txt = "never" if not expires else time.strftime(
-                        "%Y-%m-%d %H:%M", time.localtime(expires))
-                    ir.add_widget(Label(
-                        text="%s  %s  uses %s/%s  exp %s" % (
-                            inv.get("code", ""), inv.get("label") or "-",
-                            inv.get("uses", 0),
-                            inv.get("max_uses") or "*", exp_txt),
-                        size_hint_x=0.8, halign="left", valign="middle",
-                        font_size=sp(10)))
-                    rm = Button(text="revoke", size_hint_x=None, width=70,
-                                size_hint_y=None, height=scaled(dp(26)),
-                                font_size=sp(10), pos_hint={"center_y": 0.5})
-
-                    def do_revoke(code=inv.get("code")):
-                        def work():
-                            try:
-                                r = self.guild_api.invites("revoke",
-                                                           code=code)
-                            except Exception as ex:
-                                set_status("invites: %r" % ex)
-                                return
-                            if r.get("ok"):
-                                set_status("revoked %s" % code)
-                                Clock.schedule_once(lambda dt: refresh(), 0)
-                            else:
-                                set_status("revoke: %s" % r.get("error"))
-                        threading.Thread(target=work, daemon=True).start()
-                    rm.bind(on_press=lambda inst: do_revoke())
-                    ir.add_widget(rm)
-                    grid.add_widget(ir)
-            fetch(lambda: self.guild_api.invites("list"), render)
-
-        views = [("config", load_config), ("moderators", load_mods),
-                 ("audit", load_audit), ("invites", load_invites)]
-        current = [0]
-
-        def show(idx):
-            current[0] = idx
-            # Invalidate any in-flight load from the previous tab so a slow
-            # response cannot append its rows to the newly-cleared grid.
-            load_gen[0] += 1
-            app = App.get_running_app()
-            active_bg = app.theme_colors['primary'] if app else (0.36, 0.41, 0.59, 1)
-            inactive_bg = app.theme_colors['sidebar_ctrl'] if app else (0.24, 0.26, 0.3, 1)
-            for i, btn in enumerate(tab_buttons):
-                btn.background_color = active_bg if i == idx else inactive_bg
-            grid.clear_widgets()
-            views[idx][1]()
-
-        def refresh():
-            """Reload the tab that is currently open."""
-            show(current[0])
-
-        tab_buttons = []
-        for i, (title, _) in enumerate(views):
-            app = App.get_running_app()
-            inactive_bg = app.theme_colors['sidebar_ctrl'] if app else (0.24, 0.26, 0.3, 1)
-            btn = Button(text=title, background_color=inactive_bg,
-                         size_hint_y=None, height=scaled(32),
-                         font_size=sp(12), pos_hint={"center_y": 0.5})
-            btn.bind(on_press=lambda inst, idx=i: show(idx))
-            tabs.add_widget(btn)
-            tab_buttons.append(btn)
-        show(0)
-        popup.open()
 
     def _open_join_prompt(self, on_done=None):
         """Join-code prompt (U6b): shown when the guild's registration
@@ -5110,16 +5334,22 @@ class sHadesClientApp(MDApp):
         self._set_status("copied to clipboard")
 
     def _reply_quote(self, username, content):
-        """Quote a message into the input bar: '> name: line' per line."""
-        lines = (content or "").split("\n")[:3]
-        quote = "\n".join("> %s: %s" % (username, ln[:120]) for ln in lines)
+        """Stage a reply card. The wire prefix stays readable on older clients."""
+        _author, _excerpt, body = split_reply(content)
+        self._pending_reply = (username, body)
+        self.reply_draft = "Replying to @%s · %s" % (
+            username, " ".join(body.split())[:80])
+
         try:
             main = self.root.get_screen("main")
             inp = main.ids.msg_input
-            inp.text = (quote + "\n" + (inp.text or "")).strip("\n") + "\n"
             inp.focus = True
         except Exception as e:
-            print("reply quote failed:", repr(e))
+            print("reply stage failed:", repr(e))
+
+    def cancel_reply(self):
+        self._pending_reply = None
+        self.reply_draft = ""
 
     def _mention(self, username):
         try:
@@ -5320,7 +5550,85 @@ class sHadesClientApp(MDApp):
         btn = ChannelButton(channel_name=name,
                             selected=name == main._current_channel)
         btn.bind(on_press=lambda inst: self._switch_channel(name))
-        grid.add_widget(btn)
+        # task 7: build in server order. channels/list carries position;
+        # Kivy layouts fill rows in reversed-children order, so the child
+        # index of visual row i is (visible_count - i). Insert into the
+        # first visual slot whose row holds a channel with a HIGHER position
+        # (or an unpositioned one), else the end.
+        my_pos = self._channel_pos.get(name)
+        if my_pos is None:
+            grid.add_widget(btn)
+            return
+        existing = [w for w in reversed(grid.children)
+                    if isinstance(w, ChannelButton)]
+        insert_at = None
+        for visual_row, b in enumerate(existing):
+            pos = self._channel_pos.get(b.channel_name)
+            if pos is None or pos > my_pos:
+                insert_at = len(existing) - visual_row
+                break
+        if insert_at is None:
+            grid.add_widget(btn)
+        else:
+            grid.add_widget(btn, index=insert_at)
+
+    def _post_channel_reorder(self):
+        """Send the visual order (top -> bottom) to the server once."""
+        try:
+            main = self.root.get_screen("main")
+            grid = main.ids.channel_grid
+        except Exception:
+            return
+        buttons = [w for w in reversed(grid.children)
+                   if isinstance(w, ChannelButton)]
+        order = []
+        for b in buttons:
+            cid = self._channels.get(b.channel_name)
+            if cid and cid not in order:
+                order.append(cid)
+
+        def work():
+            try:
+                res = self.guild_api.channels_reorder(order)
+            except Exception as e:
+                msg = repr(e)
+                Clock.schedule_once(
+                    lambda dt: self._set_status("reorder failed: %s" % msg),
+                    0)
+                return
+            if res.get("ok"):
+                for i, cid in enumerate(res.get("order") or order, start=1):
+                    self._channel_order[cid] = i
+            else:
+                Clock.schedule_once(
+                    lambda dt: self._set_status("reorder: %s"
+                                                % res.get("error")), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _invite_to_channel(self, cid, name):
+        """Create a channel-targeted invite + copy the shades:// link."""
+        if not self.guild_api:
+            return
+
+        def work():
+            try:
+                res = self.guild_api.invites("create",
+                                             label="#%s" % name, channel=cid)
+            except Exception as e:
+                msg = repr(e)
+                Clock.schedule_once(
+                    lambda dt: self._set_status("invite failed: %s" % msg),
+                    0)
+                return
+            if res.get("ok"):
+                link = "shades://join/%s" % res.get("code", "")
+                Clock.schedule_once(
+                    lambda dt: self._copy_text(link), 0)
+            else:
+                Clock.schedule_once(
+                    lambda dt: self._set_status("invite: %s"
+                                                % res.get("error")), 0)
+        threading.Thread(target=work, daemon=True).start()
 
     def _refresh_channels_ui(self):
         self._ensure_general_channel()
@@ -5342,6 +5650,7 @@ class sHadesClientApp(MDApp):
             pass
         grid = main.ids.message_grid
         grid.clear_widgets()
+        self._remove_skeleton(getattr(self, "_skeleton_cid", None))
         self._msg_widgets.clear()
         self._seq = 0
         self._last_ts = 0.0
@@ -5364,6 +5673,7 @@ class sHadesClientApp(MDApp):
             return
         self._older.setdefault(cid, {"oldest_id": None, "has_older": True,
                                      "loading": False})
+        self._show_skeleton(cid)
         self._fetch_messages(name)
         self._refresh_members_ui(name)
         # v0.31: re-subscribe NOW. The server binds the channel at
@@ -5498,6 +5808,7 @@ class sHadesClientApp(MDApp):
             return   # user switched away while the page was in flight
         grid = main.ids.message_grid
         grid.clear_widgets()
+        self._remove_skeleton(getattr(self, "_skeleton_cid", None))
         self._msg_widgets.clear()
         blocks = micron_parse(text)
         page = SitePage()
@@ -5741,6 +6052,9 @@ class sHadesClientApp(MDApp):
         # Allow attachment-only messages (no text) when a file is pending.
         if not text and not getattr(self, "_pending_attachment", None):
             return
+        if self._pending_reply:
+            text = reply_wire(*self._pending_reply, text)
+            self.cancel_reply()
         cid = self._channel_cid(cid)
         inp.text = ""
         # Capture ONCE here (main thread): a second send during this
@@ -5847,14 +6161,29 @@ class sHadesClientApp(MDApp):
         return None
 
     # -- attachments: server-stored vs ephemeral (P2P) -------------------
-    def _add_loading_placeholder(self, row):
+    @staticmethod
+    def _loading_placeholder_text(name):
+        """Match tay's v0.31.10 receipt ('loading image' for mp3's): say
+        what the row is actually loading, judged by extension. Images keep
+        the original wording; everything else gets its own word."""
+        ext = (name.rsplit(".", 1)[-1].lower()
+               if (name or "").count(".") else "")
+        if ext in ("mp3", "wav", "ogg", "flac", "m4a", "opus", "aac", "wma"):
+            return "[loading audio…]"
+        if ext in ("mp4", "mov", "webm", "mkv", "avi"):
+            return "[loading video…]"
+        if ext in ("png", "jpg", "jpeg", "gif", "webp", "bmp"):
+            return "[loading image…]"
+        return "[loading file…]"
+
+    def _add_loading_placeholder(self, row, name=""):
         """Show a loading placeholder in the row's embed container."""
         print(
             f"[TRACE] _add_loading_placeholder: "
             f"row={row.msg_id[:12] if row.msg_id else '?'}", flush=True)
         dlog(f"_add_loading_placeholder: row={row.msg_id[:12] if row.msg_id else '?'}")
         lbl = Label(
-            text=ATT_PLACEHOLDER_TEXT,
+            text=self._loading_placeholder_text(name),
             size_hint_y=None,
             height=dp(200),
             color=(0.7, 0.73, 0.77, 1),
@@ -7305,6 +7634,12 @@ class sHadesClientApp(MDApp):
         if hasattr(self, "profile_screen"):
             self.profile_screen.target_avatar = small_path
             self.profile_screen.ids.profile_pfp.source = small_path
+
+        # task 9: the composer pfp follows the saved crop immediately
+        try:
+            self.composer_pfp_path = small_path
+        except Exception:
+            pass
 
         # Refresh existing chat message rows for local user with new pfp
         msg_widgets = getattr(self, "_msg_widgets", {})

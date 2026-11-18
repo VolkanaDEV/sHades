@@ -527,6 +527,32 @@ def has_perm(user, channel_id, bit):
         return True
     return (perms & bit) != 0
 
+def page_can_view(user, channel_id):
+    """Anonymous NomadNet readers see only channels whose @everyone
+    overwrite (or the open default) grants VIEW; identified readers take
+    their role grants. has_perm itself rejects user=None, which is what
+    makes the anonymous lane a separate question. (tay fork tier-1)"""
+    if user is not None:
+        return has_perm(user, channel_id, PERMS["VIEW"])
+    with db_lock:
+        row = db.execute("SELECT perms FROM channel_overwrites "
+                         "WHERE channel_id=? AND role_id=0",
+                         (channel_id,)).fetchone()
+    perms = row["perms"] if row else DEFAULT_CHANNEL_PERMS
+    return bool(perms & PERMS["VIEW"])
+
+def attachment_visible(viewer, fname):
+    """A stored attachment is readable only through a visible, non-deleted
+    message. Serving a hash-keyed file with no message linkage would let
+    anyone with a node link pull every stored blob by name (or after its
+    message was deleted). (tay fork tier-1)"""
+    with db_lock:
+        rows = db.execute(
+            "SELECT DISTINCT m.channel_id FROM attachments a "
+            "JOIN messages m ON m.msg_id=a.msg_id "
+            "WHERE a.path=? AND m.deleted_at IS NULL", (fname,)).fetchall()
+    return any(page_can_view(viewer, row["channel_id"]) for row in rows)
+
 def _ensure_role(name, perms, position=0, color=None):
     """Create a role if missing (boot seeding / role editor). Returns id."""
     with db_lock:
@@ -708,6 +734,9 @@ def serve_attachment_file(path, data, request_id, link_id, remote_identity, requ
     dlog(f"serve_attachment_file: requested fname={fname!r}")
     if not re.match(r"^[0-9a-f]{32}\.[a-z0-9]{1,8}$", fname):
         dlog(f"serve_attachment_file: invalid fname {fname!r}")
+        return b"not found"
+    if not attachment_visible(viewer_of(remote_identity), fname):
+        dlog(f"serve_attachment_file: gated {fname!r}")
         return b"not found"
     fpath = os.path.join(STORAGE, "attachments", fname)
     if os.path.isfile(fpath):
@@ -920,6 +949,9 @@ def page_index(path, data, request_id, link_id, remote_identity, requested_at):
     out.append("> Channels\n")
     with db_lock:
         chans = db.execute("SELECT id, name FROM channels ORDER BY name ASC").fetchall()
+    viewer = viewer_of(remote_identity)
+    # anonymous / insufficient-VIEW lanes never even see the channel names
+    chans = [c for c in chans if page_can_view(viewer, c["id"])]
     for c in chans:
         out.append("`[#" + esc_micron_text(c["name"]) +
                    "`:/page/sHades/channel.mu`channel=" + c["id"] + "]\n")
@@ -935,13 +967,15 @@ def page_channel(path, data, request_id, link_id, remote_identity, requested_at)
     if not chan:
         return (page_header() + "> Unknown channel\n"
                 "cPick one from `[Channels`:/page/index.mu]\n").encode("utf-8")
+    viewer = viewer_of(remote_identity)
+    if not page_can_view(viewer, cid):
+        return (page_header() + "> Channel unavailable\n").encode("utf-8")
     out = [page_header()]
     out.append("> #" + esc_micron_text(chan["name"]) + "\n")
     out.append("-\n")
     # live subframe: auto-refresh partial (verified partial grammar + parse_url)
     out.append("`{:/page/sHades/messages.mu`8`channel=" + chan["id"] + "}\n")
     out.append("-\n")
-    viewer = viewer_of(remote_identity)
     token = issue_token(viewer, f"post:{chan['id']}") if viewer else ""
     out.append("`B333`<msg`>`b  `[Send`:/page/sHades/update.mu`msg|channel=" +
                chan["id"] + "|token=" + token + "]\n")
@@ -969,6 +1003,8 @@ def page_messages(path, data, request_id, link_id, remote_identity, requested_at
         oldest = rows[-1]["id"] if rows else None
         total_before = (db.execute("SELECT COUNT(*) AS n FROM messages WHERE channel_id=? AND id<?",
                                    (cid, oldest)).fetchone()["n"] if oldest else 0)
+    if not page_can_view(viewer, cid):
+        return (page_header() + "> Channel unavailable\n").encode("utf-8")
     rows = list(reversed(rows))  # newest last, Discord order
     out = []
     for r in rows:
@@ -1103,7 +1139,9 @@ def page_do_delete(path, data, request_id, link_id, remote_identity, requested_a
     token = get_data(data, "token") or ""
     with db_lock:
         row = db.execute("SELECT * FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
-    if not row or not can_delete(viewer, row):
+    if not row or not page_can_view(viewer, row["channel_id"]):
+        return (page_header() + "> Not allowed\n").encode("utf-8")
+    if not can_delete(viewer, row):
         return (page_header() + "> Not allowed\n").encode("utf-8")
     if not check_token(viewer, f"del:{msg_id}", token):
         return (page_header() + "> Expired form\ncReload and retry.\n").encode("utf-8")
@@ -1126,6 +1164,8 @@ def page_members(path, data, request_id, link_id, remote_identity, requested_at)
             "LEFT JOIN users u ON u.dest_hash = m.member_hash "
             "WHERE m.channel_id=? ORDER BY m.last_post DESC LIMIT 100", (cid,)).fetchall()
     viewer = viewer_of(remote_identity)
+    if not page_can_view(viewer, cid):
+        return (page_header() + "> Channel unavailable\n").encode("utf-8")
     online = online_users()
     out = [page_header()]
     out.append("> Members of #" + esc_micron_text(chan["name"]) + "\n-\n")
@@ -1761,9 +1801,14 @@ def _push_stream(cid):
     receives it. The poll endpoint stays for one-shot gap recovery.
     """
     with SUB_LOCK:
-        subs = [(lid, s["cursor"]) for lid, s in SUBSCRIPTIONS.items()
+        subs = [(lid, s["cursor"], s.get("user_hash")) for lid, s in SUBSCRIPTIONS.items()
                 if s["channel"] == cid]
-    for lid, cursor in subs:
+    for lid, cursor, user_hash in subs:
+        if not has_perm(user_hash, cid, PERMS["VIEW"]):
+            # a revoked or never-granted VIEW must not keep a live push
+            # flowing down the link (tay fork tier-1)
+            _drop_subscription(lid)
+            continue
         events, head, reset = _stream_collect(cid, cursor)
         # v0.31 ticket protocol: the push frame carries REFERENCES, never
         # bodies. The frame rides a raw RNS.Packet with the 500-byte link
@@ -1809,11 +1854,19 @@ def _purge_subs():
     cutoff = now() - SUB_TTL_S
     with SUB_LOCK:
         dead = [lid for lid, s in SUBSCRIPTIONS.items() if s["at"] < cutoff]
-        for lid in dead:
-            s = SUBSCRIPTIONS.pop(lid)
-            cur = SUB_BY_USER.get(s["user_hash"])
-            if cur and cur.get("link_id") == lid:
-                del SUB_BY_USER[s["user_hash"]]
+    for lid in dead:
+        _drop_subscription(lid)
+
+def _drop_subscription(link_id):
+    """Remove one subscription by link id, including its per-user index.
+    Lock owner: callers must not hold SUB_LOCK. (tay fork tier-1)"""
+    with SUB_LOCK:
+        sub = SUBSCRIPTIONS.pop(link_id, None)
+        if sub:
+            cur = SUB_BY_USER.get(sub["user_hash"])
+            if cur and cur.get("link_id") == link_id:
+                del SUB_BY_USER[sub["user_hash"]]
+    return sub
 
 def _stream_collect(cid, cursor):
     """(events after cursor, head seq, gap?) for one channel's ring.
@@ -1962,6 +2015,8 @@ def api_v1_stream_subscribe(viewer, data, link_id):
         chan = db.execute("SELECT id, kind FROM channels WHERE id=?", (cid,)).fetchone()
     if not chan:
         return {"ok": 0, "error": "unknown channel", "code": 404}
+    if not has_perm(viewer, cid, PERMS["VIEW"]):
+        return {"ok": 0, "error": "view permission required", "code": 403}
     _purge_subs()
     with EVENT_COND:
         head = EVENT_SEQ
@@ -1996,6 +2051,11 @@ def api_v1_stream_poll(viewer, data, link_id):
         if not sub:
             return {"ok": 0, "error": "not subscribed", "code": 409}
         cid = sub["channel"]
+        if sub["user_hash"] != viewer or not has_perm(viewer, cid, PERMS["VIEW"]):
+            # identity swap on this link, or a permission revoke: the sub
+            # must not outlive the VIEW grant (tay fork tier-1)
+            _drop_subscription(link_id)
+            return {"ok": 0, "error": "view permission required", "code": 403}
         cursor = sub["cursor"]
         pc = data.get("cursor")
         if isinstance(pc, (int, float)) and pc >= 0:
@@ -2169,6 +2229,8 @@ def api_v1_att_get(viewer, data, link_id):
     fname = ((data.get("path") or "").rsplit("/", 1)[-1]).strip()
     if not re.match(r"^[0-9a-f]{32}\.[a-z0-9]{1,8}$", fname):
         return {"ok": 0, "error": "unknown path", "code": 404}
+    if not attachment_visible(viewer, fname):
+        return {"ok": 0, "error": "attachment unavailable", "code": 404}
     offset, length = _chunk_params(data)
     total, chunk = _read_slice(
         os.path.join(STORAGE, "attachments", fname), offset, length)
@@ -2458,6 +2520,21 @@ def _site_safe_rel(path):
         return None
     return rel
 
+def _site_file_path(cid, rel):
+    """Resolve a site resource only if it stays beneath this channel's root.
+    commonpath, not realpath.startswith: a realpath prefix also matches
+    sibling directories (sites/ab accepts sites/abc/x that startswith(root)),
+    and differing drives raise ValueError on Windows. (tay fork tier-1)"""
+    root = os.path.realpath(os.path.join(_site_root(), cid))
+    path = os.path.realpath(os.path.join(root, rel))
+    try:
+        inside = os.path.commonpath((root, path)) == root
+    except ValueError:
+        inside = False
+    if not inside:
+        return None
+    return path
+
 def _site_channel(cid):
     with db_lock:
         r = db.execute("SELECT id, kind FROM channels WHERE id=?", (cid,)).fetchone()
@@ -2484,8 +2561,9 @@ def api_v1_site_put(viewer, data, link_id):
         return {"ok": 0, "error": "data_b64 must be valid base64", "code": 400}
     if len(blob) > MAX_ATTACHMENT_SZ:
         return {"ok": 0, "error": "resource too large", "code": 413}
-    cdir = os.path.join(_site_root(), cid)
-    fpath = os.path.join(cdir, rel)
+    fpath = _site_file_path(cid, rel)
+    if fpath is None:
+        return {"ok": 0, "error": "invalid resource path", "code": 400}
     os.makedirs(os.path.dirname(fpath), exist_ok=True)
     try:
         with open(fpath, "wb") as f:
@@ -2516,13 +2594,8 @@ def api_v1_site_get(viewer, data, link_id):
     rel = _site_safe_rel(data.get("path"))
     if not rel:
         return {"ok": 0, "error": "invalid resource path", "code": 400}
-    fpath = os.path.join(_site_root(), cid, rel)
-    # traversal guard: the resolved file must stay inside this site's dir.
-    # realpath BOTH sides: rel may carry forward slashes (client-supplied),
-    # and on Windows realpath normalizes to backslashes while a raw join
-    # does not, so the un-normalized comparison could never pass there.
-    if os.path.realpath(fpath) != os.path.realpath(
-            os.path.join(os.path.realpath(_site_root()), cid, rel)):
+    fpath = _site_file_path(cid, rel)
+    if fpath is None:
         return {"ok": 0, "error": "invalid resource path", "code": 400}
     offset, length = _chunk_params(data)
     total, chunk = _read_slice(fpath, offset, length)
@@ -2578,9 +2651,10 @@ def serve_site_file(path, data, request_id, link_id, remote_identity, requested_
     cid, rel = m.group(1), m.group(2)
     if not _site_safe_rel("/" + rel):
         return b"not found"
-    fpath = os.path.join(_site_root(), cid, rel)
-    root = os.path.realpath(os.path.join(_site_root(), cid))
-    if os.path.realpath(fpath).startswith(root) and os.path.isfile(fpath):
+    if not page_can_view(viewer_of(remote_identity), cid):
+        return b"not found"
+    fpath = _site_file_path(cid, rel)
+    if fpath and os.path.isfile(fpath):
         with open(fpath, "rb") as f:
             return f.read()
     return b"not found"
@@ -3041,12 +3115,24 @@ def api_v1_search(viewer, data, link_id):
             return {"ok": 0, "error": "view permission required", "code": 403}
         sql += "AND channel_id=? "
         args.append(cid)
+    else:
+        # Filter before LIMIT (tay fork tier-1): trimming the first N
+        # matches afterwards can return an empty page when hidden-channel
+        # posts are newer than a visible match — and the trim also leaks
+        # the mere existence of results it discarded.
+        with db_lock:
+            channel_ids = [r["id"] for r in
+                           db.execute("SELECT id FROM channels").fetchall()]
+        visible = [ch for ch in channel_ids
+                   if has_perm(viewer, ch, PERMS["VIEW"])]
+        if not visible:
+            return {"ok": 1, "query": q, "results": []}
+        sql += "AND channel_id IN (%s) " % ",".join("?" for _ in visible)
+        args.extend(visible)
     sql += "ORDER BY id DESC LIMIT ?"
     args.append(limit)
     with db_lock:
         rows = db.execute(sql, args).fetchall()
-    # unscoped search never leaks channels the viewer cannot read
-    rows = [r for r in rows if has_perm(viewer, r["channel_id"], PERMS["VIEW"])]
     return {"ok": 1, "query": q, "results": [msg_row_json(r) for r in rows]}
 
 # ---- whoami + moderation + channel deletion (U3: context-menu backend) -------------
