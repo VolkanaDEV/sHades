@@ -13,7 +13,7 @@ icon.filename = icon_512.png
 # tay: keep the composer above the virtual keyboard
 android.window_soft_input_mode = adjustResize
 
-version = 0.36.9
+version = 0.36.10
 # Bump version on every android-facing fix so the installed build can be
 # verified on-device (Settings > Apps > sHades) without adb.
 # wasmtime runs the micron applet sandbox on-device (applet_bridge.py).

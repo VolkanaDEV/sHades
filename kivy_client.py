@@ -7977,6 +7977,17 @@ class sHadesClientApp(MDApp):
 
     def _finish_saf_result(self, payload):
         """Process a picker result on the kivy thread."""
+        # v0.36.10 (tay's blank-black on selection, ANGLE device): after
+        # any opaque full-screen picker activity the GL surface sometimes
+        # comes back unre-painted. Force a draw now and once the frames
+        # settle -- cheap, and both legs (icon/banner) benefit.
+        try:
+            from kivy.core.window import Window
+            Window.request_draw()
+            Clock.schedule_once(
+                lambda dt: Window.request_draw(), 0.15)
+        except Exception:
+            pass
         result_code = payload["result_code"]
         intent = payload["intent"]
         on_file = payload["on_file"]

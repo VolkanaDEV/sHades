@@ -149,6 +149,16 @@ class _Tab:
         threading.Thread(target=work, daemon=True).start()
 
     def _status(self, txt):
+        # v0.36.10 (tay's boot_15 receipt): the admin picks ran silent --
+        # _set_status mirrors to connect+profile only, and tay stands on
+        # the admin screen, so "icon set"/"link dead" never surfaced.
+        # Mirror onto config_status on THIS screen; keep the mirrors.
+        try:
+            lbl = self.screen.ids.get("config_status")
+            if lbl is not None:
+                lbl.text = str(txt)
+        except Exception:
+            pass
         try:
             self.screen.client._set_status(txt)
         except Exception:
@@ -883,6 +893,23 @@ class ServerConfigScreen(Screen):
         except Exception:
             pass
 
+    def _apply_status(self, txt):
+        """Status on the ADMIN screen thread-safely: config_status here
+        (what tay sees while picking) + the standard mirrors."""
+        Clock.schedule_once(lambda dt, t=txt: self._apply_status_ui(t), 0)
+
+    def _apply_status_ui(self, txt):
+        try:
+            lbl = self.ids.get("config_status")
+            if lbl is not None:
+                lbl.text = str(txt)
+        except Exception:
+            pass
+        try:
+            self.client._set_status(txt)
+        except Exception:
+            pass
+
     def _apply_icon_file(self, path):
         """FileChooser result: upload through the standard blob flow, then
         set guild_icon to the returned blob_id (the blob store carries the
@@ -899,23 +926,32 @@ class ServerConfigScreen(Screen):
             with open(path, "rb") as f:
                 data = f.read()
         except OSError as e:
-            self.client._set_status("icon read failed: %r" % e)
+            self._apply_status("icon read failed: %r" % e)
             return
 
         def work():
-            res = self.client.guild_api.blobs_put(name, mime, data)
+            # v0.36.10: every path reports; a raise can no longer kill the
+            # worker silently (tay's "returns without setting").
+            try:
+                res = self.client.guild_api.blobs_put(name, mime, data)
+            except Exception as e:
+                self._apply_status("icon upload: %r" % e)
+                return
             if not res.get("ok"):
-                self.client._set_status("icon upload: %s"
-                                        % res.get("error"))
+                self._apply_status("icon upload: %s" % res.get("error"))
                 return
             blob_id = res.get("blob_id")
-            res2 = self.client.guild_api.admin_config("guild_icon", blob_id)
+            try:
+                res2 = self.client.guild_api.admin_config("guild_icon",
+                                                          blob_id)
+            except Exception as e:
+                self._apply_status("icon config: %r" % e)
+                return
             if res2.get("ok"):
-                self.client._set_status("icon set")
+                self._apply_status("icon set")
                 Clock.schedule_once(lambda dt: self._refresh_general(), 0)
             else:
-                self.client._set_status("icon config: %s"
-                                        % res2.get("error"))
+                self._apply_status("icon config: %s" % res2.get("error"))
         threading.Thread(target=work, daemon=True).start()
 
     def _apply_banner_file(self, path):
@@ -934,23 +970,31 @@ class ServerConfigScreen(Screen):
             with open(path, "rb") as f:
                 data = f.read()
         except OSError as e:
-            self.client._set_status("banner read failed: %r" % e)
+            self._apply_status("banner read failed: %r" % e)
             return
 
         def work():
-            res = self.client.guild_api.blobs_put(name, mime, data)
+            # v0.36.10: every path reports; a raise can no longer kill the
+            # worker silently (tay's "returns without setting").
+            try:
+                res = self.client.guild_api.blobs_put(name, mime, data)
+            except Exception as e:
+                self._apply_status("banner upload: %r" % e)
+                return
             if not res.get("ok"):
-                self.client._set_status("banner upload: %s"
-                                        % res.get("error"))
+                self._apply_status("banner upload: %s" % res.get("error"))
                 return
             blob_id = res.get("blob_id")
-            res2 = self.client.guild_api.admin_config("banner", blob_id)
+            try:
+                res2 = self.client.guild_api.admin_config("banner", blob_id)
+            except Exception as e:
+                self._apply_status("banner config: %r" % e)
+                return
             if res2.get("ok"):
-                self.client._set_status("banner set")
+                self._apply_status("banner set")
                 Clock.schedule_once(lambda dt: self._refresh_general(), 0)
             else:
-                self.client._set_status("banner config: %s"
-                                        % res2.get("error"))
+                self._apply_status("banner config: %s" % res2.get("error"))
         threading.Thread(target=work, daemon=True).start()
 
     def _refresh_general(self):
