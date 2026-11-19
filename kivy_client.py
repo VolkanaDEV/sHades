@@ -8728,9 +8728,12 @@ class sHadesClientApp(MDApp):
         with open(file_path, "rb") as f:
             return f.read()
 
-    def open_file_chooser(self, avatar=False):
-        """Open a file chooser popup to attach a file or select an avatar."""
+    def open_file_chooser(self, avatar=False, purpose=None):
+        """Open a file chooser popup to attach a file or select an avatar.
+        purpose (optional): "icon" or "banner" routes the picked file to
+        the server config screen's upload flow (P10: device uploads)."""
         self._avatar_mode = avatar
+        self._picker_purpose = purpose
         if self._android_platform():
             self._android_pick_generic(avatar)
             return
@@ -8743,6 +8746,25 @@ class sHadesClientApp(MDApp):
                      self._on_file_selected(selection, popup))
         popup.open()
 
+    def _route_purpose_file(self, path, purpose):
+        """P10: hand the picked file to the server config screen's
+        icon/banner upload flow (blobs_put -> admin_config)."""
+        panel = None
+        try:
+            root = App.get_running_app().root
+            scr = root.get_screen("server_config") if root else None
+            panel = getattr(scr, "tab_content", {}).get("General")
+        except Exception:
+            panel = None
+        if panel is None:
+            self._set_status("no server config screen to apply %s"
+                             % purpose)
+            return
+        if purpose == "icon":
+            panel._apply_icon_file(path)
+        else:
+            panel._apply_banner_file(path)
+
     def _on_file_selected(self, selection, popup):
         if popup is not None:
             popup.dismiss()
@@ -8750,7 +8772,11 @@ class sHadesClientApp(MDApp):
             return
         path = selection[0]
         try:
-            if getattr(self, "_avatar_mode", False):
+            purpose = getattr(self, "_picker_purpose", None)
+            if purpose in ("icon", "banner"):
+                self._set_status("reading %s..." % purpose)
+                self._route_purpose_file(path, purpose)
+            elif getattr(self, "_avatar_mode", False):
                 self._set_status("opening PFP editor ...")
                 self._open_pfp_editor(path)
             else:

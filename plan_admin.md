@@ -153,11 +153,38 @@ scope   : profile-screen delete-account; server toggles that bind live
   ServerConfigScreen; keep the gesture tay named (right-click /
   long-press on the rail disc) as the entry point.
 
+## P10 — Admin config: prettier + device uploads (tay, 2026-11-19: "Admin
+## config works now, but it should be prettier & icon/banner selection
+## should allow for uploading as well")
+
+- tay's message closes the admin-gate saga: admin.txt seed worked, the
+  config screen opened on-device.
+- P10a (device upload lane, the functional miss): the blob chain is
+  fully built (blobs_put -> blob_id -> admin_config["guild_icon"/
+  "banner" -> load_icon_into previews); the chooser is desktop-only
+  (FileChooserListView lists nothing in the Android sandbox) while the
+  proven SAF picker routes only avatar/attach purposes. Missing
+  arrow: purpose-routed picking -- open_file_chooser carries
+  purpose=None|"icon"|"banner", _on_file_selected routes icon/banner
+  to ServerConfigScreen.tab_content["General"]._apply_icon_file/
+  _apply_banner_file via the screen manager, ui_server_config pick
+  buttons take the SAF route when _android_platform() (desktop popup
+  unchanged). Price: small (~50 lines, two files).
+- P10b (prettier pass): General tab -- icon preview 56px, banner
+  preview strip (own row, loads via load_icon_into when the config
+  carries a banner), row spacing dp(4)->dp(8). Pure widget code, no kv.
+- Contracts: server_config lane gains the purpose-routing recorder
+  (FakeApp with _android_platform -> open_file_chooser(purpose) call
+  tuple asserted) + banner preview widget presence; kivy_client static
+  pins for the routing helper. Battery green.
+- Ship: bump 0.36.7 (single bump), full gates, CI pair + watcher,
+  byte-verify with the routing symbols in the want set.
+
 ## Build order
 
-P1, P2, P3, P5, P6, P9 in the v0.34.0 ship train (client + server
-land together). P7 next (arrow closed: site channel, existing
-endpoints) — same train if the receipts stay small. P4, P8 parked
-until tay calls them. PR merge stays tay's.
+P1, P2, P3, P5 in the v0.34.0-0.36.x ships (done: admin gate closed by
+tay's admin.txt seed 2026-11-19; bootlog diagnosis channel v0.36.5,
+external_primary v0.36.6). Next: P10 (tay's device receipt), then P6,
+P9->P7. P4, P8 parked until tay calls them. PR merge stays tay's.
 
 [END PLAN]

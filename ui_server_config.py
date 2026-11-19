@@ -100,7 +100,7 @@ class _Tab:
 
     # -- widget scaffolding --------------------------------------------------
     def make_content(self):
-        self.box = BoxLayout(orientation="vertical", spacing=dp(4))
+        self.box = BoxLayout(orientation="vertical", spacing=dp(8))
         self._build_controls()
         scroll = ScrollView(size_hint=(1, 1))
         grid = GridLayout(cols=1, size_hint_y=None, spacing=dp(3),
@@ -221,9 +221,9 @@ class GeneralTab(_Tab):
         a_row.add_widget(self.att_eph_btn)
         self.box.add_widget(a_row)
 
-        icon_row = BoxLayout(size_hint_y=None, height=_scaled(40),
-                             spacing=dp(4))
-        self.icon_widget = Image(size_hint_x=None, width=_scaled(36),
+        icon_row = BoxLayout(size_hint_y=None, height=_scaled(56),
+                             spacing=dp(8))
+        self.icon_widget = Image(size_hint_x=None, width=_scaled(56),
                                  allow_stretch=True, keep_ratio=True)
         pick = _btn("set icon...", 110, 30)
         clear = _btn("clear", 60, 30)
@@ -234,8 +234,14 @@ class GeneralTab(_Tab):
         icon_row.add_widget(clear)
         self.box.add_widget(icon_row)
 
+        # P10b: banner preview strip -- the picked/committed banner is
+        # visible in the tab instead of a blind flip
+        self.banner_widget = Image(size_hint_y=None,
+                                   height=_scaled(56),
+                                   allow_stretch=True, keep_ratio=False)
+        self.box.add_widget(self.banner_widget)
         banner_row = BoxLayout(size_hint_y=None, height=_scaled(40),
-                               spacing=dp(4))
+                               spacing=dp(8))
         bpick = _btn("set banner...", 110, 30)
         bclear = _btn("clear", 60, 30)
         bpick.bind(on_press=lambda _i: self._open_banner_chooser())
@@ -290,6 +296,13 @@ class GeneralTab(_Tab):
         icon = (cfg.get("guild_icon") or "").strip()
         if icon:
             self.screen.load_icon_into(self.icon_widget, icon)
+        else:
+            self.icon_widget.texture = None
+        banner = (cfg.get("banner") or "").strip()
+        if banner:
+            self.screen.load_icon_into(self.banner_widget, banner)
+        else:
+            self.banner_widget.texture = None
         self._load_audit()
 
     def _load_audit(self):
@@ -310,6 +323,11 @@ class GeneralTab(_Tab):
 
     # -- icon picker ---------------------------------------------------------
     def _open_icon_chooser(self):
+        app = App.get_running_app()
+        if app is not None and getattr(
+                app, "_android_platform", lambda: False)():
+            app.open_file_chooser(purpose="icon")
+            return
         box = BoxLayout(orientation="vertical")
         chooser = FileChooserListView(
             path=os.path.expanduser("~"),
@@ -343,6 +361,11 @@ class GeneralTab(_Tab):
 
     # -- banner picker (P5): rides the guild-icon chooser flow ---------
     def _open_banner_chooser(self):
+        app = App.get_running_app()
+        if app is not None and getattr(
+                app, "_android_platform", lambda: False)():
+            app.open_file_chooser(purpose="banner")
+            return
         box = BoxLayout(orientation="vertical")
         chooser = FileChooserListView(
             path=os.path.expanduser("~"),
