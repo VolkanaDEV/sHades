@@ -1143,6 +1143,16 @@ class ImageCache:
             print("image cache error:", e)
             return None
 
+    def forget(self, key):
+        """Drop one cache entry and its file (P1 account purge: the
+        cached avatar of the account leaving must not survive it)."""
+        path = self._paths.pop(key, None)
+        if path and os.path.isfile(path):
+            try:
+                os.unlink(path)
+            except OSError as e:
+                print("image cache forget error:", e)
+
     def fetch_and_cache(self, api, path, key, ext="png"):
         if not self.begin_load(key):
             return self._paths.get(key)
@@ -9004,6 +9014,190 @@ class sHadesClientApp(MDApp):
         name = path.split("/")[-1]
         self._pending_attachment = [name, mime, blob]
         self._set_status("Attached: %s (%d bytes)" % (name, len(blob)))
+
+    def open_confirm_delete_account(self, *_):
+        """P1 (tay 2026-11-19): purge this guild account from the server.
+
+        Two stage-gates matching the server's own validations verbatim
+        (account/delete-posts and account/leave check the confirm
+        strings exactly): "DELETE MY POSTS", then "LEAVE GUILD".
+        Between the two, only the server mutates; the local wipe runs
+        after leave confirms so a failed step never strands the local
+        profile.
+        """
+        from kivymd.uix.button import MDButton, MDButtonText
+        if not (self.guild_api or getattr(self, "guild_api", None)):
+            self._set_status("No guild connection: nothing to purge.")
+            return
+        box = BoxLayout(orientation="vertical", spacing=dp(10),
+                        padding=dp(12))
+        note = Label(text=("Delete account erases everything you posted "
+                           "to this guild -- messages, edits, reactions "
+                           "and attachment files -- then leaves the "
+                           "guild. This cannot be undone."),
+                     color=self.theme_colors["text_muted"],
+                     font_size=sp(13), size_hint_y=None, height=dp(70),
+                     halign="center", valign="middle")
+        note.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+        box.add_widget(note)
+        typed = TextInput(multiline=False, hint_text="Type DELETE MY POSTS",
+                          font_name="MeshBody", font_size=sp(16),
+                          foreground_color=self.theme_colors["text"],
+                          hint_text_color=self.theme_colors["text_muted"],
+                          background_normal="", background_active="",
+                          background_color=self.theme_colors["input_bg"],
+                          size_hint_y=None, height=dp(46))
+        box.add_widget(typed)
+        status = Label(text="", color=self.theme_colors["accent"],
+                       size_hint_y=None, height=dp(22))
+        box.add_widget(status)
+        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
+        box.add_widget(row)
+        go = MDButton(style="filled", theme_bg_color="Custom",
+                      md_bg_color=(0.76, 0.22, 0.22, 1),
+                      size_hint=(None, None), width=dp(160))
+        go.add_widget(MDButtonText(text="Erase my posts",
+                                   text_color=(1, 1, 1, 1)))
+        stay = MDButton(style="outlined", size_hint=(None, None),
+                        width=dp(120))
+        stay.add_widget(MDButtonText(text="Cancel",
+                                     text_color=self.theme_colors["text"]))
+        row.add_widget(go)
+        row.add_widget(stay)
+        sheet = Popup(title="Stage 1 of 2: erase posts", content=box,
+                      size_hint=(0.9, 0.62))
+
+        def proceed(*_a):
+            if (typed.text or "") != "DELETE MY POSTS":
+                status.text = "The phrase does not match."
+                return
+            sheet.dismiss()
+            self.open_confirm_leave_guild()
+
+        go.bind(on_press=proceed)
+        stay.bind(on_press=lambda *_: sheet.dismiss())
+        sheet.open()
+
+    def open_confirm_leave_guild(self, *_):
+        """Stage 2: the literal the leave endpoint validates."""
+        from kivymd.uix.button import MDButton, MDButtonText
+        box = BoxLayout(orientation="vertical", spacing=dp(10),
+                        padding=dp(12))
+        note = Label(text=("Posts erased. Leaving releases your "
+                           "membership, roles, receipts and registration "
+                           "on this guild. Type LEAVE GUILD to finish."),
+                     color=self.theme_colors["text_muted"],
+                     font_size=sp(13), size_hint_y=None, height=dp(64),
+                     halign="center", valign="middle")
+        note.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+        box.add_widget(note)
+        typed = TextInput(multiline=False, hint_text="Type LEAVE GUILD",
+                          font_name="MeshBody", font_size=sp(16),
+                          foreground_color=self.theme_colors["text"],
+                          hint_text_color=self.theme_colors["text_muted"],
+                          background_normal="", background_active="",
+                          background_color=self.theme_colors["input_bg"],
+                          size_hint_y=None, height=dp(46))
+        box.add_widget(typed)
+        status = Label(text="", color=self.theme_colors["accent"],
+                       size_hint_y=None, height=dp(22))
+        box.add_widget(status)
+        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
+        box.add_widget(row)
+        go = MDButton(style="filled", theme_bg_color="Custom",
+                      md_bg_color=(0.76, 0.22, 0.22, 1),
+                      size_hint=(None, None), width=dp(160))
+        go.add_widget(MDButtonText(text="Leave guild",
+                                   text_color=(1, 1, 1, 1)))
+        stay = MDButton(style="outlined", size_hint=(None, None),
+                        width=dp(120))
+        stay.add_widget(MDButtonText(text="Cancel",
+                                     text_color=self.theme_colors["text"]))
+        row.add_widget(go)
+        row.add_widget(stay)
+        sheet = Popup(title="Stage 2 of 2: leave guild", content=box,
+                      size_hint=(0.9, 0.62))
+
+        def proceed(*_a):
+            if (typed.text or "") != "LEAVE GUILD":
+                status.text = "The phrase does not match."
+                return
+            sheet.dismiss()
+            self.purge_account_worker()
+
+        go.bind(on_press=proceed)
+        stay.bind(on_press=lambda *_: sheet.dismiss())
+        sheet.open()
+
+    def purge_account_worker(self, *_):
+        """Both server steps, in order, on the worker thread; every
+        failure aborts before the local wipe (the account stays
+        functional and the retries are idempotent)."""
+        api = self.guild_api
+        if api is None:
+            return
+
+        def work():
+            res1 = None
+            res2 = None
+            try:
+                res1 = api.account_delete_posts(
+                    {"confirm": "DELETE MY POSTS"})
+            except Exception as exc:
+                print("account delete-posts failed:", repr(exc))
+            if not (res1 or {}).get("ok"):
+                Clock.schedule_once(
+                    lambda dt: self._set_status(
+                        "Post purge failed: nothing was deleted locally."),
+                    0)
+                return
+            try:
+                res2 = api.account_leave({"confirm": "LEAVE GUILD"})
+            except Exception as exc:
+                print("account leave failed:", repr(exc))
+            if not (res2 or {}).get("ok"):
+                Clock.schedule_once(
+                    lambda dt: self._set_status(
+                        "Leave failed: guild membership intact."),
+                    0)
+                return
+            Clock.schedule_once(
+                lambda dt: self.finish_account_purge(), 0)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def finish_account_purge(self):
+        """Local wipe + gate back to staging: the two profile files
+        (their existence is the routing gate at boot), my cached
+        avatar rows, avatar/username state. The RNS identity file and
+        servers.json survive: the identity outlives one guild, and the
+        hub entry lets a fresh account reconnect.
+        """
+        for path in (self._portable_profile_path(),
+                     self._onboarding_path(),
+                     # the saved session carries hub login state; without
+                     # this the next boot would resume main with a purged
+                     # account instead of staging fresh
+                     self._session_path()):
+            try:
+                if os.path.isfile(path):
+                    os.unlink(path)
+            except OSError as e:
+                print("profile file delete failed:", repr(e))
+        key = "av:" + (getattr(self, "my_hash", "") or "")
+        IMAGE_CACHE.forget(key)
+        self.my_avatar_small = ""
+        self.avatar_preview = ""
+        self.username = ""
+        self._portable_name = ""
+        self.i_am_admin = False
+        self._set_status("Account purged: stage a new profile to return.")
+        try:
+            if self.root is not None:
+                self.root.get_screen("onboarding").stage = 0
+                self.root.current = "onboarding"
+        except Exception as e:
+            print("routing back to staging failed:", repr(e))
 
     def save_profile(self):
         """Save username to the guild."""

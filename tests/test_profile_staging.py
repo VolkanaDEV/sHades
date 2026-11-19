@@ -133,7 +133,57 @@ def main():
         check("%s rides the hint child in-block" % fid,
               "MDTextFieldHintText:" in kv[i:b])
     check("no dead hint_text property anywhere in kv",
-          "\r\nhint_text: '" not in kv and "\r\n                hint_text: '" not in kv)
+          "hint_text: '" not in kv)
+
+    # --- 8. profile-screen delete account (tay, plan_admin P1) -----------
+    # Server purge machinery existed; the client flow is the arrow:
+    # danger row -> two type-to-confirm stage-gates whose literals are
+    # byte-equal to what sHades.py validates -> sequential worker ->
+    # local wipe (profile files + session + cached avatar) ->
+    # staging gate-back.
+    check("danger row on the profile screen",
+          "id: profile_delete" in kv
+          and "on_press: app.open_confirm_delete_account()" in kv)
+    check("stage-1 handler exists with the posts literal",
+          "def open_confirm_delete_account" in py
+          and '!= "DELETE MY POSTS"' in py)
+    check("stage-2 handler exists with the leave literal",
+          "def open_confirm_leave_guild" in py
+          and '!= "LEAVE GUILD"' in py)
+    server = open(os.path.join(REPO, "sHades.py"),
+                  "rb").read().decode("utf-8")
+    check("client literals byte-equal the server payloads",
+          'data.get("confirm") != "DELETE MY POSTS"' in server
+          and 'data.get("confirm") != "LEAVE GUILD"' in server
+          and '{"confirm": "DELETE MY POSTS"}' in py
+          and '{"confirm": "LEAVE GUILD"}' in py)
+    wp = py.find("def purge_account_worker")
+    check("worker posts then leaves, in order",
+          0 < wp < py.find("def finish_account_purge", wp)
+          and py.find("account_delete_posts", wp)
+          < py.find("account_leave", wp)
+          and "threading.Thread(target=work, daemon=True).start()" in py)
+    check("failed step aborts before the local wipe",
+          "Post purge failed" in py and "Leave failed" in py)
+    check("local wipe drops both profile files and the session",
+          "finish_account_purge" in py
+          and "self._portable_profile_path()" in py
+          and "self._onboarding_path()" in py
+          and "self._session_path()" in py)
+    check("wipe drops my cached avatar and resets identity state",
+          "IMAGE_CACHE.forget(key)" in py
+          and 'key = "av:" + (getattr(self, "my_hash", "") or "")' in py
+          and "self.i_am_admin = False" in py)
+    check("gate-back routes to staging at stage 0",
+          'root.get_screen("onboarding").stage = 0' in py
+          and 'root.current = "onboarding"' in py)
+    check("ImageCache.forget ships and unlinks the cached file",
+          "def forget(self, key):" in py
+          and "os.unlink(path)" in py)
+    # the purge relies on the same file the boot gate checks at
+    # :2866 -- keep both sides of that invariant honest
+    check("boot gate and purge agree on the profile file",
+          "os.path.isfile(self._portable_profile_path())" in py)
 
     print()
     print("P=%d F=%d" % (len(PASS), len(FAIL)))

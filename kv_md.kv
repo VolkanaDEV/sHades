@@ -478,6 +478,21 @@
                 MDButtonText:
                     text: 'Back'
                     text_color: app.theme_colors['text']
+        MDButton:
+            id: profile_delete
+            # P1 (plan_admin v1.1, tay 2026-11-19): purge this
+            # guild account from the server; two-stage type-to-
+            # confirm carries the literals the server validates.
+            style: 'filled'
+            size_hint_x: None
+            width: dp(230)
+            pos_hint: {'center_x': 0.5}
+            theme_bg_color: 'Custom'
+            md_bg_color: 0.76, 0.22, 0.22, 1
+            on_press: app.open_confirm_delete_account()
+            MDButtonText:
+                text: 'Delete account'
+                text_color: 1, 1, 1, 1
 
 <MainScreen>:
     BoxLayout:
