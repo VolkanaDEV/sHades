@@ -237,6 +237,31 @@ def _show_on_screen(text):
         traceback.print_exc()
 
 
+def _android_softinput_resize():
+    """tay's 0.36.8 boot-log receipt: the keyboard covers the composer.
+
+    Byte-verified on the 0.36.9 APK: p4a develop ships NO
+    windowSoftInputMode in AndroidManifest.xml (the attribute is
+    absent), and buildozer 1.5.0 has zero code for the
+    android.window_soft_input_mode spec key (grepped the wheel); kivy
+    itself says 'resize' needs a different java root layout. So the
+    spec key was inert string. Apply ADJUST_RESIZE at runtime here
+    instead: the window resizes under the keyboard and the composer,
+    pinned to the layout bottom, rides up. Prints a boot-log receipt
+    either way so the device run is checkable.
+    """
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        Params = autoclass("android.view.WindowManager$LayoutParams")
+        window = PythonActivity.mActivity.getWindow()
+        window.setSoftInputMode(Params.SOFT_INPUT_ADJUST_RESIZE)
+        print("SOFTINPUT: window set to ADJUST_RESIZE", flush=True)
+    except Exception as e:
+        # non-android host or a jnius resolution miss: report, never raise
+        print("SOFTINPUT: resize not applied (%r)" % (e,), flush=True)
+
+
 def main():
     """Entry point called from Android activity. All Python execution
     is wrapped so any import/runtime crash is visible on-device."""
@@ -248,6 +273,7 @@ def main():
     except Exception:
         pass
     print("PYTHON: main() starting", flush=True)
+    _android_softinput_resize()
     try:
         print("PYTHON: importing kivy_client", flush=True)
         from kivy_client import sHadesClientApp

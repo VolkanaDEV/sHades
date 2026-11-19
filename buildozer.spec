@@ -10,10 +10,14 @@ source.exclude_dirs = .git, .github, tests, __pycache__, build, dist, .buildozer
 # tay's sHades wordmark art, centered inside the circular adaptive safe zone
 # (measured 55.9% lettering span; contract lane: tests/test_launcher_icon.py)
 icon.filename = icon_512.png
-# tay: keep the composer above the virtual keyboard
+# buildozer 1.5.0 has NO code path for this key (byte-verified: the
+# shipped manifest carries no windowSoftInputMode attribute at all);
+# the operative fix is main._android_softinput_resize (runtime
+# ADJUST_RESIZE via pyjnius). Key kept as a marker for a future
+# buildozer that honors it.
 android.window_soft_input_mode = adjustResize
 
-version = 0.36.10
+version = 0.36.11
 # Bump version on every android-facing fix so the installed build can be
 # verified on-device (Settings > Apps > sHades) without adb.
 # wasmtime runs the micron applet sandbox on-device (applet_bridge.py).
