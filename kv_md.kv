@@ -922,10 +922,9 @@
                     MDButtonText:
                         text: 'Choose photo'
                         text_color: app.theme_colors['text']
-            HintOverlayField:
+            MDTextField:
                 id: welcome_name
                 text: app.onboarding_name
-                hint_text: 'Your name on the mesh'
                 mode: 'filled'
                 multiline: False
                 size_hint_y: None
@@ -933,9 +932,10 @@
                 opacity: 1 if root.stage == 2 else 0
                 fill_color_normal: app.theme_colors['input_bg']
                 text_color_normal: app.theme_colors['text']
-            HintOverlayField:
+                MDTextFieldHintText:
+                    text: 'Your name on the mesh'
+            MDTextField:
                 id: onb_hub
-                hint_text: 'Hub address (ip:port), empty = community hub'
                 mode: 'filled'
                 multiline: False
                 size_hint_y: None
@@ -943,9 +943,10 @@
                 opacity: 1 if root.stage == 2 else 0
                 fill_color_normal: app.theme_colors['input_bg']
                 text_color_normal: app.theme_colors['text']
-            HintOverlayField:
+                MDTextFieldHintText:
+                    text: 'Hub address (ip:port), empty = community hub'
+            MDTextField:
                 id: onb_node
-                hint_text: 'Guild node hash (optional)'
                 mode: 'filled'
                 multiline: False
                 size_hint_y: None
@@ -953,18 +954,21 @@
                 opacity: 1 if root.stage == 2 else 0
                 fill_color_normal: app.theme_colors['input_bg']
                 text_color_normal: app.theme_colors['text']
+                MDTextFieldHintText:
+                    text: 'Guild node hash (optional)'
             BoxLayout:
                 spacing: dp(10)
                 size_hint_y: None
                 height: dp(44) if root.stage == 2 else 0
                 opacity: 1 if root.stage == 2 else 0
-                HintOverlayField:
+                MDTextField:
                     id: onb_delivery
-                    hint_text: 'Delivery hash (optional)'
                     mode: 'filled'
                     multiline: False
                     fill_color_normal: app.theme_colors['input_bg']
                     text_color_normal: app.theme_colors['text']
+                    MDTextFieldHintText:
+                        text: 'Delivery hash (optional)'
             MDButton:
                 style: 'filled'
                 size_hint_y: None
@@ -1136,7 +1140,6 @@
                         height: self.minimum_height
                         MDTextField:
                             id: node_hash
-                            hint_text: 'Guild node_hash (32 hex, optional)'
                             multiline: False
                             size_hint_y: None
                             height: dp(44)
@@ -1145,9 +1148,10 @@
                             text_color_normal: app.theme_colors['text']
                             text_color_focus: app.theme_colors['text']
                             cursor_color: app.theme_colors['text']
+                            MDTextFieldHintText:
+                                text: 'Guild node_hash (32 hex, optional)'
                         MDTextField:
                             id: delivery_hash
-                            hint_text: 'Guild delivery_hash (32 hex, optional)'
                             multiline: False
                             size_hint_y: None
                             height: dp(44)
@@ -1156,6 +1160,8 @@
                             text_color_normal: app.theme_colors['text']
                             text_color_focus: app.theme_colors['text']
                             cursor_color: app.theme_colors['text']
+                            MDTextFieldHintText:
+                                text: 'Guild delivery_hash (32 hex, optional)'
                     Widget:
                         size_hint_x: 1
         # The status line is OUTSIDE the scroll so a long message never

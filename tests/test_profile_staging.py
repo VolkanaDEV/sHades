@@ -119,27 +119,21 @@ def main():
     check("seed pre-fills the filter", "if seed:" in py)
 
     # --- 7. profile-screen fields carry the in-box placeholder (tay) ------
-    # kivymd 2.0.0 leaves the native hint label unbuilt (probed: None at
-    # rest AND focused), so the stager fields ride HintOverlayField, an
-    # in-box placeholder that disappears on type.
-    check("hint overlay class shipped",
-          kv.count("HintOverlayField:") == 4 and "class HintOverlayField"
-          in py)
+    # kivymd 2.0.0 delivers the hint as an MDTextFieldHintText CHILD
+    # (add_widget override wires _hint_text_label + the canvas.after
+    # "hint-text-rectangle"); the legacy hint_text property is dead and
+    # was the reason the stager fields shipped labelless.
+    check("stager fields ride the native hint child",
+          kv.count("MDTextFieldHintText:") == 10)
+    SIBS = ("MDTextField:", "MDButton:", "BoxLayout:", "Label:")
     for fid in ("onb_hub", "onb_node", "onb_delivery", "welcome_name"):
-        check("%s rides the overlay field" % fid, "HintOverlayField:"
-              in kv[max(0, kv.find("id: %s" % fid) - 80):
-                    kv.find("id: %s" % fid)])
-    check("overlay hides once text exists",
-          "lbl.opacity = 0 if (self.text or \"\") else 1" in py)
-    check("overlay tracks hint_text",
-          "lbl.text = self.hint_text or \"\"" in py)
-    # 0.33.20: the label must be MOUNTED (0.33.19 shipped an unmounted
-    # label -- created but never add_widget'ed; probed: parent_kind None)
-    check("overlay label is mounted on the field",
-          "self.add_widget(self._placeholder_lbl)" in py)
-    check("overlay resyncs on size and pos",
-          "size=self._sync_placeholder," in py
-          and "pos=self._sync_placeholder)" in py)
+        i = kv.find("id: %s" % fid)
+        marks = [kv.find(n, i + 10) for n in SIBS]
+        b = min(x for x in marks if x > i)
+        check("%s rides the hint child in-block" % fid,
+              "MDTextFieldHintText:" in kv[i:b])
+    check("no dead hint_text property anywhere in kv",
+          "\r\nhint_text: '" not in kv and "\r\n                hint_text: '" not in kv)
 
     print()
     print("P=%d F=%d" % (len(PASS), len(FAIL)))

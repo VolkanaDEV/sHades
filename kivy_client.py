@@ -1252,8 +1252,6 @@ class ContextMenuMixin:
 
 
 if KIVY:
-    from kivymd.uix.textfield import MDTextField
-
     class PfpImage(Image):
         """Circular-ish avatar placeholder with fallback color."""
         pass
@@ -1262,53 +1260,6 @@ if KIVY:
         """Image that passes touch events through to parent widget."""
         def on_touch_down(self, touch):
             return False
-
-    class HintOverlayField(MDTextField):
-        """Filled field with an in-box placeholder that disappears on
-        type.
-
-        kivymd 2.0.0 (2026-08-06 build) never builds _hint_text_label
-        for a field that is not focused -- probed at rest AND with
-        focus forced: both None -- so a plain filled field renders with
-        no in-box placeholder at all. tay (2026-11-19) asked for
-        "text-labeled" fields: darker overlayed placeholder text that
-        disappears on type. This subclass keeps its own in-box Label
-        driven by hint_text, scoped to the staged profile fields.
-        """
-        def __init__(self, **kwargs):
-            super().__init__(**kwargs)
-            self._placeholder_lbl = Label(
-                color=(0.6, 0.62, 0.66, 1),
-                font_size=sp(15),
-                halign="left",
-                valign="middle",
-                size_hint=(None, None),
-            )
-            # Mount on the field itself: children draw after the parent's
-            # own canvas, so the label sits on top of the fill box.
-            self.add_widget(self._placeholder_lbl)
-            self.bind(hint_text=self._sync_placeholder,
-                      text=self._sync_placeholder,
-                      size=self._sync_placeholder,
-                      pos=self._sync_placeholder)
-            # frame-1 resync: kv layout gives the field its real width/height
-            # after __init__, and the first sync must not freeze a stale
-            # geometry (the 0.33.19 labels never mounted at all -- probed:
-            # parent None, frozen size 76x20 at negative y).
-            Clock.schedule_once(lambda dt: self._sync_placeholder(), 1)
-
-        def _sync_placeholder(self, *args):
-            lbl = self._placeholder_lbl
-            lbl.text = self.hint_text or ""
-            lbl.opacity = 0 if (self.text or "") else 1
-            self._reposition_placeholder()
-
-        def _reposition_placeholder(self, *args):
-            lbl = self._placeholder_lbl
-            if not lbl.text or self.width <= 0:
-                return
-            lbl.size = (self.width - dp(24), dp(20))
-            lbl.pos = (dp(12), (self.height - lbl.height) / 2)
 
     class PFPEditorWidget(FloatLayout):
         """Round-mask avatar cropper — image at natural size (never stretched),
