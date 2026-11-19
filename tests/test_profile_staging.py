@@ -130,9 +130,16 @@ def main():
               in kv[max(0, kv.find("id: %s" % fid) - 80):
                     kv.find("id: %s" % fid)])
     check("overlay hides once text exists",
-          "_placeholder_lbl.opacity = 0 if (self.text or \"\") else 1" in py)
+          "lbl.opacity = 0 if (self.text or \"\") else 1" in py)
     check("overlay tracks hint_text",
           "lbl.text = self.hint_text or \"\"" in py)
+    # 0.33.20: the label must be MOUNTED (0.33.19 shipped an unmounted
+    # label -- created but never add_widget'ed; probed: parent_kind None)
+    check("overlay label is mounted on the field",
+          "self.add_widget(self._placeholder_lbl)" in py)
+    check("overlay resyncs on size and pos",
+          "size=self._sync_placeholder," in py
+          and "pos=self._sync_placeholder)" in py)
 
     print()
     print("P=%d F=%d" % (len(PASS), len(FAIL)))

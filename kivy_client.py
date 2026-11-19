@@ -1284,24 +1284,31 @@ if KIVY:
                 valign="middle",
                 size_hint=(None, None),
             )
+            # Mount on the field itself: children draw after the parent's
+            # own canvas, so the label sits on top of the fill box.
+            self.add_widget(self._placeholder_lbl)
             self.bind(hint_text=self._sync_placeholder,
                       text=self._sync_placeholder,
-                      size=self._reposition_placeholder)
-            Clock.schedule_once(lambda dt: self._sync_placeholder(), 0)
+                      size=self._sync_placeholder,
+                      pos=self._sync_placeholder)
+            # frame-1 resync: kv layout gives the field its real width/height
+            # after __init__, and the first sync must not freeze a stale
+            # geometry (the 0.33.19 labels never mounted at all -- probed:
+            # parent None, frozen size 76x20 at negative y).
+            Clock.schedule_once(lambda dt: self._sync_placeholder(), 1)
 
         def _sync_placeholder(self, *args):
             lbl = self._placeholder_lbl
             lbl.text = self.hint_text or ""
-            self._placeholder_lbl.opacity = 0 if (self.text or "") else 1
+            lbl.opacity = 0 if (self.text or "") else 1
             self._reposition_placeholder()
 
         def _reposition_placeholder(self, *args):
             lbl = self._placeholder_lbl
-            if not lbl.text:
+            if not lbl.text or self.width <= 0:
                 return
             lbl.size = (self.width - dp(24), dp(20))
-            lbl.pos = (dp(12),
-                       (self.height - lbl.height) / 2)
+            lbl.pos = (dp(12), (self.height - lbl.height) / 2)
 
     class PFPEditorWidget(FloatLayout):
         """Round-mask avatar cropper — image at natural size (never stretched),
