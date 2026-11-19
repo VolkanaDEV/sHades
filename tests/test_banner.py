@@ -143,7 +143,13 @@ def main():
     kv_path = os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "kv_md.kv")
     kv = open(kv_path, encoding="utf-8").read()
-    assert open(kv_path, "rb").read().count(b"\r\n") > 1200, "kv crlf law"
+    # EOL law, portable across runners (repo bytes are LF; a Windows
+    # checkout may show CRLF via autocrlf): consistent terminators only
+    raw_kv = open(kv_path, "rb").read()
+    crlf, lf_only = bytes((13, 10)), bytes((10,))
+    cr, lf = raw_kv.count(crlf), raw_kv.count(lf_only)
+
+    assert cr == lf or cr == 0, "kv eol law (consistent terminators)"
     check("kv has the banner strip container", "id: banner_strip" in kv)
     check("kv has the letter-tile fallback label", "id: banner_letter"
           in kv and "app.banner_letter or 'S'" in kv)
