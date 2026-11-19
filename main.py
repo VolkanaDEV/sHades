@@ -102,15 +102,23 @@ def _export_bootlog_for_user():
                     return False
             try:
                 out = resolver.openOutputStream(uri)
-                fin = autoclass("java.io.FileInputStream")(src_path)
-                copied = autoclass("java.nio.file.Files").copy(fin, out)
+                if out is None:
+                    return False
+                # Files.copy(Path, OutputStream) is a REAL overload
+                # (API 26+); the shipped InputStream/OutputStream pair
+                # resolved to nothing and jnius threw on-device. The
+                # source is an internal file, so Paths.get() is legal;
+                # Path objects pass through jnius by reference.
+                p9 = autoclass("java.nio.file.Paths")
+                f9 = autoclass("java.nio.file.Files")
+                f9.copy(p9.get(src_path), out)
                 try:
-                    fin.close()
                     out.close()
                 except Exception:
                     pass
-                return copied > 0
-            except Exception:
+                return True
+            except Exception as e:
+                print("bootlog export failed:", e, flush=True)
                 return False
         # API 26-28: legacy public Downloads dir
         env = autoclass("android.os.Environment")

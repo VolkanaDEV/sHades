@@ -561,8 +561,12 @@ def test_bootlog_export_contract():
     assert "DIRECTORY_DOWNLOADS" in main_src, "API 26-28 fallback route"
     assert "_display_name = " in main_src and "'sHades_boot.log'" \
         in main_src, "existing-row overwrite (no (1).log stacking)"
-    assert "FileInputStream" in main_src and "Files" in main_src \
-        and ".copy(" in main_src, "java-side copy (no jbyte/jarray)"
+    # v0.36.4: nio copy -- Files.copy(Path, OutputStream) is the legal
+    # overload; FileInputStream/InputStream targets never resolved
+    assert "java.nio.file.Paths" in main_src and \
+        "java.nio.file.Files" in main_src and \
+        ".copy(p9.get(src_path), out)" in main_src, \
+        "nio copy on the legal overload"
     # the crash path mirrors the fatal log even when rendering is dead
     tb_idx = main_src.index("--- TRACEBACK ---")
     crash_hook = main_src.index("_export_bootlog_for_user()", tb_idx)
@@ -646,6 +650,160 @@ def test_whoami_retry_contract():
     print("PASS  whoami retry contract")
 
 
+def _fake_jnius_device(main_mod, tmp_log):
+    """Install a fake jnius module modelling the p4a bridge (API 29+):
+    MediaStore insert/query, ContentResolver streams, and the REAL
+    java.nio Files.copy(Path, OutputStream) overload -- every call's
+    argument types are captured so the lane proves the bridge shape,
+    not just source strings. Files.copy raises if handed the illegal
+    (InputStream, OutputStream) pair, like real Java does."""
+    import types
+    import sys as _sys
+    calls = []
+
+    class FakeOut:
+        def __init__(self):
+            self.buf = []
+
+        def write(self, b):
+            self.buf.append(b)
+
+        def close(self):
+            pass
+
+    class FakePath:
+        pass
+
+    class FakeQueryCursor:
+        def __init__(self, has_row):
+            self.has_row = has_row
+
+        def moveToFirst(self):
+            return self.has_row
+
+        def getLong(self, _ix):
+            return 77
+
+        def close(self):
+            pass
+
+    class FakeResolver:
+        def __init__(self):
+            self.has_row = False
+
+        def query(self, coll, proj, sel, args, order):
+            calls.append(("query", sel))
+            return FakeQueryCursor(self.has_row)
+
+        def insert(self, coll, cv):
+            calls.append(("insert", dict(cv)))
+            self.has_row = True
+            return "uri://dl/1"
+
+        def openOutputStream(self, uri):
+            calls.append(("openout", uri))
+            return FakeOut()
+
+    class ContentVal(dict):
+        def put(self, k, v):
+            self[k] = v
+
+    class Files:
+        @staticmethod
+        def copy(src, out):
+            if isinstance(src, FakeOutputStream):
+                raise TypeError(
+                    "Files.copy(InputStream, OutputStream) is not an "
+                    "overload -- exactly the shipped bug")
+            assert isinstance(src, FakePath), "source must be a Path"
+            out.write(open(src.name, "rb").read())
+            calls.append(("copy", "path,out"))
+            return src
+
+    class FakeOutputStream:
+        pass
+
+    class Paths:
+        @staticmethod
+        def get(name):
+            assert isinstance(name, str)
+            p = FakePath()
+            p.name = name
+            return p
+
+    class DL:
+        VOLUME_EXTERNAL_PRIMARY = "primary"
+
+        @staticmethod
+        def getContentUri(vol):
+            calls.append(("coll", vol))
+            return "coll://dl"
+
+    class CUris:
+        @staticmethod
+        def withAppendedId(coll, row_id):
+            assert row_id == 77
+            return "uri://dl/%d" % row_id
+
+    class PyAct:
+        resolver = FakeResolver()
+        mActivity = types.SimpleNamespace(
+            getContentResolver=lambda: PyAct.resolver)
+
+    class Ver:
+        SDK_INT = 34
+
+    def autoclass(name):
+        calls.append(("ac", name))
+        return {"android.provider.MediaStore$Downloads": DL,
+                "org.kivy.android.PythonActivity": PyAct,
+                "android.os.Build$VERSION": Ver,
+                "android.content.ContentValues": ContentVal,
+                "android.content.ContentUris": CUris,
+                "java.nio.file.Paths": Paths,
+                "java.nio.file.Files": Files}[name]
+
+    fake = types.ModuleType("jnius")
+    fake.autoclass = autoclass
+    _sys.modules["jnius"] = fake
+    return calls, FakeOut
+
+
+def test_bootlog_bridge_contract():
+    """v0.36.4: the whole MediaStore bridge executes against a fake
+    jnius -- insert shape, Paths.get source, Files.copy(Path, out),
+    and the copied bytes land in the fake stream. This lane executes
+    what the static contract only texted: an illegal overload pair
+    raises here instead of silently returning False on-device."""
+    import main as main_mod
+    calls, _fakeout = _fake_jnius_device(main_mod, None)
+    try:
+        with open(main_mod._log_path(), "w", encoding="utf-8") as f:
+            f.write("== boot v0.36.4 ==\n")
+        assert main_mod._export_bootlog_for_user() is True, \
+            "clean boot export lands on-device"
+        kinds = [c[0] for c in calls]
+        assert "insert" in kinds, "no existing row -> insert"
+        assert ("copy", "path,out") in calls, \
+            "copy ran on the legal Path,OutputStream overload"
+        ac_names = [c[1] for c in calls if c[0] == "ac"]
+        assert "java.nio.file.Paths" in ac_names and \
+            "java.nio.file.Files" in ac_names, "nio classes used"
+        # overwrite lane: second run updates the known row
+        calls.clear()
+        with open(main_mod._log_path(), "a", encoding="utf-8") as f:
+            f.write("second boot\n")
+        assert main_mod._export_bootlog_for_user() is True
+        assert ("query", "_display_name = 'sHades_boot.log'") in calls, \
+            "overwrite query before any insert"
+        assert [c[0] for c in calls].count("insert") == 0, \
+            "no (1).log stacking: query found the row, insert skipped"
+    finally:
+        import sys as _sys
+        del _sys.modules["jnius"]
+    print("PASS  bootlog bridge contract")
+
+
 def main():
     test_link_dead_reported_and_signalled()
     test_link_raise_reported_and_signalled()
@@ -659,7 +817,8 @@ def main():
     test_wait_path_mtu_bounded_gives_up()
     test_bootlog_export_contract()
     test_whoami_retry_contract()
-    print("PASS: 12  FAIL: 0")
+    test_bootlog_bridge_contract()
+    print("PASS: 13  FAIL: 0")
 
 
 if __name__ == "__main__":
