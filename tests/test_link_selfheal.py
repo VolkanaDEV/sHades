@@ -598,6 +598,10 @@ def test_whoami_retry_contract():
         "_WHOAMI_RETRY_S = 4.0" in client_src, "knobs live in the class"
     assert client_src.count("whoami failed:") == 1 and \
         "tries_left - 1" in client_src, "bounded schedule, no hard loop"
+    # the whoami verdict (incl. user_hash) rides the boot log so a Downloads
+    # copy answers a missing admin item without adb (v0.36.3)
+    assert "whoami ok: admin=%s" in client_src and \
+        '"user_hash=%s"' in client_src, "verdict print ships"
 
     import kivy_client as kc
     app = kc.sHadesClientApp()

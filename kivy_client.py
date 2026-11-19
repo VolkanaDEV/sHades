@@ -5978,6 +5978,16 @@ class sHadesClientApp(MDApp):
                 self.i_am_moderator = bool(res.get("is_moderator"))
                 self.i_am_admin = bool(res.get("is_admin"))
                 self.my_roles = res.get("roles") or []
+                # the whole whoami verdict rides the boot log: the
+                # Downloads copy then answers "why is the admin item
+                # absent" without adb, and carries the user_hash for
+                # admin.txt seeding when the answer is a missed grant
+                print("whoami ok: admin=%s mod=%s roles=[%s] "
+                      "user_hash=%s" % (
+                          self.i_am_admin, self.i_am_moderator,
+                          ",".join(r.get("name", "")
+                                   for r in self.my_roles),
+                          res.get("user_hash", "")), flush=True)
                 # task 6: the guild icon rides whoami; ingest it per server
                 guild = res.get("guild") or {}
                 icon_blob = (guild.get("icon") or "").strip()
