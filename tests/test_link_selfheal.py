@@ -557,7 +557,12 @@ def test_bootlog_export_contract():
 
     assert "def _export_bootlog_for_user" in main_src, "export fn exists"
     assert "MediaStore$Downloads" in main_src, "API 29+ route"
-    assert "VOLUME_EXTERNAL_PRIMARY" in main_src, "user-visible collection"
+    assert "external_primary" in main_src, \
+        "literal volume name (jnius resolves only nested-class fields)"
+    assert "VOLUME_EXTERNAL_PRIMARY" not in main_src, \
+        "the parent-class field lookup threw on tay's device (log)"
+    assert "_EXPORT_MIN_INTERVAL" in main_src and \
+        "_LAST_EXPORT_TS" in main_src, "30 s attempt-throttle knob"
     assert "DIRECTORY_DOWNLOADS" in main_src, "API 26-28 fallback route"
     assert "_display_name = " in main_src and "'sHades_boot.log'" \
         in main_src, "existing-row overwrite (no (1).log stacking)"
@@ -732,11 +737,15 @@ def _fake_jnius_device(main_mod, tmp_log):
             return p
 
     class DL:
-        VOLUME_EXTERNAL_PRIMARY = "primary"
+        def __init__(self):
+            raise AssertionError("Downloads is called as a class")
 
         @staticmethod
         def getContentUri(vol):
             calls.append(("coll", vol))
+            assert vol == "external_primary", (
+                "parent-class field resolution -- literal volume name, "
+                "jnius finds only nested-class-declared fields")
             return "coll://dl"
 
     class CUris:
@@ -778,6 +787,7 @@ def test_bootlog_bridge_contract():
     import main as main_mod
     calls, _fakeout = _fake_jnius_device(main_mod, None)
     try:
+        main_mod._LAST_EXPORT_TS[0] = 0.0  # order-independent lane
         with open(main_mod._log_path(), "w", encoding="utf-8") as f:
             f.write("== boot v0.36.4 ==\n")
         assert main_mod._export_bootlog_for_user() is True, \
@@ -791,6 +801,7 @@ def test_bootlog_bridge_contract():
             "java.nio.file.Files" in ac_names, "nio classes used"
         # overwrite lane: second run updates the known row
         calls.clear()
+        main_mod._LAST_EXPORT_TS[0] = 0.0  # fresh attempt window
         with open(main_mod._log_path(), "a", encoding="utf-8") as f:
             f.write("second boot\n")
         assert main_mod._export_bootlog_for_user() is True
@@ -798,6 +809,18 @@ def test_bootlog_bridge_contract():
             "overwrite query before any insert"
         assert [c[0] for c in calls].count("insert") == 0, \
             "no (1).log stacking: query found the row, insert skipped"
+        # throttle sub-lane: within the interval there is NO MediaStore
+        # traffic; _log_path()'s own PythonActivity probe is by design
+        calls.clear()
+        main_mod._EXPORT_MIN_INTERVAL = 60.0
+        main_mod._LAST_EXPORT_TS[0] = main_mod.time.monotonic()
+        assert main_mod._export_bootlog_for_user() is False, \
+            "throttled attempt exits before the bridge"
+        bridge_calls = [c for c in calls if c[0] in
+                        ("coll", "query", "insert", "openout", "copy")]
+        assert bridge_calls == [], \
+            "no MediaStore traffic while throttled: %s" % bridge_calls
+        main_mod._EXPORT_MIN_INTERVAL = 0.0
     finally:
         import sys as _sys
         del _sys.modules["jnius"]

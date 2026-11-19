@@ -45,6 +45,10 @@ def _log_path():
     return os.path.join(os.path.expanduser("~"), "sHades_boot.log")
 
 
+_EXPORT_MIN_INTERVAL = 30.0
+_LAST_EXPORT_TS = [0.0]
+
+
 def _export_bootlog_for_user():
     """Mirror sHades_boot.log into the user-visible Downloads collection
     ( tay 2026-11-19: "crashes are difficult to debug when adb is
@@ -66,13 +70,20 @@ def _export_bootlog_for_user():
         from jnius import autoclass  # p4a only
     except Exception:
         return False
+    # throttle at the real attempt: a stamp placed before these
+    # probes would arm on dev no-ops and suppress a later attempt
+    now = time.monotonic()
+    if _LAST_EXPORT_TS[0] and now - _LAST_EXPORT_TS[0] < \
+            _EXPORT_MIN_INTERVAL:
+        return False
+    _LAST_EXPORT_TS[0] = now
     try:
         act = autoclass("org.kivy.android.PythonActivity").mActivity
         SDK_INT = int(autoclass("android.os.Build$VERSION").SDK_INT)
         if SDK_INT >= 29:
             resolver = act.getContentResolver()
             DL = autoclass("android.provider.MediaStore$Downloads")
-            coll = DL.getContentUri(DL.VOLUME_EXTERNAL_PRIMARY)
+            coll = DL.getContentUri("external_primary")
             uri = None
             # find an existing row first so re-boots overwrite instead
             # of stacking sHades_boot (1).log, (2).log, ...
