@@ -2486,6 +2486,12 @@ class sHadesClientApp(MDApp):
     theme_colors = DictProperty({})
     # task 9: the composer rail's pfp; "" = letterless default disc
     composer_pfp_path = StringProperty("")
+    # P5: sidebar banner strip (above the channel list); "" = letter tile
+    banner_channel_path = StringProperty("")
+    # P5: config-pane header strip (stays empty; bindings tolerate "")
+    banner_config_path = StringProperty("")
+    # P5: letter tile shown inside the banner strip when unset
+    banner_letter = StringProperty("S")
     # tay (2026-11): the onboarding avatar slot and the connect-screen
     # username gate bind to these; preview mirrors my_avatar_small so
     # the onboarding card shows the pick (or the generated pattern)
@@ -2625,9 +2631,9 @@ class sHadesClientApp(MDApp):
         self._scroll_bound = False
 
         # Banner images - random selection from media folder on startup.
-        self.banner_config_path = None
+        self.banner_config_path = ""
         self.onboarding_name = "wanderer-%04x" % random.getrandbits(16)
-        self.banner_channel_path = None
+        self.banner_channel_path = ""
         self._select_random_banners()
 
         # Avatar pfp paths (set by _save_pfp_crop)
@@ -2663,12 +2669,12 @@ class sHadesClientApp(MDApp):
         tay (receipt 2026-11-19): "cull the media images, it's bloating
         the repo and they are random placeholders" - the fork's 18 MB
         z-image-turbo set is gone from the tree and the APK. The kv
-        widgets tolerate the None source (source: app.banner_... or '').
+        widgets tolerate the empty source (source: app.banner_... or '').
         If real banners ever return, land them as vetted assets, not
         an 18 MB placeholder folder that ships in every binary.
         """
-        self.banner_config_path = None
-        self.banner_channel_path = None
+        self.banner_config_path = ""
+        self.banner_channel_path = ""
 
     # -- UI theme / config ----------------------------------------------
 
@@ -4067,6 +4073,18 @@ class sHadesClientApp(MDApp):
     # -- server sidebar ------------------------------------------------------
     def _refresh_server_sidebar(self):
         """Populate the server grid with rail discs (task 6)."""
+        # P5: the active server banner feeds the sidebar strip; the
+        # letter tile covers the gap when no banner is set
+        active = (self._servers[self._active_server_idx]
+                  if 0 <= self._active_server_idx < len(self._servers)
+                  else None)
+        if active is not None:
+            bpath = active.get("banner_path") or ""
+            self.banner_channel_path = (bpath
+                                        if os.path.isfile(bpath) else "")
+            self.banner_letter = (
+                (active.get("display_name", active.get("host", ""))
+                 or "S")[:1].upper() or "S")
         try:
             main = self.root.get_screen("main")
             grid = main.ids.server_grid
@@ -4089,7 +4107,27 @@ class sHadesClientApp(MDApp):
         thread, only the widget refresh hops to the main thread."""
         if not blob_id or not srv or not self.guild_api:
             return
-        if srv.get("icon_blob") == blob_id and srv.get("icon_path"):
+        self._fetch_server_blob(blob_id, srv, "icons", "icon_blob",
+                                "icon_path")
+
+    def _ingest_banner(self, blob_id, srv):
+        """whoami guild banner (a blob id) -> blobs fetch ->
+        banners/<host>_<blob head>.<ext> -> servers entry -> the sidebar
+        strip refresh. Engine shared with the rail icon (the wrappers
+        keep the whoami flow readable)."""
+        self._fetch_server_blob(blob_id, srv, "banners", "banner_blob",
+                                "banner_path")
+
+    def _fetch_server_blob(self, blob_id, srv, subdir, blob_key, path_key):
+        """Shared ingest engine for server-owned blob assets: fetch a
+        blob by id, store it under _app_data_dir()/subdir as
+        <host>_<blob head>.<ext>, record blob_key/path_key on the servers
+        entry, then refresh the sidebar. Disk writes happen on the
+        caller worker thread; only the widget refresh hops to the main
+        thread."""
+        if not blob_id or not srv or not self.guild_api:
+            return
+        if srv.get(blob_key) == blob_id and srv.get(path_key):
             return  # unchanged
         api = self.guild_api
 
@@ -4097,7 +4135,7 @@ class sHadesClientApp(MDApp):
             try:
                 res = api.blobs_get(blob_id)
             except Exception as e:
-                print("guild icon fetch failed:", repr(e))
+                print("asset fetch failed (%s):" % subdir, repr(e))
                 return
             if not res.get("ok"):
                 return
@@ -4114,21 +4152,21 @@ class sHadesClientApp(MDApp):
             elif raw[:4] in (b"RIFF",):
                 ext = "webp"
             try:
-                icons_dir = os.path.join(_app_data_dir(), "icons")
-                os.makedirs(icons_dir, exist_ok=True)
+                dest_dir = os.path.join(_app_data_dir(), subdir)
+                os.makedirs(dest_dir, exist_ok=True)
                 host = (srv.get("host") or "server").replace(":", "_")
                 path = os.path.join(
-                    icons_dir,
+                    dest_dir,
                     "%s_%s.%s" % (host, blob_id[:12], ext))
                 with open(path, "wb") as f:
                     f.write(raw)
-                srv["icon_blob"] = blob_id
-                srv["icon_path"] = path
+                srv[blob_key] = blob_id
+                srv[path_key] = path
                 self._save_servers()
                 Clock.schedule_once(
                     lambda dt: self._refresh_server_sidebar(), 0)
             except Exception as e:
-                print("guild icon save failed:", repr(e))
+                print("asset save failed (%s):" % subdir, repr(e))
         threading.Thread(target=work, daemon=True).start()
 
     def _select_server(self, idx):
@@ -5924,6 +5962,15 @@ class sHadesClientApp(MDApp):
                             Clock.schedule_once(
                                 lambda dt: self._ingest_guild_icon(
                                     icon_blob, srv), 0)
+                banner_blob = (guild.get("banner") or "").strip()
+                if banner_blob:
+                    idx = self._active_server_idx
+                    if 0 <= idx < len(self._servers):
+                        srv = self._servers[idx]
+                        if srv.get("banner_blob") != banner_blob:
+                            Clock.schedule_once(
+                                lambda dt: self._ingest_banner(
+                                    banner_blob, srv), 0)
         threading.Thread(target=work, daemon=True).start()
 
     def _can_manage_roles(self):

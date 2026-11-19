@@ -3308,11 +3308,12 @@ def api_v1_whoami(viewer, data, link_id):
               "color": r["color"]} for r in rows]
     is_admin = any(r["perms"] & PERMS["ADMIN"] for r in roles)
     icon = _cfg_get("guild_icon", "") or None
+    banner = _cfg_get("banner", "") or None
     return {"ok": 1, "user_hash": viewer, "username": get_username(viewer),
             "is_moderator": is_moderator(viewer) or is_admin,
             "is_admin": is_admin, "roles": roles,
             "guild": {"name": _cfg_get("guild_name", "") or GUILD_NAME,
-                      "icon": icon}}
+                      "icon": icon, "banner": banner}}
 
 def _register_mod_endpoint(path, verb, apply_fn):
     """Register one moderator-gated JSON endpoint. `apply_fn(viewer, target,
@@ -3390,6 +3391,7 @@ SERVER_CONFIG_KEYS = {
     "slowmode": "0",             # seconds between posts, 0 = off
     "motd": "",
     "guild_icon": "",            # empty = no icon; else a stored blob_id
+    "banner": "",                # empty = no banner; else a stored blob_id
     "attachments": "saved",      # saved | ephemeral (P2: RAM-only bytes)
 }
 
@@ -3431,6 +3433,42 @@ def api_v1_admin_config(viewer, data, link_id):
         if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
                 or not _blob_fname(digest):
             return {"ok": 0, "error": "guild_icon must be a stored blob_id",
+                    "code": 400}
+        value = digest
+    if key == "banner" and value:
+        # P5: same shape as guild_icon -- the asset rides the standard
+        # blob store; the config only references it
+        digest = value.strip().lower()
+        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
+                or not _blob_fname(digest):
+            return {"ok": 0, "error": "banner must be a stored blob_id",
+                    "code": 400}
+        value = digest
+    if key == "banner" and value:
+        # P5: same shape as guild_icon -- the asset rides the standard
+        # blob store; the config only references it
+        digest = value.strip().lower()
+        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
+                or not _blob_fname(digest):
+            return {"ok": 0, "error": "banner must be a stored blob_id",
+                    "code": 400}
+        value = digest
+    if key == "banner" and value:
+        # P5: same shape as guild_icon -- the asset rides the standard
+        # blob store; the config only references it
+        digest = value.strip().lower()
+        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
+                or not _blob_fname(digest):
+            return {"ok": 0, "error": "banner must be a stored blob_id",
+                    "code": 400}
+        value = digest
+    if key == "banner" and value:
+        # P5: same shape as guild_icon -- the asset rides the standard
+        # blob store; the config only references it
+        digest = value.strip().lower()
+        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
+                or not _blob_fname(digest):
+            return {"ok": 0, "error": "banner must be a stored blob_id",
                     "code": 400}
         value = digest
     if key == "slowmode":

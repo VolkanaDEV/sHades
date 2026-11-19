@@ -234,6 +234,16 @@ class GeneralTab(_Tab):
         icon_row.add_widget(clear)
         self.box.add_widget(icon_row)
 
+        banner_row = BoxLayout(size_hint_y=None, height=_scaled(40),
+                               spacing=dp(4))
+        bpick = _btn("set banner...", 110, 30)
+        bclear = _btn("clear", 60, 30)
+        bpick.bind(on_press=lambda _i: self._open_banner_chooser())
+        bclear.bind(on_press=lambda _i: self._clear_banner())
+        banner_row.add_widget(bpick)
+        banner_row.add_widget(bclear)
+        self.box.add_widget(banner_row)
+
     def do_save_key(self, key):
         entry = self.entries[key]
         val = entry.text  # read on the main thread; the worker must not
@@ -330,6 +340,39 @@ class GeneralTab(_Tab):
         def job():
             return self.client.guild_api.admin_config("guild_icon", "")
         self._post(job, on_ok=self.reload, label="clear icon")
+
+    # -- banner picker (P5): rides the guild-icon chooser flow ---------
+    def _open_banner_chooser(self):
+        box = BoxLayout(orientation="vertical")
+        chooser = FileChooserListView(
+            path=os.path.expanduser("~"),
+            filters=["*.png", "*.jpg", "*.jpeg", "*.webp", "*.gif"])
+        cancel = _btn("cancel", 90, 30)
+        pick = _btn("use this file", 130, 30)
+        buttons = BoxLayout(size_hint_y=None, height=_scaled(34),
+                            spacing=dp(4))
+        buttons.add_widget(cancel)
+        buttons.add_widget(pick)
+        box.add_widget(chooser)
+        box.add_widget(buttons)
+        popup = Popup(title="choose a banner", content=box,
+                      size_hint=(0.85, 0.85))
+        self._banner_chooser_popup = popup
+        cancel.bind(on_press=lambda _i: popup.dismiss())
+        pick.bind(on_press=lambda _i: self._banner_file_selected(chooser,
+                                                                 popup))
+        popup.open()
+
+    def _banner_file_selected(self, chooser, popup):
+        selection = chooser.selection
+        popup.dismiss()
+        if selection:
+            self.screen._apply_banner_file(selection[0])
+
+    def _clear_banner(self):
+        def job():
+            return self.client.guild_api.admin_config("banner", "")
+        self._post(job, on_ok=self.reload, label="clear banner")
 
 
 # ---------------------------------------------------------------------------
@@ -849,6 +892,41 @@ class ServerConfigScreen(Screen):
                 Clock.schedule_once(lambda dt: self._refresh_general(), 0)
             else:
                 self.client._set_status("icon config: %s"
+                                        % res2.get("error"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_banner_file(self, path):
+        """FileChooser result: upload through the standard blob flow, then
+        set banner to the returned blob_id (P5 mirrors _apply_icon_file;
+        the strip shows it on the next whoami the client ingests)."""
+        name = os.path.basename(path)
+        mime = "image/png"
+        if name.lower().endswith((".jpg", ".jpeg")):
+            mime = "image/jpeg"
+        elif name.lower().endswith(".webp"):
+            mime = "image/webp"
+        elif name.lower().endswith(".gif"):
+            mime = "image/gif"
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            self.client._set_status("banner read failed: %r" % e)
+            return
+
+        def work():
+            res = self.client.guild_api.blobs_put(name, mime, data)
+            if not res.get("ok"):
+                self.client._set_status("banner upload: %s"
+                                        % res.get("error"))
+                return
+            blob_id = res.get("blob_id")
+            res2 = self.client.guild_api.admin_config("banner", blob_id)
+            if res2.get("ok"):
+                self.client._set_status("banner set")
+                Clock.schedule_once(lambda dt: self._refresh_general(), 0)
+            else:
+                self.client._set_status("banner config: %s"
                                         % res2.get("error"))
         threading.Thread(target=work, daemon=True).start()
 

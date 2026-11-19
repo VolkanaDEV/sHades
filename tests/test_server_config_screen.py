@@ -35,7 +35,7 @@ class FakeApi:
         self.config = {"config": {k: v for k, v in {
             "guild_name": "TestHub", "registration": "open",
             "slowmode": "0", "motd": "hi", "guild_icon": "",
-            "attachments": "saved"}.items()}}
+            "attachments": "saved", "banner": ""}.items()}}
 
     def _rec(self, proto, res):
         self.calls.append(proto)
@@ -231,6 +231,24 @@ def main():
           general.att_eph_btn.disabled is True
           and "ephemeral" in general.att_state.text,
           general.att_state.text)
+
+    # P5: banner row routes the chooser flow and clear posts the pair
+    usc_src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "ui_server_config.py"),
+        encoding="utf-8").read()
+    check("general tab has the banner row",
+          '"set banner..."' in usc_src and "_clear_banner" in usc_src)
+    general._clear_banner()
+    pump(0.8)
+    check("banner clear posts empty pair",
+          ("admin_config", "banner", "") in client.guild_api.calls,
+          client.guild_api.calls[-3:])
+    check("banner chooser routes through the blob flow",
+          "def _apply_banner_file" in usc_src
+          and 'admin_config("banner", blob_id)' in usc_src)
+    check("config pane read-back includes banner prefill",
+          "banner" in client.guild_api.config["config"],
+          client.guild_api.config["config"])
 
     # Channels tab: post an overwrite bitmask through channels/patch
     ch_tab = scr.tab_content["Channels"]
