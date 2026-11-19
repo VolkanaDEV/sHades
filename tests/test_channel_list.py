@@ -163,6 +163,13 @@ def main():
 
     b_zero, b_uno, b_dos, b_tre = buttons
 
+    # v0.36.9 (tay): the drawer gate. The channel buttons live inside
+    # left_pane, which is disabled while the drawer is closed (the gate
+    # that stops a closed drawer swallowing composer taps). On a real
+    # device this scenario runs with the drawer OPEN -- the harness must
+    # mirror that: open before the touch chain, like a user would.
+    main.left_open = True
+
     # ---------- drag: full realistic touch chain ----------
     down = FakeTouch(x=b_tre.center_x, y=b_tre.center_y)
     b_tre.on_touch_down(down)  # realistic down: ButtonBehavior stamps ud,
@@ -226,6 +233,10 @@ def main():
     while scroll is not None and scroll.__class__.__name__ != "ScrollView":
         scroll = scroll.parent
     check("channel grid descends from a ScrollView", scroll is not None, "")
+
+    # the reorder pump re-ran _switch_channel at phone width and closed
+    # the drawer again (device-real); re-open for this button's chain
+    main.left_open = True
 
     down = FakeTouch(x=b_dos.center_x, y=b_dos.center_y)
     down.grab_current = scroll  # the scroll claimed the touch first

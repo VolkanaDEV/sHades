@@ -638,7 +638,8 @@
                         background_color: [0, 0, 0, 0]
                         size_hint_x: None
                         width: dp(46)
-                        on_press: app.open_file_chooser(avatar=True)
+                        # v0.36.9 (tay): tap opens the profile editor
+                        on_press: app.open_profile(app.my_hash or '', app.username or '')
                         PfpImage:
                             id: composer_pfp
                             source: app.composer_pfp_path or ''
@@ -736,6 +737,10 @@
                     size_hint: 1, 1
                     BoxLayout:
                         id: left_pane
+                        # v0.36.9 (tay): StencilView clips paint, not touches --
+                        # a closed 0-width drawer still let add server swallow
+                        # composer taps; disabled propagates and gates them
+                        disabled: not root.left_open
                         orientation: 'horizontal'
                         pos: self.parent.pos
                         size: self.parent.size

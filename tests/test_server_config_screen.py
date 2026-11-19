@@ -356,6 +356,35 @@ def main():
     for t in scr.tab_buttons:
         pass  # build sanity, no exceptions above is the bar
 
+    # ---------- v0.36.10: verdicts visible on the ADMIN screen ---------------
+    # (tay's boot_15: icon pick black, banner pick silent. _set_status
+    # mirrors connect+profile only -- the admin screen saw nothing. Every
+    # apply path must now write config_status HERE.)
+    from kivy.uix.label import Label as _Lbl
+    status_lbl = _Lbl()
+    scr.ids["config_status"] = status_lbl
+    gen._status("mirror test")
+    check("_Tab._status writes the admin config_status label",
+          status_lbl.text == "mirror test", repr(status_lbl.text))
+    check("_Tab._status keeps the client mirror",
+          "mirror test" in client.status)
+
+    # a raising upload no longer dies in silence: both legs report
+    def _boom(name, mime, data, on_progress=None):
+        raise RuntimeError("link dead (fake)")
+    client.guild_api.blobs_put = _boom
+    scr._apply_icon_file(png)
+    pump(1.0)
+    check("icon upload failure lands on config_status",
+          status_lbl.text.startswith("icon upload:"), repr(status_lbl.text))
+    scr._apply_banner_file(png)
+    pump(1.0)
+    check("banner upload failure lands on config_status",
+          "banner upload:" in status_lbl.text, repr(status_lbl.text))
+    check("failures also mirror to the client status",
+          any("icon upload:" in s for s in client.status)
+          and any("banner upload:" in s for s in client.status))
+
     print("RESULT: %d PASS, %d FAIL" % (len(PASS), len(FAIL)))
     return 1 if FAIL else 0
 
