@@ -220,6 +220,12 @@ def main():
     """Entry point called from Android activity. All Python execution
     is wrapped so any import/runtime crash is visible on-device."""
     _install_tee()
+    # first mirror: the log exists from the tee header onward, so even
+    # a pre-app crash leaves a readable copy in Downloads
+    try:
+        _export_bootlog_for_user()
+    except Exception:
+        pass
     print("PYTHON: main() starting", flush=True)
     try:
         print("PYTHON: importing kivy_client", flush=True)

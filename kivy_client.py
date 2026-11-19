@@ -5944,17 +5944,36 @@ class sHadesClientApp(MDApp):
     def _channel_kind(self, cid):
         return self._channel_kinds.get(cid, "chat")
 
+    # whoami is the admin-menu gate; failure retries are bounded and
+    # lane-tunable (never an unbounded loop)
+    _WHOAMI_RETRY_N = 2
+    _WHOAMI_RETRY_S = 4.0
+
     def _fetch_whoami(self):
         """Fetch our own identity/role view (gates moderator menu items)."""
         if not self.guild_api:
             return
 
-        def work():
+        def work(tries_left=None):
+            if tries_left is None:
+                tries_left = self._WHOAMI_RETRY_N
             try:
                 res = self.guild_api.whoami()
             except Exception as e:
                 print("whoami failed:", repr(e))
+                # bounded retry: the admin menu rides is_admin, which
+                # only a successful whoami sets; one early failure must
+                # not cost the panel for the whole session
+                if tries_left > 0:
+                    Clock.schedule_once(
+                        lambda dt: work(tries_left - 1),
+                        self._WHOAMI_RETRY_S)
                 return
+            try:
+                from main import _export_bootlog_for_user
+                _export_bootlog_for_user()
+            except Exception:
+                pass
             if res.get("ok"):
                 self.i_am_moderator = bool(res.get("is_moderator"))
                 self.i_am_admin = bool(res.get("is_admin"))

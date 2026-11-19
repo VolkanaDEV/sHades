@@ -543,9 +543,11 @@ def test_wait_path_mtu_bounded_gives_up():
 
 
 def test_bootlog_export_contract():
-    """v0.36.1: the boot log mirrors into the user-visible Downloads
+    """v0.36.2: the boot log mirrors into the user-visible Downloads
     collection (MediaStore on API 29+, public dir API 26-28) so crash
-    triage needs no adb. Java-side copy only (v0.15 jarray lesson)."""
+    triage needs no adb; a CLEAN boot must also produce a copy (the
+    v0.36.1 device miss: only milestone/crash fires, both absent on a
+    healthy boot). Java-side copy only (v0.15 jarray lesson)."""
     main_path = os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "main.py")
     client_path = os.path.join(os.path.dirname(os.path.dirname(
@@ -566,13 +568,78 @@ def test_bootlog_export_contract():
     crash_hook = main_src.index("_export_bootlog_for_user()", tb_idx)
     assert crash_hook < main_src.index("sys.exit(1)", tb_idx), \
         "crash hook before exit"
-    # milestones refresh the mirror while BOOT_DEBUG is on
+    # v0.36.2: tee-time fire -- a clean boot leaves a copy too
+    tee_idx = main_src.index("    _install_tee()\n")
+    boot_export = main_src.index("_export_bootlog_for_user()", tee_idx)
+    assert boot_export < main_src.index('print("PYTHON: main() starting'
+                                        '"', tee_idx), \
+        "first mirror runs before app import"
+    # milestones refresh the mirror while BOOT_DEBUG is on, and the
+    # v0.36.2 whoami-success mirror is the second call site
     assert client_src.count("from main import _export_bootlog_for_user"
-                            ) == 1, "milestone hook in _boot_file"
+                            ) == 2, "milestone + whoami-success mirrors"
     # degraded bridge never raises and never returns True off-device
     import main as mc
     assert mc._export_bootlog_for_user() is False, "dev no-op"
     print("PASS  bootlog export contract")
+
+
+def test_whoami_retry_contract():
+    """v0.36.2: an early whoami failure must not permanently cost the
+    admin menu (the device miss: server-config item gated on
+    app.i_am_admin, set only by a successful whoami). Bounded retry,
+    knobs shrinkable in lanes; a whoami success mirrors the log."""
+    import time as _time
+    import kivy.clock as kclock
+    client_path = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "kivy_client.py")
+    client_src = open(client_path, encoding="utf-8").read()
+    assert "_WHOAMI_RETRY_N = 2" in client_src and \
+        "_WHOAMI_RETRY_S = 4.0" in client_src, "knobs live in the class"
+    assert client_src.count("whoami failed:") == 1 and \
+        "tries_left - 1" in client_src, "bounded schedule, no hard loop"
+
+    import kivy_client as kc
+    app = kc.sHadesClientApp()
+
+    class FlakyApi:
+        def __init__(self, n_fail):
+            self.n = 0
+            self.n_fail = n_fail
+
+        def whoami(self):
+            self.n += 1
+            if self.n <= self.n_fail:
+                raise RuntimeError("net down (test)")
+            return {"ok": 1, "is_admin": True, "is_moderator": True,
+                    "roles": [],
+                    "guild": {"name": "T", "icon": "", "banner": ""}}
+
+    app._WHOAMI_RETRY_S = 0.05
+    api = FlakyApi(2)
+    app.guild_api = api
+    app._fetch_whoami()
+    i = 0
+    while api.n < 3 and i < 40:
+        _time.sleep(0.05)
+        kclock.Clock.tick()
+        i += 1
+    assert api.n == 3, "all attempts fired (got %d)" % api.n
+    assert app.i_am_admin is True, "flag lands after the late success"
+
+    api2 = FlakyApi(99)
+    app.guild_api = api2
+    app._fetch_whoami()
+    i = 0
+    while api2.n < 3 and i < 40:
+        _time.sleep(0.05)
+        kclock.Clock.tick()
+        i += 1
+    _time.sleep(0.2)
+    kclock.Clock.tick()
+    assert api2.n == 3, "permanent failure still bounded at 3 (got %d)" \
+        % api2.n
+    print("PASS  whoami retry contract")
 
 
 def main():
@@ -587,7 +654,8 @@ def main():
     test_wait_path_mtu_bounded_and_uses_live_path()
     test_wait_path_mtu_bounded_gives_up()
     test_bootlog_export_contract()
-    print("PASS: 11  FAIL: 0")
+    test_whoami_retry_contract()
+    print("PASS: 12  FAIL: 0")
 
 
 if __name__ == "__main__":
