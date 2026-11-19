@@ -1252,6 +1252,8 @@ class ContextMenuMixin:
 
 
 if KIVY:
+    from kivymd.uix.textfield import MDTextField
+
     class PfpImage(Image):
         """Circular-ish avatar placeholder with fallback color."""
         pass
@@ -1260,6 +1262,46 @@ if KIVY:
         """Image that passes touch events through to parent widget."""
         def on_touch_down(self, touch):
             return False
+
+    class HintOverlayField(MDTextField):
+        """Filled field with an in-box placeholder that disappears on
+        type.
+
+        kivymd 2.0.0 (2026-08-06 build) never builds _hint_text_label
+        for a field that is not focused -- probed at rest AND with
+        focus forced: both None -- so a plain filled field renders with
+        no in-box placeholder at all. tay (2026-11-19) asked for
+        "text-labeled" fields: darker overlayed placeholder text that
+        disappears on type. This subclass keeps its own in-box Label
+        driven by hint_text, scoped to the staged profile fields.
+        """
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._placeholder_lbl = Label(
+                color=(0.6, 0.62, 0.66, 1),
+                font_size=sp(15),
+                halign="left",
+                valign="middle",
+                size_hint=(None, None),
+            )
+            self.bind(hint_text=self._sync_placeholder,
+                      text=self._sync_placeholder,
+                      size=self._reposition_placeholder)
+            Clock.schedule_once(lambda dt: self._sync_placeholder(), 0)
+
+        def _sync_placeholder(self, *args):
+            lbl = self._placeholder_lbl
+            lbl.text = self.hint_text or ""
+            self._placeholder_lbl.opacity = 0 if (self.text or "") else 1
+            self._reposition_placeholder()
+
+        def _reposition_placeholder(self, *args):
+            lbl = self._placeholder_lbl
+            if not lbl.text:
+                return
+            lbl.size = (self.width - dp(24), dp(20))
+            lbl.pos = (dp(12),
+                       (self.height - lbl.height) / 2)
 
     class PFPEditorWidget(FloatLayout):
         """Round-mask avatar cropper — image at natural size (never stretched),
@@ -2534,6 +2576,7 @@ class sHadesClientApp(MDApp):
         self._channels = OrderedDict()   # name -> cid (filled on guild load)
         self._members = {}               # member_hash -> username
         self._msg_widgets = {}           # msg_id -> MessageRow
+        self._member_widgets = {}        # user_hash -> MemberRow (sidebar)
         self._popup = None
         self._poll_error_shown = False
         self._ui_populated = False
@@ -5786,12 +5829,13 @@ class sHadesClientApp(MDApp):
         threading.Thread(target=work, daemon=True).start()
 
     def _refresh_avatar(self, key):
-        # re-render rows that use this avatar
+        # re-render rows that use this avatar (messages + sidebar rows)
         path = IMAGE_CACHE.get(key)
         if not path:
             return
         author = key[3:]  # strip "av:" prefix
-        for row in self._msg_widgets.values():
+        for row in list(self._msg_widgets.values()) + \
+                list(self._member_widgets.values()):
             if row.author_hash == author:
                 row.avatar_source = ""   # force Kivy to re-bind source
                 row.avatar_source = path
@@ -7134,6 +7178,43 @@ class sHadesClientApp(MDApp):
         threading.Thread(target=work, daemon=True).start()
 
 
+    def _member_row(self, user_hash, uname, presence_color):
+        """Build a sidebar row with the same avatar resolution as the
+        message rows. tay (2026-11-19): the userlist showed a white
+        square because rows were built with avatar_source="" -- the
+        sidebar never resolved from IMAGE_CACHE and never fetched.
+        Registered in _member_widgets so _refresh_avatar rebinds these
+        rows too when a fetch lands.
+        """
+        avatar_source = ""
+        if user_hash == self.my_hash and getattr(
+                self, "my_avatar_small", None):
+            avatar_source = self.my_avatar_small
+        else:
+            key = "av:" + (user_hash or "")
+            path = IMAGE_CACHE.get(key)
+            if path:
+                avatar_source = path
+            elif user_hash and IMAGE_CACHE.begin_load(key):
+                def _fetch(a=user_hash, k=key):
+                    try:
+                        res = self.guild_api.avatar_get(a)
+                        if res.get("ok") and res.get("avatar"):
+                            IMAGE_CACHE.set_bytes(k, res["avatar"], "png")
+                            Clock.schedule_once(
+                                lambda dt: self._refresh_avatar(k), 0)
+                    finally:
+                        IMAGE_CACHE.end_load(k)
+                threading.Thread(target=_fetch, daemon=True).start()
+        row = MemberRow(
+            username=uname,
+            avatar_source=avatar_source,
+            author_hash=user_hash,
+            presence_color=presence_color,
+        )
+        self._member_widgets[user_hash] = row
+        return row
+
     def _refresh_members_ui(self, channel):
         # Widget access must happen on the main thread.
         Clock.schedule_once(lambda dt: self._refresh_members_ui_main(channel), 0)
@@ -7154,6 +7235,7 @@ class sHadesClientApp(MDApp):
             main = self.root.get_screen("main")
             grid = main.ids.member_grid
             grid.clear_widgets()
+            self._member_widgets = {}
             # Friends first (U7): local roster, online state best-effort from
             # the guild presence map (a friend away from the guild shows gray).
             if self._friends:
@@ -7163,14 +7245,10 @@ class sHadesClientApp(MDApp):
                     font_size=sp(12), bold=True))
                 for f in self._friends:
                     online = f["user_hash"] in self._active_users
-                    grid.add_widget(MemberRow(
-                        username=f.get("nickname") or
-                        ("user-" + f["user_hash"][:6]),
-                        avatar_source="",
-                        author_hash=f["user_hash"],
-                        presence_color=[0.2, 0.8, 0.2, 1] if online
-                        else [0.5, 0.5, 0.5, 1],
-                    ))
+                    grid.add_widget(self._member_row(
+                        f["user_hash"],
+                        f.get("nickname") or ("user-" + f["user_hash"][:6]),
+                        [0.2, 0.8, 0.2, 1] if online else [0.5, 0.5, 0.5, 1]))
                 grid.add_widget(Label(
                     text="members", size_hint_y=None, height=dp(22),
                     color=(0.7, 0.73, 0.77, 1), font_size=sp(12), bold=True))
@@ -7178,12 +7256,10 @@ class sHadesClientApp(MDApp):
                 for user_hash, info in sorted(
                         self._active_users.items(),
                         key=lambda kv: (kv[1].get("username") or "").lower()):
-                    grid.add_widget(MemberRow(
-                        username=info.get("username") or ("user-" + user_hash[:6]),
-                        avatar_source="",
-                        author_hash=user_hash,
-                        presence_color=[0.2, 0.8, 0.2, 1],   # green = online
-                    ))
+                    grid.add_widget(self._member_row(
+                        user_hash,
+                        info.get("username") or ("user-" + user_hash[:6]),
+                        [0.2, 0.8, 0.2, 1]))   # green = online
                 if not self._active_users:
                     # A Label, not a MemberRow: rows are clickable profiles.
                     grid.add_widget(Label(
@@ -7192,12 +7268,8 @@ class sHadesClientApp(MDApp):
                 return
             # Fallback: authors seen this session; presence unknown.
             for h, uname in list(self._members.items())[:50]:
-                grid.add_widget(MemberRow(
-                    username=uname,
-                    avatar_source="",
-                    author_hash=h,
-                    presence_color=[0.5, 0.5, 0.5, 1],
-                ))
+                grid.add_widget(self._member_row(
+                    h, uname, [0.5, 0.5, 0.5, 1]))
         except Exception as e:
             print("members ui error:", e)
 

@@ -922,7 +922,7 @@
                     MDButtonText:
                         text: 'Choose photo'
                         text_color: app.theme_colors['text']
-            MDTextField:
+            HintOverlayField:
                 id: welcome_name
                 text: app.onboarding_name
                 hint_text: 'Your name on the mesh'
@@ -933,7 +933,7 @@
                 opacity: 1 if root.stage == 2 else 0
                 fill_color_normal: app.theme_colors['input_bg']
                 text_color_normal: app.theme_colors['text']
-            MDTextField:
+            HintOverlayField:
                 id: onb_hub
                 hint_text: 'Hub address (ip:port), empty = community hub'
                 mode: 'filled'
@@ -943,7 +943,7 @@
                 opacity: 1 if root.stage == 2 else 0
                 fill_color_normal: app.theme_colors['input_bg']
                 text_color_normal: app.theme_colors['text']
-            MDTextField:
+            HintOverlayField:
                 id: onb_node
                 hint_text: 'Guild node hash (optional)'
                 mode: 'filled'
@@ -958,7 +958,7 @@
                 size_hint_y: None
                 height: dp(44) if root.stage == 2 else 0
                 opacity: 1 if root.stage == 2 else 0
-                MDTextField:
+                HintOverlayField:
                     id: onb_delivery
                     hint_text: 'Delivery hash (optional)'
                     mode: 'filled'

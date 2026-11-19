@@ -118,6 +118,22 @@ def main():
           "seed=None):" in py)
     check("seed pre-fills the filter", "if seed:" in py)
 
+    # --- 7. profile-screen fields carry the in-box placeholder (tay) ------
+    # kivymd 2.0.0 leaves the native hint label unbuilt (probed: None at
+    # rest AND focused), so the stager fields ride HintOverlayField, an
+    # in-box placeholder that disappears on type.
+    check("hint overlay class shipped",
+          kv.count("HintOverlayField:") == 4 and "class HintOverlayField"
+          in py)
+    for fid in ("onb_hub", "onb_node", "onb_delivery", "welcome_name"):
+        check("%s rides the overlay field" % fid, "HintOverlayField:"
+              in kv[max(0, kv.find("id: %s" % fid) - 80):
+                    kv.find("id: %s" % fid)])
+    check("overlay hides once text exists",
+          "_placeholder_lbl.opacity = 0 if (self.text or \"\") else 1" in py)
+    check("overlay tracks hint_text",
+          "lbl.text = self.hint_text or \"\"" in py)
+
     print()
     print("P=%d F=%d" % (len(PASS), len(FAIL)))
     return 1 if FAIL else 0
