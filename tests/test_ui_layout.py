@@ -123,6 +123,26 @@ class LayoutProbe(sHadesClientApp):
             node = node.parent
         self.check(any(w == main.ids.left_clip for w in chain),
                    "server rail is clipped inside the drawer")
+        # ---- v0.36.9 (tay): closed drawer must not eat composer taps --
+        btn = main.ids.add_server_btn
+        main.left_open = False
+        self.check(btn.disabled,
+                   "closed drawer disables add server (no ghost taps)")
+        main.left_open = True
+        self.check(not btn.disabled,
+                   "open drawer re-enables add server")
+        kv = open(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "kv_md.kv"), "rb").read()
+        self.check(b"disabled: not root.left_open" in kv,
+                   "kv pins the drawer touch gate")
+        self.check(b"app.open_profile(app.my_hash or '', app.username or '')"
+                   in kv,
+                   "composer pfp press opens the profile editor")
+        spec = open(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "buildozer.spec"), "rb").read()
+        self.check(b"android.window_soft_input_mode = adjustResize" in spec,
+                   "android builds resize above the keyboard")
+        main.left_open = False
         drawer = main.ids.left_sidebar
         overlay_width = drawer.width
         main.left_open = True

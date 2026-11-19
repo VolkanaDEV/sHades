@@ -10,7 +10,10 @@ source.exclude_dirs = .git, .github, tests, __pycache__, build, dist, .buildozer
 # tay's sHades wordmark art, centered inside the circular adaptive safe zone
 # (measured 55.9% lettering span; contract lane: tests/test_launcher_icon.py)
 icon.filename = icon_512.png
-version = 0.36.8
+# tay: keep the composer above the virtual keyboard
+android.window_soft_input_mode = adjustResize
+
+version = 0.36.9
 # Bump version on every android-facing fix so the installed build can be
 # verified on-device (Settings > Apps > sHades) without adb.
 # wasmtime runs the micron applet sandbox on-device (applet_bridge.py).
