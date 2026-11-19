@@ -108,6 +108,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt "pyinstaller>=6.0,<7.0"
       - name: Build onefile binary
+        env:
+          KIVY_GL_BACKEND: mock
+          KIVY_NO_ARGS: '1'
         # --collect-all=wasmtime: the package ships a raw data DLL (wasmtime
         # layout: wasmtime/win32-x86_64/_wasmtime.dll) that plain analysis
         # never bundles; local mirror of this exact command produced an exe
