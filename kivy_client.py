@@ -1733,6 +1733,8 @@ class CtxHeaderLabel(ContextMenuMixin, Label):
         if app and getattr(app, "i_am_admin", False):
             actions.append(("server settings", True,
                             lambda: app and app._open_admin_panel()))
+        actions.append(("copy boot log", True,
+                        lambda: app and app._copy_bootlog()))
         return actions
 
 
@@ -1956,6 +1958,8 @@ if KIVY:
             if app and getattr(app, "i_am_admin", False):
                 actions.append(("server settings", True,
                                 lambda: app and app._open_admin_panel()))
+            actions.append(("copy boot log", True,
+                            lambda: app and app._copy_bootlog()))
             actions.append(("remove server", True,
                             lambda: app and app._remove_server(self.index)))
             return actions
@@ -6592,6 +6596,27 @@ class sHadesClientApp(MDApp):
         from kivy.core.clipboard import Clipboard
         Clipboard.copy(text)
         self._set_status("copied to clipboard")
+
+    def _copy_bootlog(self):
+        """paste-able boot-log handoff: no adb, no MediaStore. The
+        clipboard bridge (kivy) is proven on-device; MediaStore was
+        not, and tay's device miss proved it wrong in exactly the
+        way a second bridge can bypass. Long-press -> tap -> paste."""
+        try:
+            from main import _log_path
+            with open(_log_path(), "r", encoding="utf-8",
+                      errors="replace") as f:
+                text = f.read()
+            tail = text[-20000:]
+            if not tail.strip():
+                self._set_status("boot log empty")
+                return
+            self._copy_text(tail)
+            print("boot log handed to clipboard: %d chars"
+                  % len(tail), flush=True)
+        except Exception as e:
+            print("boot log clipboard failed:", repr(e), flush=True)
+            self._set_status("boot log copy failed")
 
     def _reply_quote(self, username, content):
         """Stage a reply card. The wire prefix stays readable on older clients."""

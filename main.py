@@ -102,6 +102,7 @@ def _export_bootlog_for_user():
                     return False
             try:
                 out = resolver.openOutputStream(uri)
+                print("export: out-stream opened", flush=True)
                 if out is None:
                     return False
                 # Files.copy(Path, OutputStream) is a REAL overload
@@ -112,6 +113,7 @@ def _export_bootlog_for_user():
                 p9 = autoclass("java.nio.file.Paths")
                 f9 = autoclass("java.nio.file.Files")
                 f9.copy(p9.get(src_path), out)
+                print("export: nio copy ok", flush=True)
                 try:
                     out.close()
                 except Exception:

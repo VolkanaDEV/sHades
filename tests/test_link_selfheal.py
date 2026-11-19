@@ -804,6 +804,29 @@ def test_bootlog_bridge_contract():
     print("PASS  bootlog bridge contract")
 
 
+def test_bootlog_clipboard_contract():
+    """v0.36.5: the diagnosis channel cannot ride the bridge it
+    diagnoses -- an ungated clipboard item in BOTH long-press menus
+    hands the boot-log text over the proven kivy bridge, and the
+    export prints its stage story into the tee (visible in the very
+    paste it enables)."""
+    with open("kivy_client.py", "r", encoding="utf-8") as f:
+        client_src = f.read()
+    with open("main.py", "r", encoding="utf-8") as f:
+        main_src = f.read()
+    n_items = client_src.count('"copy boot log"')
+    assert "def _copy_bootlog" in client_src and n_items == 2, (
+        "ungated item x%d + method (both menus)" % n_items)
+    assert "def _copy_bootlog" in client_src, "handoff method ships"
+    assert "boot log handed to clipboard" in client_src, (
+        "handoff prints its size into the tee")
+    assert "export: out-stream opened" in main_src, (
+        "stage print: stream open")
+    assert "export: nio copy ok" in main_src, (
+        "stage print: copy ok")
+    print("PASS  bootlog clipboard contract")
+
+
 def main():
     test_link_dead_reported_and_signalled()
     test_link_raise_reported_and_signalled()
@@ -818,7 +841,8 @@ def main():
     test_bootlog_export_contract()
     test_whoami_retry_contract()
     test_bootlog_bridge_contract()
-    print("PASS: 13  FAIL: 0")
+    test_bootlog_clipboard_contract()
+    print("PASS: 14  FAIL: 0")
 
 
 if __name__ == "__main__":
