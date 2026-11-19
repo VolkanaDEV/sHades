@@ -850,6 +850,82 @@ def test_bootlog_clipboard_contract():
     print("PASS  bootlog clipboard contract")
 
 
+def test_softinput_bridge_contract():
+    """v0.36.11: main._android_softinput_resize() executes against a
+    fake jnius and the argument TYPES are the contract. AOSP receipts:
+    WindowManager.java defines SOFT_INPUT_ADJUST_RESIZE = 0x10 inside
+    the LayoutParams nested class (exact-class field per the jnius law)
+    and Window.java's setSoftInputMode(int mode) is the only overload --
+    Java takes one int, nothing else."""
+    import io
+    import sys as _sys
+    import types as _t
+    import main as main_mod
+    import contextlib as _ctx
+
+    calls = []
+
+    class FakeWin:
+        def setSoftInputMode(self, mode):
+            if not isinstance(mode, int) or isinstance(mode, bool):
+                raise TypeError("Window.setSoftInputMode(int) -- one "
+                                "int overload, AOSP Window.java:1223")
+            calls.append(("setmode", mode))
+
+    def _win():
+        return _WIN["win"]
+
+    _WIN = {"win": FakeWin()}
+
+    class PyAct:
+        mActivity = _t.SimpleNamespace(getWindow=lambda: _win())
+
+    class FakeWSLP:
+        def __init__(self):
+            raise AssertionError("LayoutParams is read as a class")
+
+    # the real declaration placement: the constant lives ON LayoutParams
+    FakeWSLP.SOFT_INPUT_ADJUST_RESIZE = 0x10
+
+    def autoclass(name):
+        calls.append(("ac", name))
+        return {"org.kivy.android.PythonActivity": PyAct,
+                "android.view.WindowManager$LayoutParams":
+                    FakeWSLP}[name]
+
+    fake = _t.ModuleType("jnius")
+    fake.autoclass = autoclass
+    _sys.modules["jnius"] = fake
+    try:
+        buf = io.StringIO()
+        with _ctx.redirect_stdout(buf):
+            main_mod._android_softinput_resize()
+        out = buf.getvalue()
+        assert ("setmode", 0x10) in calls, \
+            "the mode lands on the window: %s" % calls
+        acs = [c[1] for c in calls if c[0] == "ac"]
+        assert acs == ["org.kivy.android.PythonActivity",
+                       "android.view.WindowManager$LayoutParams"], \
+            "exact classes only: %s" % acs
+        assert "SOFTINPUT: window set to ADJUST_RESIZE" in out, repr(out)
+        # type-faithfulness leg: a misdeclared constant (str where the
+        # int overload expects a mode) names itself in the production
+        # except instead of dying silently or lying about the receipt
+        calls.clear()
+        FakeWSLP.SOFT_INPUT_ADJUST_RESIZE = "16"
+        buf = io.StringIO()
+        with _ctx.redirect_stdout(buf):
+            main_mod._android_softinput_resize()
+        assert [c for c in calls if c[0] == "setmode"] == [], \
+            "no int-overload call on a str mode"
+        assert "SOFTINPUT: resize not applied" in buf.getvalue(), \
+            repr(buf.getvalue())
+    finally:
+        import sys as _sys
+        del _sys.modules["jnius"]
+    print("PASS  softinput bridge contract")
+
+
 def main():
     test_link_dead_reported_and_signalled()
     test_link_raise_reported_and_signalled()
@@ -865,7 +941,8 @@ def main():
     test_whoami_retry_contract()
     test_bootlog_bridge_contract()
     test_bootlog_clipboard_contract()
-    print("PASS: 14  FAIL: 0")
+    test_softinput_bridge_contract()
+    print("PASS: 15  FAIL: 0")
 
 
 if __name__ == "__main__":
