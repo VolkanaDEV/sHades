@@ -2143,8 +2143,19 @@ if KIVY:
                     # tay (2026-11): a username is required before the
                     # first connection; the hint stays until one is typed.
                     return
-                App.get_running_app().open_recovery_sheet(
-                    onboarding_name=name)
+
+                def _staged(wid):
+                    widget = self.ids.get(wid)
+                    return ((widget.text or "").strip() if widget else "")
+
+                app = App.get_running_app()
+                # tay (2026-11): the staged screen carries the hub
+                # destination alongside the profile; the sheet's connect
+                # path then uses exactly what the stager typed.
+                app._onboard_hub = (_staged("onb_hub"),
+                                    _staged("onb_node"),
+                                    _staged("onb_delivery"))
+                app.open_recovery_sheet(onboarding_name=name)
 
         def _next_card(self, card):
             self.stage += 1
@@ -2784,6 +2795,17 @@ class sHadesClientApp(MDApp):
         if BOOT_DEBUG:
             _boot_mark("on_start")
         self._apply_system_gesture_exclusions()
+        # tay (2026-11): '/' pops the command palette for live selections.
+        # The channel input watches its own text: a bare '/' opens the
+        # palette with the filter seeded from the input, everything else
+        # keeps the existing send path (kivy_client._handle_slash).
+        try:
+            _main = self.root.get_screen("main")
+            _msg = _main.ids.get("msg_input")
+            if _msg:
+                _msg.bind(text=self._on_live_slash)
+        except Exception as _exc:
+            _boot_file("slash-live bind unavailable: %s" % _exc)
         # Try to resume a saved session
         sess = self._load_session()
         # fork merge: the identity file is the sole carrier of
@@ -2822,14 +2844,24 @@ class sHadesClientApp(MDApp):
             # loading placeholder until their bytes arrive.
             Clock.schedule_once(self._load_history_ui, 2.0)
         else:
-            # Fresh install: connect to the default community hub without
-            # making the user type a server address. The connect screen stays
-            # up (showing progress) and is used as the fallback if the
-            # default hub is unreachable, so a fresh install is never locked
-            # out of the app.
-            if BOOT_DEBUG:
-                _boot_mark("fresh install -> default hub")
-            self._auto_connect_default_hub()
+            # Fresh install: tay (2026-11), profile staging must be the
+            # very first screen presented when no extant profile is
+            # saved. The staged screen carries the hub destination and
+            # guild-hash fields and replaces the standalone connect
+            # screen for this path; completing it mints the profile and
+            # then connects. A restored or previously completed profile
+            # keeps the auto-connect fallthrough so upgrades never see
+            # staging twice.
+            if os.path.isfile(self._portable_profile_path()):
+                if BOOT_DEBUG:
+                    _boot_mark("profile exists -> default hub")
+                self._auto_connect_default_hub()
+            else:
+                if BOOT_DEBUG:
+                    _boot_mark("fresh install -> profile staging first")
+                self.root.get_screen("onboarding").stage = 0
+                self.root.current = "onboarding"
+                self._set_status("Stage your profile: name, photo, hub address.")
 
     def _onboarding_path(self):
         return os.path.join(_app_data_dir(), "onboarding.json")
@@ -2861,7 +2893,7 @@ class sHadesClientApp(MDApp):
                        "avatar": getattr(self, "my_avatar_small", None)}, stream)
         os.replace(temp, path)
 
-    def complete_onboarding(self, name):
+    def complete_onboarding(self, name, hub_data=None):
         """Create a durable local identity before the first connection.
 
         tay (2026-11): a username is required before the first hub
@@ -2899,7 +2931,16 @@ class sHadesClientApp(MDApp):
         # popup rides the fork's show_qr pattern; the boot's
         # client_identity lifecycle is untouched (read-only from_file).
         Clock.schedule_once(lambda dt: self.show_blank_card(), 0.4)
-        self._auto_connect_default_hub()
+        # tay (2026-11): the staged hub destination, when typed, is the
+        # connect target; an empty hub field keeps the community-hub
+        # default so a fresh install is never locked out.
+        hub, node_hash, delivery_hash = (hub_data or ("", "", ""))
+        if (hub or "").strip():
+            self.connect_to_guild(hub, self.username,
+                                  node_hash=node_hash or "",
+                                  delivery_hash=delivery_hash or "")
+        else:
+            self._auto_connect_default_hub()
 
     def _blank_card_payload(self, ident):
         """Payload for the onboarding blank card; None if unusable.
@@ -2986,7 +3027,25 @@ class sHadesClientApp(MDApp):
         except Exception as e:
             print("generated avatar upload pending:", repr(e))
 
-    def open_command_palette(self):
+    def _on_live_slash(self, inst, value):
+        """tay (2026-11): '/' pops the command palette for live
+        selections. Only a bare '/' triggers it: anything longer has
+        been completed by a pick or is a literal command line and keeps
+        the normal send path. A pick sets the suppression flag before it
+        writes the completed command back, so the write-back never
+        re-opens the palette."""
+        if getattr(self, "_suppress_live_slash", False):
+            return
+        if getattr(self, "_palette_popup", None) is not None:
+            return
+        try:
+            text = (value or "").strip()
+        except Exception:
+            return
+        if text == "/":
+            self.open_command_palette(seed="/")
+
+    def open_command_palette(self, seed=None):
         """Tier-2 command palette (tay's correction 2026-11): the
         slash-command surface for bot & script integration.
 
@@ -3023,6 +3082,7 @@ class sHadesClientApp(MDApp):
         popup = Popup(title="Slash commands", content=box,
                       size_hint=(0.9, 0.75))
         self._palette_popup = popup
+        popup.bind(on_dismiss=lambda *_: setattr(self, "_palette_popup", None))
 
         def _prefill(inst=None, cmd=""):
             popup.dismiss()
@@ -3031,6 +3091,10 @@ class sHadesClientApp(MDApp):
                 inp = main.ids.msg_input
             except Exception:
                 return
+            # tay (2026-11): the write-back would re-fire the live-slash
+            # watcher (the completed text also starts with '/'); suppress
+            # for this frame so the pick finalizes instead of reopening.
+            self._suppress_live_slash = True
             inp.text = cmd + " "
 
             def focus(dt):
@@ -3039,6 +3103,8 @@ class sHadesClientApp(MDApp):
                 except Exception:
                     pass
             Clock.schedule_once(focus, 0)
+            Clock.schedule_once(
+                lambda _dt: setattr(self, "_suppress_live_slash", False), 0)
 
         def render(*_):
             query = (filt.text or "").strip().lower()
@@ -3076,6 +3142,12 @@ class sHadesClientApp(MDApp):
         filt.bind(text=render)
         render(filt, None)
         popup.open()
+        # tay (2026-11): a live '/'-trigger seeds the filter from the
+        # channel input and takes the keyboard, so the palette is the
+        # selection surface while typing.
+        if seed:
+            filt.text = seed
+        filt.focus = True
         note.text = "client commands + hub dispatcher (fetching...)"
         Clock.schedule_once(lambda dt: fetch_hub(), 0)
 
@@ -3146,7 +3218,8 @@ class sHadesClientApp(MDApp):
             save.disabled = False
             if success and onboarding_name is not None:
                 sheet.dismiss()
-                self.complete_onboarding(onboarding_name)
+                self.complete_onboarding(
+                    onboarding_name, getattr(self, "_onboard_hub", None))
                 self._set_status(detail)
 
         def save_kit(*_):
@@ -3169,7 +3242,9 @@ class sHadesClientApp(MDApp):
 
         save.bind(on_press=save_kit)
         later.bind(on_press=lambda *_: (sheet.dismiss(),
-                   self.complete_onboarding(onboarding_name)) if onboarding_name is not None
+                   self.complete_onboarding(
+                       onboarding_name, getattr(self, "_onboard_hub", None)))
+                   if onboarding_name is not None
                    else sheet.dismiss())
         sheet.open()
 
