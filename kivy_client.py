@@ -142,12 +142,20 @@ _boot_label = {"ref": None}
 
 
 def _boot_file(msg):
-    """Append a milestone to the boot log file. Never raises."""
+    """Append a milestone to the boot log file, then mirror it
+    into the user-visible Downloads collection (adb-free crash
+    triage; every milestone refreshes the mirror while
+    BOOT_DEBUG is on). Never raises."""
     try:
         from main import _log_path
         p = _log_path()
         with open(p, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
+    except Exception:
+        pass
+    try:
+        from main import _export_bootlog_for_user
+        _export_bootlog_for_user()
     except Exception:
         pass
 

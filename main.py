@@ -45,6 +45,87 @@ def _log_path():
     return os.path.join(os.path.expanduser("~"), "sHades_boot.log")
 
 
+def _export_bootlog_for_user():
+    """Mirror sHades_boot.log into the user-visible Downloads collection
+    ( tay 2026-11-19: "crashes are difficult to debug when adb is
+    unavailable" ). MediaStore.Downloads on API 29+ -- own rows need no
+    runtime permission and every file manager lists Downloads; on
+    API 26-28 the direct public Downloads dir rides the declared
+    WRITE_EXTERNAL_STORAGE. Java-side copy only (the v0.15 lesson:
+    jbyte/jarray imports fail on-device; autoclass + Files.copy is the
+    proven bridge). Never raises; off-device or degraded bridges are a
+    quiet no-op. Returns True when a copy landed in Downloads."""
+    try:
+        src_path = _log_path()
+        with open(src_path, "rb") as f:
+            if not f.read(1) and f.seek(0, 2) == 0:
+                return False  # nothing to export yet
+    except OSError:
+        return False
+    try:
+        from jnius import autoclass  # p4a only
+    except Exception:
+        return False
+    try:
+        act = autoclass("org.kivy.android.PythonActivity").mActivity
+        SDK_INT = int(autoclass("android.os.Build$VERSION").SDK_INT)
+        if SDK_INT >= 29:
+            resolver = act.getContentResolver()
+            DL = autoclass("android.provider.MediaStore$Downloads")
+            coll = DL.getContentUri(DL.VOLUME_EXTERNAL_PRIMARY)
+            uri = None
+            # find an existing row first so re-boots overwrite instead
+            # of stacking sHades_boot (1).log, (2).log, ...
+            try:
+                cur = resolver.query(coll, ["_id"],
+                                     "_display_name = "
+                                     "'sHades_boot.log'",
+                                     None, None)
+                try:
+                    if cur is not None and cur.moveToFirst():
+                        uri = autoclass(
+                            "android.content.ContentUris"
+                        ).withAppendedId(coll, cur.getLong(0))
+                finally:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+            except Exception:
+                uri = None
+            if uri is None:
+                cv = autoclass("android.content.ContentValues")()
+                cv.put("_display_name", "sHades_boot.log")
+                cv.put("mime_type", "text/plain")
+                uri = resolver.insert(coll, cv)
+                if uri is None:
+                    return False
+            try:
+                out = resolver.openOutputStream(uri)
+                fin = autoclass("java.io.FileInputStream")(src_path)
+                copied = autoclass("java.nio.file.Files").copy(fin, out)
+                try:
+                    fin.close()
+                    out.close()
+                except Exception:
+                    pass
+                return copied > 0
+            except Exception:
+                return False
+        # API 26-28: legacy public Downloads dir
+        env = autoclass("android.os.Environment")
+        dest = env.getExternalStoragePublicDirectory(
+            env.DIRECTORY_DOWNLOADS)
+        dest_path = os.path.join(str(dest.getAbsolutePath()),
+                                 "sHades_boot.log")
+        with open(src_path, "rb") as fin, open(dest_path, "wb") as fout:
+            fout.write(fin.read())
+        return True
+    except Exception as e:
+        print("bootlog export failed:", e, flush=True)
+        return False
+
+
 class _Tee:
     """Write to the original stream AND the launch log; never raise."""
 
@@ -154,6 +235,11 @@ def main():
         try:
             with open(_log_path(), "a", encoding="utf-8") as f:
                 f.write("\n--- TRACEBACK ---\n" + tb)
+        except Exception:
+            pass
+        # mirror the (now fatal) log into Downloads: no adb needed
+        try:
+            _export_bootlog_for_user()
         except Exception:
             pass
         # Show the traceback immediately; the console itself remains open

@@ -542,6 +542,39 @@ def test_wait_path_mtu_bounded_gives_up():
     assert waited["n"] == 3, waited
 
 
+def test_bootlog_export_contract():
+    """v0.36.1: the boot log mirrors into the user-visible Downloads
+    collection (MediaStore on API 29+, public dir API 26-28) so crash
+    triage needs no adb. Java-side copy only (v0.15 jarray lesson)."""
+    main_path = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "main.py")
+    client_path = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "kivy_client.py")
+    main_src = open(main_path, encoding="utf-8").read()
+    client_src = open(client_path, encoding="utf-8").read()
+
+    assert "def _export_bootlog_for_user" in main_src, "export fn exists"
+    assert "MediaStore$Downloads" in main_src, "API 29+ route"
+    assert "VOLUME_EXTERNAL_PRIMARY" in main_src, "user-visible collection"
+    assert "DIRECTORY_DOWNLOADS" in main_src, "API 26-28 fallback route"
+    assert "_display_name = " in main_src and "'sHades_boot.log'" \
+        in main_src, "existing-row overwrite (no (1).log stacking)"
+    assert "FileInputStream" in main_src and "Files" in main_src \
+        and ".copy(" in main_src, "java-side copy (no jbyte/jarray)"
+    # the crash path mirrors the fatal log even when rendering is dead
+    tb_idx = main_src.index("--- TRACEBACK ---")
+    crash_hook = main_src.index("_export_bootlog_for_user()", tb_idx)
+    assert crash_hook < main_src.index("sys.exit(1)", tb_idx), \
+        "crash hook before exit"
+    # milestones refresh the mirror while BOOT_DEBUG is on
+    assert client_src.count("from main import _export_bootlog_for_user"
+                            ) == 1, "milestone hook in _boot_file"
+    # degraded bridge never raises and never returns True off-device
+    import main as mc
+    assert mc._export_bootlog_for_user() is False, "dev no-op"
+    print("PASS  bootlog export contract")
+
+
 def main():
     test_link_dead_reported_and_signalled()
     test_link_raise_reported_and_signalled()
@@ -553,7 +586,8 @@ def main():
     test_blob_linkdead_never_falls_through()
     test_wait_path_mtu_bounded_and_uses_live_path()
     test_wait_path_mtu_bounded_gives_up()
-    print("PASS: 10  FAIL: 0")
+    test_bootlog_export_contract()
+    print("PASS: 11  FAIL: 0")
 
 
 if __name__ == "__main__":
