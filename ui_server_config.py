@@ -204,6 +204,23 @@ class GeneralTab(_Tab):
         r_row.add_widget(r_save)
         self.box.add_widget(r_row)
 
+        # attachments persistence (P3): the live mode, one tap to flip.
+        # Ephemeral means bytes ride the server RAM registry (TTL +
+        # cap) instead of disk: new uploads only, flip-back is safe.
+        a_row = BoxLayout(size_hint_y=None, height=_scaled(32),
+                          spacing=dp(4))
+        self.att_state = _row_label("attachments: saved", w=0.35)
+        self.att_saved_btn = _btn("saved", 80, 30)
+        self.att_eph_btn = _btn("ephemeral", 110, 30)
+        self.att_saved_btn.bind(
+            on_press=lambda _i: self._save_attachments("saved"))
+        self.att_eph_btn.bind(
+            on_press=lambda _i: self._save_attachments("ephemeral"))
+        a_row.add_widget(self.att_state)
+        a_row.add_widget(self.att_saved_btn)
+        a_row.add_widget(self.att_eph_btn)
+        self.box.add_widget(a_row)
+
         icon_row = BoxLayout(size_hint_y=None, height=_scaled(40),
                              spacing=dp(4))
         self.icon_widget = Image(size_hint_x=None, width=_scaled(36),
@@ -225,6 +242,21 @@ class GeneralTab(_Tab):
             return self.client.guild_api.admin_config(key, val)
         self._post(job, on_ok=self.reload, label="save %s" % key)
 
+    def _save_attachments(self, value):
+        # main-thread decision; the worker only carries the string,
+        # same shape as do_save_key
+        def job():
+            return self.client.guild_api.admin_config("attachments", value)
+        self._post(job, on_ok=self.reload,
+                   label="set attachments " + value)
+
+    def _reflect_attachments(self, mode):
+        mode = mode if mode in ("saved", "ephemeral") else "saved"
+        self.att_state.text = "attachments: " + mode
+        # the ACTIVE mode is disabled: pressing it would post a no-op
+        self.att_saved_btn.disabled = (mode == "saved")
+        self.att_eph_btn.disabled = (mode == "ephemeral")
+
     def do_save_motd(self):
         self.do_save_key("motd")
 
@@ -244,6 +276,7 @@ class GeneralTab(_Tab):
                     self.entries[key].text = str(cfg.get(key, ""))
                 except Exception:
                     pass
+        self._reflect_attachments(cfg.get("attachments", "saved"))
         icon = (cfg.get("guild_icon") or "").strip()
         if icon:
             self.screen.load_icon_into(self.icon_widget, icon)

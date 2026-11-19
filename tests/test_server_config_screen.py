@@ -34,7 +34,8 @@ class FakeApi:
         self.calls = []
         self.config = {"config": {k: v for k, v in {
             "guild_name": "TestHub", "registration": "open",
-            "slowmode": "0", "motd": "hi", "guild_icon": ""}.items()}}
+            "slowmode": "0", "motd": "hi", "guild_icon": "",
+            "attachments": "saved"}.items()}}
 
     def _rec(self, proto, res):
         self.calls.append(proto)
@@ -203,6 +204,33 @@ def main():
     check("motd save posts the right key",
           ("admin_config", "motd", "brb") in client.guild_api.calls,
           saved)
+
+    # P3: attachments row -- active-mode reflect + one-tap flip posts
+    check("attachments row built with both buttons",
+          general.att_saved_btn is not None
+          and general.att_eph_btn is not None
+          and "saved" in general.att_state.text,
+          general.att_state.text)
+    general._reflect_attachments("saved")
+    check("reflect marks the active mode disabled",
+          general.att_saved_btn.disabled is True
+          and general.att_eph_btn.disabled is False, None)
+    general._save_attachments("ephemeral")
+    pump(0.8)
+    flips = [c for c in client.guild_api.calls if c[0] == "admin_config"]
+    check("ephemeral tap posts attachments=ephemeral",
+          ("admin_config", "attachments", "ephemeral") in flips, flips)
+    general._save_attachments("saved")
+    pump(0.8)
+    check("saved tap posts attachments=saved",
+          ("admin_config", "attachments", "saved")
+          in client.guild_api.calls,
+          client.guild_api.calls)
+    general._reflect_attachments("ephemeral")
+    check("reflect follows the flipped mode",
+          general.att_eph_btn.disabled is True
+          and "ephemeral" in general.att_state.text,
+          general.att_state.text)
 
     # Channels tab: post an overwrite bitmask through channels/patch
     ch_tab = scr.tab_content["Channels"]
