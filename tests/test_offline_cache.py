@@ -82,6 +82,19 @@ class _CacheApp(kc.sHadesClientApp):
                 scroll_y=1.0))))
 
 
+def wait_for(pred, cap=5.0):
+    """Poll a worker-thread result instead of racing a fixed sleep.
+
+    CI (cold Linux runner) regularly overran the old time.sleep(0.3)
+    flush windows; the assertions are unchanged -- only the wait is
+    now bounded-by-completion rather than bounded-by-wall-clock.
+    """
+    deadline = time.time() + cap
+    while not pred() and time.time() < deadline:
+        time.sleep(0.025)
+    return pred()
+
+
 def fetch_store_test():
     app = _CacheApp()
     rendered = []
@@ -107,7 +120,8 @@ def fetch_store_test():
     from kivy.clock import Clock
     for _ in range(30):
         Clock.tick()
-    time.sleep(0.3)  # flush thread
+    wait_for(lambda: rendered == ["m0", "m1", "m2"])
+    wait_for(lambda: refreshed == [("m1", "hello 1")])
     rows = offline_store.recent(app._offline_path(), GUILD, CID)
     check("fetch stores the page in the offline cache",
           [r["msg_id"] for r in rows] == ["m0", "m1", "m2"], rows)
@@ -144,14 +158,18 @@ def apply_update_test():
     app = _CacheApp()
     app._apply_update({"msg_id": "m1", "content": "edited",
                        "deleted_at": None, "channel_id": CID})
-    time.sleep(0.3)
+    wait_for(lambda: any(
+        m.get("content") == "edited"
+        for m in offline_store.recent(app._offline_path(), GUILD, CID)))
     rows = {m["msg_id"]: m for m in
             offline_store.recent(app._offline_path(), GUILD, CID)}
     check("edit delta mirrors into the cache",
           rows.get("m1", {}).get("content") == "edited", rows.get("m1"))
     app._apply_update({"msg_id": "m2", "content": "",
                        "deleted_at": 4242.0, "channel_id": CID})
-    time.sleep(0.3)
+    wait_for(lambda: "m2" not in [
+        m["msg_id"] for m in
+        offline_store.recent(app._offline_path(), GUILD, CID)])
     ids = [m["msg_id"] for m in
            offline_store.recent(app._offline_path(), GUILD, CID)]
     check("delete delta removes the cached row", "m2" not in ids, ids)
@@ -176,7 +194,8 @@ def erase_test():
     from kivy.clock import Clock
     for _ in range(20):
         Clock.tick()
-    time.sleep(0.3)
+    wait_for(lambda: offline_store.recent(
+        app._offline_path(), GUILD, CID) == [])
     rows = offline_store.recent(app._offline_path(), GUILD, CID)
     check("purge marker blocks re-entry after erasure", rows == [], rows)
 
