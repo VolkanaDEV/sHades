@@ -34,7 +34,8 @@ class FakeApi:
         self.calls = []
         self.config = {"config": {k: v for k, v in {
             "guild_name": "TestHub", "registration": "open",
-            "slowmode": "0", "motd": "hi", "guild_icon": ""}.items()}}
+            "slowmode": "0", "motd": "hi", "guild_icon": "",
+            "attachments": "saved", "banner": ""}.items()}}
 
     def _rec(self, proto, res):
         self.calls.append(proto)
@@ -90,6 +91,10 @@ class FakeApi:
     def blobs_put(self, name, mime, data, on_progress=None):
         return self._rec(("blobs_put", name, mime, len(data)),
                          {"ok": 1, "blob_id": "d" * 32, "size": len(data)})
+
+    def blobs_get(self, blob_id):
+        return self._rec(("blobs_get", blob_id),
+                         {"ok": 0, "error": "no blob in the fake"})
 
 class FakeClient:
     def __init__(self):
@@ -204,6 +209,51 @@ def main():
           ("admin_config", "motd", "brb") in client.guild_api.calls,
           saved)
 
+    # P3: attachments row -- active-mode reflect + one-tap flip posts
+    check("attachments row built with both buttons",
+          general.att_saved_btn is not None
+          and general.att_eph_btn is not None
+          and "saved" in general.att_state.text,
+          general.att_state.text)
+    general._reflect_attachments("saved")
+    check("reflect marks the active mode disabled",
+          general.att_saved_btn.disabled is True
+          and general.att_eph_btn.disabled is False, None)
+    general._save_attachments("ephemeral")
+    pump(0.8)
+    flips = [c for c in client.guild_api.calls if c[0] == "admin_config"]
+    check("ephemeral tap posts attachments=ephemeral",
+          ("admin_config", "attachments", "ephemeral") in flips, flips)
+    general._save_attachments("saved")
+    pump(0.8)
+    check("saved tap posts attachments=saved",
+          ("admin_config", "attachments", "saved")
+          in client.guild_api.calls,
+          client.guild_api.calls)
+    general._reflect_attachments("ephemeral")
+    check("reflect follows the flipped mode",
+          general.att_eph_btn.disabled is True
+          and "ephemeral" in general.att_state.text,
+          general.att_state.text)
+
+    # P5: banner row routes the chooser flow and clear posts the pair
+    usc_src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "ui_server_config.py"),
+        encoding="utf-8").read()
+    check("general tab has the banner row",
+          '"set banner..."' in usc_src and "_clear_banner" in usc_src)
+    general._clear_banner()
+    pump(0.8)
+    check("banner clear posts empty pair",
+          ("admin_config", "banner", "") in client.guild_api.calls,
+          client.guild_api.calls[-3:])
+    check("banner chooser routes through the blob flow",
+          "def _apply_banner_file" in usc_src
+          and 'admin_config("banner", blob_id)' in usc_src)
+    check("config pane read-back includes banner prefill",
+          "banner" in client.guild_api.config["config"],
+          client.guild_api.config["config"])
+
     # Channels tab: post an overwrite bitmask through channels/patch
     ch_tab = scr.tab_content["Channels"]
     ch_tab.post_overwrites(cid="c" * 31 + "1", role_id=2, view=True, post=True)
@@ -259,6 +309,49 @@ def main():
     check("blob_id then config set",
           ("admin_config", "guild_icon", "d" * 32) in client.guild_api.calls,
           client.guild_api.calls[-3:])
+
+    # ---------- P10a: device (Android) purpose routing -----------------------
+    # the SAF route must be taken instead of the desktop FileChooser
+    # (which lists nothing in an Android sandbox) and must carry the
+    # purpose; _route_purpose_file hands the file to the General tab
+    picked = []
+    from kivy.metrics import dp as _dp
+    probe._android_platform = lambda: True
+    probe.open_file_chooser = (lambda **kw: picked.append(kw.get("purpose")))
+    gen = scr.tab_content["General"]
+    gen._open_icon_chooser()
+    gen._open_banner_chooser()
+    check("android pickers ride SAF with purpose",
+          picked == ["icon", "banner"], picked)
+    # desktop app keeps its own chooser: restore a non-android probe and
+    # watch the FileChooser popup get built (not opened twice in a lane)
+    probe._android_platform = lambda: False
+    popups = []
+    from kivy.uix.popup import Popup as _P
+    real_popup_init = _P.__init__
+
+    def spy_init(pself, **kw):
+        popups.append(kw.get("title"))
+        return real_popup_init(pself, **kw)
+    _P.__init__ = spy_init
+    gen._open_icon_chooser()
+    _P.__init__ = real_popup_init
+    check("desktop chooser popup preserved for non-android app",
+          popups == ["choose an icon"], popups)
+
+    # ---------- P10b: prettier receipts --------------------------------------
+    check("banner preview widget exists on General",
+          hasattr(gen, "banner_widget"))
+    check("icon preview sized for the strip row",
+          gen.icon_widget.width == _dp(56), repr(gen.icon_widget.width))
+    # config render with a banner id hands it to the preview loader
+    client.guild_api.calls = []
+    client.guild_api.config["config"]["banner"] = "b" * 32
+    gen._render({"ok": 1, "config": client.guild_api.config["config"]})
+    pump(1.0)
+    check("banner render fetches the banner blob",
+          ("blobs_get", "b" * 32) in client.guild_api.calls,
+          client.guild_api.calls[-4:])
 
     for t in scr.tab_buttons:
         pass  # build sanity, no exceptions above is the bar

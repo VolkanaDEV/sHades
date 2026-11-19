@@ -478,6 +478,21 @@
                 MDButtonText:
                     text: 'Back'
                     text_color: app.theme_colors['text']
+        MDButton:
+            id: profile_delete
+            # P1 (plan_admin v1.1, tay 2026-11-19): purge this
+            # guild account from the server; two-stage type-to-
+            # confirm carries the literals the server validates.
+            style: 'filled'
+            size_hint_x: None
+            width: dp(230)
+            pos_hint: {'center_x': 0.5}
+            theme_bg_color: 'Custom'
+            md_bg_color: 0.76, 0.22, 0.22, 1
+            on_press: app.open_confirm_delete_account()
+            MDButtonText:
+                text: 'Delete account'
+                text_color: 1, 1, 1, 1
 
 <MainScreen>:
     BoxLayout:
@@ -762,16 +777,28 @@
                         # ---- channels column ----
                         BoxLayout:
                             orientation: 'vertical'
-                            Image:
-                                id: banner_channel
-                                source: app.banner_channel_path or ''
+                            FloatLayout:
+                                id: banner_strip
                                 size_hint_y: None
                                 height: dp(96)
-                                size_hint_x: None
-                                width: dp(200)
-                                allow_stretch: False
-                                keep_ratio: True
-                                pos_hint: {'center_x': 0.5}
+                                Image:
+                                    id: banner_channel
+                                    source: app.banner_channel_path or ''
+                                    size_hint: (None, None)
+                                    height: dp(96)
+                                    width: dp(200)
+                                    allow_stretch: False
+                                    keep_ratio: True
+                                    pos_hint: {'center_x': 0.5, 'center_y': 0.5}
+                                    opacity: 1 if app.banner_channel_path else 0
+                                Label:
+                                    id: banner_letter
+                                    text: app.banner_letter or 'S'
+                                    font_size: sp(48)
+                                    bold: True
+                                    color: app.theme_colors['sidebar_ctrl']
+                                    pos_hint: {'center_x': 0.5, 'center_y': 0.5}
+                                    opacity: 0 if app.banner_channel_path else 1
                             BoxLayout:
                                 size_hint_y: None
                                 height: dp(52)
@@ -863,7 +890,7 @@
             orientation: 'vertical'
             size_hint: None, None
             width: min(dp(420), root.width - dp(32))
-            height: min(dp(560), root.height - dp(32))
+            height: min((dp(700) if root.stage == 2 else dp(560)), root.height - dp(32))
             pos_hint: {'center_x': 0.5, 'center_y': 0.5}
             padding: [dp(24), dp(28)]
             spacing: dp(16)
@@ -902,10 +929,29 @@
                 halign: 'center'
                 valign: 'middle'
                 size_hint_y: 1
+            BoxLayout:
+                spacing: dp(10)
+                size_hint_y: None
+                height: dp(52) if root.stage == 2 else 0
+                opacity: 1 if root.stage == 2 else 0
+                PfpImage:
+                    size_hint_x: None
+                    width: dp(44)
+                    source: app.avatar_preview or ""
+                    allow_stretch: False
+                    keep_ratio: True
+                MDButton:
+                    style: 'outlined'
+                    size_hint_x: None
+                    width: dp(160)
+                    height: dp(40)
+                    on_press: app.open_file_chooser(avatar=True)
+                    MDButtonText:
+                        text: 'Choose photo'
+                        text_color: app.theme_colors['text']
             MDTextField:
                 id: welcome_name
                 text: app.onboarding_name
-                hint_text: 'Your name on the mesh'
                 mode: 'filled'
                 multiline: False
                 size_hint_y: None
@@ -913,6 +959,43 @@
                 opacity: 1 if root.stage == 2 else 0
                 fill_color_normal: app.theme_colors['input_bg']
                 text_color_normal: app.theme_colors['text']
+                MDTextFieldHintText:
+                    text: 'Your name on the mesh'
+            MDTextField:
+                id: onb_hub
+                mode: 'filled'
+                multiline: False
+                size_hint_y: None
+                height: dp(44) if root.stage == 2 else 0
+                opacity: 1 if root.stage == 2 else 0
+                fill_color_normal: app.theme_colors['input_bg']
+                text_color_normal: app.theme_colors['text']
+                MDTextFieldHintText:
+                    text: 'Hub address (ip:port), empty = community hub'
+            MDTextField:
+                id: onb_node
+                mode: 'filled'
+                multiline: False
+                size_hint_y: None
+                height: dp(44) if root.stage == 2 else 0
+                opacity: 1 if root.stage == 2 else 0
+                fill_color_normal: app.theme_colors['input_bg']
+                text_color_normal: app.theme_colors['text']
+                MDTextFieldHintText:
+                    text: 'Guild node hash (optional)'
+            BoxLayout:
+                spacing: dp(10)
+                size_hint_y: None
+                height: dp(44) if root.stage == 2 else 0
+                opacity: 1 if root.stage == 2 else 0
+                MDTextField:
+                    id: onb_delivery
+                    mode: 'filled'
+                    multiline: False
+                    fill_color_normal: app.theme_colors['input_bg']
+                    text_color_normal: app.theme_colors['text']
+                    MDTextFieldHintText:
+                        text: 'Delivery hash (optional)'
             MDButton:
                 style: 'filled'
                 size_hint_y: None
@@ -921,6 +1004,7 @@
                 md_bg_color: app.theme_colors['primary']
                 on_press: root.advance()
                 MDButtonText:
+                    disabled: root.stage == 2 and not welcome_name.text.strip()
                     text: 'Protect identity' if root.stage == 2 else 'Continue'
                     text_color: app.theme_colors['btn_text']
             MDButton:
@@ -1015,6 +1099,7 @@
                                 text_color_focus: app.theme_colors['text']
                         MDTextField:
                             id: username
+                            text: app.username
                             multiline: False
                             size_hint_y: None
                             height: dp(44)
@@ -1052,6 +1137,7 @@
                             height: scaled(dp(40))
                             theme_bg_color: 'Custom'
                             md_bg_color: app.theme_colors['primary']
+                            disabled: app.connect_username_required and not username.text.strip()
                             on_press: app.connect_to_guild(hub_address.text, username.text, node_hash.text, delivery_hash.text)
                             MDButtonText:
                                 text: 'Connect'
@@ -1081,7 +1167,6 @@
                         height: self.minimum_height
                         MDTextField:
                             id: node_hash
-                            hint_text: 'Guild node_hash (32 hex, optional)'
                             multiline: False
                             size_hint_y: None
                             height: dp(44)
@@ -1090,9 +1175,10 @@
                             text_color_normal: app.theme_colors['text']
                             text_color_focus: app.theme_colors['text']
                             cursor_color: app.theme_colors['text']
+                            MDTextFieldHintText:
+                                text: 'Guild node_hash (32 hex, optional)'
                         MDTextField:
                             id: delivery_hash
-                            hint_text: 'Guild delivery_hash (32 hex, optional)'
                             multiline: False
                             size_hint_y: None
                             height: dp(44)
@@ -1101,6 +1187,8 @@
                             text_color_normal: app.theme_colors['text']
                             text_color_focus: app.theme_colors['text']
                             cursor_color: app.theme_colors['text']
+                            MDTextFieldHintText:
+                                text: 'Guild delivery_hash (32 hex, optional)'
                     Widget:
                         size_hint_x: 1
         # The status line is OUTSIDE the scroll so a long message never

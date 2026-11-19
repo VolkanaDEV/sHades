@@ -664,6 +664,11 @@ def _node_reaper():
                 _reap_stale_uploads()
         except Exception as e:
             RNS.log("upload reaper error: %s" % e, RNS.LOG_ERROR)
+        try:
+            if ATT_RAM:
+                _att_ram_sweep()
+        except Exception as e:
+            RNS.log("att RAM reaper error: %s" % e, RNS.LOG_ERROR)
 
 def online_users():
     """The active user list, derived from guild link liveness (v0.29).
@@ -707,23 +712,32 @@ def safe_ext(name, mime):
     mm = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "audio/mpeg": "mp3"}
     return mm.get((mime or "").lower(), "bin")
 
-def store_attachment(name, mime, data):
+def store_attachment(name, mime, data, by=None):
     if not isinstance(data, (bytes, bytearray)) or not data:
         return None
     if len(data) > MAX_ATTACHMENT_SZ:
         return None
     digest = hashlib.sha256(data).hexdigest()[:32]
     fname = f"{digest}.{safe_ext(name, mime)}"
-    adir = os.path.join(STORAGE, "attachments")
-    os.makedirs(adir, exist_ok=True)
-    path = os.path.join(adir, fname)
-    try:
-        if not os.path.exists(path):
-            with open(path, "wb") as f:
-                f.write(data)
-    except Exception as e:
-        RNS.log(f"store_attachment write failed for {fname}: {e}", RNS.LOG_ERROR)
-        return None
+    if _attachment_mode() == "ephemeral":
+        # P2: the message row persists, the attachment bytes live in
+        # the RAM registry until the TTL; the /file/attachments/<fname>
+        # handler below stays registered so remote fetches route and
+        # land in the RAM branch (serve + att/get resolve RAM-first).
+        _att_ram_put(digest, bytes(data), str(name)[:128],
+                     str(mime)[:64], by)
+    else:
+        adir = os.path.join(STORAGE, "attachments")
+        os.makedirs(adir, exist_ok=True)
+        path = os.path.join(adir, fname)
+        try:
+            if not os.path.exists(path):
+                with open(path, "wb") as f:
+                    f.write(data)
+        except Exception as e:
+            RNS.log(f"store_attachment write failed for {fname}: {e}",
+                    RNS.LOG_ERROR)
+            return None
     dlog(f"store_attachment: name={name!r} mime={mime!r} size={len(data)} fname={fname}")
     if node_destination is not None:
         node_destination.register_request_handler(
@@ -741,6 +755,12 @@ def serve_attachment_file(path, data, request_id, link_id, remote_identity, requ
     if not attachment_visible(viewer_of(remote_identity), fname):
         dlog(f"serve_attachment_file: gated {fname!r}")
         return b"not found"
+    entry = _att_ram_get(fname.split(".")[0])
+    if entry is not None:
+        blob = bytes(entry["bytes"])
+        dlog(f"serve_attachment_file: served {fname} from RAM "
+             f"({len(blob)} bytes)")
+        return blob
     fpath = os.path.join(STORAGE, "attachments", fname)
     if os.path.isfile(fpath):
         with open(fpath, "rb") as f:
@@ -817,7 +837,8 @@ def ingest(channel_id, author_hash, content, ts=None, attachments=None):
             except Exception:
                 dlog(f"ingest: malformed attachment at idx {idx}, skipping")
                 continue
-            fname = store_attachment(str(name)[:128], str(mime)[:64], blob)
+            fname = store_attachment(str(name)[:128], str(mime)[:64],
+                                     blob, by=author_hash)
             if fname:
                 dlog(f"ingest: stored attachment idx={idx} name={name} fname={fname}")
                 db.execute("INSERT OR REPLACE INTO attachments "
@@ -2158,7 +2179,78 @@ def _blob_fname(digest):
                 return fname
     except OSError:
         pass
+    # P2 (ephemeral "attachments" mode): the bytes live in the RAM
+    # registry, so the disk scan misses -- but the blobs metadata row
+    # persists in both modes, and its path is exactly the fname the
+    # serve paths (RAM-first, then disk) use.
+    with db_lock:
+        row = db.execute("SELECT path FROM blobs WHERE id=?",
+                         (digest,)).fetchone()
+    if row and row["path"]:
+        return row["path"]
     return None
+
+# ---- ephemeral attachment mode (P2): RAM registry, disk untouched -------
+# tay (plan_admin v1.1): the "attachments" config governs where blob
+# bytes land. "saved" = today's law (content-addressed files on disk,
+# DB carries only metadata). "ephemeral" = bytes live in this RAM
+# registry keyed by digest {bytes, ts, name, mime, by}, TTL-swept by the
+# 1 s reaper, hard-capped with LRU eviction; serve paths resolve
+# RAM-first, then disk. Flipping back to "saved" restores disk commits
+# for NEW uploads; existing stored blobs keep serving untouched.
+
+ATT_RAM_TTL = 6 * 3600          # seconds an ephemeral blob lives
+ATT_RAM_MAX_BYTES = 32 * 1024 * 1024
+ATT_RAM = {}                    # digest -> {bytes, ts, name, mime, by}
+ATT_RAM_LOCK = threading.Lock()
+
+
+def _attachment_mode():
+    """Live config read: every upload/commit checks the CURRENT value,
+    so a flip binds on the next request with no restart."""
+    try:
+        return ("ephemeral" if _cfg_get("attachments", "saved")
+                == "ephemeral" else "saved")
+    except Exception:
+        return "saved"
+
+
+def _att_ram_sweep():
+    """Drop TTL-expired RAM blobs; runs in the 1 s reaper loop."""
+    try:
+        deadline = now() - ATT_RAM_TTL
+    except Exception:
+        return 0
+    with ATT_RAM_LOCK:
+        stale = [k for k, v in ATT_RAM.items() if v["ts"] < deadline]
+        for k in stale:
+            del ATT_RAM[k]
+    return len(stale)
+
+
+def _att_ram_put(digest, blob, name, mime, by):
+    """Insert an ephemeral blob, LRU-evicting to stay under the cap."""
+    with ATT_RAM_LOCK:
+        deadline = now() - ATT_RAM_TTL
+        for k in [k for k, v in ATT_RAM.items() if v["ts"] < deadline]:
+            del ATT_RAM[k]
+        if digest not in ATT_RAM:
+            while (sum(len(v["bytes"]) for v in ATT_RAM.values())
+                   + len(blob) > ATT_RAM_MAX_BYTES and ATT_RAM):
+                oldest = min(ATT_RAM, key=lambda k: ATT_RAM[k]["ts"])
+                del ATT_RAM[oldest]
+        ATT_RAM[digest] = {"bytes": bytearray(blob), "ts": now(),
+                           "name": name, "mime": mime, "by": by}
+
+
+def _att_ram_get(digest):
+    """Return the entry (refreshing its LRU clock) or None."""
+    with ATT_RAM_LOCK:
+        v = ATT_RAM.get(digest)
+        if v is not None:
+            v["ts"] = now()
+        return v
+
 
 def _read_slice(fpath, offset, length):
     """Read one chunk of a file. Returns (total, chunk) or (None, None)."""
@@ -2215,9 +2307,15 @@ def api_v1_blobs_get(viewer, data, link_id):
     if not fname:
         return {"ok": 0, "error": "unknown blob_id", "code": 404}
     offset, length = _chunk_params(data)
-    total, chunk = _read_slice(os.path.join(_blob_dir(), fname), offset, length)
-    if total is None:
-        return {"ok": 0, "error": "blob unreadable", "code": 500}
+    entry = _att_ram_get(digest)
+    if entry is not None:
+        total = len(entry["bytes"])
+        chunk = bytes(entry["bytes"][offset:offset + length])
+    else:
+        total, chunk = _read_slice(os.path.join(_blob_dir(), fname),
+                                   offset, length)
+        if total is None:
+            return {"ok": 0, "error": "blob unreadable", "code": 500}
     return {"ok": 1, "blob_id": digest, "total": total, "offset": offset,
             "eof": offset + len(chunk) >= total,
             "data_b64": base64.b64encode(chunk).decode("ascii")}
@@ -2241,10 +2339,15 @@ def api_v1_att_get(viewer, data, link_id):
     if not attachment_visible(viewer, fname):
         return {"ok": 0, "error": "attachment unavailable", "code": 404}
     offset, length = _chunk_params(data)
-    total, chunk = _read_slice(
-        os.path.join(STORAGE, "attachments", fname), offset, length)
-    if total is None:
-        return {"ok": 0, "error": "attachment unreadable", "code": 404}
+    entry = _att_ram_get(fname.split(".")[0])
+    if entry is not None:
+        total = len(entry["bytes"])
+        chunk = bytes(entry["bytes"][offset:offset + length])
+    else:
+        total, chunk = _read_slice(
+            os.path.join(STORAGE, "attachments", fname), offset, length)
+        if total is None:
+            return {"ok": 0, "error": "attachment unreadable", "code": 404}
     return {"ok": 1, "path": "/file/attachments/" + fname, "total": total,
             "offset": offset, "eof": offset + len(chunk) >= total,
             "data_b64": base64.b64encode(chunk).decode("ascii")}
@@ -2255,6 +2358,9 @@ def serve_blob_file(path, data, request_id, link_id, remote_identity, requested_
     fname = path.rsplit("/", 1)[-1]
     if not re.match(r"^[0-9a-f]{32}\.[a-z0-9]{1,8}$", fname):
         return b"not found"
+    entry = _att_ram_get(fname.split(".")[0])
+    if entry is not None:
+        return bytes(entry["bytes"])
     fpath = os.path.join(_blob_dir(), fname)
     if os.path.isfile(fpath):
         with open(fpath, "rb") as f:
@@ -2269,20 +2375,32 @@ def _blob_commit(blob, name, mime, by=None):
 
     Storage law (tay): files live native on disk as content-addressed
     <sha256>.<ext>; the database carries only name/mime/size/path metadata
-    (blobs table), never bytes."""
+    (blobs table), never bytes. Ephemeral "attachments" mode (P2) keeps
+    the same law but holds the bytes in ATT_RAM under a TTL instead of
+    the disk; serving resolves RAM-first, metadata persists normally."""
     digest = hashlib.sha256(blob).hexdigest()[:32]
     ext = safe_ext(name, mime)
     fname = f"{digest}.{ext}"
-    bdir = _blob_dir()
-    os.makedirs(bdir, exist_ok=True)
-    fpath = os.path.join(bdir, fname)
-    if not os.path.exists(fpath):
-        try:
-            with open(fpath, "wb") as f:
-                f.write(blob)
-        except OSError as e:
-            RNS.log(f"blob store failed for {fname}: {e}", RNS.LOG_ERROR)
-            return None
+    if _attachment_mode() == "ephemeral":
+        # P2: bytes stay in RAM under the same law (DB carries metadata
+        # only, never bytes); no disk write. Serve paths resolve
+        # RAM-first for the digest, while the /file/blobs/<fname>
+        # handler below stays registered so remote fetches route and
+        # land in the RAM branch -- until the TTL (or the admin flips
+        # back to "saved").
+        _att_ram_put(digest, blob, name, mime, by)
+    else:
+        bdir = _blob_dir()
+        os.makedirs(bdir, exist_ok=True)
+        fpath = os.path.join(bdir, fname)
+        if not os.path.exists(fpath):
+            try:
+                with open(fpath, "wb") as f:
+                    f.write(blob)
+            except OSError as e:
+                RNS.log(f"blob store failed for {fname}: {e}",
+                        RNS.LOG_ERROR)
+                return None
     if node_destination is not None:
         node_destination.register_request_handler(
             "/file/blobs/" + fname, serve_blob_file,
@@ -2353,14 +2471,21 @@ def api_v1_blobs_put_init(viewer, data, link_id):
     name = (data.get("name") or "").strip()[:128]
     mime = (data.get("mime") or "").strip()[:64]
     upload_id = os.urandom(16).hex()
-    sdir = _blob_staging_dir()
-    os.makedirs(sdir, exist_ok=True)
-    part = os.path.join(sdir, upload_id + ".part")
-    with open(part, "wb"):
-        pass
+    if _attachment_mode() == "ephemeral":
+        # P2: staging stays in RAM too -- init/chunk touch no disk;
+        # finish commits the assembled bytes per the mode AT THAT MOMENT
+        staging = None
+    else:
+        sdir = _blob_staging_dir()
+        os.makedirs(sdir, exist_ok=True)
+        part = os.path.join(sdir, upload_id + ".part")
+        with open(part, "wb"):
+            pass
+        staging = part
     with BLOB_UPLOADS_LOCK:
         BLOB_UPLOADS[upload_id] = {
-            "path": part, "name": name, "mime": mime, "size": size,
+            "path": staging, "mem": None if staging else bytearray(),
+            "name": name, "mime": mime, "size": size,
             "offset": 0, "user": viewer, "ts": now(),
         }
     return {"ok": 1, "upload_id": upload_id, "chunk_size": BLOB_UPLOAD_CHUNK,
@@ -2392,14 +2517,22 @@ def api_v1_blobs_put_chunk(viewer, data, link_id):
         return {"ok": 0, "error": "offset out of range", "code": 400}
     if offset + len(chunk) > up["size"]:
         return {"ok": 0, "error": "chunk overruns declared size", "code": 400}
-    try:
-        with open(up["path"], "r+b") as f:
-            f.seek(offset)
-            f.write(chunk)
-    except OSError as e:
-        RNS.log(f"blob chunk write failed ({up['name']}@{offset}): {e}",
-                RNS.LOG_ERROR)
-        return {"ok": 0, "error": "storage failed", "code": 500}
+    if up.get("mem") is not None:
+        with BLOB_UPLOADS_LOCK:
+            cur = BLOB_UPLOADS.get(upload_id)
+            if cur is None:
+                return {"ok": 0, "error": "unknown upload_id", "code": 404}
+            cur["mem"][offset:offset + len(chunk)] = chunk
+        up = cur
+    else:
+        try:
+            with open(up["path"], "r+b") as f:
+                f.seek(offset)
+                f.write(chunk)
+        except OSError as e:
+            RNS.log(f"blob chunk write failed ({up['name']}@{offset}): {e}",
+                    RNS.LOG_ERROR)
+            return {"ok": 0, "error": "storage failed", "code": 500}
     received = offset + len(chunk)
     with BLOB_UPLOADS_LOCK:
         if received > up["offset"]:
@@ -2428,18 +2561,24 @@ def api_v1_blobs_put_finish(viewer, data, link_id):
         return {"ok": 0, "error": "incomplete upload "
                 f"({up['offset']}/{up['size']} bytes)", "code": 400,
                 "received": up["offset"]}
-    try:
-        with open(up["path"], "rb") as f:
-            blob = f.read()
-    except OSError as e:
-        RNS.log(f"blob finish read failed ({up['name']}): {e}", RNS.LOG_ERROR)
-        return {"ok": 0, "error": "storage failed", "code": 500}
+    if up.get("mem") is not None:
+        with BLOB_UPLOADS_LOCK:
+            blob = bytes(up["mem"])
+    else:
+        try:
+            with open(up["path"], "rb") as f:
+                blob = f.read()
+        except OSError as e:
+            RNS.log(f"blob finish read failed ({up['name']}): {e}",
+                    RNS.LOG_ERROR)
+            return {"ok": 0, "error": "storage failed", "code": 500}
     if len(blob) != up["size"]:
         return {"ok": 0, "error": "staged bytes do not match declared size",
                 "code": 400}
     res = _blob_commit(blob, up["name"], up["mime"], by=up["user"])
     try:
-        os.remove(up["path"])
+        if up.get("path"):
+            os.remove(up["path"])
     except OSError:
         pass
     if res is None:
@@ -2469,11 +2608,19 @@ def _resolve_v1_attachments(atts):
             fname = _blob_fname(bid)
             if not fname:
                 return None, "unknown blob_id: " + bid[:12]
-            try:
-                with open(os.path.join(_blob_dir(), fname), "rb") as f:
-                    blob = f.read()
-            except OSError:
-                return None, "blob unreadable"
+            entry = _att_ram_get(bid)
+            if entry is not None:
+                blob = bytes(entry["bytes"])
+                # the RAM registry carries the upload's original
+                # metadata; prefer it over the content-derived fname
+                name = name or (entry.get("name") or None)
+                mime = mime or (entry.get("mime") or None)
+            else:
+                try:
+                    with open(os.path.join(_blob_dir(), fname), "rb") as f:
+                        blob = f.read()
+                except OSError:
+                    return None, "blob unreadable"
             ext = fname.rsplit(".", 1)[-1]
             mime = mime or EXT_MIME.get(ext, "application/octet-stream")
             name = name or fname
@@ -3161,11 +3308,12 @@ def api_v1_whoami(viewer, data, link_id):
               "color": r["color"]} for r in rows]
     is_admin = any(r["perms"] & PERMS["ADMIN"] for r in roles)
     icon = _cfg_get("guild_icon", "") or None
+    banner = _cfg_get("banner", "") or None
     return {"ok": 1, "user_hash": viewer, "username": get_username(viewer),
             "is_moderator": is_moderator(viewer) or is_admin,
             "is_admin": is_admin, "roles": roles,
             "guild": {"name": _cfg_get("guild_name", "") or GUILD_NAME,
-                      "icon": icon}}
+                      "icon": icon, "banner": banner}}
 
 def _register_mod_endpoint(path, verb, apply_fn):
     """Register one moderator-gated JSON endpoint. `apply_fn(viewer, target,
@@ -3243,6 +3391,8 @@ SERVER_CONFIG_KEYS = {
     "slowmode": "0",             # seconds between posts, 0 = off
     "motd": "",
     "guild_icon": "",            # empty = no icon; else a stored blob_id
+    "banner": "",                # empty = no banner; else a stored blob_id
+    "attachments": "saved",      # saved | ephemeral (P2: RAM-only bytes)
 }
 
 def _require_admin(viewer):
@@ -3285,6 +3435,42 @@ def api_v1_admin_config(viewer, data, link_id):
             return {"ok": 0, "error": "guild_icon must be a stored blob_id",
                     "code": 400}
         value = digest
+    if key == "banner" and value:
+        # P5: same shape as guild_icon -- the asset rides the standard
+        # blob store; the config only references it
+        digest = value.strip().lower()
+        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
+                or not _blob_fname(digest):
+            return {"ok": 0, "error": "banner must be a stored blob_id",
+                    "code": 400}
+        value = digest
+    if key == "banner" and value:
+        # P5: same shape as guild_icon -- the asset rides the standard
+        # blob store; the config only references it
+        digest = value.strip().lower()
+        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
+                or not _blob_fname(digest):
+            return {"ok": 0, "error": "banner must be a stored blob_id",
+                    "code": 400}
+        value = digest
+    if key == "banner" and value:
+        # P5: same shape as guild_icon -- the asset rides the standard
+        # blob store; the config only references it
+        digest = value.strip().lower()
+        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
+                or not _blob_fname(digest):
+            return {"ok": 0, "error": "banner must be a stored blob_id",
+                    "code": 400}
+        value = digest
+    if key == "banner" and value:
+        # P5: same shape as guild_icon -- the asset rides the standard
+        # blob store; the config only references it
+        digest = value.strip().lower()
+        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
+                or not _blob_fname(digest):
+            return {"ok": 0, "error": "banner must be a stored blob_id",
+                    "code": 400}
+        value = digest
     if key == "slowmode":
         try:
             secs = int(value)
@@ -3293,6 +3479,9 @@ def api_v1_admin_config(viewer, data, link_id):
         if secs < 0 or secs > 3600:
             return {"ok": 0, "error": "slowmode must be 0-3600", "code": 400}
         value = str(secs)
+    if key == "attachments" and value not in ("saved", "ephemeral"):
+        return {"ok": 0, "error": "attachments must be 'saved' or "
+                "'ephemeral'", "code": 400}
     old = _cfg_get(key, SERVER_CONFIG_KEYS[key])
     _cfg_set(key, value)
     _audit(viewer, "config.set", key, "%s -> %s" % (old, value))

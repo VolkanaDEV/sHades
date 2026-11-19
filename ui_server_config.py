@@ -100,7 +100,7 @@ class _Tab:
 
     # -- widget scaffolding --------------------------------------------------
     def make_content(self):
-        self.box = BoxLayout(orientation="vertical", spacing=dp(4))
+        self.box = BoxLayout(orientation="vertical", spacing=dp(8))
         self._build_controls()
         scroll = ScrollView(size_hint=(1, 1))
         grid = GridLayout(cols=1, size_hint_y=None, spacing=dp(3),
@@ -204,9 +204,26 @@ class GeneralTab(_Tab):
         r_row.add_widget(r_save)
         self.box.add_widget(r_row)
 
-        icon_row = BoxLayout(size_hint_y=None, height=_scaled(40),
-                             spacing=dp(4))
-        self.icon_widget = Image(size_hint_x=None, width=_scaled(36),
+        # attachments persistence (P3): the live mode, one tap to flip.
+        # Ephemeral means bytes ride the server RAM registry (TTL +
+        # cap) instead of disk: new uploads only, flip-back is safe.
+        a_row = BoxLayout(size_hint_y=None, height=_scaled(32),
+                          spacing=dp(4))
+        self.att_state = _row_label("attachments: saved", w=0.35)
+        self.att_saved_btn = _btn("saved", 80, 30)
+        self.att_eph_btn = _btn("ephemeral", 110, 30)
+        self.att_saved_btn.bind(
+            on_press=lambda _i: self._save_attachments("saved"))
+        self.att_eph_btn.bind(
+            on_press=lambda _i: self._save_attachments("ephemeral"))
+        a_row.add_widget(self.att_state)
+        a_row.add_widget(self.att_saved_btn)
+        a_row.add_widget(self.att_eph_btn)
+        self.box.add_widget(a_row)
+
+        icon_row = BoxLayout(size_hint_y=None, height=_scaled(56),
+                             spacing=dp(8))
+        self.icon_widget = Image(size_hint_x=None, width=_scaled(56),
                                  allow_stretch=True, keep_ratio=True)
         pick = _btn("set icon...", 110, 30)
         clear = _btn("clear", 60, 30)
@@ -217,6 +234,22 @@ class GeneralTab(_Tab):
         icon_row.add_widget(clear)
         self.box.add_widget(icon_row)
 
+        # P10b: banner preview strip -- the picked/committed banner is
+        # visible in the tab instead of a blind flip
+        self.banner_widget = Image(size_hint_y=None,
+                                   height=_scaled(56),
+                                   allow_stretch=True, keep_ratio=False)
+        self.box.add_widget(self.banner_widget)
+        banner_row = BoxLayout(size_hint_y=None, height=_scaled(40),
+                               spacing=dp(8))
+        bpick = _btn("set banner...", 110, 30)
+        bclear = _btn("clear", 60, 30)
+        bpick.bind(on_press=lambda _i: self._open_banner_chooser())
+        bclear.bind(on_press=lambda _i: self._clear_banner())
+        banner_row.add_widget(bpick)
+        banner_row.add_widget(bclear)
+        self.box.add_widget(banner_row)
+
     def do_save_key(self, key):
         entry = self.entries[key]
         val = entry.text  # read on the main thread; the worker must not
@@ -224,6 +257,21 @@ class GeneralTab(_Tab):
         def job():
             return self.client.guild_api.admin_config(key, val)
         self._post(job, on_ok=self.reload, label="save %s" % key)
+
+    def _save_attachments(self, value):
+        # main-thread decision; the worker only carries the string,
+        # same shape as do_save_key
+        def job():
+            return self.client.guild_api.admin_config("attachments", value)
+        self._post(job, on_ok=self.reload,
+                   label="set attachments " + value)
+
+    def _reflect_attachments(self, mode):
+        mode = mode if mode in ("saved", "ephemeral") else "saved"
+        self.att_state.text = "attachments: " + mode
+        # the ACTIVE mode is disabled: pressing it would post a no-op
+        self.att_saved_btn.disabled = (mode == "saved")
+        self.att_eph_btn.disabled = (mode == "ephemeral")
 
     def do_save_motd(self):
         self.do_save_key("motd")
@@ -244,9 +292,17 @@ class GeneralTab(_Tab):
                     self.entries[key].text = str(cfg.get(key, ""))
                 except Exception:
                     pass
+        self._reflect_attachments(cfg.get("attachments", "saved"))
         icon = (cfg.get("guild_icon") or "").strip()
         if icon:
             self.screen.load_icon_into(self.icon_widget, icon)
+        else:
+            self.icon_widget.texture = None
+        banner = (cfg.get("banner") or "").strip()
+        if banner:
+            self.screen.load_icon_into(self.banner_widget, banner)
+        else:
+            self.banner_widget.texture = None
         self._load_audit()
 
     def _load_audit(self):
@@ -267,6 +323,11 @@ class GeneralTab(_Tab):
 
     # -- icon picker ---------------------------------------------------------
     def _open_icon_chooser(self):
+        app = App.get_running_app()
+        if app is not None and getattr(
+                app, "_android_platform", lambda: False)():
+            app.open_file_chooser(purpose="icon")
+            return
         box = BoxLayout(orientation="vertical")
         chooser = FileChooserListView(
             path=os.path.expanduser("~"),
@@ -297,6 +358,44 @@ class GeneralTab(_Tab):
         def job():
             return self.client.guild_api.admin_config("guild_icon", "")
         self._post(job, on_ok=self.reload, label="clear icon")
+
+    # -- banner picker (P5): rides the guild-icon chooser flow ---------
+    def _open_banner_chooser(self):
+        app = App.get_running_app()
+        if app is not None and getattr(
+                app, "_android_platform", lambda: False)():
+            app.open_file_chooser(purpose="banner")
+            return
+        box = BoxLayout(orientation="vertical")
+        chooser = FileChooserListView(
+            path=os.path.expanduser("~"),
+            filters=["*.png", "*.jpg", "*.jpeg", "*.webp", "*.gif"])
+        cancel = _btn("cancel", 90, 30)
+        pick = _btn("use this file", 130, 30)
+        buttons = BoxLayout(size_hint_y=None, height=_scaled(34),
+                            spacing=dp(4))
+        buttons.add_widget(cancel)
+        buttons.add_widget(pick)
+        box.add_widget(chooser)
+        box.add_widget(buttons)
+        popup = Popup(title="choose a banner", content=box,
+                      size_hint=(0.85, 0.85))
+        self._banner_chooser_popup = popup
+        cancel.bind(on_press=lambda _i: popup.dismiss())
+        pick.bind(on_press=lambda _i: self._banner_file_selected(chooser,
+                                                                 popup))
+        popup.open()
+
+    def _banner_file_selected(self, chooser, popup):
+        selection = chooser.selection
+        popup.dismiss()
+        if selection:
+            self.screen._apply_banner_file(selection[0])
+
+    def _clear_banner(self):
+        def job():
+            return self.client.guild_api.admin_config("banner", "")
+        self._post(job, on_ok=self.reload, label="clear banner")
 
 
 # ---------------------------------------------------------------------------
@@ -816,6 +915,41 @@ class ServerConfigScreen(Screen):
                 Clock.schedule_once(lambda dt: self._refresh_general(), 0)
             else:
                 self.client._set_status("icon config: %s"
+                                        % res2.get("error"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_banner_file(self, path):
+        """FileChooser result: upload through the standard blob flow, then
+        set banner to the returned blob_id (P5 mirrors _apply_icon_file;
+        the strip shows it on the next whoami the client ingests)."""
+        name = os.path.basename(path)
+        mime = "image/png"
+        if name.lower().endswith((".jpg", ".jpeg")):
+            mime = "image/jpeg"
+        elif name.lower().endswith(".webp"):
+            mime = "image/webp"
+        elif name.lower().endswith(".gif"):
+            mime = "image/gif"
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            self.client._set_status("banner read failed: %r" % e)
+            return
+
+        def work():
+            res = self.client.guild_api.blobs_put(name, mime, data)
+            if not res.get("ok"):
+                self.client._set_status("banner upload: %s"
+                                        % res.get("error"))
+                return
+            blob_id = res.get("blob_id")
+            res2 = self.client.guild_api.admin_config("banner", blob_id)
+            if res2.get("ok"):
+                self.client._set_status("banner set")
+                Clock.schedule_once(lambda dt: self._refresh_general(), 0)
+            else:
+                self.client._set_status("banner config: %s"
                                         % res2.get("error"))
         threading.Thread(target=work, daemon=True).start()
 

@@ -6,7 +6,8 @@ Pins down:
   - setting it accepts a stored blob_id (32-hex digest reachable by
     /api/v1/blobs/get) and an empty value (clears);
   - non-blob junk rejected and stored nothing;
-  - /api/v1/whoami surfaces {guild: {name, icon}} to every member;
+  - /api/v1/whoami surfaces {guild: {name, icon, banner}} to
+    every member;
   - the icon value round-trips: config read-back and whoami agree;
   - non-admin writes stay 403.
 """
@@ -71,6 +72,8 @@ def main():
           r.get("ok") == 1 and isinstance(r.get("guild"), dict), r)
     check("guild name flows through whoami", r["guild"].get("name"), r)
     check("no icon until one is set", not r["guild"].get("icon"), r)
+    check("no banner until one is set (P5)",
+          not r["guild"].get("banner"), r)
 
     # ---------- set the icon ----------
     r = call("/api/v1/admin/config", {"key": "guild_icon", "value": blob_id})

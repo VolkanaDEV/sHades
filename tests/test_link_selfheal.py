@@ -542,6 +542,314 @@ def test_wait_path_mtu_bounded_gives_up():
     assert waited["n"] == 3, waited
 
 
+def test_bootlog_export_contract():
+    """v0.36.2: the boot log mirrors into the user-visible Downloads
+    collection (MediaStore on API 29+, public dir API 26-28) so crash
+    triage needs no adb; a CLEAN boot must also produce a copy (the
+    v0.36.1 device miss: only milestone/crash fires, both absent on a
+    healthy boot). Java-side copy only (v0.15 jarray lesson)."""
+    main_path = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "main.py")
+    client_path = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "kivy_client.py")
+    main_src = open(main_path, encoding="utf-8").read()
+    client_src = open(client_path, encoding="utf-8").read()
+
+    assert "def _export_bootlog_for_user" in main_src, "export fn exists"
+    assert "MediaStore$Downloads" in main_src, "API 29+ route"
+    assert "external_primary" in main_src, \
+        "literal volume name (jnius resolves only nested-class fields)"
+    assert "VOLUME_EXTERNAL_PRIMARY" not in main_src, \
+        "the parent-class field lookup threw on tay's device (log)"
+    assert "_EXPORT_MIN_INTERVAL" in main_src and \
+        "_LAST_EXPORT_TS" in main_src, "30 s attempt-throttle knob"
+    assert "DIRECTORY_DOWNLOADS" in main_src, "API 26-28 fallback route"
+    assert "_display_name = " in main_src and "'sHades_boot.log'" \
+        in main_src, "existing-row overwrite (no (1).log stacking)"
+    # v0.36.4: nio copy -- Files.copy(Path, OutputStream) is the legal
+    # overload; FileInputStream/InputStream targets never resolved
+    assert "java.nio.file.Paths" in main_src and \
+        "java.nio.file.Files" in main_src and \
+        ".copy(p9.get(src_path), out)" in main_src, \
+        "nio copy on the legal overload"
+    # the crash path mirrors the fatal log even when rendering is dead
+    tb_idx = main_src.index("--- TRACEBACK ---")
+    crash_hook = main_src.index("_export_bootlog_for_user()", tb_idx)
+    assert crash_hook < main_src.index("sys.exit(1)", tb_idx), \
+        "crash hook before exit"
+    # v0.36.2: tee-time fire -- a clean boot leaves a copy too
+    tee_idx = main_src.index("    _install_tee()\n")
+    boot_export = main_src.index("_export_bootlog_for_user()", tee_idx)
+    assert boot_export < main_src.index('print("PYTHON: main() starting'
+                                        '"', tee_idx), \
+        "first mirror runs before app import"
+    # milestones refresh the mirror while BOOT_DEBUG is on, and the
+    # v0.36.2 whoami-success mirror is the second call site
+    assert client_src.count("from main import _export_bootlog_for_user"
+                            ) == 2, "milestone + whoami-success mirrors"
+    # degraded bridge never raises and never returns True off-device
+    import main as mc
+    assert mc._export_bootlog_for_user() is False, "dev no-op"
+    print("PASS  bootlog export contract")
+
+
+def test_whoami_retry_contract():
+    """v0.36.2: an early whoami failure must not permanently cost the
+    admin menu (the device miss: server-config item gated on
+    app.i_am_admin, set only by a successful whoami). Bounded retry,
+    knobs shrinkable in lanes; a whoami success mirrors the log."""
+    import time as _time
+    import kivy.clock as kclock
+    client_path = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "kivy_client.py")
+    client_src = open(client_path, encoding="utf-8").read()
+    assert "_WHOAMI_RETRY_N = 2" in client_src and \
+        "_WHOAMI_RETRY_S = 4.0" in client_src, "knobs live in the class"
+    assert client_src.count("whoami failed:") == 1 and \
+        "tries_left - 1" in client_src, "bounded schedule, no hard loop"
+    # the whoami verdict (incl. user_hash) rides the boot log so a Downloads
+    # copy answers a missing admin item without adb (v0.36.3)
+    assert "whoami ok: admin=%s" in client_src and \
+        '"user_hash=%s"' in client_src, "verdict print ships"
+
+    import kivy_client as kc
+    app = kc.sHadesClientApp()
+
+    class FlakyApi:
+        def __init__(self, n_fail):
+            self.n = 0
+            self.n_fail = n_fail
+
+        def whoami(self):
+            self.n += 1
+            if self.n <= self.n_fail:
+                raise RuntimeError("net down (test)")
+            return {"ok": 1, "is_admin": True, "is_moderator": True,
+                    "roles": [],
+                    "guild": {"name": "T", "icon": "", "banner": ""}}
+
+    app._WHOAMI_RETRY_S = 0.05
+    api = FlakyApi(2)
+    app.guild_api = api
+    app._fetch_whoami()
+    i = 0
+    while api.n < 3 and i < 40:
+        _time.sleep(0.05)
+        kclock.Clock.tick()
+        i += 1
+    assert api.n == 3, "all attempts fired (got %d)" % api.n
+    assert app.i_am_admin is True, "flag lands after the late success"
+
+    api2 = FlakyApi(99)
+    app.guild_api = api2
+    app._fetch_whoami()
+    i = 0
+    while api2.n < 3 and i < 40:
+        _time.sleep(0.05)
+        kclock.Clock.tick()
+        i += 1
+    _time.sleep(0.2)
+    kclock.Clock.tick()
+    assert api2.n == 3, "permanent failure still bounded at 3 (got %d)" \
+        % api2.n
+    print("PASS  whoami retry contract")
+
+
+def _fake_jnius_device(main_mod, tmp_log):
+    """Install a fake jnius module modelling the p4a bridge (API 29+):
+    MediaStore insert/query, ContentResolver streams, and the REAL
+    java.nio Files.copy(Path, OutputStream) overload -- every call's
+    argument types are captured so the lane proves the bridge shape,
+    not just source strings. Files.copy raises if handed the illegal
+    (InputStream, OutputStream) pair, like real Java does."""
+    import types
+    import sys as _sys
+    calls = []
+
+    class FakeOut:
+        def __init__(self):
+            self.buf = []
+
+        def write(self, b):
+            self.buf.append(b)
+
+        def close(self):
+            pass
+
+    class FakePath:
+        pass
+
+    class FakeQueryCursor:
+        def __init__(self, has_row):
+            self.has_row = has_row
+
+        def moveToFirst(self):
+            return self.has_row
+
+        def getLong(self, _ix):
+            return 77
+
+        def close(self):
+            pass
+
+    class FakeResolver:
+        def __init__(self):
+            self.has_row = False
+
+        def query(self, coll, proj, sel, args, order):
+            calls.append(("query", sel))
+            return FakeQueryCursor(self.has_row)
+
+        def insert(self, coll, cv):
+            calls.append(("insert", dict(cv)))
+            self.has_row = True
+            return "uri://dl/1"
+
+        def openOutputStream(self, uri):
+            calls.append(("openout", uri))
+            return FakeOut()
+
+    class ContentVal(dict):
+        def put(self, k, v):
+            self[k] = v
+
+    class Files:
+        @staticmethod
+        def copy(src, out):
+            if isinstance(src, FakeOutputStream):
+                raise TypeError(
+                    "Files.copy(InputStream, OutputStream) is not an "
+                    "overload -- exactly the shipped bug")
+            assert isinstance(src, FakePath), "source must be a Path"
+            out.write(open(src.name, "rb").read())
+            calls.append(("copy", "path,out"))
+            return src
+
+    class FakeOutputStream:
+        pass
+
+    class Paths:
+        @staticmethod
+        def get(name):
+            assert isinstance(name, str)
+            p = FakePath()
+            p.name = name
+            return p
+
+    class DL:
+        def __init__(self):
+            raise AssertionError("Downloads is called as a class")
+
+        @staticmethod
+        def getContentUri(vol):
+            calls.append(("coll", vol))
+            assert vol == "external_primary", (
+                "parent-class field resolution -- literal volume name, "
+                "jnius finds only nested-class-declared fields")
+            return "coll://dl"
+
+    class CUris:
+        @staticmethod
+        def withAppendedId(coll, row_id):
+            assert row_id == 77
+            return "uri://dl/%d" % row_id
+
+    class PyAct:
+        resolver = FakeResolver()
+        mActivity = types.SimpleNamespace(
+            getContentResolver=lambda: PyAct.resolver)
+
+    class Ver:
+        SDK_INT = 34
+
+    def autoclass(name):
+        calls.append(("ac", name))
+        return {"android.provider.MediaStore$Downloads": DL,
+                "org.kivy.android.PythonActivity": PyAct,
+                "android.os.Build$VERSION": Ver,
+                "android.content.ContentValues": ContentVal,
+                "android.content.ContentUris": CUris,
+                "java.nio.file.Paths": Paths,
+                "java.nio.file.Files": Files}[name]
+
+    fake = types.ModuleType("jnius")
+    fake.autoclass = autoclass
+    _sys.modules["jnius"] = fake
+    return calls, FakeOut
+
+
+def test_bootlog_bridge_contract():
+    """v0.36.4: the whole MediaStore bridge executes against a fake
+    jnius -- insert shape, Paths.get source, Files.copy(Path, out),
+    and the copied bytes land in the fake stream. This lane executes
+    what the static contract only texted: an illegal overload pair
+    raises here instead of silently returning False on-device."""
+    import main as main_mod
+    calls, _fakeout = _fake_jnius_device(main_mod, None)
+    try:
+        main_mod._LAST_EXPORT_TS[0] = 0.0  # order-independent lane
+        with open(main_mod._log_path(), "w", encoding="utf-8") as f:
+            f.write("== boot v0.36.4 ==\n")
+        assert main_mod._export_bootlog_for_user() is True, \
+            "clean boot export lands on-device"
+        kinds = [c[0] for c in calls]
+        assert "insert" in kinds, "no existing row -> insert"
+        assert ("copy", "path,out") in calls, \
+            "copy ran on the legal Path,OutputStream overload"
+        ac_names = [c[1] for c in calls if c[0] == "ac"]
+        assert "java.nio.file.Paths" in ac_names and \
+            "java.nio.file.Files" in ac_names, "nio classes used"
+        # overwrite lane: second run updates the known row
+        calls.clear()
+        main_mod._LAST_EXPORT_TS[0] = 0.0  # fresh attempt window
+        with open(main_mod._log_path(), "a", encoding="utf-8") as f:
+            f.write("second boot\n")
+        assert main_mod._export_bootlog_for_user() is True
+        assert ("query", "_display_name = 'sHades_boot.log'") in calls, \
+            "overwrite query before any insert"
+        assert [c[0] for c in calls].count("insert") == 0, \
+            "no (1).log stacking: query found the row, insert skipped"
+        # throttle sub-lane: within the interval there is NO MediaStore
+        # traffic; _log_path()'s own PythonActivity probe is by design
+        calls.clear()
+        main_mod._EXPORT_MIN_INTERVAL = 60.0
+        main_mod._LAST_EXPORT_TS[0] = main_mod.time.monotonic()
+        assert main_mod._export_bootlog_for_user() is False, \
+            "throttled attempt exits before the bridge"
+        bridge_calls = [c for c in calls if c[0] in
+                        ("coll", "query", "insert", "openout", "copy")]
+        assert bridge_calls == [], \
+            "no MediaStore traffic while throttled: %s" % bridge_calls
+        main_mod._EXPORT_MIN_INTERVAL = 0.0
+    finally:
+        import sys as _sys
+        del _sys.modules["jnius"]
+    print("PASS  bootlog bridge contract")
+
+
+def test_bootlog_clipboard_contract():
+    """v0.36.5: the diagnosis channel cannot ride the bridge it
+    diagnoses -- an ungated clipboard item in BOTH long-press menus
+    hands the boot-log text over the proven kivy bridge, and the
+    export prints its stage story into the tee (visible in the very
+    paste it enables)."""
+    with open("kivy_client.py", "r", encoding="utf-8") as f:
+        client_src = f.read()
+    with open("main.py", "r", encoding="utf-8") as f:
+        main_src = f.read()
+    n_items = client_src.count('"copy boot log"')
+    assert "def _copy_bootlog" in client_src and n_items == 2, (
+        "ungated item x%d + method (both menus)" % n_items)
+    assert "def _copy_bootlog" in client_src, "handoff method ships"
+    assert "boot log handed to clipboard" in client_src, (
+        "handoff prints its size into the tee")
+    assert "export: out-stream opened" in main_src, (
+        "stage print: stream open")
+    assert "export: nio copy ok" in main_src, (
+        "stage print: copy ok")
+    print("PASS  bootlog clipboard contract")
+
+
 def main():
     test_link_dead_reported_and_signalled()
     test_link_raise_reported_and_signalled()
@@ -553,7 +861,11 @@ def main():
     test_blob_linkdead_never_falls_through()
     test_wait_path_mtu_bounded_and_uses_live_path()
     test_wait_path_mtu_bounded_gives_up()
-    print("PASS: 10  FAIL: 0")
+    test_bootlog_export_contract()
+    test_whoami_retry_contract()
+    test_bootlog_bridge_contract()
+    test_bootlog_clipboard_contract()
+    print("PASS: 14  FAIL: 0")
 
 
 if __name__ == "__main__":

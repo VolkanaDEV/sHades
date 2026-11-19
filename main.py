@@ -45,6 +45,108 @@ def _log_path():
     return os.path.join(os.path.expanduser("~"), "sHades_boot.log")
 
 
+_EXPORT_MIN_INTERVAL = 30.0
+_LAST_EXPORT_TS = [0.0]
+
+
+def _export_bootlog_for_user():
+    """Mirror sHades_boot.log into the user-visible Downloads collection
+    ( tay 2026-11-19: "crashes are difficult to debug when adb is
+    unavailable" ). MediaStore.Downloads on API 29+ -- own rows need no
+    runtime permission and every file manager lists Downloads; on
+    API 26-28 the direct public Downloads dir rides the declared
+    WRITE_EXTERNAL_STORAGE. Java-side copy only (the v0.15 lesson:
+    jbyte/jarray imports fail on-device; autoclass + Files.copy is the
+    proven bridge). Never raises; off-device or degraded bridges are a
+    quiet no-op. Returns True when a copy landed in Downloads."""
+    try:
+        src_path = _log_path()
+        with open(src_path, "rb") as f:
+            if not f.read(1) and f.seek(0, 2) == 0:
+                return False  # nothing to export yet
+    except OSError:
+        return False
+    try:
+        from jnius import autoclass  # p4a only
+    except Exception:
+        return False
+    # throttle at the real attempt: a stamp placed before these
+    # probes would arm on dev no-ops and suppress a later attempt
+    now = time.monotonic()
+    if _LAST_EXPORT_TS[0] and now - _LAST_EXPORT_TS[0] < \
+            _EXPORT_MIN_INTERVAL:
+        return False
+    _LAST_EXPORT_TS[0] = now
+    try:
+        act = autoclass("org.kivy.android.PythonActivity").mActivity
+        SDK_INT = int(autoclass("android.os.Build$VERSION").SDK_INT)
+        if SDK_INT >= 29:
+            resolver = act.getContentResolver()
+            DL = autoclass("android.provider.MediaStore$Downloads")
+            coll = DL.getContentUri("external_primary")
+            uri = None
+            # find an existing row first so re-boots overwrite instead
+            # of stacking sHades_boot (1).log, (2).log, ...
+            try:
+                cur = resolver.query(coll, ["_id"],
+                                     "_display_name = "
+                                     "'sHades_boot.log'",
+                                     None, None)
+                try:
+                    if cur is not None and cur.moveToFirst():
+                        uri = autoclass(
+                            "android.content.ContentUris"
+                        ).withAppendedId(coll, cur.getLong(0))
+                finally:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+            except Exception:
+                uri = None
+            if uri is None:
+                cv = autoclass("android.content.ContentValues")()
+                cv.put("_display_name", "sHades_boot.log")
+                cv.put("mime_type", "text/plain")
+                uri = resolver.insert(coll, cv)
+                if uri is None:
+                    return False
+            try:
+                out = resolver.openOutputStream(uri)
+                print("export: out-stream opened", flush=True)
+                if out is None:
+                    return False
+                # Files.copy(Path, OutputStream) is a REAL overload
+                # (API 26+); the shipped InputStream/OutputStream pair
+                # resolved to nothing and jnius threw on-device. The
+                # source is an internal file, so Paths.get() is legal;
+                # Path objects pass through jnius by reference.
+                p9 = autoclass("java.nio.file.Paths")
+                f9 = autoclass("java.nio.file.Files")
+                f9.copy(p9.get(src_path), out)
+                print("export: nio copy ok", flush=True)
+                try:
+                    out.close()
+                except Exception:
+                    pass
+                return True
+            except Exception as e:
+                print("bootlog export failed:", e, flush=True)
+                return False
+        # API 26-28: legacy public Downloads dir
+        env = autoclass("android.os.Environment")
+        dest = env.getExternalStoragePublicDirectory(
+            env.DIRECTORY_DOWNLOADS)
+        dest_path = os.path.join(str(dest.getAbsolutePath()),
+                                 "sHades_boot.log")
+        with open(src_path, "rb") as fin, open(dest_path, "wb") as fout:
+            fout.write(fin.read())
+        return True
+    except Exception as e:
+        print("bootlog export failed:", e, flush=True)
+        return False
+
+
 class _Tee:
     """Write to the original stream AND the launch log; never raise."""
 
@@ -139,6 +241,12 @@ def main():
     """Entry point called from Android activity. All Python execution
     is wrapped so any import/runtime crash is visible on-device."""
     _install_tee()
+    # first mirror: the log exists from the tee header onward, so even
+    # a pre-app crash leaves a readable copy in Downloads
+    try:
+        _export_bootlog_for_user()
+    except Exception:
+        pass
     print("PYTHON: main() starting", flush=True)
     try:
         print("PYTHON: importing kivy_client", flush=True)
@@ -154,6 +262,11 @@ def main():
         try:
             with open(_log_path(), "a", encoding="utf-8") as f:
                 f.write("\n--- TRACEBACK ---\n" + tb)
+        except Exception:
+            pass
+        # mirror the (now fatal) log into Downloads: no adb needed
+        try:
+            _export_bootlog_for_user()
         except Exception:
             pass
         # Show the traceback immediately; the console itself remains open

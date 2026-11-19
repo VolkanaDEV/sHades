@@ -142,12 +142,20 @@ _boot_label = {"ref": None}
 
 
 def _boot_file(msg):
-    """Append a milestone to the boot log file. Never raises."""
+    """Append a milestone to the boot log file, then mirror it
+    into the user-visible Downloads collection (adb-free crash
+    triage; every milestone refreshes the mirror while
+    BOOT_DEBUG is on). Never raises."""
     try:
         from main import _log_path
         p = _log_path()
         with open(p, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
+    except Exception:
+        pass
+    try:
+        from main import _export_bootlog_for_user
+        _export_bootlog_for_user()
     except Exception:
         pass
 
@@ -1143,6 +1151,16 @@ class ImageCache:
             print("image cache error:", e)
             return None
 
+    def forget(self, key):
+        """Drop one cache entry and its file (P1 account purge: the
+        cached avatar of the account leaving must not survive it)."""
+        path = self._paths.pop(key, None)
+        if path and os.path.isfile(path):
+            try:
+                os.unlink(path)
+            except OSError as e:
+                print("image cache forget error:", e)
+
     def fetch_and_cache(self, api, path, key, ext="png"):
         if not self.begin_load(key):
             return self._paths.get(key)
@@ -1715,6 +1733,8 @@ class CtxHeaderLabel(ContextMenuMixin, Label):
         if app and getattr(app, "i_am_admin", False):
             actions.append(("server settings", True,
                             lambda: app and app._open_admin_panel()))
+        actions.append(("copy boot log", True,
+                        lambda: app and app._copy_bootlog()))
         return actions
 
 
@@ -1938,6 +1958,8 @@ if KIVY:
             if app and getattr(app, "i_am_admin", False):
                 actions.append(("server settings", True,
                                 lambda: app and app._open_admin_panel()))
+            actions.append(("copy boot log", True,
+                            lambda: app and app._copy_bootlog()))
             actions.append(("remove server", True,
                             lambda: app and app._remove_server(self.index)))
             return actions
@@ -2138,8 +2160,24 @@ if KIVY:
                 fade.bind(on_complete=lambda *_: self._next_card(card))
                 fade.start(card)
             else:
-                App.get_running_app().open_recovery_sheet(
-                    onboarding_name=self.ids.welcome_name.text)
+                name = (self.ids.welcome_name.text or "").strip()
+                if not name:
+                    # tay (2026-11): a username is required before the
+                    # first connection; the hint stays until one is typed.
+                    return
+
+                def _staged(wid):
+                    widget = self.ids.get(wid)
+                    return ((widget.text or "").strip() if widget else "")
+
+                app = App.get_running_app()
+                # tay (2026-11): the staged screen carries the hub
+                # destination alongside the profile; the sheet's connect
+                # path then uses exactly what the stager typed.
+                app._onboard_hub = (_staged("onb_hub"),
+                                    _staged("onb_node"),
+                                    _staged("onb_delivery"))
+                app.open_recovery_sheet(onboarding_name=name)
 
         def _next_card(self, card):
             self.stage += 1
@@ -2460,6 +2498,18 @@ class sHadesClientApp(MDApp):
     theme_colors = DictProperty({})
     # task 9: the composer rail's pfp; "" = letterless default disc
     composer_pfp_path = StringProperty("")
+    # P5: sidebar banner strip (above the channel list); "" = letter tile
+    banner_channel_path = StringProperty("")
+    # P5: config-pane header strip (stays empty; bindings tolerate "")
+    banner_config_path = StringProperty("")
+    # P5: letter tile shown inside the banner strip when unset
+    banner_letter = StringProperty("S")
+    # tay (2026-11): the onboarding avatar slot and the connect-screen
+    # username gate bind to these; preview mirrors my_avatar_small so
+    # the onboarding card shows the pick (or the generated pattern)
+    # live.
+    avatar_preview = StringProperty("")
+    connect_username_required = BooleanProperty(True)
     # path-state chip: the observed RNS path to the guild node
     # (offline / direct / relay + hop count), rendered by MeshPulse,
     # MeshConstellation and the header label in kv_md.kv
@@ -2512,6 +2562,7 @@ class sHadesClientApp(MDApp):
         self._channels = OrderedDict()   # name -> cid (filled on guild load)
         self._members = {}               # member_hash -> username
         self._msg_widgets = {}           # msg_id -> MessageRow
+        self._member_widgets = {}        # user_hash -> MemberRow (sidebar)
         self._popup = None
         self._poll_error_shown = False
         self._ui_populated = False
@@ -2592,9 +2643,9 @@ class sHadesClientApp(MDApp):
         self._scroll_bound = False
 
         # Banner images - random selection from media folder on startup.
-        self.banner_config_path = None
+        self.banner_config_path = ""
         self.onboarding_name = "wanderer-%04x" % random.getrandbits(16)
-        self.banner_channel_path = None
+        self.banner_channel_path = ""
         self._select_random_banners()
 
         # Avatar pfp paths (set by _save_pfp_crop)
@@ -2630,12 +2681,12 @@ class sHadesClientApp(MDApp):
         tay (receipt 2026-11-19): "cull the media images, it's bloating
         the repo and they are random placeholders" - the fork's 18 MB
         z-image-turbo set is gone from the tree and the APK. The kv
-        widgets tolerate the None source (source: app.banner_... or '').
+        widgets tolerate the empty source (source: app.banner_... or '').
         If real banners ever return, land them as vetted assets, not
         an 18 MB placeholder folder that ships in every binary.
         """
-        self.banner_config_path = None
-        self.banner_channel_path = None
+        self.banner_config_path = ""
+        self.banner_channel_path = ""
 
     # -- UI theme / config ----------------------------------------------
 
@@ -2773,6 +2824,17 @@ class sHadesClientApp(MDApp):
         if BOOT_DEBUG:
             _boot_mark("on_start")
         self._apply_system_gesture_exclusions()
+        # tay (2026-11): '/' pops the command palette for live selections.
+        # The channel input watches its own text: a bare '/' opens the
+        # palette with the filter seeded from the input, everything else
+        # keeps the existing send path (kivy_client._handle_slash).
+        try:
+            _main = self.root.get_screen("main")
+            _msg = _main.ids.get("msg_input")
+            if _msg:
+                _msg.bind(text=self._on_live_slash)
+        except Exception as _exc:
+            _boot_file("slash-live bind unavailable: %s" % _exc)
         # Try to resume a saved session
         sess = self._load_session()
         # fork merge: the identity file is the sole carrier of
@@ -2811,14 +2873,24 @@ class sHadesClientApp(MDApp):
             # loading placeholder until their bytes arrive.
             Clock.schedule_once(self._load_history_ui, 2.0)
         else:
-            # Fresh install: connect to the default community hub without
-            # making the user type a server address. The connect screen stays
-            # up (showing progress) and is used as the fallback if the
-            # default hub is unreachable, so a fresh install is never locked
-            # out of the app.
-            if BOOT_DEBUG:
-                _boot_mark("fresh install -> default hub")
-            self._auto_connect_default_hub()
+            # Fresh install: tay (2026-11), profile staging must be the
+            # very first screen presented when no extant profile is
+            # saved. The staged screen carries the hub destination and
+            # guild-hash fields and replaces the standalone connect
+            # screen for this path; completing it mints the profile and
+            # then connects. A restored or previously completed profile
+            # keeps the auto-connect fallthrough so upgrades never see
+            # staging twice.
+            if os.path.isfile(self._portable_profile_path()):
+                if BOOT_DEBUG:
+                    _boot_mark("profile exists -> default hub")
+                self._auto_connect_default_hub()
+            else:
+                if BOOT_DEBUG:
+                    _boot_mark("fresh install -> profile staging first")
+                self.root.get_screen("onboarding").stage = 0
+                self.root.current = "onboarding"
+                self._set_status("Stage your profile: name, photo, hub address.")
 
     def _onboarding_path(self):
         return os.path.join(_app_data_dir(), "onboarding.json")
@@ -2850,10 +2922,20 @@ class sHadesClientApp(MDApp):
                        "avatar": getattr(self, "my_avatar_small", None)}, stream)
         os.replace(temp, path)
 
-    def complete_onboarding(self, name):
-        """Create a durable local identity before the first connection."""
+    def complete_onboarding(self, name, hub_data=None):
+        """Create a durable local identity before the first connection.
+
+        tay (2026-11): a username is required before the first hub
+        connection -- the staged "wanderer-hex" name is only a prefilled
+        hint; if the user clears it the flow stops before identity
+        creation rather than silently minting a name.
+        """
         cleaned = re.sub(r"[^a-zA-Z0-9_. -]", "", name or "").strip()[:24]
-        self.username = cleaned or self.onboarding_name
+        if not cleaned:
+            self._set_status("A username is required before connecting.")
+            self.root.current = "onboarding"
+            return
+        self.username = cleaned
         self._portable_name = self.username
         os.makedirs(_app_data_dir(), exist_ok=True)
         try:
@@ -2861,10 +2943,14 @@ class sHadesClientApp(MDApp):
         except Exception as exc:
             self._set_status("Identity creation failed: %s" % exc)
             return
-        try:
-            self._create_generated_avatar(self.username)
-        except (OSError, ValueError) as e:
-            print("avatar preview unavailable:", repr(e))
+        if not (getattr(self, "my_avatar_small", None)
+                and os.path.isfile(str(self.my_avatar_small))):
+            # tay (2026-11): cheaply generated from the username when the
+            # user did not pick a photo during onboarding.
+            try:
+                self._create_generated_avatar(self.username)
+            except (OSError, ValueError) as e:
+                print("avatar preview unavailable:", repr(e))
         self._save_portable_profile()
         with open(self._onboarding_path(), "w", encoding="utf-8") as f:
             json.dump({"name": self.username, "completed": True}, f)
@@ -2874,7 +2960,16 @@ class sHadesClientApp(MDApp):
         # popup rides the fork's show_qr pattern; the boot's
         # client_identity lifecycle is untouched (read-only from_file).
         Clock.schedule_once(lambda dt: self.show_blank_card(), 0.4)
-        self._auto_connect_default_hub()
+        # tay (2026-11): the staged hub destination, when typed, is the
+        # connect target; an empty hub field keeps the community-hub
+        # default so a fresh install is never locked out.
+        hub, node_hash, delivery_hash = (hub_data or ("", "", ""))
+        if (hub or "").strip():
+            self.connect_to_guild(hub, self.username,
+                                  node_hash=node_hash or "",
+                                  delivery_hash=delivery_hash or "")
+        else:
+            self._auto_connect_default_hub()
 
     def _blank_card_payload(self, ident):
         """Payload for the onboarding blank card; None if unusable.
@@ -2961,7 +3056,25 @@ class sHadesClientApp(MDApp):
         except Exception as e:
             print("generated avatar upload pending:", repr(e))
 
-    def open_command_palette(self):
+    def _on_live_slash(self, inst, value):
+        """tay (2026-11): '/' pops the command palette for live
+        selections. Only a bare '/' triggers it: anything longer has
+        been completed by a pick or is a literal command line and keeps
+        the normal send path. A pick sets the suppression flag before it
+        writes the completed command back, so the write-back never
+        re-opens the palette."""
+        if getattr(self, "_suppress_live_slash", False):
+            return
+        if getattr(self, "_palette_popup", None) is not None:
+            return
+        try:
+            text = (value or "").strip()
+        except Exception:
+            return
+        if text == "/":
+            self.open_command_palette(seed="/")
+
+    def open_command_palette(self, seed=None):
         """Tier-2 command palette (tay's correction 2026-11): the
         slash-command surface for bot & script integration.
 
@@ -2998,6 +3111,7 @@ class sHadesClientApp(MDApp):
         popup = Popup(title="Slash commands", content=box,
                       size_hint=(0.9, 0.75))
         self._palette_popup = popup
+        popup.bind(on_dismiss=lambda *_: setattr(self, "_palette_popup", None))
 
         def _prefill(inst=None, cmd=""):
             popup.dismiss()
@@ -3006,6 +3120,10 @@ class sHadesClientApp(MDApp):
                 inp = main.ids.msg_input
             except Exception:
                 return
+            # tay (2026-11): the write-back would re-fire the live-slash
+            # watcher (the completed text also starts with '/'); suppress
+            # for this frame so the pick finalizes instead of reopening.
+            self._suppress_live_slash = True
             inp.text = cmd + " "
 
             def focus(dt):
@@ -3014,6 +3132,8 @@ class sHadesClientApp(MDApp):
                 except Exception:
                     pass
             Clock.schedule_once(focus, 0)
+            Clock.schedule_once(
+                lambda _dt: setattr(self, "_suppress_live_slash", False), 0)
 
         def render(*_):
             query = (filt.text or "").strip().lower()
@@ -3051,6 +3171,12 @@ class sHadesClientApp(MDApp):
         filt.bind(text=render)
         render(filt, None)
         popup.open()
+        # tay (2026-11): a live '/'-trigger seeds the filter from the
+        # channel input and takes the keyboard, so the palette is the
+        # selection surface while typing.
+        if seed:
+            filt.text = seed
+        filt.focus = True
         note.text = "client commands + hub dispatcher (fetching...)"
         Clock.schedule_once(lambda dt: fetch_hub(), 0)
 
@@ -3121,7 +3247,8 @@ class sHadesClientApp(MDApp):
             save.disabled = False
             if success and onboarding_name is not None:
                 sheet.dismiss()
-                self.complete_onboarding(onboarding_name)
+                self.complete_onboarding(
+                    onboarding_name, getattr(self, "_onboard_hub", None))
                 self._set_status(detail)
 
         def save_kit(*_):
@@ -3144,7 +3271,9 @@ class sHadesClientApp(MDApp):
 
         save.bind(on_press=save_kit)
         later.bind(on_press=lambda *_: (sheet.dismiss(),
-                   self.complete_onboarding(onboarding_name)) if onboarding_name is not None
+                   self.complete_onboarding(
+                       onboarding_name, getattr(self, "_onboard_hub", None)))
+                   if onboarding_name is not None
                    else sheet.dismiss())
         sheet.open()
 
@@ -3879,8 +4008,15 @@ class sHadesClientApp(MDApp):
             node_widget.text = inv["node_hash"]
 
     def connect_to_guild(self, hub_address, username, node_hash="", delivery_hash=""):
-        hub_address = (hub_address or "").strip()
-        username = (username or "user").strip() or "user"
+        if not (hub_address or "").strip():
+            self._set_status("Hub address required.")
+            return
+        # tay (2026-11): a username is required before connecting to a
+        # hub for the first time; no silent "user" fallback.
+        username = (username or "").strip()
+        if not username:
+            self._set_status("A username is required before connecting.")
+            return
         node_hash = (node_hash or "").strip().lower()
         delivery_hash = (delivery_hash or "").strip().lower()
 
@@ -3949,6 +4085,18 @@ class sHadesClientApp(MDApp):
     # -- server sidebar ------------------------------------------------------
     def _refresh_server_sidebar(self):
         """Populate the server grid with rail discs (task 6)."""
+        # P5: the active server banner feeds the sidebar strip; the
+        # letter tile covers the gap when no banner is set
+        active = (self._servers[self._active_server_idx]
+                  if 0 <= self._active_server_idx < len(self._servers)
+                  else None)
+        if active is not None:
+            bpath = active.get("banner_path") or ""
+            self.banner_channel_path = (bpath
+                                        if os.path.isfile(bpath) else "")
+            self.banner_letter = (
+                (active.get("display_name", active.get("host", ""))
+                 or "S")[:1].upper() or "S")
         try:
             main = self.root.get_screen("main")
             grid = main.ids.server_grid
@@ -3971,7 +4119,27 @@ class sHadesClientApp(MDApp):
         thread, only the widget refresh hops to the main thread."""
         if not blob_id or not srv or not self.guild_api:
             return
-        if srv.get("icon_blob") == blob_id and srv.get("icon_path"):
+        self._fetch_server_blob(blob_id, srv, "icons", "icon_blob",
+                                "icon_path")
+
+    def _ingest_banner(self, blob_id, srv):
+        """whoami guild banner (a blob id) -> blobs fetch ->
+        banners/<host>_<blob head>.<ext> -> servers entry -> the sidebar
+        strip refresh. Engine shared with the rail icon (the wrappers
+        keep the whoami flow readable)."""
+        self._fetch_server_blob(blob_id, srv, "banners", "banner_blob",
+                                "banner_path")
+
+    def _fetch_server_blob(self, blob_id, srv, subdir, blob_key, path_key):
+        """Shared ingest engine for server-owned blob assets: fetch a
+        blob by id, store it under _app_data_dir()/subdir as
+        <host>_<blob head>.<ext>, record blob_key/path_key on the servers
+        entry, then refresh the sidebar. Disk writes happen on the
+        caller worker thread; only the widget refresh hops to the main
+        thread."""
+        if not blob_id or not srv or not self.guild_api:
+            return
+        if srv.get(blob_key) == blob_id and srv.get(path_key):
             return  # unchanged
         api = self.guild_api
 
@@ -3979,7 +4147,7 @@ class sHadesClientApp(MDApp):
             try:
                 res = api.blobs_get(blob_id)
             except Exception as e:
-                print("guild icon fetch failed:", repr(e))
+                print("asset fetch failed (%s):" % subdir, repr(e))
                 return
             if not res.get("ok"):
                 return
@@ -3996,21 +4164,21 @@ class sHadesClientApp(MDApp):
             elif raw[:4] in (b"RIFF",):
                 ext = "webp"
             try:
-                icons_dir = os.path.join(_app_data_dir(), "icons")
-                os.makedirs(icons_dir, exist_ok=True)
+                dest_dir = os.path.join(_app_data_dir(), subdir)
+                os.makedirs(dest_dir, exist_ok=True)
                 host = (srv.get("host") or "server").replace(":", "_")
                 path = os.path.join(
-                    icons_dir,
+                    dest_dir,
                     "%s_%s.%s" % (host, blob_id[:12], ext))
                 with open(path, "wb") as f:
                     f.write(raw)
-                srv["icon_blob"] = blob_id
-                srv["icon_path"] = path
+                srv[blob_key] = blob_id
+                srv[path_key] = path
                 self._save_servers()
                 Clock.schedule_once(
                     lambda dt: self._refresh_server_sidebar(), 0)
             except Exception as e:
-                print("guild icon save failed:", repr(e))
+                print("asset save failed (%s):" % subdir, repr(e))
         threading.Thread(target=work, daemon=True).start()
 
     def _select_server(self, idx):
@@ -5679,12 +5847,13 @@ class sHadesClientApp(MDApp):
         threading.Thread(target=work, daemon=True).start()
 
     def _refresh_avatar(self, key):
-        # re-render rows that use this avatar
+        # re-render rows that use this avatar (messages + sidebar rows)
         path = IMAGE_CACHE.get(key)
         if not path:
             return
         author = key[3:]  # strip "av:" prefix
-        for row in self._msg_widgets.values():
+        for row in list(self._msg_widgets.values()) + \
+                list(self._member_widgets.values()):
             if row.author_hash == author:
                 row.avatar_source = ""   # force Kivy to re-bind source
                 row.avatar_source = path
@@ -5779,21 +5948,50 @@ class sHadesClientApp(MDApp):
     def _channel_kind(self, cid):
         return self._channel_kinds.get(cid, "chat")
 
+    # whoami is the admin-menu gate; failure retries are bounded and
+    # lane-tunable (never an unbounded loop)
+    _WHOAMI_RETRY_N = 2
+    _WHOAMI_RETRY_S = 4.0
+
     def _fetch_whoami(self):
         """Fetch our own identity/role view (gates moderator menu items)."""
         if not self.guild_api:
             return
 
-        def work():
+        def work(tries_left=None):
+            if tries_left is None:
+                tries_left = self._WHOAMI_RETRY_N
             try:
                 res = self.guild_api.whoami()
             except Exception as e:
                 print("whoami failed:", repr(e))
+                # bounded retry: the admin menu rides is_admin, which
+                # only a successful whoami sets; one early failure must
+                # not cost the panel for the whole session
+                if tries_left > 0:
+                    Clock.schedule_once(
+                        lambda dt: work(tries_left - 1),
+                        self._WHOAMI_RETRY_S)
                 return
+            try:
+                from main import _export_bootlog_for_user
+                _export_bootlog_for_user()
+            except Exception:
+                pass
             if res.get("ok"):
                 self.i_am_moderator = bool(res.get("is_moderator"))
                 self.i_am_admin = bool(res.get("is_admin"))
                 self.my_roles = res.get("roles") or []
+                # the whole whoami verdict rides the boot log: the
+                # Downloads copy then answers "why is the admin item
+                # absent" without adb, and carries the user_hash for
+                # admin.txt seeding when the answer is a missed grant
+                print("whoami ok: admin=%s mod=%s roles=[%s] "
+                      "user_hash=%s" % (
+                          self.i_am_admin, self.i_am_moderator,
+                          ",".join(r.get("name", "")
+                                   for r in self.my_roles),
+                          res.get("user_hash", "")), flush=True)
                 # task 6: the guild icon rides whoami; ingest it per server
                 guild = res.get("guild") or {}
                 icon_blob = (guild.get("icon") or "").strip()
@@ -5805,6 +6003,15 @@ class sHadesClientApp(MDApp):
                             Clock.schedule_once(
                                 lambda dt: self._ingest_guild_icon(
                                     icon_blob, srv), 0)
+                banner_blob = (guild.get("banner") or "").strip()
+                if banner_blob:
+                    idx = self._active_server_idx
+                    if 0 <= idx < len(self._servers):
+                        srv = self._servers[idx]
+                        if srv.get("banner_blob") != banner_blob:
+                            Clock.schedule_once(
+                                lambda dt: self._ingest_banner(
+                                    banner_blob, srv), 0)
         threading.Thread(target=work, daemon=True).start()
 
     def _can_manage_roles(self):
@@ -6389,6 +6596,27 @@ class sHadesClientApp(MDApp):
         from kivy.core.clipboard import Clipboard
         Clipboard.copy(text)
         self._set_status("copied to clipboard")
+
+    def _copy_bootlog(self):
+        """paste-able boot-log handoff: no adb, no MediaStore. The
+        clipboard bridge (kivy) is proven on-device; MediaStore was
+        not, and tay's device miss proved it wrong in exactly the
+        way a second bridge can bypass. Long-press -> tap -> paste."""
+        try:
+            from main import _log_path
+            with open(_log_path(), "r", encoding="utf-8",
+                      errors="replace") as f:
+                text = f.read()
+            tail = text[-20000:]
+            if not tail.strip():
+                self._set_status("boot log empty")
+                return
+            self._copy_text(tail)
+            print("boot log handed to clipboard: %d chars"
+                  % len(tail), flush=True)
+        except Exception as e:
+            print("boot log clipboard failed:", repr(e), flush=True)
+            self._set_status("boot log copy failed")
 
     def _reply_quote(self, username, content):
         """Stage a reply card. The wire prefix stays readable on older clients."""
@@ -7027,6 +7255,43 @@ class sHadesClientApp(MDApp):
         threading.Thread(target=work, daemon=True).start()
 
 
+    def _member_row(self, user_hash, uname, presence_color):
+        """Build a sidebar row with the same avatar resolution as the
+        message rows. tay (2026-11-19): the userlist showed a white
+        square because rows were built with avatar_source="" -- the
+        sidebar never resolved from IMAGE_CACHE and never fetched.
+        Registered in _member_widgets so _refresh_avatar rebinds these
+        rows too when a fetch lands.
+        """
+        avatar_source = ""
+        if user_hash == self.my_hash and getattr(
+                self, "my_avatar_small", None):
+            avatar_source = self.my_avatar_small
+        else:
+            key = "av:" + (user_hash or "")
+            path = IMAGE_CACHE.get(key)
+            if path:
+                avatar_source = path
+            elif user_hash and IMAGE_CACHE.begin_load(key):
+                def _fetch(a=user_hash, k=key):
+                    try:
+                        res = self.guild_api.avatar_get(a)
+                        if res.get("ok") and res.get("avatar"):
+                            IMAGE_CACHE.set_bytes(k, res["avatar"], "png")
+                            Clock.schedule_once(
+                                lambda dt: self._refresh_avatar(k), 0)
+                    finally:
+                        IMAGE_CACHE.end_load(k)
+                threading.Thread(target=_fetch, daemon=True).start()
+        row = MemberRow(
+            username=uname,
+            avatar_source=avatar_source,
+            author_hash=user_hash,
+            presence_color=presence_color,
+        )
+        self._member_widgets[user_hash] = row
+        return row
+
     def _refresh_members_ui(self, channel):
         # Widget access must happen on the main thread.
         Clock.schedule_once(lambda dt: self._refresh_members_ui_main(channel), 0)
@@ -7047,6 +7312,7 @@ class sHadesClientApp(MDApp):
             main = self.root.get_screen("main")
             grid = main.ids.member_grid
             grid.clear_widgets()
+            self._member_widgets = {}
             # Friends first (U7): local roster, online state best-effort from
             # the guild presence map (a friend away from the guild shows gray).
             if self._friends:
@@ -7056,14 +7322,10 @@ class sHadesClientApp(MDApp):
                     font_size=sp(12), bold=True))
                 for f in self._friends:
                     online = f["user_hash"] in self._active_users
-                    grid.add_widget(MemberRow(
-                        username=f.get("nickname") or
-                        ("user-" + f["user_hash"][:6]),
-                        avatar_source="",
-                        author_hash=f["user_hash"],
-                        presence_color=[0.2, 0.8, 0.2, 1] if online
-                        else [0.5, 0.5, 0.5, 1],
-                    ))
+                    grid.add_widget(self._member_row(
+                        f["user_hash"],
+                        f.get("nickname") or ("user-" + f["user_hash"][:6]),
+                        [0.2, 0.8, 0.2, 1] if online else [0.5, 0.5, 0.5, 1]))
                 grid.add_widget(Label(
                     text="members", size_hint_y=None, height=dp(22),
                     color=(0.7, 0.73, 0.77, 1), font_size=sp(12), bold=True))
@@ -7071,12 +7333,10 @@ class sHadesClientApp(MDApp):
                 for user_hash, info in sorted(
                         self._active_users.items(),
                         key=lambda kv: (kv[1].get("username") or "").lower()):
-                    grid.add_widget(MemberRow(
-                        username=info.get("username") or ("user-" + user_hash[:6]),
-                        avatar_source="",
-                        author_hash=user_hash,
-                        presence_color=[0.2, 0.8, 0.2, 1],   # green = online
-                    ))
+                    grid.add_widget(self._member_row(
+                        user_hash,
+                        info.get("username") or ("user-" + user_hash[:6]),
+                        [0.2, 0.8, 0.2, 1]))   # green = online
                 if not self._active_users:
                     # A Label, not a MemberRow: rows are clickable profiles.
                     grid.add_widget(Label(
@@ -7085,12 +7345,8 @@ class sHadesClientApp(MDApp):
                 return
             # Fallback: authors seen this session; presence unknown.
             for h, uname in list(self._members.items())[:50]:
-                grid.add_widget(MemberRow(
-                    username=uname,
-                    avatar_source="",
-                    author_hash=h,
-                    presence_color=[0.5, 0.5, 0.5, 1],
-                ))
+                grid.add_widget(self._member_row(
+                    h, uname, [0.5, 0.5, 0.5, 1]))
         except Exception as e:
             print("members ui error:", e)
 
@@ -8472,9 +8728,12 @@ class sHadesClientApp(MDApp):
         with open(file_path, "rb") as f:
             return f.read()
 
-    def open_file_chooser(self, avatar=False):
-        """Open a file chooser popup to attach a file or select an avatar."""
+    def open_file_chooser(self, avatar=False, purpose=None):
+        """Open a file chooser popup to attach a file or select an avatar.
+        purpose (optional): "icon" or "banner" routes the picked file to
+        the server config screen's upload flow (P10: device uploads)."""
         self._avatar_mode = avatar
+        self._picker_purpose = purpose
         if self._android_platform():
             self._android_pick_generic(avatar)
             return
@@ -8487,6 +8746,25 @@ class sHadesClientApp(MDApp):
                      self._on_file_selected(selection, popup))
         popup.open()
 
+    def _route_purpose_file(self, path, purpose):
+        """P10: hand the picked file to the server config screen's
+        icon/banner upload flow (blobs_put -> admin_config)."""
+        panel = None
+        try:
+            root = App.get_running_app().root
+            scr = root.get_screen("server_config") if root else None
+            panel = getattr(scr, "tab_content", {}).get("General")
+        except Exception:
+            panel = None
+        if panel is None:
+            self._set_status("no server config screen to apply %s"
+                             % purpose)
+            return
+        if purpose == "icon":
+            panel._apply_icon_file(path)
+        else:
+            panel._apply_banner_file(path)
+
     def _on_file_selected(self, selection, popup):
         if popup is not None:
             popup.dismiss()
@@ -8494,7 +8772,11 @@ class sHadesClientApp(MDApp):
             return
         path = selection[0]
         try:
-            if getattr(self, "_avatar_mode", False):
+            purpose = getattr(self, "_picker_purpose", None)
+            if purpose in ("icon", "banner"):
+                self._set_status("reading %s..." % purpose)
+                self._route_purpose_file(path, purpose)
+            elif getattr(self, "_avatar_mode", False):
                 self._set_status("opening PFP editor ...")
                 self._open_pfp_editor(path)
             else:
@@ -8631,6 +8913,7 @@ class sHadesClientApp(MDApp):
             return
         newest = max(candidates, key=os.path.getmtime)
         self.my_avatar_small = newest
+        self.avatar_preview = newest
         self.composer_pfp_path = newest
 
     def _save_pfp_crop(self, path, crop_cx=0, crop_cy=0, crop_r=0,
@@ -8827,6 +9110,9 @@ class sHadesClientApp(MDApp):
         # the files are saved to disk even if guild upload fails.
         self.my_avatar_orig = orig_path
         self.my_avatar_small = small_path
+        # tay (2026-11): the onboarding slot and the connect gate bind
+        # to avatar_preview.
+        self.avatar_preview = small_path
 
         # Apply to profile screen if it exists
         if hasattr(self, "profile_screen"):
@@ -8863,6 +9149,190 @@ class sHadesClientApp(MDApp):
         name = path.split("/")[-1]
         self._pending_attachment = [name, mime, blob]
         self._set_status("Attached: %s (%d bytes)" % (name, len(blob)))
+
+    def open_confirm_delete_account(self, *_):
+        """P1 (tay 2026-11-19): purge this guild account from the server.
+
+        Two stage-gates matching the server's own validations verbatim
+        (account/delete-posts and account/leave check the confirm
+        strings exactly): "DELETE MY POSTS", then "LEAVE GUILD".
+        Between the two, only the server mutates; the local wipe runs
+        after leave confirms so a failed step never strands the local
+        profile.
+        """
+        from kivymd.uix.button import MDButton, MDButtonText
+        if not (self.guild_api or getattr(self, "guild_api", None)):
+            self._set_status("No guild connection: nothing to purge.")
+            return
+        box = BoxLayout(orientation="vertical", spacing=dp(10),
+                        padding=dp(12))
+        note = Label(text=("Delete account erases everything you posted "
+                           "to this guild -- messages, edits, reactions "
+                           "and attachment files -- then leaves the "
+                           "guild. This cannot be undone."),
+                     color=self.theme_colors["text_muted"],
+                     font_size=sp(13), size_hint_y=None, height=dp(70),
+                     halign="center", valign="middle")
+        note.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+        box.add_widget(note)
+        typed = TextInput(multiline=False, hint_text="Type DELETE MY POSTS",
+                          font_name="MeshBody", font_size=sp(16),
+                          foreground_color=self.theme_colors["text"],
+                          hint_text_color=self.theme_colors["text_muted"],
+                          background_normal="", background_active="",
+                          background_color=self.theme_colors["input_bg"],
+                          size_hint_y=None, height=dp(46))
+        box.add_widget(typed)
+        status = Label(text="", color=self.theme_colors["accent"],
+                       size_hint_y=None, height=dp(22))
+        box.add_widget(status)
+        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
+        box.add_widget(row)
+        go = MDButton(style="filled", theme_bg_color="Custom",
+                      md_bg_color=(0.76, 0.22, 0.22, 1),
+                      size_hint=(None, None), width=dp(160))
+        go.add_widget(MDButtonText(text="Erase my posts",
+                                   text_color=(1, 1, 1, 1)))
+        stay = MDButton(style="outlined", size_hint=(None, None),
+                        width=dp(120))
+        stay.add_widget(MDButtonText(text="Cancel",
+                                     text_color=self.theme_colors["text"]))
+        row.add_widget(go)
+        row.add_widget(stay)
+        sheet = Popup(title="Stage 1 of 2: erase posts", content=box,
+                      size_hint=(0.9, 0.62))
+
+        def proceed(*_a):
+            if (typed.text or "") != "DELETE MY POSTS":
+                status.text = "The phrase does not match."
+                return
+            sheet.dismiss()
+            self.open_confirm_leave_guild()
+
+        go.bind(on_press=proceed)
+        stay.bind(on_press=lambda *_: sheet.dismiss())
+        sheet.open()
+
+    def open_confirm_leave_guild(self, *_):
+        """Stage 2: the literal the leave endpoint validates."""
+        from kivymd.uix.button import MDButton, MDButtonText
+        box = BoxLayout(orientation="vertical", spacing=dp(10),
+                        padding=dp(12))
+        note = Label(text=("Posts erased. Leaving releases your "
+                           "membership, roles, receipts and registration "
+                           "on this guild. Type LEAVE GUILD to finish."),
+                     color=self.theme_colors["text_muted"],
+                     font_size=sp(13), size_hint_y=None, height=dp(64),
+                     halign="center", valign="middle")
+        note.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+        box.add_widget(note)
+        typed = TextInput(multiline=False, hint_text="Type LEAVE GUILD",
+                          font_name="MeshBody", font_size=sp(16),
+                          foreground_color=self.theme_colors["text"],
+                          hint_text_color=self.theme_colors["text_muted"],
+                          background_normal="", background_active="",
+                          background_color=self.theme_colors["input_bg"],
+                          size_hint_y=None, height=dp(46))
+        box.add_widget(typed)
+        status = Label(text="", color=self.theme_colors["accent"],
+                       size_hint_y=None, height=dp(22))
+        box.add_widget(status)
+        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
+        box.add_widget(row)
+        go = MDButton(style="filled", theme_bg_color="Custom",
+                      md_bg_color=(0.76, 0.22, 0.22, 1),
+                      size_hint=(None, None), width=dp(160))
+        go.add_widget(MDButtonText(text="Leave guild",
+                                   text_color=(1, 1, 1, 1)))
+        stay = MDButton(style="outlined", size_hint=(None, None),
+                        width=dp(120))
+        stay.add_widget(MDButtonText(text="Cancel",
+                                     text_color=self.theme_colors["text"]))
+        row.add_widget(go)
+        row.add_widget(stay)
+        sheet = Popup(title="Stage 2 of 2: leave guild", content=box,
+                      size_hint=(0.9, 0.62))
+
+        def proceed(*_a):
+            if (typed.text or "") != "LEAVE GUILD":
+                status.text = "The phrase does not match."
+                return
+            sheet.dismiss()
+            self.purge_account_worker()
+
+        go.bind(on_press=proceed)
+        stay.bind(on_press=lambda *_: sheet.dismiss())
+        sheet.open()
+
+    def purge_account_worker(self, *_):
+        """Both server steps, in order, on the worker thread; every
+        failure aborts before the local wipe (the account stays
+        functional and the retries are idempotent)."""
+        api = self.guild_api
+        if api is None:
+            return
+
+        def work():
+            res1 = None
+            res2 = None
+            try:
+                res1 = api.account_delete_posts(
+                    {"confirm": "DELETE MY POSTS"})
+            except Exception as exc:
+                print("account delete-posts failed:", repr(exc))
+            if not (res1 or {}).get("ok"):
+                Clock.schedule_once(
+                    lambda dt: self._set_status(
+                        "Post purge failed: nothing was deleted locally."),
+                    0)
+                return
+            try:
+                res2 = api.account_leave({"confirm": "LEAVE GUILD"})
+            except Exception as exc:
+                print("account leave failed:", repr(exc))
+            if not (res2 or {}).get("ok"):
+                Clock.schedule_once(
+                    lambda dt: self._set_status(
+                        "Leave failed: guild membership intact."),
+                    0)
+                return
+            Clock.schedule_once(
+                lambda dt: self.finish_account_purge(), 0)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def finish_account_purge(self):
+        """Local wipe + gate back to staging: the two profile files
+        (their existence is the routing gate at boot), my cached
+        avatar rows, avatar/username state. The RNS identity file and
+        servers.json survive: the identity outlives one guild, and the
+        hub entry lets a fresh account reconnect.
+        """
+        for path in (self._portable_profile_path(),
+                     self._onboarding_path(),
+                     # the saved session carries hub login state; without
+                     # this the next boot would resume main with a purged
+                     # account instead of staging fresh
+                     self._session_path()):
+            try:
+                if os.path.isfile(path):
+                    os.unlink(path)
+            except OSError as e:
+                print("profile file delete failed:", repr(e))
+        key = "av:" + (getattr(self, "my_hash", "") or "")
+        IMAGE_CACHE.forget(key)
+        self.my_avatar_small = ""
+        self.avatar_preview = ""
+        self.username = ""
+        self._portable_name = ""
+        self.i_am_admin = False
+        self._set_status("Account purged: stage a new profile to return.")
+        try:
+            if self.root is not None:
+                self.root.get_screen("onboarding").stage = 0
+                self.root.current = "onboarding"
+        except Exception as e:
+            print("routing back to staging failed:", repr(e))
 
     def save_profile(self):
         """Save username to the guild."""
