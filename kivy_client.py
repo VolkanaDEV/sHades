@@ -7091,8 +7091,35 @@ class sHadesClientApp(MDApp):
                 Clock.schedule_once(lambda dt: self._render_site_page(cid, text), 0)
             else:
                 Clock.schedule_once(
-                    lambda dt: self._set_status("page failed: %s" % err), 0)
+                    lambda dt: self._site_empty_page(cid, err), 0)
         threading.Thread(target=work, daemon=True).start()
+
+    def _site_empty_page(self, cid, err):
+        """The page fetch failed: replace the 'loading site' placeholder
+        with an honest empty page instead of leaving it forever (tay's
+        device receipt, 0.36.10 era). The server now seeds fresh site
+        channels with a default /index.mu, so this is the exceptional
+        branch: a site created before the seed, or a deleted target."""
+        try:
+            main = self.root.get_screen("main")
+        except Exception:
+            return
+        cur = getattr(main, "_current_channel", None)
+        if cur and self._channel_cid(cur) != cid:
+            return   # user switched away while the fetch was in flight
+        try:
+            grid = main.ids.message_grid
+            grid.clear_widgets()
+            self._msg_widgets.clear()
+            page = SitePage()
+            page.add_widget(self._micron_label(
+                "[b]This site is empty[/b]"))
+            page.add_widget(self._micron_label(
+                "The page failed to load: %s" % _escape(err or "unknown")))
+            grid.add_widget(page)
+        except Exception as e:
+            print("site empty-page render failed:", repr(e))
+        self._set_status("page failed: %s" % (err or "unknown"))
 
     def _render_site_page(self, cid, text):
         try:

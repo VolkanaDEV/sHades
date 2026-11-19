@@ -2000,6 +2000,9 @@ def _create_channel_txn(viewer, name, kind, manifest=None):
                    (cid, name, now(), kind, manifest_json, nxt))
         db.execute("INSERT OR IGNORE INTO channel_state (channel_id, seq) VALUES (?, 0)", (cid,))
         db.commit()
+    if kind == "site":
+        # outside db_lock: the seed is a file write + handler registration
+        _seed_default_site(cid)
     _audit(viewer, "channel.create", cid, "%s (%s)" % (name, kind))
     return cid, None
 
@@ -2690,6 +2693,47 @@ def _site_file_path(cid, rel):
     if not inside:
         return None
     return path
+
+# Starter page for fresh site channels (tay: creating a site used to
+# leave the channel rendering "loading site..." forever, because no
+# resource existed to fetch). Micron grammar per micron.py: heading
+# lines start with '>', separators '-', directives '#!k=v', links
+# [label`target]. Headings parse via micron.py:184.
+DEFAULT_SITE_INDEX_MU = (
+    "#!c=0\n"
+    "> A fresh sHades site\n"
+    "-\n"
+    "This channel is a micron site. Pages live as site resources\n"
+    "served from this guild; the default template at /index.mu\n"
+    "stands in until you publish your own pages.\n"
+    "-\n"
+    "Quick micron form:\n"
+    "`!bold!` `*italic*` `_underline_` `F8a8`code`f`\n"
+    "[publish with site/put `/index.mu]\n"
+)
+
+
+def _seed_default_site(cid):
+    """Seed a fresh site channel with the default template /index.mu,
+    through the same storage path and handler registration as
+    site/put. Best-effort: the channel row already committed, so a
+    seed failure is logged, not fatal -- the client renders its
+    empty-state page instead (that leg covers this branch)."""
+    fpath = _site_file_path(cid, "index.mu")
+    if fpath is None:
+        return
+    os.makedirs(os.path.dirname(fpath), exist_ok=True)
+    try:
+        with open(fpath, "wb") as f:
+            f.write(DEFAULT_SITE_INDEX_MU.encode("utf-8"))
+    except OSError as e:
+        RNS.log(f"default site seed failed {cid}: {e}", RNS.LOG_ERROR)
+        return
+    if node_destination is not None:
+        node_destination.register_request_handler(
+            f"/file/sites/{cid}/index.mu", serve_site_file,
+            allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
+    RNS.log(f"site channel seeded: {cid}/index.mu", RNS.LOG_INFO)
 
 def _site_channel(cid):
     with db_lock:

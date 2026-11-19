@@ -136,8 +136,34 @@ scope   : profile-screen delete-account; server toggles that bind live
   markup (site/get) -> edit multiline MICRON (the tay LAW grammar)
   -> preview through micron.py + SitePage render -> publish via
   site/put. Channel rename rides the existing channels/patch.
-- Tests: micron round-trip (parse -> render), publish contract.
-- Price: medium. UI pattern exists (General tab editor rows).
+- EXTENDED 2026-11-19 (tay's site-channel asks, three arrows in
+  build order — receipts this same day):
+  - **P7a (bug, built)**: fresh site channels now seed a default
+    template /index.mu. Receipts: `_seed_default_site` +
+    `DEFAULT_SITE_INDEX_MU` in sHades.py (micron grammar receipts:
+    headings `>`-prefixed at micron.py:184; write path, handler
+    registration and manifest-free default index all reuse the
+    site/put machinery); client `_site_empty_page` replaces the
+    eternal "loading site…" with an honest empty page + the named
+    error (the fetch-miss branch had no failure leg — sHades.py
+    site/get 404s left the placeholder on screen forever). Lane:
+    tests/test_sites.py 10 checks (seed exists/parses, chat
+    unseeded, overwrite republishes, duplicate create 409 never
+    reseeds). Battery green. Ships as 0.36.12 together with the
+    0.36.11 softinput lane (tests-only companion commit).
+  - **P7b (wikipedia-style permission)**: site/put is currently
+    moderator-only (site routes, sHades.py). Missing arrow: a
+    channel-scoped PERMS["SITE_EDIT"] bit carried in
+    channel_overwrites (the VIEW/POST table), gate = SITE_EDIT OR
+    moderator on site/put + site/manifest_put, overwrite rows
+    writable from the Channels/Roles tabs (pattern exists). Price:
+    small-medium.
+  - **P7c (the editor UI)**: P7's above editor flow + a wikipedia-
+    style [edit] affordance on rendered pages, visible to holders of
+    SITE_EDIT (the channel payload/whoami must carry the flag
+    client-side), landing on the micron source editor -> preview
+    (micron.py + SitePage) -> publish (site/put). Price: medium
+    (editor screen is the only new surface).
 
 ## P8 — Announcements (priced, parked)
 
@@ -184,7 +210,11 @@ scope   : profile-screen delete-account; server toggles that bind live
 
 P1, P2, P3, P5 in the v0.34.0-0.36.x ships (done: admin gate closed by
 tay's admin.txt seed 2026-11-19; bootlog diagnosis channel v0.36.5,
-external_primary v0.36.6). Next: P10 (tay's device receipt), then P6,
-P9->P7. P4, P8 parked until tay calls them. PR merge stays tay's.
+external_primary v0.36.6). Next: 0.36.12 = P7a (site seed + empty
+state) plus the 0.36.11 softinput lane as its tests-only companion —
+both hold until the 0.36.11 CI pair closes, then ship in one round.
+Then P7b (the SITE_EDIT bit), then P7c (the editor UI; P10's device-
+upload follow-ups stay merged with PR #18). P4, P8 parked until tay
+calls them. PR merge stays tay's.
 
 [END PLAN]
