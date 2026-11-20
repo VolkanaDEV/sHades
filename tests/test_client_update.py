@@ -209,6 +209,40 @@ check("hint: off -> strip cleared", hint("0.36.20", "0.36.22", "off")
 check("hint: current -> strip cleared", hint("0.36.22", "0.36.22",
                                              "github") == "")
 
+# ------------------- account transfer rides the update consent (tay) ----
+app_src = open(os.path.join(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))), "kivy_client.py"),
+    encoding="utf-8", errors="replace").read()
+SEP_DEF = chr(10) + "    def "
+def span(fn):
+    i = app_src.index("def %s(" % fn)
+    j = app_src.index(SEP_DEF, i + 1)
+    return app_src[i:j]
+
+
+upd = span("_open_update_prompt")
+check("consent popup offers the kit before the install",
+      'Button(text="Save kit first")' in upd
+      and "open_recovery_sheet" in upd
+      and upd.index("Save kit first") < upd.index(
+          "Download and install"))
+kit_leg = upd[upd.index("kit.bind"):upd.index("go.bind")]
+check("the kit leg does not dismiss the consent popup",
+      "popup.dismiss" not in kit_leg)
+check("the popup text names the upgrade account path",
+      "upgrading" in upd.lower() and "uninstall" in upd.lower())
+rec = span("open_recovery_sheet")
+check("the kit sheet is the real one (phrase gate + profile kit)",
+      "passphrase" in rec or "phrase" in rec)
+kit_body = app_src[app_src.index("def save_kit"):app_src.index(
+    "save.bind(on_press=save_kit)")]
+for want in ('"username"', '"friends"', '"servers"',
+             "recovery.create_kit", "_ensure_identity_file"):
+    check("kit carries the account: %s" % want, want in kit_body)
+check("restore refuses an installed identity",
+      'FileExistsError("an identity is already installed")'
+      in app_src)
+
 print()
 print("PASS: %d  FAIL: %d" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

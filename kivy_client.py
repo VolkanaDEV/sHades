@@ -6259,7 +6259,6 @@ class sHadesClientApp(MDApp):
 
     # ------------------------------------------------- P11 arrow 5 flow
     def _open_update_prompt(self):
-        import client_update
         target = self.client_update_version or ""
         if not target:
             return
@@ -6268,9 +6267,9 @@ class sHadesClientApp(MDApp):
         ask = Label(markup=True, font_size=sp(14),
                     color=self.theme_colors.get(
                         "text", (0.92, 0.94, 0.96, 1)))
-        ask.text = ("Update to %s?\n%s" % (
-            target, client_update.APP_APK_RE.pattern.replace(
-                "^", "").replace("$", "")))
+        ask.text = ("Update to %s?\nUpgrading over the install keeps your "
+                    "account; uninstalling first needs your recovery kit "
+                    "to hand it to the new install." % target)
         ask.bind(width=lambda inst, w: setattr(inst, "text_size",
                                                (w, None)))
         box.add_widget(ask)
@@ -6280,14 +6279,23 @@ class sHadesClientApp(MDApp):
         status.text = ""
         box.add_widget(status)
         row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(8))
+        # tay (2026-11-20): accounts must transfer between clients during
+        # the upgrade - the kit gate rides the consent popup, the kit sheet
+        # (recovery.open_recovery_sheet) exports identity + username +
+        # friends + servers outside the app sandbox BEFORE the install
+        # intent is offered
+        kit = Button(text="Save kit first")
         go = Button(text="Download and install")
         cancel = Button(text="Not now")
+        row.add_widget(kit)
         row.add_widget(go)
         row.add_widget(cancel)
         box.add_widget(row)
         popup = Popup(title="sHades update", content=box,
                       size_hint=(0.86, 0.5), auto_dismiss=True)
         cancel.bind(on_press=lambda inst: popup.dismiss())
+        kit.bind(on_press=lambda inst: Clock.schedule_once(
+            lambda dt: self.open_recovery_sheet(), 0))
         go.bind(on_press=lambda inst: (
             popup.dismiss(),
             Clock.schedule_once(
