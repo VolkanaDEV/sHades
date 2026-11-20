@@ -310,6 +310,18 @@ PLANNED, priced, build order below. No code until tay calls it.
   before commit (constants 0.36.20 vs spec 0.36.19 red), battery
   red=none after the bump. Artifacts of this chain verify via the
   0.36.19 table + the pairing lane.
+- **Chain 2 BUILT 2026-11-20, v0.36.21 `c164f8b`**: updater.py (the
+  shared core: parse_version, github transport, safe extraction,
+  py_compile stage probe, stage->backup->swap, check_and_apply),
+  update_run.py (the handover launcher owning boot + rollback:
+  marker pending_version, update_backup/, one retry, exit 2 for a
+  human), sHades wiring (SERVER_CONFIG_KEYS += update_channel
+  off|github|rns + update_check_minutes 360; the reaper-loop branch +
+  worker thread; boot check; admin-only /api/v1/update_status).
+  Receipts: test_updater 33/0 (hostile members; zero fetches under
+  off/rns on a live http seam; the happy path; mismatch refusal; the
+  launcher rollback as a REAL subprocess — BROKEN->OLD runlog),
+  battery red=none, lockstep lane green at 0.36.21.
 - Standing risk named in the plan: auto-update is the one feature
   whose worst failure bricks the updater's own host — the toggle
   defaults OFF, the apply gates on sha + staged-import probe, and

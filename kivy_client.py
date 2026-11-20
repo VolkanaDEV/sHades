@@ -35,7 +35,7 @@ from ui_theme import preset_colors
 # ---------------------------------------------------------------------------
 # P11 version bridge: the running build knows its own version.
 # ---------------------------------------------------------------------------
-APP_VERSION = "0.36.21"
+APP_VERSION = "0.36.22"
 
 # buildozer.spec, kivy_client.APP_VERSION and sHades.SERVER_VERSION must all
 # match (tests/test_update_meta.py keeps them in lockstep). On-device the
@@ -2591,6 +2591,10 @@ class sHadesClientApp(MDApp):
     banner_letter = StringProperty("S")
     # P6: the server's message-of-the-day; "" = the strip stays hidden
     server_motd = StringProperty("")
+    # P11 arrow 5: "0.36.22"-shaped hint from the server's whoami; ""
+    # hides the strip (the update check is toggle-gated server-side)
+    client_update_version = StringProperty("")
+    update_status = StringProperty("")
     # P8: the composer's truth per channel (announce channels hide it
     # without an explicit grant; holders see the Announce send label)
     composer_readonly = BooleanProperty(False)
@@ -6205,7 +6209,23 @@ class sHadesClientApp(MDApp):
                 Clock.schedule_once(
                     lambda dt: self._apply_motd(
                         (guild.get("motd") or "").strip()), 0)
+                # P11 arrow 5: the server's version + toggle -> the strip
+                Clock.schedule_once(
+                    lambda dt: self._apply_update_hint(
+                        (guild.get("app_version") or ""),
+                        (guild.get("update_channel") or "")), 0)
         threading.Thread(target=work, daemon=True).start()
+
+    def _apply_update_hint(self, server_version, channel):
+        """Pure decision through client_update; "" clears the strip."""
+        import client_update
+        offer = client_update.update_decision(
+            self._client_ver(), server_version, channel)
+        self.client_update_version = (
+            ".".join(str(x) for x in offer) if offer else "")
+
+    def _client_ver(self):
+        return _client_version()
 
     def _apply_motd(self, value):
         """Bind whoami's guild motd to the sidebar strip ('' hides it)."""
@@ -6236,6 +6256,85 @@ class sHadesClientApp(MDApp):
         if not self.server_motd:
             return
         self._build_motd_popup().open()
+
+    # ------------------------------------------------- P11 arrow 5 flow
+    def _open_update_prompt(self):
+        import client_update
+        target = self.client_update_version or ""
+        if not target:
+            return
+        box = BoxLayout(orientation="vertical", padding=dp(10),
+                        spacing=dp(8))
+        ask = Label(markup=True, font_size=sp(14),
+                    color=self.theme_colors.get(
+                        "text", (0.92, 0.94, 0.96, 1)))
+        ask.text = ("Update to %s?\n%s" % (
+            target, client_update.APP_APK_RE.pattern.replace(
+                "^", "").replace("$", "")))
+        ask.bind(width=lambda inst, w: setattr(inst, "text_size",
+                                               (w, None)))
+        box.add_widget(ask)
+        status = Label(markup=True, font_size=sp(12),
+                       color=self.theme_colors.get(
+                           "text_dim", (0.7, 0.72, 0.75, 1)))
+        status.text = ""
+        box.add_widget(status)
+        row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(8))
+        go = Button(text="Download and install")
+        cancel = Button(text="Not now")
+        row.add_widget(go)
+        row.add_widget(cancel)
+        box.add_widget(row)
+        popup = Popup(title="sHades update", content=box,
+                      size_hint=(0.86, 0.5), auto_dismiss=True)
+        cancel.bind(on_press=lambda inst: popup.dismiss())
+        go.bind(on_press=lambda inst: (
+            popup.dismiss(),
+            Clock.schedule_once(
+                lambda dt: self._update_start(inst), 0)))
+        self._update_status_label = status
+        popup.open()
+
+    def _update_start(self, *a):
+        """The consented path, on a worker thread; every leg reports
+        into update_status (the popup is closed; the status shows on
+        the next open)."""
+        import client_update
+
+        def note(txt):
+            Clock.schedule_once(lambda dt: setattr(self, "update_status",
+                                                   txt), 0)
+
+        def work():
+            try:
+                note("checking the release...")
+                manifest = json.loads(
+                    client_update.fetch(client_update.LATEST_PATTERN))
+                pick = client_update.newest_client_asset(
+                    manifest.get("assets") or [], since=_client_version())
+                if pick is None:
+                    note("no newer arm64 build found on %s"
+                         % client_update.REPO)
+                    return
+                note("fetching the sha for %s..." % pick["apk_name"])
+                sha_hex = client_update.parse_sha_file(
+                    client_update.fetch(pick["sha_url"]))
+                note("downloading %s (DownloadManager)..."
+                     % pick["apk_name"])
+                blob = client_update.download_with_dm(
+                    pick["apk_url"], pick["apk_name"], sha_hex)
+                note("sha ok; parking %s..." % pick["apk_name"])
+                path = client_update.save_candidate(
+                    blob, pick["apk_name"], cache_dir())
+                note("handing %s to the installer..." % path)
+                client_update.install_intent(path, pick["apk_name"])
+                note("installer handed off")
+            except client_update.HttpError as e:
+                note("update failed: %s" % e)
+            except Exception as e:
+                note("update failed: %s" % e)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _can_manage_roles(self):
         """UI gate: any of my roles carries MANAGE_ROLES or ADMIN."""

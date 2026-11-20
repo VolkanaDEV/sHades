@@ -142,7 +142,7 @@ FIELD_ATTACHMENTS = LXMF.FIELD_FILE_ATTACHMENTS  # 0x05 — envelope ours (plan 
 
 # P11 version bridge: the server knows its own version. Lockstep with
 # buildozer.spec and kivy_client.APP_VERSION (tests/test_update_meta.py).
-SERVER_VERSION = "0.36.21"
+SERVER_VERSION = "0.36.22"
 
 # ----------------------------------------------------------------------------------
 # Database
@@ -3418,7 +3418,12 @@ def api_v1_whoami(viewer, data, link_id):
             "is_admin": is_admin, "roles": roles,
             "guild": {"name": _cfg_get("guild_name", "") or GUILD_NAME,
                       "motd": _cfg_get("motd", "") or "",
-                      "icon": icon, "banner": banner}}
+                      "icon": icon, "banner": banner,
+                      # P11 arrow 5: what this server runs + the toggle,
+                      # so a client can offer to pull the release
+                      "app_version": SERVER_VERSION,
+                      "update_channel": _cfg_get(
+                          "update_channel", "off")}}
 
 def _register_mod_endpoint(path, verb, apply_fn):
     """Register one moderator-gated JSON endpoint. `apply_fn(viewer, target,

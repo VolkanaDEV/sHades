@@ -821,6 +821,21 @@
                                     text_size: self.width, None
                                     halign: 'left'
                                     valign: 'middle'
+                            Button:
+                                id: update_strip
+                                size_hint_y: None
+                                height: scaled(dp(22)) if app.client_update_version else 0
+                                background_normal: ''
+                                background_color: (0.55, 0.13, 0.13, 0.85)
+                                disabled: not app.client_update_version
+                                on_press: app._open_update_prompt()
+                                Label:
+                                    text: ('Update available: ' + (app.client_update_version or ''))[:64]
+                                    font_size: sp(11)
+                                    color: app.theme_colors['text']
+                                    text_size: self.width, None
+                                    halign: 'left'
+                                    valign: 'middle'
                             BoxLayout:
                                 size_hint_y: None
                                 height: dp(52)
