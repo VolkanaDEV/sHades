@@ -51,7 +51,7 @@ ATTACHMENT_EXT    = {"png", "jpg", "jpeg", "gif", "webp", "mp3", "ogg", "wav",
                      "flac", "mp4", "webm", "pdf", "txt"}
 
 # Channel kinds: chat, a NomadNet micron "site", or a terminal stream.
-CHANNEL_KINDS     = ("chat", "site", "term")
+CHANNEL_KINDS     = ("chat", "site", "term", "announce")
 
 # Permission bitmask (U5). Guild-wide bits (MANAGE_*/ADMIN) live on roles;
 # channel-scoped bits (VIEW/POST) live in channel_overwrites keyed by role
@@ -500,6 +500,40 @@ def has_role_perm(user, bits):
             (user, bits)).fetchone()
     return row is not None
 
+def _effective_perms(user_hash, channel_id, base):
+    """The union: base + each of the user's roles' perms + each role's
+    per-channel overwrite. The admin short-circuit lives in has_perm."""
+    if user_hash is None:
+        return 0
+    with db_lock:
+        rows = db.execute(
+            "SELECT co.perms AS operms, r.perms AS rperms "
+            "FROM user_roles ur JOIN roles r ON r.role_id = ur.role_id "
+            "LEFT JOIN channel_overwrites co ON co.role_id = ur.role_id "
+            "AND co.channel_id=? WHERE ur.user_hash=?",
+            (channel_id, user_hash)).fetchall()
+    perms = base
+    for r in rows:
+        perms |= (r["operms"] or 0) | (r["rperms"] or 0)
+    return perms
+
+def _announce_post_ok(user_hash, channel_id):
+    """kind=='announce' POST gate (P8): moderators/admins always; everyone
+    else only with an EXPLICIT POST grant -- an @everyone overwrite row
+    carrying POST, a role perm, or a role overwrite. The open channel
+    default confers VIEW here, never POST."""
+    if is_moderator(user_hash):
+        return True
+    if user_hash is None:
+        return False
+    with db_lock:
+        base_row = db.execute("SELECT perms FROM channel_overwrites "
+                              "WHERE channel_id=? AND role_id=0",
+                              (channel_id,)).fetchone()
+    perms = _effective_perms(user_hash, channel_id,
+                             base_row["perms"] if base_row else 0)
+    return (perms & PERMS["POST"]) != 0
+
 def has_perm(user, channel_id, bit):
     """Effective permission for one channel. VIEW/POST = the @everyone
     overwrite (or the open default) UNION each of the user's roles' own
@@ -513,19 +547,12 @@ def has_perm(user, channel_id, bit):
         base = db.execute("SELECT perms FROM channel_overwrites "
                           "WHERE channel_id=? AND role_id=0",
                           (channel_id,)).fetchone()
-        rows = db.execute(
-            "SELECT co.perms AS operms, r.perms AS rperms "
-            "FROM user_roles ur JOIN roles r ON r.role_id = ur.role_id "
-            "LEFT JOIN channel_overwrites co ON co.role_id = ur.role_id "
-            "AND co.channel_id=? WHERE ur.user_hash=?",
-            (channel_id, user)).fetchall()
         is_admin = db.execute(
             "SELECT 1 FROM user_roles ur JOIN roles r ON r.role_id = ur.role_id "
             "WHERE ur.user_hash=? AND (r.perms & ?) != 0 LIMIT 1",
             (user, PERMS["ADMIN"])).fetchone()
-    perms = base["perms"] if base else DEFAULT_CHANNEL_PERMS
-    for r in rows:
-        perms |= (r["operms"] or 0) | (r["rperms"] or 0)
+    perms = _effective_perms(user, channel_id,
+                             base["perms"] if base else DEFAULT_CHANNEL_PERMS)
     if is_admin:
         return True
     return (perms & bit) != 0
@@ -795,7 +822,18 @@ def ingest(channel_id, author_hash, content, ts=None, attachments=None):
         return None
     if is_muted(author_hash):
         return None  # muted: post silently dropped
-    if not has_perm(author_hash, channel_id, PERMS["POST"]):
+    with db_lock:
+        _kind_row = db.execute("SELECT kind FROM channels WHERE id=?",
+                               (channel_id,)).fetchone()
+    _chn_kind = _kind_row["kind"] if _kind_row else "chat"
+    if _chn_kind == "announce":
+        # P8: announcements only -- explicit grants (or mods); the open
+        # default never confers POST on an announce channel
+        if not _announce_post_ok(author_hash, channel_id):
+            RNS.log("ingest: announce POST denied for %s in %s"
+                    % (author_hash[:12], channel_id[:12]), RNS.LOG_WARNING)
+            return None
+    elif not has_perm(author_hash, channel_id, PERMS["POST"]):
         RNS.log("ingest: POST denied for %s in %s" % (author_hash[:12],
                                                       channel_id[:12]),
                 RNS.LOG_WARNING)
@@ -1943,6 +1981,12 @@ def api_v1_channels_list(viewer, data, link_id):
     # VIEW permission: channels the viewer cannot read are absent entirely
     chans = [c for c in chans if has_perm(viewer, c["id"], PERMS["VIEW"])]
     for c in chans:
+        if c["kind"] == "announce":
+            # P8: the composer's truth rides the read the client already
+            # fetches (the site-edit verdict shape)
+            c["can_post"] = bool(_announce_post_ok(viewer, c["id"]))
+        else:
+            c["can_post"] = bool(has_perm(viewer, c["id"], PERMS["POST"]))
         last_id = _receipt_last_id(c["id"], viewer)
         c["unread"] = _unread_count(c["id"], last_id)
     return {"ok": 1, "channels": chans}

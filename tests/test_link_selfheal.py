@@ -1232,6 +1232,79 @@ def test_motd_strip_contract():
     print("PASS  motd strip (binds -> popup -> kv placement)")
 
 
+def test_announce_composer_contract():
+    """P8: the composer's truth per channel -- an announce channel
+    without a grant read-locks the composer (hint + disabled binding on
+    the kivy Properties), a holder sees the Announce label, and every
+    other kind leaves the composer open. The channels apply stores the
+    server's can_post stamp and old servers default it to True."""
+    app = types.SimpleNamespace(
+        composer_readonly=False,
+        composer_send_label="Send",
+    )
+    ANNC_CID = "cid-annc"
+    app._channel_kind = types.MethodType(kc.sHadesClientApp._channel_kind, app)
+    SITE_CID = "cid-general"
+    app._channel_kinds = {ANNC_CID: "announce", SITE_CID: "chat"}
+    app._channel_can_post = {ANNC_CID: False}
+    app._sync_composer_props = types.MethodType(
+        kc.sHadesClientApp._sync_composer_props, app)
+
+    app._sync_composer_props("announcements", ANNC_CID)
+    assert app.composer_readonly is True, app.composer_readonly
+    assert app.composer_send_label == "Announce", app.composer_send_label
+
+    app._channel_can_post[ANNC_CID] = True
+    app._sync_composer_props("announcements", ANNC_CID)
+    assert app.composer_readonly is False, app.composer_readonly
+    assert app.composer_send_label == "Announce", app.composer_send_label
+
+    app._channel_kinds[SITE_CID] = "chat"
+    app._sync_composer_props("general", SITE_CID)
+    assert app.composer_readonly is False and \
+        app.composer_send_label == "Send", \
+        (app.composer_readonly, app.composer_send_label)
+
+    # kv contract: the composer bindings carry the properties
+    kvs = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "kv_md.kv"),
+        encoding="utf-8").read()
+    assert "disabled: app.composer_readonly" in kvs, "input not read-locked"
+    assert "app.composer_send_label" in kvs, "send label not mirrored"
+    assert "'announcements only'" in kvs, "hint missing"
+
+    # static: the client's can_post stamp store + the fetch guard
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "kivy_client.py"),
+        encoding="utf-8").read()
+    assert "self._channel_can_post = {}" in src, "stamp store missing"
+    assert 'c.get("can_post", True)' in src, "old-server default not True"
+    assert 'not in ("chat", "announce")' in src, "fetch guard not widened"
+    print("PASS  announce composer (stamp -> read-only -> label)")
+
+
+def test_announce_fetch_guard_contract():
+    """P8: announce channels keep the message ledger flow -- the fetch
+    runs (guard passes) and the stream slot stays assigned for them."""
+    import os
+    # the guard is inline in _fetch_messages; assert its shape statically
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "kivy_client.py"),
+        encoding="utf-8").read()
+    seg = src[src.index("def _fetch_messages"):]
+    seg = seg[:seg.index("def ", 1)]
+    assert 'not in ("chat", "announce")' in seg, \
+        "the ledger fetch must run for announce channels"
+    # and the stream slot must NOT release for announce
+    seg2 = src[src.index("def _switch_channel"):]
+    seg2 = seg2[:seg2.index("def ", 1)]
+    assert 'kind not in ("chat", "announce")' in seg2, \
+        "announce channels keep live push (the stream slot stays)"
+    assert 'self._sync_composer_props(name, cid)' in seg2, \
+        "channel switch never skips the composer sync"
+    print("PASS  announce ledger flow (fetch + push + composer sync)")
+
+
 def main():
     test_link_dead_reported_and_signalled()
     test_link_raise_reported_and_signalled()
@@ -1251,7 +1324,9 @@ def main():
     test_softinput_frame_meter_contract()
     test_site_editor_publish_contract()
     test_motd_strip_contract()
-    print("PASS: 20  FAIL: 0")
+    test_announce_composer_contract()
+    test_announce_fetch_guard_contract()
+    print("PASS: 22  FAIL: 0")
 
 
 if __name__ == "__main__":

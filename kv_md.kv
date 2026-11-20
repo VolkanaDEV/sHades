@@ -676,6 +676,7 @@
                             size: self.parent.size
                     MDTextField:
                         id: msg_input
+                        disabled: app.composer_readonly
                         mode: 'filled'
                         multiline: True
                         size_hint_x: 1
@@ -699,7 +700,7 @@
                         helper_text_color: app.theme_colors['text_dim']
                         on_text_validate: app.send_message()
                         MDTextFieldHintText:
-                            text: 'Message...'
+                            text: 'announcements only' if app.composer_readonly else 'Message...'
                             text_color_normal: app.theme_colors['text']
                             text_color_focus: app.theme_colors['text']
                     MDButton:
@@ -708,11 +709,12 @@
                         width: dp(56)
                         size_hint_y: None
                         height: scaled(dp(40))
+                        disabled: app.composer_readonly
                         theme_bg_color: 'Custom'
                         md_bg_color: app.theme_colors['primary']
                         on_press: app.send_message()
                         MDButtonText:
-                            text: 'Send'
+                            text: app.composer_send_label
                             text_color: app.theme_colors['btn_text']
 
             # -------- left: servers + channels in ONE swipe drawer --------

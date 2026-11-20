@@ -2571,6 +2571,10 @@ class sHadesClientApp(MDApp):
     banner_letter = StringProperty("S")
     # P6: the server's message-of-the-day; "" = the strip stays hidden
     server_motd = StringProperty("")
+    # P8: the composer's truth per channel (announce channels hide it
+    # without an explicit grant; holders see the Announce send label)
+    composer_readonly = BooleanProperty(False)
+    composer_send_label = StringProperty("Send")
     # tay (2026-11): the onboarding avatar slot and the connect-screen
     # username gate bind to these; preview mirrors my_avatar_small so
     # the onboarding card shows the pick (or the generated pattern)
@@ -2645,7 +2649,8 @@ class sHadesClientApp(MDApp):
         self._stream_tick_event = None
         # site channels: kind per cid, the rendered page stack, the page
         # currently shown, and the active theme from the manifest
-        self._channel_kinds = {}     # cid -> chat|site|term
+        self._channel_kinds = {}     # cid -> chat|site|term|announce
+        self._channel_can_post = {}  # cid -> can_post (P8)
         self._channel_pos = {}       # name -> position (task 7 ordering)
         self._channel_order = {}     # cid -> position (server-side index)
         self._site_stack = []        # [(cid, path)] back stack
@@ -4337,6 +4342,7 @@ class sHadesClientApp(MDApp):
         # Clear all channel/chat state for the new server
         self._channels.clear()
         self._channel_kinds.clear()
+        self._channel_can_post.clear()
         self._channel_unread.clear()
         self._msg_widgets.clear()
         self._older.clear()
@@ -5266,6 +5272,7 @@ class sHadesClientApp(MDApp):
                 def apply_del(dt):
                     dead = data.get("channel")
                     self._channel_kinds.pop(dead, None)
+                    self._channel_can_post.pop(dead, None)
                     self._channel_unread.pop(dead, None)
                     self._term_sessions.pop(dead, None)
                     name = data.get("name") or "channel"
@@ -5325,7 +5332,8 @@ class sHadesClientApp(MDApp):
                         before=None, limit=50, prepend=False):
         # site/term channels don't have a message ledger — their grid is a
         # rendered micron page; never stomp it with chat fetches
-        if self._channel_kinds.get(self._channel_cid(channel), "chat") != "chat":
+        if self._channel_kinds.get(self._channel_cid(channel), "chat") \
+                not in ("chat", "announce"):
             return
         # Network call must not block the main thread — run it in background,
         # schedule UI updates via Clock.schedule_once.
@@ -6077,6 +6085,8 @@ class sHadesClientApp(MDApp):
                     if not cid or not name:
                         continue
                     self._channel_kinds[cid] = c.get("kind", "chat")
+                    # P8: an old server without the stamp stays open
+                    self._channel_can_post[cid] = bool(c.get("can_post", True))
                     self._channel_order[cid] = c.get("position") or 0
                     self._channel_pos[name] = c.get("position") or 0
                     if name not in self._channels:
@@ -6093,6 +6103,19 @@ class sHadesClientApp(MDApp):
 
     def _channel_kind(self, cid):
         return self._channel_kinds.get(cid, "chat")
+
+    def _sync_composer_props(self, name, cid):
+        """P8: mirror the channel's post truth into the composer's
+        kivy Properties (announce channels read-only for non-grants)."""
+        kind = self._channel_kind(cid)
+        if kind == "announce":
+            can = self._channel_can_post.get(cid, True)
+        else:
+            can = True
+        self.composer_readonly = (kind == "announce" and not can)
+        self.composer_send_label = ("Announce" if kind == "announce"
+                                    else "Send")
+
 
     # whoami is the admin-menu gate; failure retries are bounded and
     # lane-tunable (never an unbounded loop)
@@ -7127,10 +7150,12 @@ class sHadesClientApp(MDApp):
         self._last_ts = 0.0
         cid = self._channel_cid(name)
         kind = self._channel_kind(cid)
+        # P8: the composer's truth follows the channel everywhere
+        self._sync_composer_props(name, cid)
         # reroute the stream: only the visible channel flows
         self._stream_cid = cid
         self._stream_cursor = None
-        if kind != "chat":
+        if kind not in ("chat", "announce"):
             # site/term channels carry no live push: release the stream
             # slot (one subscription per link) so the previous channel
             # stops flowing into a channel nobody is watching
