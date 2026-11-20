@@ -183,6 +183,20 @@ jobs:
           P4A_DIR="$GITHUB_WORKSPACE/.buildozer/android/platform"
           git clone -b develop --single-branch \
             https://github.com/kivy/python-for-android.git "$P4A_DIR/python-for-android"
+          # Pinned (REVIEW.md "still to validate", closed 2026-11-20):
+          # develop HEAD 9562d1b4f306d0af1e76991c711114010dea4152 is the
+          # exact revision that built APK artifact 14621601277
+          # (sHades-client-android, sha256 3b1ea2818177...225b,
+          # run 44717730161), which booted clean on the arm64 phone
+          # with the IME meter live and the composer lift working.
+          # Both recipe edits below are guarded by grep against this
+          # revision; a future unpin must re-trigger them by hand.
+          P4A_PIN=9562d1b4f306d0af1e76991c711114010dea4152
+          git -C "$P4A_DIR/python-for-android" checkout -q "$P4A_PIN"
+          if [ "$(git -C "$P4A_DIR/python-for-android" rev-parse HEAD)" != "$P4A_PIN" ]; then
+            echo "::error::p4a pinned revision check-out failed"; exit 1
+          fi
+          echo "p4a pinned to $P4A_PIN (the revision behind 0.36.15)"
           RECIPE="$P4A_DIR/python-for-android/pythonforandroid/recipes/python3/__init__.py"
           grep -q "ac_cv_header_bzlib_h=no" "$RECIPE"
           sed -i "/ac_cv_header_bzlib_h=no/d" "$RECIPE"
