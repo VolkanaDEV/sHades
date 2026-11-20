@@ -417,6 +417,30 @@ PR merge stays tay's.
   PR #20 -> tag v0.36.24 on main -> publish -> the release job drops
   the named main APK (+ .sha256) as assets. tay: the branch is
   receipts-complete; the merge click is yours.
+- **The account transfer on restore (tay's device report during the
+  kit test: "it loads and then goes to the server connect screen ...
+  It never connects, even when specifying the ip:port"; relaunch said
+  the profile already exists and forced re-registration).** Three
+  defects mapped from code, same version fold (fold 2): (1) the
+  restore never wrote the portable profile or a session - the boot
+  gate misrouted the restored key to fresh staging, and the restore
+  sheet's identity-exists guard made the state a dead end; (2) the
+  connect screen opened empty, and a reconnect that types only
+  ip:port wiped the kit's guild node/delivery hashes through the
+  server-row replace; (3) nothing entered the account alive. Fix:
+  `_restore_recovery_file` writes the portable profile and the
+  kit's last-active guild as the saved session (resume = the source
+  device's next boot, tay's transfer contract); restore hands off
+  through `_enter_restored_account` (pre-fills the connect screen and
+  dials the kit's guild with its own hashes) or
+  `_prefill_connect_from_servers` when no dial is possible; the
+  server-row update preserves node/delivery hashes a hashless
+  reconnect would have wiped. Server untouched (register already
+  upserts a returning identity). Lane: test_recovery_client
+  transfer receipts (session keys, portable file, the live-enter
+  state, the hashless-reconnect inheritance). Pair closes with the
+  run on this head; fold-1's pair (44811578328/44811578581) is
+  superseded-BY-fold-2, not cancelled mid-run.
 - **tay's flight on this release (one merge, one tag):** merge PR #20
   -> tag v0.36.24 on main -> publish -> drop the named APK
   (+ .sha256 companion) as release assets so the auto-updaters can

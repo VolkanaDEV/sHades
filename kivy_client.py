@@ -3681,9 +3681,15 @@ class sHadesClientApp(MDApp):
                 return
             sheet.dismiss()
             self.root.current = "connect"
-            if complete:
+            if complete and self._enter_restored_account():
+                # the account transfers alive; the connect attempt set
+                # its own status
+                pass
+            elif complete:
+                self._prefill_connect_from_servers()
                 self._set_status("Identity recovered. Connect to a saved guild.")
             else:
+                self._prefill_connect_from_servers()
                 self._set_status(
                     "Identity recovered, but some profile details could not be saved.")
 
@@ -3758,6 +3764,28 @@ class sHadesClientApp(MDApp):
                              and 0 < len(s["hub_address"]) <= 256]
             metadata_ok = self._save_servers() and metadata_ok
             self._active_server_idx = 0 if self._servers else -1
+        # tay's transfer contract (0.36.24): the restored device resumes
+        # exactly like the device the kit came from. The kit's
+        # last-active guild becomes the saved session, so the next boot
+        # reconnects instead of re-staging, and the portable profile
+        # exists so the boot gate routes the restored key as a
+        # completed profile rather than fresh staging.
+        self._portable_name = self.username
+        try:
+            self._save_portable_profile()
+        except OSError:
+            metadata_ok = False
+        first = self._servers[0] if self._servers else None
+        port = (first or {}).get("port")
+        if first and isinstance(port, int) and port > 0 and first.get(
+                "hub_address"):
+            self.hub_address = first["hub_address"]
+            self.hub_host = first.get("host") or ""
+            self.hub_port = port
+            self.guild_node_hash = first.get("node_hash") or None
+            self.delivery_hash = first.get("delivery_hash") or None
+            self.username = self.username or first.get("username") or ""
+            self._save_session()
         try:
             recovery.write_private(self._onboarding_path(),
                                    json.dumps({"name": self.username,
@@ -3765,6 +3793,44 @@ class sHadesClientApp(MDApp):
         except OSError:
             metadata_ok = False
         return metadata_ok
+
+    def _prefill_connect_from_servers(self):
+        """Fill the connect screen from the kit's first server row, so a
+        restore the flow cannot auto-dial still opens with the restored
+        destination ready to edit and tap."""
+        if not self._servers:
+            return
+        try:
+            scr = self.root.get_screen("connect")
+            first = self._servers[0]
+            scr.ids.hub_address.text = first.get("hub_address") or ""
+            scr.ids.username.text = self.username or first.get("username") or ""
+            scr.ids.node_hash.text = first.get("node_hash") or ""
+            scr.ids.delivery_hash.text = first.get("delivery_hash") or ""
+        except Exception:
+            pass
+
+    def _enter_restored_account(self):
+        """tay's transfer contract (0.36.24): a restored kit whose server
+        row is complete transfers the account ALIVE - dial the kit's
+        last-active guild exactly as the device it came from. Returns
+        True when the attempt started."""
+        first = self._servers[0] if self._servers else None
+        if not (first and first.get("hub_address")):
+            return False
+        port = first.get("port")
+        if not (isinstance(port, int) and port > 0):
+            return False
+        try:
+            self.root.current = "connect"
+        except Exception:
+            pass
+        self._prefill_connect_from_servers()
+        username = self.username or first.get("username") or ""
+        self.connect_to_guild(first.get("hub_address"), username,
+                              first.get("node_hash") or "",
+                              first.get("delivery_hash") or "")
+        return True
 
     def _auto_connect_default_hub(self):
         """Connect to the default community hub on a fresh install.
@@ -3975,6 +4041,13 @@ class sHadesClientApp(MDApp):
                 # rail icon state (task 6): an update must not wipe the icon
                 for key in ("icon_path", "icon_blob"):
                     if s.get(key):
+                        entry[key] = s[key]
+                # tay's device report (0.36.24): a reconnect that types
+                # only ip:port must not wipe the guild hashes a restored
+                # kit carried in this row; the connect flow re-adopts
+                # them from the returned row.
+                for key in ("node_hash", "delivery_hash"):
+                    if not entry.get(key) and s.get(key):
                         entry[key] = s[key]
                 self._servers[i] = entry
                 self._active_server_idx = i
@@ -4236,7 +4309,15 @@ class sHadesClientApp(MDApp):
             return
 
         # Add/update server in the list
-        self._add_server(hub_address, username, node_hash, delivery_hash)
+        srv_idx = self._add_server(hub_address, username, node_hash, delivery_hash)
+        row = self._servers[srv_idx] if 0 <= srv_idx < len(self._servers) else {}
+        # tay's device report (0.36.24): a restored kit carries the
+        # guild's node/delivery hashes in its server row; a reconnect
+        # that only types ip:port inherits them instead of wiping them.
+        if not node_hash and row.get("node_hash"):
+            node_hash = row["node_hash"]
+        if not delivery_hash and row.get("delivery_hash"):
+            delivery_hash = row["delivery_hash"]
 
         self.hub_address = hub_address
         self.hub_host = host
