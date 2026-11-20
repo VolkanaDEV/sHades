@@ -119,13 +119,21 @@ scope   : profile-screen delete-account; server toggles that bind live
   kv display block contract).
 - Price: medium. One server key + one client ingest clone.
 
-## P6 — motd display (client only)
+## P6 — motd display (BUILT 2026-11-20, v0.36.18 `93d2ec0`)
 
-- Sidebar strip under the banner: muted one-line motd from whoami
-  payload (verify the payload carries it; if not, add the field).
-- Tapping opens a full-text popup (long motd must not truncate).
-- Tests: kv contract + whoami payload field contract.
-- Price: small.
+- Sidebar strip (id motd_strip) under the banner: muted one-line motd
+  from the whoami payload's NEW guild.motd field (added when the plan
+  was priced: "verify the payload carries it; if not, add the field"
+  — it did not, so the field rides whoami now; the admin panel's
+  existing motd key feeds it, zero new endpoints).
+- Tapping opens a full-text popup (long motd never truncates).
+- Receipts: guild-icon lane 18/0 (2 new motd checks, file made
+  flake8-clean), selfheal lane 20/0 (bind -> hide-on-empty -> full
+  popup text -> kv placement), battery red=none, pair
+  44742331577/44742331549. NEXT ARROW after the device verdicts:
+  P9 config-entry check (verify _open_admin_panel lands on
+  ServerConfigScreen, keep the rail gesture), then P10a device
+  uploads.
 
 ## P7 — Node page admin (admin tab)
 
@@ -182,49 +190,46 @@ scope   : profile-screen delete-account; server toggles that bind live
   (schema, emit, catchup) — its own receipts round. motd (P6) is
   the v1 stand-in.
 
-## P9 — Config entry point (client only)
+## P9 — Config entry point (VERIFIED 2026-11-20, contracts added
+## CI-only: admin-panel lane 11/0)
 
-- The rail ctx menu already carries "server settings" (admin-gated)
-  -> _open_admin_panel. Verify _open_admin_panel lands on
-  ServerConfigScreen; keep the gesture tay named (right-click /
-  long-press on the rail disc) as the entry point.
+- The gesture tay named was already in production: the guild header
+  (CtxHeaderLabel, kv rule at the drawer top, right-click /
+  long-press) carries "copy invite link", "server settings"
+  (admin-gated), "copy boot log"; the settings action lands on
+  ServerConfigScreen via the ScreenManager (popup fallback pre-boot).
+- Receipts: tests/test_admin_panel.py +3 (header carries the entry,
+  its action opens the panel, hidden for non-admins) — lane 11/0.
+  Routing itself was covered by the panel-drive tests.
 
-## P10 — Admin config: prettier + device uploads (tay, 2026-11-19: "Admin
-## config works now, but it should be prettier & icon/banner selection
-## should allow for uploading as well")
+## P10 — Admin config: prettier + device uploads (SHIPPED 0.36.7
+## `359c145`; pick-verdict hardening 0.36.10 `6236c00`)
 
 - tay's message closes the admin-gate saga: admin.txt seed worked, the
   config screen opened on-device.
-- P10a (device upload lane, the functional miss): the blob chain is
-  fully built (blobs_put -> blob_id -> admin_config["guild_icon"/
-  "banner" -> load_icon_into previews); the chooser is desktop-only
-  (FileChooserListView lists nothing in the Android sandbox) while the
-  proven SAF picker routes only avatar/attach purposes. Missing
-  arrow: purpose-routed picking -- open_file_chooser carries
-  purpose=None|"icon"|"banner", _on_file_selected routes icon/banner
-  to ServerConfigScreen.tab_content["General"]._apply_icon_file/
-  _apply_banner_file via the screen manager, ui_server_config pick
-  buttons take the SAF route when _android_platform() (desktop popup
-  unchanged). Price: small (~50 lines, two files).
-- P10b (prettier pass): General tab -- icon preview 56px, banner
-  preview strip (own row, loads via load_icon_into when the config
-  carries a banner), row spacing dp(4)->dp(8). Pure widget code, no kv.
-- Contracts: server_config lane gains the purpose-routing recorder
-  (FakeApp with _android_platform -> open_file_chooser(purpose) call
-  tuple asserted) + banner preview widget presence; kivy_client static
-  pins for the routing helper. Battery green.
-- Ship: bump 0.36.7 (single bump), full gates, CI pair + watcher,
-  byte-verify with the routing symbols in the want set.
+- P10a (device upload lane): BUILT — open_file_chooser carries
+  avatar/purpose ("icon"/"banner"); _android_platform() rides the
+  proven SAF picker (the desktop popup unchanged); _on_file_selected
+  routes purpose through _route_purpose_file into
+  tab_content["General"]._apply_icon_file / _apply_banner_file
+  (blobs_put -> admin_config). Receipts:
+  tests/test_server_config_screen.py "P10a: device (Android) purpose
+  routing" (android pickers ride SAF with purpose + General tab
+  handing).
+- P10b (prettier General tab): BUILT — same ship (icon preview,
+  banner preview strip, spacing) per `359c145`.
+- Device follow-up owned by 0.36.10 `6236c00` ("verdicts on the
+  admin screen + silent-death hardening + SAF redraw").
+- Carried small: any NEW aesthetic asks go through this section.
 
 ## Build order
 
-P1, P2, P3, P5 in the v0.34.0-0.36.x ships (done: admin gate closed by
-tay's admin.txt seed 2026-11-19; bootlog diagnosis channel v0.36.5,
-external_primary v0.36.6). Next: 0.36.12 = P7a (site seed + empty
-state) plus the 0.36.11 softinput lane as its tests-only companion —
-both hold until the 0.36.11 CI pair closes, then ship in one round.
-Then P7b (the SITE_EDIT bit), then P7c (the editor UI; P10's device-
-upload follow-ups stay merged with PR #18). P4, P8 parked until tay
-calls them. PR merge stays tay's.
+P1, P2, P3, P5, P9 in the v0.34.0-0.36.x ships (done: admin gate
+closed by tay's admin.txt seed 2026-11-19; bootlog diagnosis channel
+v0.36.5, external_primary v0.36.6; the P9 gesture verified
+CI-only 2026-11-20). P6 (0.36.18) + P7a (0.36.12) + P7b (0.36.16) +
+P7c (0.36.17) shipped; device verdicts on the 0.36.17/0.36.18
+artifacts are owed from tay's installs. P10 closed at 0.36.7/0.36.10
+(see above). P4, P8 parked until tay calls them. PR merge stays tay's.
 
 [END PLAN]
