@@ -24,6 +24,7 @@ import sqlite3
 import hashlib
 import secrets
 import threading
+import updater
 from collections import defaultdict, deque
 
 import RNS
@@ -51,15 +52,15 @@ ATTACHMENT_EXT    = {"png", "jpg", "jpeg", "gif", "webp", "mp3", "ogg", "wav",
                      "flac", "mp4", "webm", "pdf", "txt"}
 
 # Channel kinds: chat, a NomadNet micron "site", or a terminal stream.
-CHANNEL_KINDS     = ("chat", "site", "term")
+CHANNEL_KINDS     = ("chat", "site", "term", "announce")
 
 # Permission bitmask (U5). Guild-wide bits (MANAGE_*/ADMIN) live on roles;
 # channel-scoped bits (VIEW/POST) live in channel_overwrites keyed by role
 # (role_id 0 = @everyone). Missing @everyone row defaults to open reading
 # and posting, which preserves pre-roles behaviour.
 PERMS = {"VIEW": 1, "POST": 2, "MANAGE_MESSAGES": 4, "MANAGE_CHANNEL": 8,
-         "MANAGE_ROLES": 16, "ADMIN": 32}
-PERM_ALL = 63
+         "MANAGE_ROLES": 16, "ADMIN": 32, "SITE_EDIT": 64}
+PERM_ALL = 127
 DEFAULT_CHANNEL_PERMS = PERMS["VIEW"] | PERMS["POST"]
 _GUILD_MANAGE_BITS = (PERMS["MANAGE_MESSAGES"] | PERMS["MANAGE_CHANNEL"] |
                       PERMS["MANAGE_ROLES"] | PERMS["ADMIN"])
@@ -138,6 +139,10 @@ TYPING        = {}                      # channel_id -> {user_hash: expires_at}
 TYPING_LOCK   = threading.Lock()
 
 FIELD_ATTACHMENTS = LXMF.FIELD_FILE_ATTACHMENTS  # 0x05 — envelope ours (plan §14)
+
+# P11 version bridge: the server knows its own version. Lockstep with
+# buildozer.spec and kivy_client.APP_VERSION (tests/test_update_meta.py).
+SERVER_VERSION = "0.36.23"
 
 # ----------------------------------------------------------------------------------
 # Database
@@ -500,6 +505,40 @@ def has_role_perm(user, bits):
             (user, bits)).fetchone()
     return row is not None
 
+def _effective_perms(user_hash, channel_id, base):
+    """The union: base + each of the user's roles' perms + each role's
+    per-channel overwrite. The admin short-circuit lives in has_perm."""
+    if user_hash is None:
+        return 0
+    with db_lock:
+        rows = db.execute(
+            "SELECT co.perms AS operms, r.perms AS rperms "
+            "FROM user_roles ur JOIN roles r ON r.role_id = ur.role_id "
+            "LEFT JOIN channel_overwrites co ON co.role_id = ur.role_id "
+            "AND co.channel_id=? WHERE ur.user_hash=?",
+            (channel_id, user_hash)).fetchall()
+    perms = base
+    for r in rows:
+        perms |= (r["operms"] or 0) | (r["rperms"] or 0)
+    return perms
+
+def _announce_post_ok(user_hash, channel_id):
+    """kind=='announce' POST gate (P8): moderators/admins always; everyone
+    else only with an EXPLICIT POST grant -- an @everyone overwrite row
+    carrying POST, a role perm, or a role overwrite. The open channel
+    default confers VIEW here, never POST."""
+    if is_moderator(user_hash):
+        return True
+    if user_hash is None:
+        return False
+    with db_lock:
+        base_row = db.execute("SELECT perms FROM channel_overwrites "
+                              "WHERE channel_id=? AND role_id=0",
+                              (channel_id,)).fetchone()
+    perms = _effective_perms(user_hash, channel_id,
+                             base_row["perms"] if base_row else 0)
+    return (perms & PERMS["POST"]) != 0
+
 def has_perm(user, channel_id, bit):
     """Effective permission for one channel. VIEW/POST = the @everyone
     overwrite (or the open default) UNION each of the user's roles' own
@@ -513,19 +552,12 @@ def has_perm(user, channel_id, bit):
         base = db.execute("SELECT perms FROM channel_overwrites "
                           "WHERE channel_id=? AND role_id=0",
                           (channel_id,)).fetchone()
-        rows = db.execute(
-            "SELECT co.perms AS operms, r.perms AS rperms "
-            "FROM user_roles ur JOIN roles r ON r.role_id = ur.role_id "
-            "LEFT JOIN channel_overwrites co ON co.role_id = ur.role_id "
-            "AND co.channel_id=? WHERE ur.user_hash=?",
-            (channel_id, user)).fetchall()
         is_admin = db.execute(
             "SELECT 1 FROM user_roles ur JOIN roles r ON r.role_id = ur.role_id "
             "WHERE ur.user_hash=? AND (r.perms & ?) != 0 LIMIT 1",
             (user, PERMS["ADMIN"])).fetchone()
-    perms = base["perms"] if base else DEFAULT_CHANNEL_PERMS
-    for r in rows:
-        perms |= (r["operms"] or 0) | (r["rperms"] or 0)
+    perms = _effective_perms(user, channel_id,
+                             base["perms"] if base else DEFAULT_CHANNEL_PERMS)
     if is_admin:
         return True
     return (perms & bit) != 0
@@ -665,6 +697,11 @@ def _node_reaper():
         except Exception as e:
             RNS.log("upload reaper error: %s" % e, RNS.LOG_ERROR)
         try:
+            if _update_maybe_tick():
+                pass
+        except Exception as e:
+            RNS.log("update tick error: %s" % e, RNS.LOG_ERROR)
+        try:
             if ATT_RAM:
                 _att_ram_sweep()
         except Exception as e:
@@ -795,7 +832,18 @@ def ingest(channel_id, author_hash, content, ts=None, attachments=None):
         return None
     if is_muted(author_hash):
         return None  # muted: post silently dropped
-    if not has_perm(author_hash, channel_id, PERMS["POST"]):
+    with db_lock:
+        _kind_row = db.execute("SELECT kind FROM channels WHERE id=?",
+                               (channel_id,)).fetchone()
+    _chn_kind = _kind_row["kind"] if _kind_row else "chat"
+    if _chn_kind == "announce":
+        # P8: announcements only -- explicit grants (or mods); the open
+        # default never confers POST on an announce channel
+        if not _announce_post_ok(author_hash, channel_id):
+            RNS.log("ingest: announce POST denied for %s in %s"
+                    % (author_hash[:12], channel_id[:12]), RNS.LOG_WARNING)
+            return None
+    elif not has_perm(author_hash, channel_id, PERMS["POST"]):
         RNS.log("ingest: POST denied for %s in %s" % (author_hash[:12],
                                                       channel_id[:12]),
                 RNS.LOG_WARNING)
@@ -1943,6 +1991,12 @@ def api_v1_channels_list(viewer, data, link_id):
     # VIEW permission: channels the viewer cannot read are absent entirely
     chans = [c for c in chans if has_perm(viewer, c["id"], PERMS["VIEW"])]
     for c in chans:
+        if c["kind"] == "announce":
+            # P8: the composer's truth rides the read the client already
+            # fetches (the site-edit verdict shape)
+            c["can_post"] = bool(_announce_post_ok(viewer, c["id"]))
+        else:
+            c["can_post"] = bool(has_perm(viewer, c["id"], PERMS["POST"]))
         last_id = _receipt_last_id(c["id"], viewer)
         c["unread"] = _unread_count(c["id"], last_id)
     return {"ok": 1, "channels": chans}
@@ -2000,6 +2054,9 @@ def _create_channel_txn(viewer, name, kind, manifest=None):
                    (cid, name, now(), kind, manifest_json, nxt))
         db.execute("INSERT OR IGNORE INTO channel_state (channel_id, seq) VALUES (?, 0)", (cid,))
         db.commit()
+    if kind == "site":
+        # outside db_lock: the seed is a file write + handler registration
+        _seed_default_site(cid)
     _audit(viewer, "channel.create", cid, "%s (%s)" % (name, kind))
     return cid, None
 
@@ -2691,6 +2748,47 @@ def _site_file_path(cid, rel):
         return None
     return path
 
+# Starter page for fresh site channels (tay: creating a site used to
+# leave the channel rendering "loading site..." forever, because no
+# resource existed to fetch). Micron grammar per micron.py: heading
+# lines start with '>', separators '-', directives '#!k=v', links
+# [label`target]. Headings parse via micron.py:184.
+DEFAULT_SITE_INDEX_MU = (
+    "#!c=0\n"
+    "> A fresh sHades site\n"
+    "-\n"
+    "This channel is a micron site. Pages live as site resources\n"
+    "served from this guild; the default template at /index.mu\n"
+    "stands in until you publish your own pages.\n"
+    "-\n"
+    "Quick micron form:\n"
+    "`!bold!` `*italic*` `_underline_` `F8a8`code`f`\n"
+    "[publish with site/put `/index.mu]\n"
+)
+
+
+def _seed_default_site(cid):
+    """Seed a fresh site channel with the default template /index.mu,
+    through the same storage path and handler registration as
+    site/put. Best-effort: the channel row already committed, so a
+    seed failure is logged, not fatal -- the client renders its
+    empty-state page instead (that leg covers this branch)."""
+    fpath = _site_file_path(cid, "index.mu")
+    if fpath is None:
+        return
+    os.makedirs(os.path.dirname(fpath), exist_ok=True)
+    try:
+        with open(fpath, "wb") as f:
+            f.write(DEFAULT_SITE_INDEX_MU.encode("utf-8"))
+    except OSError as e:
+        RNS.log(f"default site seed failed {cid}: {e}", RNS.LOG_ERROR)
+        return
+    if node_destination is not None:
+        node_destination.register_request_handler(
+            f"/file/sites/{cid}/index.mu", serve_site_file,
+            allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
+    RNS.log(f"site channel seeded: {cid}/index.mu", RNS.LOG_INFO)
+
 def _site_channel(cid):
     with db_lock:
         r = db.execute("SELECT id, kind FROM channels WHERE id=?", (cid,)).fetchone()
@@ -2701,12 +2799,15 @@ def _site_channel(cid):
 def api_v1_site_put(viewer, data, link_id):
     """Store one site resource (micron page, image, audio, video).
     {channel, path, data_b64, mime?} -> registers /file/sites/<cid>/<path> and
-    emits a site_patch event on the channel stream. Moderator-only."""
-    if not is_moderator(viewer):
-        return {"ok": 0, "error": "moderator required", "code": 403}
+    emits a site_patch event on the channel stream. P7b: moderator OR the
+    caller carries the channel-scoped PERMS["SITE_EDIT"] (channel_overwrites).
+    Wikipedia-style: the granted bits, not the moderator list, write the
+    channel's wiki."""
     cid = data.get("channel")
     if not _site_channel(cid):
         return {"ok": 0, "error": "unknown or non-site channel", "code": 404}
+    if not (is_moderator(viewer) or has_perm(viewer, cid, PERMS["SITE_EDIT"])):
+        return {"ok": 0, "error": "site edit permission required", "code": 403}
     rel = _site_safe_rel(data.get("path"))
     if not rel:
         return {"ok": 0, "error": "invalid resource path", "code": 400}
@@ -2758,9 +2859,11 @@ def api_v1_site_get(viewer, data, link_id):
     if total is None:
         return {"ok": 0, "error": "resource not found", "code": 404}
     ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
+    can_edit = is_moderator(viewer) or has_perm(viewer, cid, PERMS["SITE_EDIT"])
     return {"ok": 1, "channel": cid, "path": "/" + rel, "total": total,
             "offset": offset, "eof": offset + len(chunk) >= total,
             "mime": EXT_MIME.get(ext, "application/octet-stream"),
+            "can_edit": bool(can_edit),
             "data_b64": base64.b64encode(chunk).decode("ascii")}
 
 @api_route("/api/v1/site/manifest")
@@ -2781,13 +2884,14 @@ def api_v1_site_manifest(viewer, data, link_id):
 @api_route("/api/v1/site/manifest_put")
 @wrap_json_api
 def api_v1_site_manifest_put(viewer, data, link_id):
-    """Update a site manifest (mod-only): {channel, manifest} — emits a
-    site_patch event carrying the manifest so open clients re-theme."""
-    if not is_moderator(viewer):
-        return {"ok": 0, "error": "moderator required", "code": 403}
+    """Update a site manifest: {channel, manifest} — emits a site_patch
+    event carrying the manifest so open clients re-theme. P7b: moderator OR
+    the channel-scoped PERMS["SITE_EDIT"], same gate as site/put."""
     cid = data.get("channel")
     if not _site_channel(cid):
         return {"ok": 0, "error": "unknown or non-site channel", "code": 404}
+    if not (is_moderator(viewer) or has_perm(viewer, cid, PERMS["SITE_EDIT"])):
+        return {"ok": 0, "error": "site edit permission required", "code": 403}
     manifest = data.get("manifest")
     if not isinstance(manifest, dict):
         return {"ok": 0, "error": "manifest must be an object", "code": 400}
@@ -3313,7 +3417,13 @@ def api_v1_whoami(viewer, data, link_id):
             "is_moderator": is_moderator(viewer) or is_admin,
             "is_admin": is_admin, "roles": roles,
             "guild": {"name": _cfg_get("guild_name", "") or GUILD_NAME,
-                      "icon": icon, "banner": banner}}
+                      "motd": _cfg_get("motd", "") or "",
+                      "icon": icon, "banner": banner,
+                      # P11 arrow 5: what this server runs + the toggle,
+                      # so a client can offer to pull the release
+                      "app_version": SERVER_VERSION,
+                      "update_channel": _cfg_get(
+                          "update_channel", "off")}}
 
 def _register_mod_endpoint(path, verb, apply_fn):
     """Register one moderator-gated JSON endpoint. `apply_fn(viewer, target,
@@ -3393,7 +3503,59 @@ SERVER_CONFIG_KEYS = {
     "guild_icon": "",            # empty = no icon; else a stored blob_id
     "banner": "",                # empty = no banner; else a stored blob_id
     "attachments": "saved",      # saved | ephemeral (P2: RAM-only bytes)
+    "update_channel": "off",     # P11: off | github | rns (rns unwired yet)
+    "update_check_minutes": "360",  # P11: soft check interval; 0 = boot only
 }
+
+# ---------------------------------------------------------------------- P11 updater
+_UPDATE_LOCK = threading.Lock()
+_UPDATE_LAST = [0.0]
+_BOOT_ARGV = []
+
+
+def _update_worker():
+    with _UPDATE_LOCK:
+        try:
+            tree = os.path.dirname(os.path.abspath(__file__))
+            res = updater.check_and_apply(
+                tree, SERVER_VERSION, _cfg_get,
+                argv=(["sHades.py"] + _BOOT_ARGV), exec_restart=True)
+            RNS.log("updater: %s" % (res,), RNS.LOG_INFO)
+        except Exception as e:
+            RNS.log("updater: failed: %s" % e, RNS.LOG_ERROR)
+
+
+def _update_maybe_tick(force=False):
+    """Called by the reaper loop and at boot; honours the toggle + interval."""
+    ch = (_cfg_get("update_channel", "off") or "off").strip().lower()
+    if ch == "off":
+        return
+    now_t = now()
+    try:
+        iv = int(_cfg_get("update_check_minutes", "360") or 0)
+    except (TypeError, ValueError):
+        iv = 360
+    iv_s = max(iv, 1) * 60
+    if not force and _UPDATE_LAST[0] and (now_t - _UPDATE_LAST[0]) < iv_s:
+        return
+    _UPDATE_LAST[0] = now_t
+    if not _UPDATE_LOCK.acquire(False):
+        return  # a worker is already out; its result answers next tick
+    threading.Thread(target=_update_worker, daemon=True).start()
+
+
+@api_route("/api/v1/update_status")
+def api_v1_update_status(viewer, data, request_id, link_id,
+                         remote_identity, requested_at):
+    """P11: the updater's last verdict, admin-only read (the panel
+    consumes this in chain 5)."""
+    denied = _require_admin(viewer)
+    if denied:
+        return denied
+    out = updater.get_status()
+    out["channel"] = _cfg_get("update_channel", "off")
+    out["interval"] = _cfg_get("update_check_minutes", "360")
+    return out
 
 def _require_admin(viewer):
     """Admin gate for the panel endpoints (U8). ADMIN role only — the
@@ -4110,7 +4272,7 @@ def api_v1_channels_patch(viewer, data, link_id):
                                "WHERE channel_id=? AND role_id=?", (cid, rid))
                 else:
                     if not isinstance(perms, int) or perms < 0 or perms > PERM_ALL:
-                        return {"ok": 0, "error": "perms must be a bitmask 0-63",
+                        return {"ok": 0, "error": "perms must be a bitmask 0-127",
                                 "code": 400}
                     db.execute("INSERT INTO channel_overwrites "
                                "(channel_id, role_id, perms) VALUES (?, ?, ?) "
@@ -4315,6 +4477,9 @@ def run(argv=None):
 
     # Reap clients that miss two consecutive 4s announcements (8 s stale).
     threading.Thread(target=_node_reaper, daemon=True).start()
+    global _BOOT_ARGV
+    _BOOT_ARGV = list(argv)
+    _update_maybe_tick(force=True)
     threading.Thread(target=announce_all, daemon=True).start()
     try:
         while True:

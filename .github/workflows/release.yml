@@ -1,0 +1,36 @@
+# P11: attach the server bundle + its sha256 to a published release.
+# The auto-updaters pull from GitHub releases; the sha256 file rides
+# the release so a puller can verify what it fetched. Checks out the
+# RELEASE TAG (not main), so the bundle is the released tree.
+name: Attach server bundle to release
+on:
+  release:
+    types: [published]
+
+jobs:
+  attach:
+    name: build + upload server bundle
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - name: Bundle server source + sha256
+        run: |
+          set -e
+          V=$(grep -E '^version = ' buildozer.spec | sed 's/version = //')
+          git archive --format=tar.gz -o "sHades-server-$V.tar.gz" HEAD
+          sha256sum "sHades-server-$V.tar.gz" > "sHades-server-$V.sha256"
+          cat "sHades-server-$V.sha256"
+          echo "BUNDLE_VERSION=$V" >> "$GITHUB_ENV"
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -e
+          V="${BUNDLE_VERSION}"
+          gh release upload "$TAG" "sHades-server-$V.tar.gz" \
+            "sHades-server-$V.sha256" --repo eldeucebag/sHades

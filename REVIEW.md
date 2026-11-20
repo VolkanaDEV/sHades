@@ -26,8 +26,12 @@ issues:
 
 - Build and install the Android APK on an arm64 device. The Buildozer lane
   uses the moving `python-for-android` `develop` branch and edits two recipes
-  by exact text; changes upstream can break that build. Pin a known-good
-  toolchain revision after a successful device run.
+  by exact text; changes upstream can break that build. **Closed 2026-11-20:**
+  the arm64 run succeeded (APK artifact 14621601277 boots clean on-device, IME
+  meter live, composer lift working), and build.yml now pins p4a to that
+  build's exact develop revision, `9562d1b4f306d0af1e76991c711114010dea4152`,
+  with a rev-parse guard. Unpinning later means re-validating both recipe
+  edits against the newer tree.
 - Run the Windows and Linux PyInstaller jobs and launch their packaged
   binaries. Source-level and Kivy-window tests do not verify frozen imports.
 - Existing saved custom themes override the new defaults. Users can choose

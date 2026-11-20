@@ -33,6 +33,26 @@ from mesh_ui import grouped_with, link_state, reply_wire, split_reply
 from ui_theme import preset_colors
 
 # ---------------------------------------------------------------------------
+# P11 version bridge: the running build knows its own version.
+# ---------------------------------------------------------------------------
+APP_VERSION = "0.36.23"
+
+# buildozer.spec, kivy_client.APP_VERSION and sHades.SERVER_VERSION must all
+# match (tests/test_update_meta.py keeps them in lockstep). On-device the
+# APK's own versionName (PackageManager) wins, so a sideloaded build always
+# reports what it really is; everywhere else the constant answers.
+def _client_version():
+    try:
+        from jnius import autoclass
+        activity = autoclass("org.kivy.android.PythonActivity").mActivity
+        info = activity.getPackageManager().getPackageInfo(
+            activity.getPackageName(), 0)
+        v = str(info.versionName)
+        return v if v else APP_VERSION
+    except Exception:
+        return APP_VERSION
+
+# ---------------------------------------------------------------------------
 # Kivy (guarded so the module can be imported for linting without Kivy present)
 # ---------------------------------------------------------------------------
 def _make_kivy_stub(name, err=None):
@@ -139,6 +159,21 @@ BOOT_DEBUG = False
 
 _boot_lines = []
 _boot_label = {"ref": None}
+
+# The IME lifting meter, v0.36.15: resolved jnius handles for the
+# kivy-thread visible-frame poll (None until the first tick), plus the
+# once-only report set for failures (a failing tick must not spam the
+# boot log).
+_FRAME_METER = None
+_FRAME_REPORTED = set()
+
+
+def _softinput_reported_once(tag):
+    """True the SECOND time a tag is seen; the first reports."""
+    if tag in _FRAME_REPORTED:
+        return True
+    _FRAME_REPORTED.add(tag)
+    return False
 
 
 def _boot_file(msg):
@@ -945,6 +980,13 @@ class GuildAPI:
         if length is not None:
             data["len"] = length
         return self._request_json("/api/v1/site/get", data)
+
+    def site_put(self, channel, path, data_b64, mime=None):
+        """Store one site resource (P7b: moderator or channel SITE_EDIT)."""
+        data = {"channel": channel, "path": path, "data_b64": data_b64}
+        if mime:
+            data["mime"] = mime
+        return self._request_json("/api/v1/site/put", data, timeout=15)
 
     def site_manifest(self, channel):
         return self._request_json("/api/v1/site/manifest", {"channel": channel})
@@ -2114,6 +2156,49 @@ if KIVY:
 # Screens
 # ---------------------------------------------------------------------------
 if KIVY:
+    class SiteEditorScreen(Screen):
+        """P7c: micron source editor for a site page. The affordance
+        reaches this screen only for SITE_EDIT holders (the server stamps
+        site/get with can_edit). Holds the source TextInput, a one-tap
+        preview, and publish via site/put; the app carries the flow."""
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            col = BoxLayout(orientation="vertical", padding=dp(8),
+                            spacing=dp(6))
+            bar = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(6))
+            for text, meth in (("< Back", "_site_editor_back"),
+                               ("Preview", "_site_editor_preview"),
+                               ("Publish", "_site_editor_publish")):
+                btn = Button(text=text)
+                btn.bind(on_press=lambda inst, m=meth: self._tap(m))
+                bar.add_widget(btn)
+            self._src = TextInput(multiline=True, size_hint_y=0.5,
+                                  font_size=sp(13),
+                                  hint_text="micron source")
+            self._status = Label(size_hint_y=None, height=dp(24),
+                                 markup=True, halign="center",
+                                 font_size=sp(12))
+            self._status.bind(width=lambda inst, w: setattr(
+                inst, "text_size", (w, None)))
+            prev_scroll = ScrollView(size_hint_y=1)
+            prev_col = BoxLayout(orientation="vertical",
+                                 size_hint_y=None,
+                                 padding=(dp(4), dp(4)))
+            prev_col.bind(minimum_height=prev_col.setter("height"))
+            self._prev_holder = prev_col
+            prev_scroll.add_widget(prev_col)
+            col.add_widget(bar)
+            col.add_widget(self._src)
+            col.add_widget(self._status)
+            col.add_widget(prev_scroll)
+            self.add_widget(col)
+
+        def _tap(self, meth):
+            app = App.get_running_app()
+            if app and hasattr(app, meth):
+                getattr(app, meth)()
+
     class ConnectScreen(Screen):
         """Connect screen. The optional guild-hash fields live behind a
         disclosure so the screen fits a small window without pushing the
@@ -2504,6 +2589,16 @@ class sHadesClientApp(MDApp):
     banner_config_path = StringProperty("")
     # P5: letter tile shown inside the banner strip when unset
     banner_letter = StringProperty("S")
+    # P6: the server's message-of-the-day; "" = the strip stays hidden
+    server_motd = StringProperty("")
+    # P11 arrow 5: "0.36.22"-shaped hint from the server's whoami; ""
+    # hides the strip (the update check is toggle-gated server-side)
+    client_update_version = StringProperty("")
+    update_status = StringProperty("")
+    # P8: the composer's truth per channel (announce channels hide it
+    # without an explicit grant; holders see the Announce send label)
+    composer_readonly = BooleanProperty(False)
+    composer_send_label = StringProperty("Send")
     # tay (2026-11): the onboarding avatar slot and the connect-screen
     # username gate bind to these; preview mirrors my_avatar_small so
     # the onboarding card shows the pick (or the generated pattern)
@@ -2578,7 +2673,8 @@ class sHadesClientApp(MDApp):
         self._stream_tick_event = None
         # site channels: kind per cid, the rendered page stack, the page
         # currently shown, and the active theme from the manifest
-        self._channel_kinds = {}     # cid -> chat|site|term
+        self._channel_kinds = {}     # cid -> chat|site|term|announce
+        self._channel_can_post = {}  # cid -> can_post (P8)
         self._channel_pos = {}       # name -> position (task 7 ordering)
         self._channel_order = {}     # cid -> position (server-side index)
         self._site_stack = []        # [(cid, path)] back stack
@@ -2758,6 +2854,7 @@ class sHadesClientApp(MDApp):
         sm.add_widget(MainScreen(name="main"))
         sm.add_widget(ProfileScreen(name="profile"))
         sm.add_widget(ConfigScreen(name="config"))
+        sm.add_widget(SiteEditorScreen(name="site_editor"))
         # Phase 1 task 5: the tabbed server-config screen replaces the U8
         # popup; its tabs are keyed to the caller's roles on entry.
         try:
@@ -2772,6 +2869,77 @@ class sHadesClientApp(MDApp):
             _boot_mark("screens ok: %d registered" % len(sm.screens))
             _boot_install(sm.get_screen(sm.current))
         return sm
+
+    def _softinput_tick(self, *_dt):
+        """Lift the composer group above the Android IME.
+
+        tay's 0.36.13 boot (launch 1795165828s): the window-mode
+        dispatch legs are green, but the ANGLE/Vulkan surface never
+        propagates the IME resize into the kivy layout. v0.36.14 tried
+        a UI-thread OnGlobalLayoutListener and KILLED the boot (log 30,
+        launches 1795169468/71s: UI-thread python collided with the
+        main thread mid-import of kivy's pyx machinery -- system kill,
+        silence). v0.36.15 measures here, on the KIVY thread, post
+        app start -- the exact pattern _apply_system_gesture_exclusions
+        already runs: PythonActivity + Rect resolved once, then each
+        0.25s tick reads the decor's visible frame bottom directly.
+        lift = base - bottom is the IME height in pixels; padding the
+        bottom edge of the chat container lifts the reply row and the
+        composer row (input field, buttons, pfp) as one group while the
+        scroll view shrinks. Zero lift when the keyboard is closed.
+        Runs only on android.
+        """
+        from kivy.utils import platform
+        if platform != "android":
+            return
+        global _FRAME_METER
+        try:
+            if _FRAME_METER is None:
+                from jnius import autoclass
+                _FRAME_METER = {
+                    "PythonActivity": autoclass(
+                        "org.kivy.android.PythonActivity"),
+                    "Rect": autoclass("android.graphics.Rect"),
+                }
+                print("SOFTINPUT: frame meter live (kivy thread poll)",
+                      flush=True)
+            meter = _FRAME_METER
+            rect = meter["Rect"]()
+            meter["PythonActivity"].mActivity.getWindow().getDecorView() \
+                .getWindowVisibleDisplayFrame(rect)
+            bottom = rect.bottom
+        except Exception as e:
+            if not _softinput_reported_once("frame read"):
+                _boot_file("softinput frame read failed: %s" % e)
+            return
+        try:
+            import main as main_mod
+            state = main_mod._SOFTINPUT
+        except Exception:
+            state = None
+        if state is None:
+            return
+        # base = the no-IME frame bottom = the largest bottom seen; if
+        # the IME was already up at first layout the base self-corrects
+        # on the first keyboard close.
+        if bottom and bottom > state["base"]:
+            state["base"] = bottom
+        state["bottom"] = bottom
+        state["live"] = True
+        base = state["base"]
+        if not base:
+            return
+        lift = (base - bottom) if bottom else 0
+        if lift < 0:
+            lift = 0
+        screen = self.root.get_screen("main")
+        cs = screen.ids.get("chat_screen")
+        if cs is None:
+            return
+        cur = cs.padding
+        if len(cur) != 4 or cur[3] != lift:
+            # kivy padding is [left, top, right, bottom]
+            cs.padding = [cur[0], cur[1], cur[2], lift]
 
     def _apply_system_gesture_exclusions(self, *_args):
         """Exclude our drawer edge bands from the Android system back
@@ -2824,6 +2992,13 @@ class sHadesClientApp(MDApp):
         if BOOT_DEBUG:
             _boot_mark("on_start")
         self._apply_system_gesture_exclusions()
+        # 0.36.14: the frame meter (main.py, UI-thread listener) feeds
+        # this tick; it pads the chat container so the composer group
+        # rides above the keyboard.
+        try:
+            Clock.schedule_interval(self._softinput_tick, 0.25)
+        except Exception as e:
+            _boot_file("softinput meter not scheduled: %s" % e)
         # tay (2026-11): '/' pops the command palette for live selections.
         # The channel input watches its own text: a bare '/' opens the
         # palette with the filter seeded from the input, everything else
@@ -4191,6 +4366,7 @@ class sHadesClientApp(MDApp):
         # Clear all channel/chat state for the new server
         self._channels.clear()
         self._channel_kinds.clear()
+        self._channel_can_post.clear()
         self._channel_unread.clear()
         self._msg_widgets.clear()
         self._older.clear()
@@ -5120,6 +5296,7 @@ class sHadesClientApp(MDApp):
                 def apply_del(dt):
                     dead = data.get("channel")
                     self._channel_kinds.pop(dead, None)
+                    self._channel_can_post.pop(dead, None)
                     self._channel_unread.pop(dead, None)
                     self._term_sessions.pop(dead, None)
                     name = data.get("name") or "channel"
@@ -5179,7 +5356,8 @@ class sHadesClientApp(MDApp):
                         before=None, limit=50, prepend=False):
         # site/term channels don't have a message ledger — their grid is a
         # rendered micron page; never stomp it with chat fetches
-        if self._channel_kinds.get(self._channel_cid(channel), "chat") != "chat":
+        if self._channel_kinds.get(self._channel_cid(channel), "chat") \
+                not in ("chat", "announce"):
             return
         # Network call must not block the main thread — run it in background,
         # schedule UI updates via Clock.schedule_once.
@@ -5931,6 +6109,8 @@ class sHadesClientApp(MDApp):
                     if not cid or not name:
                         continue
                     self._channel_kinds[cid] = c.get("kind", "chat")
+                    # P8: an old server without the stamp stays open
+                    self._channel_can_post[cid] = bool(c.get("can_post", True))
                     self._channel_order[cid] = c.get("position") or 0
                     self._channel_pos[name] = c.get("position") or 0
                     if name not in self._channels:
@@ -5947,6 +6127,19 @@ class sHadesClientApp(MDApp):
 
     def _channel_kind(self, cid):
         return self._channel_kinds.get(cid, "chat")
+
+    def _sync_composer_props(self, name, cid):
+        """P8: mirror the channel's post truth into the composer's
+        kivy Properties (announce channels read-only for non-grants)."""
+        kind = self._channel_kind(cid)
+        if kind == "announce":
+            can = self._channel_can_post.get(cid, True)
+        else:
+            can = True
+        self.composer_readonly = (kind == "announce" and not can)
+        self.composer_send_label = ("Announce" if kind == "announce"
+                                    else "Send")
+
 
     # whoami is the admin-menu gate; failure retries are bounded and
     # lane-tunable (never an unbounded loop)
@@ -6012,6 +6205,143 @@ class sHadesClientApp(MDApp):
                             Clock.schedule_once(
                                 lambda dt: self._ingest_banner(
                                     banner_blob, srv), 0)
+                # P6: the message-of-the-day strip under the banner
+                Clock.schedule_once(
+                    lambda dt: self._apply_motd(
+                        (guild.get("motd") or "").strip()), 0)
+                # P11 arrow 5: the server's version + toggle -> the strip
+                Clock.schedule_once(
+                    lambda dt: self._apply_update_hint(
+                        (guild.get("app_version") or ""),
+                        (guild.get("update_channel") or "")), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_update_hint(self, server_version, channel):
+        """Pure decision through client_update; "" clears the strip."""
+        import client_update
+        offer = client_update.update_decision(
+            self._client_ver(), server_version, channel)
+        self.client_update_version = (
+            ".".join(str(x) for x in offer) if offer else "")
+
+    def _client_ver(self):
+        return _client_version()
+
+    def _apply_motd(self, value):
+        """Bind whoami's guild motd to the sidebar strip ('' hides it)."""
+        self.server_motd = value or ""
+
+    def _build_motd_popup(self):
+        """The full-text motd popup (the strip clips long messages)."""
+        box = BoxLayout(orientation="vertical", padding=dp(8),
+                        spacing=dp(6))
+        scroll_box = ScrollView()
+        full = Label(markup=True, font_size=sp(13),
+                     color=self.theme_colors.get("text",
+                                                 (0.92, 0.94, 0.96, 1)))
+        full.text = self.server_motd or ""
+        full.bind(width=lambda inst, w: setattr(
+            inst, "text_size", (w, None)))
+        full.bind(texture_size=full.setter("size"))
+        scroll_box.add_widget(full)
+        box.add_widget(scroll_box)
+        close = Button(text="Close", size_hint_y=None, height=dp(36))
+        box.add_widget(close)
+        popup = Popup(title="Server message", content=box,
+                      size_hint=(0.8, 0.5), auto_dismiss=True)
+        close.bind(on_press=lambda inst: popup.dismiss())
+        return popup
+
+    def _open_motd_popup(self):
+        if not self.server_motd:
+            return
+        self._build_motd_popup().open()
+
+    # ------------------------------------------------- P11 arrow 5 flow
+    def _open_update_prompt(self):
+        target = self.client_update_version or ""
+        if not target:
+            return
+        box = BoxLayout(orientation="vertical", padding=dp(10),
+                        spacing=dp(8))
+        ask = Label(markup=True, font_size=sp(14),
+                    color=self.theme_colors.get(
+                        "text", (0.92, 0.94, 0.96, 1)))
+        ask.text = ("Update to %s?\nUpgrading over the install keeps your "
+                    "account; uninstalling first needs your recovery kit "
+                    "to hand it to the new install." % target)
+        ask.bind(width=lambda inst, w: setattr(inst, "text_size",
+                                               (w, None)))
+        box.add_widget(ask)
+        status = Label(markup=True, font_size=sp(12),
+                       color=self.theme_colors.get(
+                           "text_dim", (0.7, 0.72, 0.75, 1)))
+        status.text = ""
+        box.add_widget(status)
+        row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(8))
+        # tay (2026-11-20): accounts must transfer between clients during
+        # the upgrade - the kit gate rides the consent popup, the kit sheet
+        # (recovery.open_recovery_sheet) exports identity + username +
+        # friends + servers outside the app sandbox BEFORE the install
+        # intent is offered
+        kit = Button(text="Save kit first")
+        go = Button(text="Download and install")
+        cancel = Button(text="Not now")
+        row.add_widget(kit)
+        row.add_widget(go)
+        row.add_widget(cancel)
+        box.add_widget(row)
+        popup = Popup(title="sHades update", content=box,
+                      size_hint=(0.86, 0.5), auto_dismiss=True)
+        cancel.bind(on_press=lambda inst: popup.dismiss())
+        kit.bind(on_press=lambda inst: Clock.schedule_once(
+            lambda dt: self.open_recovery_sheet(), 0))
+        go.bind(on_press=lambda inst: (
+            popup.dismiss(),
+            Clock.schedule_once(
+                lambda dt: self._update_start(inst), 0)))
+        self._update_status_label = status
+        popup.open()
+
+    def _update_start(self, *a):
+        """The consented path, on a worker thread; every leg reports
+        into update_status (the popup is closed; the status shows on
+        the next open)."""
+        import client_update
+
+        def note(txt):
+            Clock.schedule_once(lambda dt: setattr(self, "update_status",
+                                                   txt), 0)
+
+        def work():
+            try:
+                note("checking the release...")
+                manifest = json.loads(
+                    client_update.fetch(client_update.LATEST_PATTERN))
+                pick = client_update.newest_client_asset(
+                    manifest.get("assets") or [], since=_client_version())
+                if pick is None:
+                    note("no newer arm64 build found on %s"
+                         % client_update.REPO)
+                    return
+                note("fetching the sha for %s..." % pick["apk_name"])
+                sha_hex = client_update.parse_sha_file(
+                    client_update.fetch(pick["sha_url"]))
+                note("downloading %s (DownloadManager)..."
+                     % pick["apk_name"])
+                blob = client_update.download_with_dm(
+                    pick["apk_url"], pick["apk_name"], sha_hex)
+                note("sha ok; parking %s..." % pick["apk_name"])
+                path = client_update.save_candidate(
+                    blob, pick["apk_name"], cache_dir())
+                note("handing %s to the installer..." % path)
+                client_update.install_intent(path, pick["apk_name"])
+                note("installer handed off")
+            except client_update.HttpError as e:
+                note("update failed: %s" % e)
+            except Exception as e:
+                note("update failed: %s" % e)
+
         threading.Thread(target=work, daemon=True).start()
 
     def _can_manage_roles(self):
@@ -6947,10 +7277,12 @@ class sHadesClientApp(MDApp):
         self._last_ts = 0.0
         cid = self._channel_cid(name)
         kind = self._channel_kind(cid)
+        # P8: the composer's truth follows the channel everywhere
+        self._sync_composer_props(name, cid)
         # reroute the stream: only the visible channel flows
         self._stream_cid = cid
         self._stream_cursor = None
-        if kind != "chat":
+        if kind not in ("chat", "announce"):
             # site/term channels carry no live push: release the stream
             # slot (one subscription per link) so the previous channel
             # stops flowing into a channel nobody is watching
@@ -7069,7 +7401,7 @@ class sHadesClientApp(MDApp):
             return
 
         def work():
-            text, err = None, "unknown"
+            text, err, can_edit = None, "unknown", False
             try:
                 if path.startswith("/page/"):
                     raw = self.guild_api.fetch_file(path)
@@ -7082,19 +7414,52 @@ class sHadesClientApp(MDApp):
                     if res.get("ok"):
                         text = base64.b64decode(
                             res.get("data_b64") or "").decode("utf-8", "replace")
+                        can_edit = bool(res.get("can_edit"))
                     else:
                         err = res.get("error", "not found")
             except Exception as e:
                 err = repr(e)
                 print("site page fetch failed:", err)
             if text is not None:
-                Clock.schedule_once(lambda dt: self._render_site_page(cid, text), 0)
+                Clock.schedule_once(
+                    lambda dt: self._render_site_page(cid, text,
+                                                      can_edit=can_edit), 0)
             else:
                 Clock.schedule_once(
-                    lambda dt: self._set_status("page failed: %s" % err), 0)
+                    lambda dt: self._site_empty_page(cid, err), 0)
         threading.Thread(target=work, daemon=True).start()
 
-    def _render_site_page(self, cid, text):
+    def _site_empty_page(self, cid, err):
+        """The page fetch failed: replace the 'loading site' placeholder
+        with an honest empty page instead of leaving it forever (tay's
+        device receipt, 0.36.10 era). The server now seeds fresh site
+        channels with a default /index.mu, so this is the exceptional
+        branch: a site created before the seed, or a deleted target."""
+        try:
+            main = self.root.get_screen("main")
+        except Exception:
+            return
+        cur = getattr(main, "_current_channel", None)
+        if cur and self._channel_cid(cur) != cid:
+            return   # user switched away while the fetch was in flight
+        try:
+            grid = main.ids.message_grid
+            grid.clear_widgets()
+            self._msg_widgets.clear()
+            page = SitePage()
+            page.add_widget(self._micron_label(
+                "[b]This site is empty[/b]"))
+            page.add_widget(self._micron_label(
+                "The page failed to load: %s" % _escape(err or "unknown")))
+            grid.add_widget(page)
+        except Exception as e:
+            print("site empty-page render failed:", repr(e))
+        self._set_status("page failed: %s" % (err or "unknown"))
+
+    def _render_site_page(self, cid, text, can_edit=False):
+        """Render one micron page into the main grid. Holds the fetched
+        source for the P7c editor and, when the server says the caller
+        carries SITE_EDIT, leads with the [ Edit page ] affordance."""
         try:
             main = self.root.get_screen("main")
         except Exception:
@@ -7102,43 +7467,163 @@ class sHadesClientApp(MDApp):
         cur = getattr(main, "_current_channel", None)
         if cur and self._channel_cid(cur) != cid:
             return   # user switched away while the page was in flight
+        self._site_src_text = text
         grid = main.ids.message_grid
         grid.clear_widgets()
         self._remove_skeleton(getattr(self, "_skeleton_cid", None))
         self._msg_widgets.clear()
         blocks = micron_parse(text)
         page = SitePage()
-        bg = micron_page_bg(blocks, self._site_theme)
-        if bg:
-            page.bg_color = self._hex6_to_rgba(bg)
         if self._site_stack:
             page.add_widget(self._micron_label(
                 "[ref=shades:back][b]< Back[/b][/ref]"))
-        for b in blocks:
-            t = b["type"]
-            if t == "directive":
-                continue
-            if t == "sep":
-                page.add_widget(MicronSep())
-                continue
-            if t == "heading":
-                page.add_widget(self._micron_label(
-                    runs_to_markup(b["runs"], _escape), heading=True))
-                continue
-            if t == "code":
-                page.add_widget(self._micron_label(_escape(b["text"]), code=True))
-                continue
-            runs = b.get("runs") or []
-            if len(runs) == 1 and micron_media_target(runs[0].get("link") or ""):
-                self._add_site_media(page, cid, runs[0])
-            else:
-                page.add_widget(self._micron_label(
-                    runs_to_markup(runs, _escape), center=b.get("center")))
+        if can_edit:
+            page.add_widget(self._micron_label(
+                "[ref=shades:site-edit][b][ Edit page ][/b][/ref]"))
+        self._micron_blocks_into(page, blocks, cid)
         grid.add_widget(page)
         try:
             main.ids.scroll.scroll_y = 1.0
         except Exception:
             pass
+
+    def _micron_blocks_into(self, container, blocks, cid, media_ok=True):
+        """The micron block loop shared by the main render and the site
+        editor's preview. media_ok=False (editor preview) renders media
+        runs as text so the preview never reaches for the network."""
+        bg = micron_page_bg(blocks, self._site_theme)
+        if bg and isinstance(container, SitePage):
+            container.bg_color = self._hex6_to_rgba(bg)
+        for b in blocks:
+            t = b["type"]
+            if t == "directive":
+                continue
+            if t == "sep":
+                container.add_widget(MicronSep())
+                continue
+            if t == "heading":
+                container.add_widget(self._micron_label(
+                    runs_to_markup(b["runs"], _escape), heading=True))
+                continue
+            if t == "code":
+                container.add_widget(self._micron_label(
+                    _escape(b["text"]), code=True))
+                continue
+            runs = b.get("runs") or []
+            if len(runs) == 1 and micron_media_target(runs[0].get("link") or ""):
+                if media_ok:
+                    self._add_site_media(container, cid, runs[0])
+                else:
+                    container.add_widget(self._micron_label(
+                        "[i][media: %s][/i]" % _escape(runs[0].get("link") or "")))
+            else:
+                container.add_widget(self._micron_label(
+                    runs_to_markup(runs, _escape), center=b.get("center")))
+
+    # -- site editor (P7c): edit the page on screen, then publish -------
+    def _open_site_editor(self):
+        """Enter the micron editor for the page currently on screen."""
+        cid, path = self._site_current or (None, None)
+        if not cid or not path:
+            self._set_status("no page on screen to edit")
+            return
+        src = getattr(self, "_site_src_text", None)
+        if src is None:
+            self._set_status("fetching page source…")
+
+            def work():
+                txt, err = None, "fetch failed"
+                try:
+                    res2 = self.guild_api.site_get(cid, path)
+                    if res2.get("ok"):
+                        txt = base64.b64decode(res2.get("data_b64") or "").decode(
+                            "utf-8", "replace")
+                    else:
+                        err = res2.get("error", "fetch failed")
+                except Exception as e2:
+                    err = repr(e2)
+                Clock.schedule_once(
+                    lambda dt: self._enter_site_editor(cid, path, txt,
+                                                       err=err), 0)
+            threading.Thread(target=work, daemon=True).start()
+            return
+        self._enter_site_editor(cid, path, src)
+
+    def _enter_site_editor(self, cid, path, src, err=None):
+        if src is None:
+            self._set_status("page source unavailable: %s" % (err or "unknown"))
+            return
+        self._edit_cid, self._edit_path = cid, path
+        scr = self.root.get_screen("site_editor")
+        scr._src.text = src
+        scr._status.text = "editing %s" % path
+        holder = scr._prev_holder
+        holder.clear_widgets()
+        holder.parent.scroll_y = 1.0
+        self.root.current = "site_editor"
+
+    def _site_editor_back(self):
+        """Return to the rendered page; _site_current is still live."""
+        if self.root is not None:
+            self.root.current = "main"
+
+    def _site_editor_preview(self):
+        """Render the editor's source into the in-screen preview column;
+        media runs stay text so the preview never reaches the network."""
+        try:
+            scr = self.root.get_screen("site_editor")
+        except Exception:
+            return
+        blocks = micron_parse(scr._src.text)
+        holder = scr._prev_holder
+        holder.clear_widgets()
+        page = SitePage()
+        holder.add_widget(page)
+        self._micron_blocks_into(page, blocks,
+                                 getattr(self, "_edit_cid", None),
+                                 media_ok=False)
+        scr._status.text = "preview: %d blocks" % len(blocks)
+
+    def _site_editor_publish(self):
+        """Store the edited source for the page the editor opened on."""
+        try:
+            scr = self.root.get_screen("site_editor")
+        except Exception:
+            return
+        cid = getattr(self, "_edit_cid", None)
+        path = getattr(self, "_edit_path", None)
+        if not cid or not path:
+            scr._status.text = "no page target"
+            return
+        src = scr._src.text
+        scr._status.text = "publishing…"
+
+        def work():
+            try:
+                res = self.guild_api.site_put(
+                    cid, path,
+                    base64.b64encode(src.encode("utf-8")).decode("ascii"))
+            except Exception as e:
+                res = {"ok": 0, "error": repr(e)}
+            ok = res.get("ok") == 1
+            err = "%s (code %s)" % (res.get("error", ""),
+                                    res.get("code", "?"))
+            Clock.schedule_once(
+                lambda dt: self._site_editor_publish_done(ok, err), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _site_editor_publish_done(self, ok, err):
+        try:
+            scr = self.root.get_screen("site_editor")
+        except Exception:
+            return
+        if ok:
+            scr._status.text = "published"
+            if self.root is not None:
+                self.root.current = "main"
+            self._site_load_page(self._edit_cid, self._edit_path)
+        else:
+            scr._status.text = "publish failed: %s" % err
 
     def _micron_label(self, markup, heading=False, center=False, code=False):
         lbl = Label(markup=True, text=markup)
@@ -7206,6 +7691,9 @@ class sHadesClientApp(MDApp):
             if self._site_stack:
                 cid, path = self._site_stack.pop()
                 self._site_load_page(cid, path)
+            return
+        if target == "shades:site-edit":
+            self._open_site_editor()
             return
         if micron_media_target(target):
             self._site_download_media(target)

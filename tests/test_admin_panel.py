@@ -120,6 +120,46 @@ class StubGuild:
         return {"ok": True, "code": "ABC123"}
 
 
+def test_context_menu_gesture():
+    """P9: the rail's guild header (CtxHeaderLabel, kv rule at the
+    drawer top) carries the admin-gated 'server settings' entry, and
+    its action is wired to _open_admin_panel."""
+    import kivy.app as _kapp
+    import kivy_client as kc
+
+    class _RA:
+        def __init__(self, _app):
+            self._app = _app
+
+        def __getattr__(self, name):
+            return getattr(self._app, name)
+
+    app = kc.sHadesClientApp()
+    app.theme_colors = dict(kc.DEFAULT_THEME_COLORS)
+    app.i_am_admin = True
+    panel_opens = []
+    app._open_admin_panel = (lambda: panel_opens.append(True))
+    widget = kc.CtxHeaderLabel(text="guild header")
+    try:
+        _kapp.App._running_app = _RA(app)
+        menu = widget.build_context_menu()
+        labels = [a[0] for a in menu]
+        check("guild header carries 'server settings' for admins",
+              "server settings" in labels, str(labels))
+        settings_actions = [a[2] for a in menu
+                            if a[0] == "server settings"]
+        if settings_actions:
+            settings_actions[0]()
+        check("its action opens the admin panel",
+              panel_opens == [True], "opens=%r" % (panel_opens,))
+        app.i_am_admin = False
+        labels = [a[0] for a in widget.build_context_menu()]
+        check("'server settings' hidden for non-admins",
+              "server settings" not in labels, str(labels))
+    finally:
+        _kapp.App._running_app = None
+
+
 def main():
     try:
         import kivy_client as kc
@@ -202,6 +242,7 @@ def main():
     for _ in range(2):
         Clock.tick()
     check("panel refuses without a guild api", app3._admin_popup is None)
+    test_context_menu_gesture()
 
     print()
     print("PASS: %d  FAIL: %d" % (len(PASS), len(FAIL)))

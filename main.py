@@ -237,6 +237,97 @@ def _show_on_screen(text):
         traceback.print_exc()
 
 
+def _android_softinput_resize():
+    """tay's 0.36.8 boot-log receipt: the keyboard covers the composer.
+
+    Byte-verified on the 0.36.9 APK: p4a develop ships NO
+    windowSoftInputMode in AndroidManifest.xml (the attribute is
+    absent), and buildozer 1.5.0 has zero code for the
+    android.window_soft_input_mode spec key (grepped the wheel); kivy
+    itself says 'resize' needs a different java root layout. So the
+    spec key was inert string. Apply ADJUST_RESIZE at runtime here
+    instead.
+
+    tay's 0.36.11 boot-log receipt (launch 1795162161s): the direct
+    call died with ViewRootImpl$CalledFromWrongThreadException --
+    main() runs on SDLThread and the window's view hierarchy may only
+    be touched from the UI thread ("Expected: SDLActivity Calling:
+    SDLThread"). kivy's changeKeyboard survives the SDL thread only
+    because it writes statics and InputMethodManager, not the view
+    tree. The set is therefore queued onto the UI thread through
+    Activity.runOnUiThread with a python-implemented Runnable (jnius
+    PythonJavaClass), the same dispatch class p4a uses elsewhere.
+    Prints a boot-log receipt either way so the device run stays
+    checkable: 'dispatch queued' from the SDL thread, the set receipt
+    from the UI thread once the runnable runs, or the named miss.
+    """
+    try:
+        from jnius import autoclass, PythonJavaClass, java_method
+
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        Params = autoclass("android.view.WindowManager$LayoutParams")
+        mode = Params.SOFT_INPUT_ADJUST_RESIZE
+        if not isinstance(mode, int):
+            raise ValueError(
+                "SOFT_INPUT_ADJUST_RESIZE is %r, expected int for the "
+                "single setSoftInputMode overload" % (mode,))
+        activity = PythonActivity.mActivity
+
+        class _UiApply(PythonJavaClass):
+            __javainterfaces__ = ["java/lang/Runnable"]
+
+            @java_method("()V")
+            def run(self):
+                # runnable runs ON the UI thread: ViewRootImpl is
+                # created by it, so the set only lands here
+                window = activity.getWindow()
+                window.setSoftInputMode(mode)
+                print("SOFTINPUT: window set to ADJUST_RESIZE", flush=True)
+
+        activity.runOnUiThread(_UiApply())
+        print("SOFTINPUT: dispatch queued on ui thread", flush=True)
+    except Exception as e:
+        # non-android host, a jnius resolution miss, or an unfaithful
+        # constant: report, never raise
+        print("SOFTINPUT: resize not dispatched (%r)" % (e,), flush=True)
+
+
+# Shared state of the visible-frame meter: {"base": frame bottom seen
+# without any IME (the largest bottom so far), "bottom": the latest
+# frame bottom, "live": a reading succeeded at least once}. The kivy
+# Clock tick writes AND reads -- every write is on the kivy thread, so
+# no cross-thread python runs on Android at all.
+_SOFTINPUT = {"base": 0, "bottom": 0, "live": False}
+
+
+def softinput_base():
+    """Frame bottom measured with no IME visible (largest seen)."""
+    return _SOFTINPUT["base"]
+
+
+def softinput_bottom():
+    """Latest visible-frame bottom; base - bottom is the IME height."""
+    return _SOFTINPUT["bottom"]
+
+
+def softinput_live():
+    """True once the kivy thread has read a frame at least once."""
+    return _SOFTINPUT["live"]
+
+
+# v0.36.14 (launches 1795169468/1795169471s): the OnGlobalLayoutListener
+# design KILLED the boot -- its python callback ran on the UI thread on
+# every layout pass and collided with the main thread mid-import of
+# kivy's pyx machinery; the main thread never came back and the system
+# killed the process inside `import kivy` (no logo-copy noise, no
+# 'imported kivy_client', no traceback). tay's log 30, launch 30.
+# v0.36.15 therefore measures from the KIVY thread on the existing
+# 0.25s Clock tick (kivy_client._softinput_tick) -- the exact pattern
+# the gesture-exclusions code already runs there -- and this module
+# only holds the state the tick writes. A UI-thread python listener on
+# Android is retired: it is a boot-killer, not a slow path.
+
+
 def main():
     """Entry point called from Android activity. All Python execution
     is wrapped so any import/runtime crash is visible on-device."""
@@ -248,6 +339,7 @@ def main():
     except Exception:
         pass
     print("PYTHON: main() starting", flush=True)
+    _android_softinput_resize()
     try:
         print("PYTHON: importing kivy_client", flush=True)
         from kivy_client import sHadesClientApp

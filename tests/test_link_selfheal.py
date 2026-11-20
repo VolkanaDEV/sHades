@@ -850,6 +850,461 @@ def test_bootlog_clipboard_contract():
     print("PASS  bootlog clipboard contract")
 
 
+def test_softinput_bridge_contract():
+    """v0.36.11->v0.36.13: main._android_softinput_resize() executes
+    against a fake jnius and the argument TYPES are the contract.
+    AOSP receipts: WindowManager.java defines SOFT_INPUT_ADJUST_RESIZE
+    = 0x10 inside the LayoutParams nested class (exact-class field per
+    the jnius law) and Window.java's setSoftInputMode(int mode) is the
+    only overload -- Java takes one int, nothing else. tay's 0.36.11
+    boot receipt: the direct call from main()'s SDL thread died on
+    ViewRootImpl$CalledFromWrongThreadException, so the set must ride
+    Activity.runOnUiThread via a python-implemented java.lang.Runnable
+    -- the lane executes that queued runnable itself and the type
+    contract applies to what the UI thread would run."""
+    import io
+    import sys as _sys
+    import types as _t
+    import main as main_mod
+    import contextlib as _ctx
+
+    calls = []
+
+    class FakeWin:
+        def setSoftInputMode(self, mode):
+            if not isinstance(mode, int) or isinstance(mode, bool):
+                raise TypeError("Window.setSoftInputMode(int) -- one "
+                                "int overload, AOSP Window.java:1223")
+            calls.append(("setmode", mode))
+
+    def _win():
+        return _WIN["win"]
+
+    _WIN = {"win": FakeWin()}
+
+    class PyAct:
+        mActivity = _t.SimpleNamespace(
+            getWindow=lambda: _win(),
+            runOnUiThread=lambda r: calls.append(("queue", r)))
+
+    class FakeWSLP:
+        def __init__(self):
+            raise AssertionError("LayoutParams is read as a class")
+
+    # the real declaration placement: the constant lives ON LayoutParams
+    FakeWSLP.SOFT_INPUT_ADJUST_RESIZE = 0x10
+
+    def autoclass(name):
+        calls.append(("ac", name))
+        return {"org.kivy.android.PythonActivity": PyAct,
+                "android.view.WindowManager$LayoutParams":
+                    FakeWSLP}[name]
+
+    class FakePyJC:
+        pass
+
+    def java_method(sig):
+        def deco(f):
+            f._jnius_sig = sig
+            return f
+        return deco
+
+    fake = _t.ModuleType("jnius")
+    fake.autoclass = autoclass
+    fake.PythonJavaClass = FakePyJC
+    fake.java_method = java_method
+    _sys.modules["jnius"] = fake
+    try:
+        buf = io.StringIO()
+        with _ctx.redirect_stdout(buf):
+            main_mod._android_softinput_resize()
+        out = buf.getvalue()
+        queued = [c[1] for c in calls if c[0] == "queue"]
+        assert len(queued) == 1, \
+            "the set dispatches once via runOnUiThread: %s" % calls
+        runnable = queued[0]
+        assert isinstance(runnable, FakePyJC), \
+            "the runnable is a python-implemented jnius proxy: %r" % runnable
+        assert getattr(type(runnable), "__javainterfaces__", None) == \
+            ["java/lang/Runnable"], \
+            "the proxy implements java/lang/Runnable: %r" % \
+            getattr(type(runnable), "__javainterfaces__", None)
+        run_fn = getattr(runnable, "run", None)
+        assert callable(run_fn) and getattr(run_fn, "_jnius_sig", None) == \
+            "()V", "run carries the java ()V signature"
+        # run the queued runnable under capture: on device this leg
+        # executes ON the UI thread; its receipt names that leg
+        buf_run = io.StringIO()
+        with _ctx.redirect_stdout(buf_run):
+            run_fn()
+        assert "SOFTINPUT: window set to ADJUST_RESIZE" in \
+            buf_run.getvalue(), \
+            "the UI-thread leg prints its set receipt: %r" % buf_run.getvalue()
+        assert [c for c in calls if c[0] == "setmode"] == [("setmode", 0x10)], \
+            "the UI-thread call lands as the AOSP int: %s" % calls
+        acs = [c[1] for c in calls if c[0] == "ac"]
+        assert acs == ["org.kivy.android.PythonActivity",
+                       "android.view.WindowManager$LayoutParams"], \
+            "exact classes only: %s" % acs
+        assert "SOFTINPUT: dispatch queued on ui thread" in out, repr(out)
+        # type-faithfulness leg: a misdeclared constant (str where the
+        # int overload expects a mode) names itself in the production
+        # except BEFORE any dispatch instead of dying silently or lying
+        # about the receipt
+        calls.clear()
+        FakeWSLP.SOFT_INPUT_ADJUST_RESIZE = "16"
+        buf = io.StringIO()
+        with _ctx.redirect_stdout(buf):
+            main_mod._android_softinput_resize()
+        assert [c for c in calls if c[0] in ("setmode", "queue")] == [], \
+            "no dispatch on a str mode: %s" % calls
+        assert "SOFTINPUT: resize not dispatched" in buf.getvalue(), \
+            repr(buf.getvalue())
+    finally:
+        import sys as _sys
+        del _sys.modules["jnius"]
+    print("PASS  softinput bridge contract")
+
+
+def test_softinput_frame_meter_contract():
+    """v0.36.15: the frame meter polls from the KIVY thread. tay's log
+    30 (launches 1795169468/71s) killed the v0.36.14 design: the
+    OnGlobalLayoutListener ran python on the UI thread on every layout
+    pass and collided with the main thread mid-import of kivy's pyx
+    machinery -- the process died inside `import kivy` with no
+    traceback. So: main.py must carry NO ui-thread listener at all,
+    and the client tick must measure directly -- first tick resolves
+    jnius handles and prints the live receipt, later ticks turn
+    base - bottom (largest bottom seen vs latest; the IME is up when
+    the bottom drops) into chat container bottom padding, and a
+    failing read reports exactly once."""
+    import io
+    import sys as _sys
+    import types as _t
+    import contextlib as _ctx
+    import unittest.mock as _mock
+    import main as main_mod
+    import kivy_client as kc
+
+    src = open(main_mod.__file__, encoding="utf-8").read()
+    # code markers only: prose comments may document the retired design
+    assert "addOnGlobalLayoutListener" not in src and \
+        "ViewTreeObserver$OnGlobalLayoutListener" not in src, \
+        "the v0.36.14 boot-killer listener must be retired from main.py"
+    assert "runOnUiThread" in src, \
+        "the window-mode dispatch (0.36.13) still rides the ui thread"
+
+    state = {"frames": []}
+
+    class FakeRect:
+        def __init__(self):
+            self.bottom = 0
+
+    class FakeDecor:
+        def getWindowVisibleDisplayFrame(self, rect):
+            rect.bottom = state["frames"][-1] if state["frames"] else 0
+
+    _activity = _t.SimpleNamespace(
+        getWindow=lambda: _t.SimpleNamespace(
+            getDecorView=lambda: FakeDecor()))
+    FakePythonActivity = _t.SimpleNamespace(mActivity=_activity)
+
+    def autoclass(name):
+        if name == "org.kivy.android.PythonActivity":
+            return FakePythonActivity
+        if name == "android.graphics.Rect":
+            return FakeRect
+        raise ValueError("unexpected autoclass %s" % name)
+
+    fake = _t.ModuleType("jnius")
+    fake.autoclass = autoclass
+    _sys.modules["jnius"] = fake
+    prev_state = dict(main_mod._SOFTINPUT)
+    prev_meter = kc._FRAME_METER
+    prev_reported = set(kc._FRAME_REPORTED)
+    try:
+        class FakeCS:
+            padding = [0, 0, 0, 0]
+
+        class FakeScreen:
+            ids = {"chat_screen": FakeCS}
+
+        class FakeRoot:
+            def get_screen(self, name):
+                if name != "main":
+                    raise KeyError(name)
+                return FakeScreen
+
+        app = _t.SimpleNamespace(root=FakeRoot())
+        buf = io.StringIO()
+        with _mock.patch("kivy.utils.platform", "android"):
+            with _ctx.redirect_stdout(buf):
+                # first tick: resolve, live receipt, closed-keyboard
+                # reading (2112) establishes the base
+                state["frames"].append(2112)
+                kc.sHadesClientApp._softinput_tick(app)
+                assert getattr(kc, "_FRAME_METER") is not None, \
+                    "the first tick resolves the jnius handles"
+                assert "SOFTINPUT: frame meter live (kivy thread " \
+                       "poll)" in buf.getvalue()
+                assert main_mod.softinput_base() == 2112
+                assert main_mod.softinput_live() is True
+                assert FakeCS.padding == [0, 0, 0, 0]
+                # the IME opens: the meter reads the drop and lifts
+                state["frames"].append(1700)
+                kc.sHadesClientApp._softinput_tick(app)
+                assert main_mod.softinput_bottom() == 1700
+                assert FakeCS.padding == [0, 0, 0, 412], \
+                    "the composer group lifts by the IME height: %r" % \
+                    (FakeCS.padding,)
+                # the IME closes: the lift clears
+                state["frames"].append(2112)
+                kc.sHadesClientApp._softinput_tick(app)
+                assert FakeCS.padding == [0, 0, 0, 0], \
+                    "the lift clears when the keyboard closes: %r" % \
+                    (FakeCS.padding,)
+            # a failing read reports exactly once, then stops spamming
+            boom = _t.ModuleType("jnius")
+
+            def broken(name):
+                raise ValueError("dead jnius")
+
+            boom.autoclass = broken
+            _sys.modules["jnius"] = boom
+            kc._FRAME_METER = None
+            kc._FRAME_REPORTED.clear()
+            seen = []
+            with _mock.patch.object(kc, "_boot_file",
+                                    side_effect=seen.append):
+                kc.sHadesClientApp._softinput_tick(app)
+                kc.sHadesClientApp._softinput_tick(app)
+            assert len(seen) == 1 and "frame read failed" in seen[0], \
+                "a failing tick reports once, not per tick: %r" % (seen,)
+    finally:
+        import sys as _sys
+        del _sys.modules["jnius"]
+        kc._FRAME_METER = prev_meter
+        kc._FRAME_REPORTED.clear()
+        kc._FRAME_REPORTED.update(prev_reported)
+        main_mod._SOFTINPUT.clear()
+        main_mod._SOFTINPUT.update(prev_state)
+    print("PASS  softinput frame meter (kivy-thread poll) + lift")
+
+
+def test_site_editor_publish_contract():
+    """P7c: the [ Edit page ] affordance reaches the micron editor with
+    the page's source; the publish leg posts the edited source to the
+    page the editor opened on and returns to the page on success; a
+    server refusal stays on the editor with the server error visible."""
+    import base64
+
+    cid, path = "c" * 64, "/index.mu"
+    source = "#!c=0\n> Owned page\n\nplain line\n"
+
+    class _NowClock(object):
+        @staticmethod
+        def schedule_once(fn, dt=0):
+            fn(0)
+
+    class _InlineThread(object):
+        def __init__(self, target=None, daemon=False, **k):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    class _FakeApi(object):
+        def __init__(self, res):
+            self.calls = []
+            self.res = res
+
+        def site_put(self, channel, pth, data_b64, mime=None):
+            self.calls.append((channel, pth, data_b64, mime))
+            return self.res
+
+    def _screen():
+        return types.SimpleNamespace(
+            _src=types.SimpleNamespace(text=""),
+            _status=types.SimpleNamespace(text=""),
+            _prev_holder=types.SimpleNamespace(
+                clear_widgets=lambda: None,
+                parent=types.SimpleNamespace(scroll_y=1.0)),
+            )
+    scr = _screen()
+    root = types.SimpleNamespace(current="main")
+
+    def get_screen(name):
+        if name == "site_editor":
+            return scr
+        raise KeyError(name)
+    root.get_screen = get_screen
+
+    app = types.SimpleNamespace(root=root, guild_api=None,
+                                _site_current=(cid, path),
+                                _site_src_text=source,
+                                _edit_cid=None, _edit_path=None,
+                                _site_load_page=lambda c, p: None)
+
+    # 1. the affordance ref opens the editor carrying the source
+    app._open_site_editor = types.MethodType(
+        kc.sHadesClientApp._open_site_editor, app)
+    app._enter_site_editor = types.MethodType(
+        kc.sHadesClientApp._enter_site_editor, app)
+    kc.sHadesClientApp._micron_link_tapped(app, "shades:site-edit")
+    assert root.current == "site_editor", root.current
+    assert scr._src.text == source, scr._src.text[:60]
+    assert getattr(app, "_edit_cid") == cid and \
+        getattr(app, "_edit_path") == path
+
+    # 2. publish posts the edited source and returns to the page
+    api = _FakeApi({"ok": 1, "channel": cid, "path": path})
+    reloaded_ = []
+    app.guild_api = api
+    app._site_load_page = lambda c, p: reloaded_.append((c, p))
+    app._site_editor_publish = types.MethodType(
+        kc.sHadesClientApp._site_editor_publish, app)
+    app._site_editor_publish_done = types.MethodType(
+        kc.sHadesClientApp._site_editor_publish_done, app)
+    scr._src.text = "#!c=0\n> Edited\n"
+    real_clock, real_thread = kc.Clock, kc.threading.Thread
+    try:
+        kc.Clock = _NowClock
+        kc.threading.Thread = _InlineThread
+        kc.sHadesClientApp._site_editor_publish(app)
+        assert api.calls == [(cid, path, base64.b64encode(
+            "#!c=0\n> Edited\n".encode("utf-8")).decode("ascii"), None)], api.calls
+        assert root.current == "main" and reloaded_ == [(cid, path)], \
+            (root.current, reloaded_)
+        assert scr._status.text == "published", scr._status.text
+
+        # 3. a refusal stays on the editor with the server error visible
+        api2 = _FakeApi({"ok": 0, "error": "site edit permission required",
+                         "code": 403})
+        app.guild_api = api2
+        reloaded_[:] = []
+        root.current = "site_editor"
+        kc.sHadesClientApp._site_editor_publish(app)
+        assert api2.calls and api2.calls[0][0] == cid
+        assert root.current == "site_editor", "a refusal must not leave the editor"
+        assert not reloaded_, "no reload after a refusal"
+        assert "publish failed" in scr._status.text \
+            and "site edit" in scr._status.text, scr._status.text
+    finally:
+        kc.Clock = real_clock
+        kc.threading.Thread = real_thread
+    print("PASS  site editor (affordance -> publish -> refusal)")
+
+
+def test_motd_strip_contract():
+    """P6: whoami's guild motd binds to the sidebar strip; a set motd
+    yields a tappable strip opening the full-text popup, an empty one
+    hides the strip. The kv carries the strip between the banner and
+    the channel list."""
+    app = types.SimpleNamespace(server_motd="")
+    app._apply_motd = types.MethodType(kc.sHadesClientApp._apply_motd, app)
+    app._build_motd_popup = types.MethodType(
+        kc.sHadesClientApp._build_motd_popup, app)
+    app.theme_colors = {"text": (0.92, 0.94, 0.96, 1)}
+    kc.sHadesClientApp._apply_motd(app, "Welcome to the node")
+    assert app.server_motd == "Welcome to the node", app.server_motd
+    app._apply_motd("")
+    assert app.server_motd == "", "empty motd must hide the strip"
+    app._apply_motd("long motd: " + "x" * 200)
+
+    popup = kc.sHadesClientApp._build_motd_popup(app)
+    full_text = None
+    for child in popup.content.children:
+        for c in getattr(child, "children", []):
+            if hasattr(c, "text") and "long motd" in c.text:
+                full_text = c.text
+    assert popup.title == "Server message", popup.title
+    assert full_text and len(full_text) == len(app.server_motd), \
+        "the popup must carry the FULL motd, untruncated"
+
+    kvs = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "kv_md.kv"),
+        encoding="utf-8").read()
+    assert "id: motd_strip" in kvs, "strip absent from kv_md.kv"
+    assert "app.server_motd" in kvs, "strip does not bind app.server_motd"
+    # the strip sits between the banner strip and the channel list
+    assert kvs.index("id: banner_strip") < kvs.index("id: motd_strip") \
+        < kvs.index("id: channel_grid"), "strip is out of position"
+    print("PASS  motd strip (binds -> popup -> kv placement)")
+
+
+def test_announce_composer_contract():
+    """P8: the composer's truth per channel -- an announce channel
+    without a grant read-locks the composer (hint + disabled binding on
+    the kivy Properties), a holder sees the Announce label, and every
+    other kind leaves the composer open. The channels apply stores the
+    server's can_post stamp and old servers default it to True."""
+    app = types.SimpleNamespace(
+        composer_readonly=False,
+        composer_send_label="Send",
+    )
+    ANNC_CID = "cid-annc"
+    app._channel_kind = types.MethodType(kc.sHadesClientApp._channel_kind, app)
+    SITE_CID = "cid-general"
+    app._channel_kinds = {ANNC_CID: "announce", SITE_CID: "chat"}
+    app._channel_can_post = {ANNC_CID: False}
+    app._sync_composer_props = types.MethodType(
+        kc.sHadesClientApp._sync_composer_props, app)
+
+    app._sync_composer_props("announcements", ANNC_CID)
+    assert app.composer_readonly is True, app.composer_readonly
+    assert app.composer_send_label == "Announce", app.composer_send_label
+
+    app._channel_can_post[ANNC_CID] = True
+    app._sync_composer_props("announcements", ANNC_CID)
+    assert app.composer_readonly is False, app.composer_readonly
+    assert app.composer_send_label == "Announce", app.composer_send_label
+
+    app._channel_kinds[SITE_CID] = "chat"
+    app._sync_composer_props("general", SITE_CID)
+    assert app.composer_readonly is False and \
+        app.composer_send_label == "Send", \
+        (app.composer_readonly, app.composer_send_label)
+
+    # kv contract: the composer bindings carry the properties
+    kvs = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "kv_md.kv"),
+        encoding="utf-8").read()
+    assert "disabled: app.composer_readonly" in kvs, "input not read-locked"
+    assert "app.composer_send_label" in kvs, "send label not mirrored"
+    assert "'announcements only'" in kvs, "hint missing"
+
+    # static: the client's can_post stamp store + the fetch guard
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "kivy_client.py"),
+        encoding="utf-8").read()
+    assert "self._channel_can_post = {}" in src, "stamp store missing"
+    assert 'c.get("can_post", True)' in src, "old-server default not True"
+    assert 'not in ("chat", "announce")' in src, "fetch guard not widened"
+    print("PASS  announce composer (stamp -> read-only -> label)")
+
+
+def test_announce_fetch_guard_contract():
+    """P8: announce channels keep the message ledger flow -- the fetch
+    runs (guard passes) and the stream slot stays assigned for them."""
+    import os
+    # the guard is inline in _fetch_messages; assert its shape statically
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "kivy_client.py"),
+        encoding="utf-8").read()
+    seg = src[src.index("def _fetch_messages"):]
+    seg = seg[:seg.index("def ", 1)]
+    assert 'not in ("chat", "announce")' in seg, \
+        "the ledger fetch must run for announce channels"
+    # and the stream slot must NOT release for announce
+    seg2 = src[src.index("def _switch_channel"):]
+    seg2 = seg2[:seg2.index("def ", 1)]
+    assert 'kind not in ("chat", "announce")' in seg2, \
+        "announce channels keep live push (the stream slot stays)"
+    assert 'self._sync_composer_props(name, cid)' in seg2, \
+        "channel switch never skips the composer sync"
+    print("PASS  announce ledger flow (fetch + push + composer sync)")
+
+
 def main():
     test_link_dead_reported_and_signalled()
     test_link_raise_reported_and_signalled()
@@ -865,7 +1320,13 @@ def main():
     test_whoami_retry_contract()
     test_bootlog_bridge_contract()
     test_bootlog_clipboard_contract()
-    print("PASS: 14  FAIL: 0")
+    test_softinput_bridge_contract()
+    test_softinput_frame_meter_contract()
+    test_site_editor_publish_contract()
+    test_motd_strip_contract()
+    test_announce_composer_contract()
+    test_announce_fetch_guard_contract()
+    print("PASS: 22  FAIL: 0")
 
 
 if __name__ == "__main__":
