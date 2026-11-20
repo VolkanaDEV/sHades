@@ -38,6 +38,11 @@ jobs:
           python tests/test_u3.py
           python tests/test_dms.py
           python tests/test_invite.py
+          # P11's own lane was never registered here: the bare-boot
+          # crasher (0.36.21-0.36.24, list(None) after the banner)
+          # survived every CI boot because each one passed argv.
+          python tests/test_update_meta.py
+          python tests/test_updater.py
 
   client-tests:
     # The widget suites use a real SDL window under Xvfb.

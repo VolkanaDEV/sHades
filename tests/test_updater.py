@@ -310,6 +310,36 @@ seen = (open(runlog, encoding="utf-8").read().split()
 check("launcher: BROKEN attempt then OLD recovery",
       seen == ["BROKEN", "OLD"], seen)
 
+# --- tay's bare boot (0.36.24 fold-3): `python sHades.py` with no args
+# crashed right after the announce banner since 0.36.21
+# (list(None)); every CI boot passed argv, so the bare path had no
+# receipt until now. Boot the hub with argv=None, wait for the
+# guild-active banner, then terminate. The crash string must never
+# appear and the banner must.
+bare_cwd = tempfile.mkdtemp(prefix="shades_bare_")
+bare = subprocess.Popen([sys.executable, os.path.join(ROOT, "sHades.py")],
+                        cwd=bare_cwd,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+assert bare.stdout is not None
+out = ""
+try:
+    for _ in range(320):
+        line = bare.stdout.readline()
+        if not line:
+            break
+        out += line
+        if "active" in line:
+            break
+finally:
+    bare.terminate()
+    try:
+        bare.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        bare.kill()
+check("bare boot: hub came up without argv", "active" in out, out[-400:])
+check("bare boot: no argv crash",
+      "'NoneType' object is not iterable" not in out, out[-400:])
+
 print()
 print("PASS: %d  FAIL: %d" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

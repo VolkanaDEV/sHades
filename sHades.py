@@ -4483,7 +4483,12 @@ def run(argv=None):
     # Reap clients that miss two consecutive 4s announcements (8 s stale).
     threading.Thread(target=_node_reaper, daemon=True).start()
     global _BOOT_ARGV
-    _BOOT_ARGV = list(argv)
+    # tay's bare boot (2026-11-20): `python sHades.py` passes argv=None
+    # here and list(None) crashed the hub right after the announce
+    # banner on every bare boot since 0.36.21 (all CI boots passed
+    # argv, so the bare path had no receipt). A bare boot restarts
+    # bare instead of crashing.
+    _BOOT_ARGV = list(argv) if argv is not None else []
     _update_maybe_tick(force=True)
     threading.Thread(target=announce_all, daemon=True).start()
     try:
