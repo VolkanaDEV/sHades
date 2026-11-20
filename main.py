@@ -246,20 +246,50 @@ def _android_softinput_resize():
     android.window_soft_input_mode spec key (grepped the wheel); kivy
     itself says 'resize' needs a different java root layout. So the
     spec key was inert string. Apply ADJUST_RESIZE at runtime here
-    instead: the window resizes under the keyboard and the composer,
-    pinned to the layout bottom, rides up. Prints a boot-log receipt
-    either way so the device run is checkable.
+    instead.
+
+    tay's 0.36.11 boot-log receipt (launch 1795162161s): the direct
+    call died with ViewRootImpl$CalledFromWrongThreadException --
+    main() runs on SDLThread and the window's view hierarchy may only
+    be touched from the UI thread ("Expected: SDLActivity Calling:
+    SDLThread"). kivy's changeKeyboard survives the SDL thread only
+    because it writes statics and InputMethodManager, not the view
+    tree. The set is therefore queued onto the UI thread through
+    Activity.runOnUiThread with a python-implemented Runnable (jnius
+    PythonJavaClass), the same dispatch class p4a uses elsewhere.
+    Prints a boot-log receipt either way so the device run stays
+    checkable: 'dispatch queued' from the SDL thread, the set receipt
+    from the UI thread once the runnable runs, or the named miss.
     """
     try:
-        from jnius import autoclass
+        from jnius import autoclass, PythonJavaClass, java_method
+
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
         Params = autoclass("android.view.WindowManager$LayoutParams")
-        window = PythonActivity.mActivity.getWindow()
-        window.setSoftInputMode(Params.SOFT_INPUT_ADJUST_RESIZE)
-        print("SOFTINPUT: window set to ADJUST_RESIZE", flush=True)
+        mode = Params.SOFT_INPUT_ADJUST_RESIZE
+        if not isinstance(mode, int):
+            raise ValueError(
+                "SOFT_INPUT_ADJUST_RESIZE is %r, expected int for the "
+                "single setSoftInputMode overload" % (mode,))
+        activity = PythonActivity.mActivity
+
+        class _UiApply(PythonJavaClass):
+            __javainterfaces__ = ["java/lang/Runnable"]
+
+            @java_method("()V")
+            def run(self):
+                # runnable runs ON the UI thread: ViewRootImpl is
+                # created by it, so the set only lands here
+                window = activity.getWindow()
+                window.setSoftInputMode(mode)
+                print("SOFTINPUT: window set to ADJUST_RESIZE", flush=True)
+
+        activity.runOnUiThread(_UiApply())
+        print("SOFTINPUT: dispatch queued on ui thread", flush=True)
     except Exception as e:
-        # non-android host or a jnius resolution miss: report, never raise
-        print("SOFTINPUT: resize not applied (%r)" % (e,), flush=True)
+        # non-android host, a jnius resolution miss, or an unfaithful
+        # constant: report, never raise
+        print("SOFTINPUT: resize not dispatched (%r)" % (e,), flush=True)
 
 
 def main():

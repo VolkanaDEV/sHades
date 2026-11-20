@@ -851,12 +851,17 @@ def test_bootlog_clipboard_contract():
 
 
 def test_softinput_bridge_contract():
-    """v0.36.11: main._android_softinput_resize() executes against a
-    fake jnius and the argument TYPES are the contract. AOSP receipts:
-    WindowManager.java defines SOFT_INPUT_ADJUST_RESIZE = 0x10 inside
-    the LayoutParams nested class (exact-class field per the jnius law)
-    and Window.java's setSoftInputMode(int mode) is the only overload --
-    Java takes one int, nothing else."""
+    """v0.36.11->v0.36.13: main._android_softinput_resize() executes
+    against a fake jnius and the argument TYPES are the contract.
+    AOSP receipts: WindowManager.java defines SOFT_INPUT_ADJUST_RESIZE
+    = 0x10 inside the LayoutParams nested class (exact-class field per
+    the jnius law) and Window.java's setSoftInputMode(int mode) is the
+    only overload -- Java takes one int, nothing else. tay's 0.36.11
+    boot receipt: the direct call from main()'s SDL thread died on
+    ViewRootImpl$CalledFromWrongThreadException, so the set must ride
+    Activity.runOnUiThread via a python-implemented java.lang.Runnable
+    -- the lane executes that queued runnable itself and the type
+    contract applies to what the UI thread would run."""
     import io
     import sys as _sys
     import types as _t
@@ -878,7 +883,9 @@ def test_softinput_bridge_contract():
     _WIN = {"win": FakeWin()}
 
     class PyAct:
-        mActivity = _t.SimpleNamespace(getWindow=lambda: _win())
+        mActivity = _t.SimpleNamespace(
+            getWindow=lambda: _win(),
+            runOnUiThread=lambda r: calls.append(("queue", r)))
 
     class FakeWSLP:
         def __init__(self):
@@ -893,32 +900,65 @@ def test_softinput_bridge_contract():
                 "android.view.WindowManager$LayoutParams":
                     FakeWSLP}[name]
 
+    class FakePyJC:
+        pass
+
+    def java_method(sig):
+        def deco(f):
+            f._jnius_sig = sig
+            return f
+        return deco
+
     fake = _t.ModuleType("jnius")
     fake.autoclass = autoclass
+    fake.PythonJavaClass = FakePyJC
+    fake.java_method = java_method
     _sys.modules["jnius"] = fake
     try:
         buf = io.StringIO()
         with _ctx.redirect_stdout(buf):
             main_mod._android_softinput_resize()
         out = buf.getvalue()
-        assert ("setmode", 0x10) in calls, \
-            "the mode lands on the window: %s" % calls
+        queued = [c[1] for c in calls if c[0] == "queue"]
+        assert len(queued) == 1, \
+            "the set dispatches once via runOnUiThread: %s" % calls
+        runnable = queued[0]
+        assert isinstance(runnable, FakePyJC), \
+            "the runnable is a python-implemented jnius proxy: %r" % runnable
+        assert getattr(type(runnable), "__javainterfaces__", None) == \
+            ["java/lang/Runnable"], \
+            "the proxy implements java/lang/Runnable: %r" % \
+            getattr(type(runnable), "__javainterfaces__", None)
+        run_fn = getattr(runnable, "run", None)
+        assert callable(run_fn) and getattr(run_fn, "_jnius_sig", None) == \
+            "()V", "run carries the java ()V signature"
+        # run the queued runnable under capture: on device this leg
+        # executes ON the UI thread; its receipt names that leg
+        buf_run = io.StringIO()
+        with _ctx.redirect_stdout(buf_run):
+            run_fn()
+        assert "SOFTINPUT: window set to ADJUST_RESIZE" in \
+            buf_run.getvalue(), \
+            "the UI-thread leg prints its set receipt: %r" % buf_run.getvalue()
+        assert [c for c in calls if c[0] == "setmode"] == [("setmode", 0x10)], \
+            "the UI-thread call lands as the AOSP int: %s" % calls
         acs = [c[1] for c in calls if c[0] == "ac"]
         assert acs == ["org.kivy.android.PythonActivity",
                        "android.view.WindowManager$LayoutParams"], \
             "exact classes only: %s" % acs
-        assert "SOFTINPUT: window set to ADJUST_RESIZE" in out, repr(out)
+        assert "SOFTINPUT: dispatch queued on ui thread" in out, repr(out)
         # type-faithfulness leg: a misdeclared constant (str where the
         # int overload expects a mode) names itself in the production
-        # except instead of dying silently or lying about the receipt
+        # except BEFORE any dispatch instead of dying silently or lying
+        # about the receipt
         calls.clear()
         FakeWSLP.SOFT_INPUT_ADJUST_RESIZE = "16"
         buf = io.StringIO()
         with _ctx.redirect_stdout(buf):
             main_mod._android_softinput_resize()
-        assert [c for c in calls if c[0] == "setmode"] == [], \
-            "no int-overload call on a str mode"
-        assert "SOFTINPUT: resize not applied" in buf.getvalue(), \
+        assert [c for c in calls if c[0] in ("setmode", "queue")] == [], \
+            "no dispatch on a str mode: %s" % calls
+        assert "SOFTINPUT: resize not dispatched" in buf.getvalue(), \
             repr(buf.getvalue())
     finally:
         import sys as _sys
