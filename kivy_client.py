@@ -35,7 +35,7 @@ from ui_theme import preset_colors
 # ---------------------------------------------------------------------------
 # P11 version bridge: the running build knows its own version.
 # ---------------------------------------------------------------------------
-APP_VERSION = "0.36.23"
+APP_VERSION = "0.36.24"
 
 # buildozer.spec, kivy_client.APP_VERSION and sHades.SERVER_VERSION must all
 # match (tests/test_update_meta.py keeps them in lockstep). On-device the
@@ -155,7 +155,8 @@ else:
 # main.py installs at process start, so the launch story survives even a
 # dead renderer. Remove BOOT_DEBUG once the launch diagnosis is done.
 # ---------------------------------------------------------------------------
-BOOT_DEBUG = False
+BOOT_DEBUG = True  # v0.36.24 DIAG: milestones ride the
+# user-grabbable log (the 0.36.22 crasher got only tee lines)
 
 _boot_lines = []
 _boot_label = {"ref": None}

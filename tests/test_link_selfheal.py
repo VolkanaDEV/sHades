@@ -716,6 +716,8 @@ def _fake_jnius_device(main_mod, tmp_log):
     class Files:
         @staticmethod
         def copy(src, out):
+            if getattr(main_mod, "_FAKE_COPY_RAISES", None):
+                raise RuntimeError("mid-copy native death (in-flight lane)")
             if isinstance(src, FakeOutputStream):
                 raise TypeError(
                     "Files.copy(InputStream, OutputStream) is not an "
@@ -821,6 +823,40 @@ def test_bootlog_bridge_contract():
         assert bridge_calls == [], \
             "no MediaStore traffic while throttled: %s" % bridge_calls
         main_mod._EXPORT_MIN_INTERVAL = 0.0
+        # tay's 0.36.22 crash (2026-11-20): a slow boot clears the
+        # 30 s throttle and the second export from a _boot_file write
+        # died inside the native copy, mid-stream. The in-flight guard
+        # is the fix: while one native copy runs, every other attempt
+        # exits before ANY bridge call, and the flag always clears.
+        main_file = open(main_mod.__file__,
+                         encoding="utf-8").read()
+        assert "_EXPORT_IN_FLIGHT" in main_file,             "in-flight guard exists"
+        calls.clear()
+        main_mod._EXPORT_IN_FLIGHT[0] = True
+        main_mod._LAST_EXPORT_TS[0] = 0.0
+        assert main_mod._export_bootlog_for_user() is False, \
+            "in-flight export refuses before the bridge"
+        hot = [c for c in calls if c[0] in
+               ("coll", "query", "insert", "openout", "copy")]
+        assert hot == [], \
+            "no bridge traffic while a copy is in flight"
+        main_mod._EXPORT_IN_FLIGHT[0] = False
+        calls.clear()
+        main_mod._LAST_EXPORT_TS[0] = 0.0
+        assert main_mod._export_bootlog_for_user() is True, \
+            "clear flag -> copy runs again"
+        assert main_mod._EXPORT_IN_FLIGHT[0] is False, \
+            "success clears the flag (finally)"
+        calls.clear()
+        main_mod._EXPORT_IN_FLIGHT[0] = False
+        main_mod._LAST_EXPORT_TS[0] = 0.0
+        main_mod._FAKE_COPY_RAISES = [True]
+        try:
+            r = main_mod._export_bootlog_for_user()
+        finally:
+            main_mod._FAKE_COPY_RAISES[0] = False
+        assert r is False and main_mod._EXPORT_IN_FLIGHT[0] is \
+            False, "copy failure still clears the flag (finally)"
     finally:
         import sys as _sys
         del _sys.modules["jnius"]
