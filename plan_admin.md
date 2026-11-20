@@ -366,4 +366,49 @@ it. P11 PLANNED above (version bridge -> CI release job -> core ->
 server toggle -> client -> RNS carrier); tay's Continue starts it.
 PR merge stays tay's.
 
+## 0.36.24 — the crasher fix + the empty-site door (folded into one
+## release; pending tay's merge of PR #20)
+
+- **Chain 3b-c: the bootlog export in-flight guard.** Tay's 0.36.22
+  device crash (2026-11-20, instant on open, no python traceback; the
+  log ended at "export: out-stream opened" with no "nio copy ok"): a
+  slow boot clears the 30 s attempt-throttle, the gesture-exclusion
+  _boot_file write fires the export reentrantly inside the live kivy
+  main loop, and the second concurrent jnius/MediaStore native copy
+  killed the process. The diagnosis lane itself crashed its own host.
+  Fix: `_EXPORT_IN_FLIGHT` — while one native copy is mid-flight every
+  other attempt exits before any bridge call; the flag always clears
+  (finally). BOOT_DEBUG rides ON for this ship so the next user log
+  carries numbered milestones. First head: 9d018e3. Receipts:
+  test_link_selfheal green with the in-flight sub-lane
+  (refuse-before-bridge / success-clear / mid-copy-death-clear against
+  the fake jnius device); the 0.36.24 artifact verified
+  (14663214777, sha256 50069ff7...a62189) with main present (the guard
+  name in no earlier head) and the count floor held at 21.
+- **The empty-site door (tay's device report during install: "I don't
+  see any editing widgets", DIRECT LINK channel, admin).** The design
+  intended the empty leg as the door, but the can_edit verdict never
+  reached a not-found response and the leg rendered no affordance. Fix
+  (same version, folded onto PR #20's head): site/get's 404 branch now
+  carries can_edit (the verdict on the read response the flow already
+  fetches); the client's empty-state leg renders [ Create index page ]
+  for a permitted viewer on a not-found read; the
+  shades:site-create ref enters the editor with a starter template
+  mirrored from the server's seed text (one source, equality-pinned).
+  Lanes: site get 404 verdicts (mod True / unbits False / 400
+  verdictless) + the seed + template-equality receipts in
+  test_blobs_site; the door contract in test_link_selfheal
+  (affordance / transport-error refusal / unauthorized refusal / the
+  ref entering the editor with the target keys bound — the lane caught
+  the creator missing the _edit_cid/_edit_path binding before ship).
+  Battery red=none at the fold. The fresh pair on the folded head
+  closes with the receipts of record; the earlier 0.36.24 pair
+  (44806741713/44806741981) documents the guard-only head and is
+  superseded BY this fold, not cancelled mid-run.
+- **tay's flight on this release (one merge, one tag):** merge PR #20
+  -> tag v0.36.24 on main -> publish -> drop the named APK
+  (+ .sha256 companion) as release assets so the auto-updaters can
+  drive; the 0.36.23-alpha release stays as-published (safe: no
+  updater assets match a prerelease with bare job zips).
+
 [END PLAN]

@@ -284,6 +284,45 @@ def main():
           and got["eof"] is False, got)
     r = call("/api/v1/site/get", {"channel": cid_site, "path": "/nope.mu"})
     check("site get missing resource -> 404", r.get("ok") == 0 and r.get("code") == 404, r)
+    # tay's device receipt (0.36.24): the read verdict rides the
+    # not-found response so the client's empty state can be the door.
+    check("site get 404 carries the edit verdict (moderator)",
+          r.get("can_edit") is True, r)
+    r = call("/api/v1/site/get", {"channel": cid_site, "path": "/nope.mu"},
+             ident=other)
+    check("site get 404 verdict False without the bits",
+          r.get("ok") == 0 and r.get("can_edit") is False, r)
+    r = call("/api/v1/site/get", {"channel": cid_site, "path": "/a\\b.mu"})
+    check("site get 400 carries no verdict",
+          r.get("ok") == 0 and "can_edit" not in r, r)
+
+    # tay's device receipt (0.36.24): a fresh site channel seeds its
+    # index, and the client's empty-state starter template mirrors the
+    # server's seed text exactly (one edit, or they drift apart).
+    cid_seed = call("/api/v1/channels/create",
+                    {"name": "seeded", "kind": "site"})["channel"]["id"]
+    check("new site channel seeds /index.mu",
+          os.path.isfile(os.path.join(base, "sites", cid_seed, "index.mu")),
+          cid_seed)
+    seed_txt = open(os.path.join(base, "sites", cid_seed, "index.mu"),
+                    encoding="utf-8").read()
+    check("seeded text == DEFAULT_SITE_INDEX_MU",
+          seed_txt == sHades.DEFAULT_SITE_INDEX_MU, repr(seed_txt[:40]))
+    import ast
+    _kc_path = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "kivy_client.py")
+    _kc_tree = ast.parse(open(_kc_path, encoding="utf-8").read())
+    starter = None
+    for node in ast.walk(_kc_tree):
+        tgt = node.targets[0] if getattr(node, "targets", None) else None
+        if (isinstance(node, ast.Assign) and tgt is not None
+                and ((isinstance(tgt, ast.Attribute)
+                      and tgt.attr == "SITE_STARTER_INDEX_MU")
+                     or (isinstance(tgt, ast.Name)
+                         and tgt.id == "SITE_STARTER_INDEX_MU"))):
+            starter = ast.literal_eval(node.value)
+    check("client starter mirrors the server seed text",
+          starter == sHades.DEFAULT_SITE_INDEX_MU, repr((starter or "")[:40]))
 
     for bad in ("/../evil.mu", "no-slash.mu", "/a//b.mu", "/a/../b.mu", "/a\\b.mu"):
         r = call("/api/v1/site/put", {"channel": cid_site, "path": bad,

@@ -7418,6 +7418,7 @@ class sHadesClientApp(MDApp):
                         can_edit = bool(res.get("can_edit"))
                     else:
                         err = res.get("error", "not found")
+                        can_edit = bool(res.get("can_edit"))
             except Exception as e:
                 err = repr(e)
                 print("site page fetch failed:", err)
@@ -7427,13 +7428,16 @@ class sHadesClientApp(MDApp):
                                                       can_edit=can_edit), 0)
             else:
                 Clock.schedule_once(
-                    lambda dt: self._site_empty_page(cid, err), 0)
+                    lambda dt: self._site_empty_page(cid, err,
+                                                     can_edit=can_edit), 0)
         threading.Thread(target=work, daemon=True).start()
 
-    def _site_empty_page(self, cid, err):
+    def _site_empty_page(self, cid, err, can_edit=False):
         """The page fetch failed: replace the 'loading site' placeholder
         with an honest empty page instead of leaving it forever (tay's
-        device receipt, 0.36.10 era). The server now seeds fresh site
+        device receipt, 0.36.10 era). When the server says the viewer
+        may edit, the empty state IS the creation door: a not-found
+        read for a permitted viewer leads with [ Create index page ].
         channels with a default /index.mu, so this is the exceptional
         branch: a site created before the seed, or a deleted target."""
         try:
@@ -7450,6 +7454,10 @@ class sHadesClientApp(MDApp):
             page = SitePage()
             page.add_widget(self._micron_label(
                 "[b]This site is empty[/b]"))
+            if can_edit and (err or "") == "resource not found":
+                page.add_widget(self._micron_label(
+                    "[ref=shades:site-create][ Create index page ]"
+                    "[/ref]"))
             page.add_widget(self._micron_label(
                 "The page failed to load: %s" % _escape(err or "unknown")))
             grid.add_widget(page)
@@ -7522,6 +7530,19 @@ class sHadesClientApp(MDApp):
                     runs_to_markup(runs, _escape), center=b.get("center")))
 
     # -- site editor (P7c): edit the page on screen, then publish -------
+    SITE_STARTER_INDEX_MU = (
+        "#!c=0\n"
+        "> A fresh sHades site\n"
+        "-\n"
+        "This channel is a micron site. Pages live as site resources\n"
+        "served from this guild; the default template at /index.mu\n"
+        "stands in until you publish your own pages.\n"
+        "-\n"
+        "Quick micron form:\n"
+        "`!bold!` `*italic*` `_underline_` `F8a8`code`f`\n"
+        "[publish with site/put `/index.mu]\n"
+    )
+
     def _open_site_editor(self):
         """Enter the micron editor for the page currently on screen."""
         cid, path = self._site_current or (None, None)
@@ -7558,6 +7579,24 @@ class sHadesClientApp(MDApp):
         scr = self.root.get_screen("site_editor")
         scr._src.text = src
         scr._status.text = "editing %s" % path
+        holder = scr._prev_holder
+        holder.clear_widgets()
+        holder.parent.scroll_y = 1.0
+        self.root.current = "site_editor"
+
+    def _open_new_site_page(self):
+        """Empty-state creation door (tay's device report, 0.36.24): a
+        permitted viewer lands on a not-found read of a site with no
+        stored index; enter the editor with the same starter template
+        the server seeds, keyed to the not-found target (_site_current)."""
+        cid, path = getattr(self, "_site_current", None) or (None, None)
+        if not cid or not path:
+            self._set_status("no page target")
+            return
+        self._edit_cid, self._edit_path = cid, path
+        scr = self.root.get_screen("site_editor")
+        scr._src.text = self.SITE_STARTER_INDEX_MU
+        scr._status.text = "creating %s" % path
         holder = scr._prev_holder
         holder.clear_widgets()
         holder.parent.scroll_y = 1.0
@@ -7695,6 +7734,9 @@ class sHadesClientApp(MDApp):
             return
         if target == "shades:site-edit":
             self._open_site_editor()
+            return
+        if target == "shades:site-create":
+            self._open_new_site_page()
             return
         if micron_media_target(target):
             self._site_download_media(target)

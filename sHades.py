@@ -2854,12 +2854,17 @@ def api_v1_site_get(viewer, data, link_id):
     fpath = _site_file_path(cid, rel)
     if fpath is None:
         return {"ok": 0, "error": "invalid resource path", "code": 400}
+    # The read verdict rides the not-found response too (tay's device
+    # receipt: an admin on an empty site had no widget anywhere). The
+    # empty-state leg is the creation door; the viewer must know here
+    # whether they may enter it.
+    can_edit = is_moderator(viewer) or has_perm(viewer, cid, PERMS["SITE_EDIT"])
     offset, length = _chunk_params(data)
     total, chunk = _read_slice(fpath, offset, length)
     if total is None:
-        return {"ok": 0, "error": "resource not found", "code": 404}
+        return {"ok": 0, "error": "resource not found", "code": 404,
+                "can_edit": bool(can_edit)}
     ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
-    can_edit = is_moderator(viewer) or has_perm(viewer, cid, PERMS["SITE_EDIT"])
     return {"ok": 1, "channel": cid, "path": "/" + rel, "total": total,
             "offset": offset, "eof": offset + len(chunk) >= total,
             "mime": EXT_MIME.get(ext, "application/octet-stream"),

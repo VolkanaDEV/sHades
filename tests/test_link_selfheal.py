@@ -1231,6 +1231,121 @@ def test_site_editor_publish_contract():
     print("PASS  site editor (affordance -> publish -> refusal)")
 
 
+def test_site_create_door_contract():
+    """tay's device receipt (0.36.24): a permitted viewer on a site whose
+    read 404s (seeded-less channel or deleted target) had no widget
+    anywhere. The empty state IS the door now: the not-found read rides
+    the server's can_edit verdict, the leg renders [ Create index page ],
+    and the ref enters the editor with the starter template keyed to the
+    not-found target. Transport errors and unauthorized viewers still
+    see the plain empty page."""
+    cid, path = "d" * 64, "/index.mu"
+
+    class SitePage(object):
+        def __init__(self):
+            self.children = []
+
+        def add_widget(self, w):
+            self.children.append(w)
+
+    def _main_root(page):
+        def clear():
+            page.children = []
+        added = []
+        grid = types.SimpleNamespace(
+            clear_widgets=clear,
+            add_widget=lambda w: added.append(w))
+        return types.SimpleNamespace(
+            current="main",
+            get_screen=lambda name: types.SimpleNamespace(
+                ids=types.SimpleNamespace(message_grid=grid),
+                _current_channel=None)
+            if name == "main" else
+            (_ for _ in ()).throw(KeyError(name))), added
+
+    def _screen():
+        return types.SimpleNamespace(
+            _src=types.SimpleNamespace(text=""),
+            _status=types.SimpleNamespace(text=""),
+            _prev_holder=types.SimpleNamespace(
+                clear_widgets=lambda: None,
+                parent=types.SimpleNamespace(scroll_y=1.0)),
+            )
+    scr = _screen()
+    root = types.SimpleNamespace(current="main")
+
+    def get_screen(name):
+        if name == "site_editor":
+            return scr
+        if name == "main":
+            return types.SimpleNamespace(
+                ids=types.SimpleNamespace(
+                    message_grid=types.SimpleNamespace(children=[])),
+                _current_channel=None)
+        raise KeyError(name)
+    root.get_screen = get_screen
+
+    app = types.SimpleNamespace(
+        root=root, guild_api=None,
+        _site_current=(cid, path), _site_src_text=None,
+        _msg_widgets=[], _remove_skeleton=lambda *a, **k: None,
+        _set_status=lambda *a, **k: None,
+        _edit_cid=None, _edit_path=None,
+        site_pages=None, sitemsg_widgets=None)
+    app._site_empty_page = types.MethodType(kc.sHadesClientApp._site_empty_page, app)
+    app._open_new_site_page = types.MethodType(
+        kc.sHadesClientApp._open_new_site_page, app)
+    app._set_status = types.MethodType(kc.sHadesClientApp._set_status, app)
+    app._micron_label = types.MethodType(
+        kc.sHadesClientApp._micron_label, app)
+
+    # 1. not-found + permitted -> the door
+    page = SitePage()
+    root, added = _main_root(page)
+    app.root = root
+    kc.sHadesClientApp._site_empty_page(app, cid, "resource not found",
+                                        can_edit=True)
+    assert added and type(added[0]).__name__ == "SitePage", added
+    texts = [w.text for w in added[0].children]
+    assert any("[ Create index page ]" in t for t in texts), texts
+    assert any("site-create" in t for t in texts), texts
+    assert any("This site is empty" in t for t in texts), texts
+
+    # 2. transport error + permitted -> still the plain empty page
+    page2 = SitePage()
+    root, added = _main_root(page2)
+    app.root = root
+    kc.sHadesClientApp._site_empty_page(app, cid, "no response",
+                                        can_edit=True)
+    assert not any("site-create" in w.text for w in added[0].children), \
+        "the door must not open on a transport error"
+
+    # 3. not-found + unauthorized -> plain empty page
+    page3 = SitePage()
+    root, added = _main_root(page3)
+    app.root = root
+    kc.sHadesClientApp._site_empty_page(app, cid, "resource not found",
+                                        can_edit=False)
+    assert not any("site-create" in w.text for w in added[0].children)
+
+    # 4. the door ref enters the editor with the starter template
+    root, added = _main_root(SitePage())
+    app.root = root
+    app.SITE_STARTER_INDEX_MU = kc.sHadesClientApp.SITE_STARTER_INDEX_MU
+    root.get_screen = (lambda name, _r=root: scr
+                       if name == "site_editor" else _r.get_screen(name))
+    root.current = "main"
+    app._site_current = (cid, path)
+    kc.sHadesClientApp._micron_link_tapped(app, "shades:site-create")
+    assert root.current == "site_editor", root.current
+    assert scr._src.text == kc.sHadesClientApp.SITE_STARTER_INDEX_MU, \
+        scr._src.text[:60]
+    assert app._edit_cid == cid and app._edit_path == path, \
+        (app._edit_cid, app._edit_path)
+    assert "creating" in scr._status.text, scr._status.text
+    print("PASS  site create door (verdict -> affordance -> editor)")
+
+
 def test_motd_strip_contract():
     """P6: whoami's guild motd binds to the sidebar strip; a set motd
     yields a tappable strip opening the full-text popup, an empty one
@@ -1359,6 +1474,7 @@ def main():
     test_softinput_bridge_contract()
     test_softinput_frame_meter_contract()
     test_site_editor_publish_contract()
+    test_site_create_door_contract()
     test_motd_strip_contract()
     test_announce_composer_contract()
     test_announce_fetch_guard_contract()
