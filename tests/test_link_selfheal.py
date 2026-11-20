@@ -967,43 +967,46 @@ def test_softinput_bridge_contract():
 
 
 def test_softinput_frame_meter_contract():
-    """v0.36.14: main._start_softinput_meter() installs a
-    python-implemented ViewTreeObserver.OnGlobalLayoutListener on the
-    UI thread, reads the visible-frame bottom on every layout pass,
-    and keeps base (max seen) vs latest; kivy_client's
-    _softinput_tick turns base - bottom into chat container bottom
-    padding. tay's 0.36.13 boot fixed the window-mode dispatch but the
-    ANGLE/Vulkan surface never resized into kivy -- so the app moves
-    its own composer group."""
+    """v0.36.15: the frame meter polls from the KIVY thread. tay's log
+    30 (launches 1795169468/71s) killed the v0.36.14 design: the
+    OnGlobalLayoutListener ran python on the UI thread on every layout
+    pass and collided with the main thread mid-import of kivy's pyx
+    machinery -- the process died inside `import kivy` with no
+    traceback. So: main.py must carry NO ui-thread listener at all,
+    and the client tick must measure directly -- first tick resolves
+    jnius handles and prints the live receipt, later ticks turn
+    base - bottom (largest bottom seen vs latest; the IME is up when
+    the bottom drops) into chat container bottom padding, and a
+    failing read reports exactly once."""
     import io
     import sys as _sys
     import types as _t
     import contextlib as _ctx
     import unittest.mock as _mock
     import main as main_mod
+    import kivy_client as kc
 
-    state = {"vto_adds": [], "frames": []}
+    src = open(main_mod.__file__, encoding="utf-8").read()
+    # code markers only: prose comments may document the retired design
+    assert "addOnGlobalLayoutListener" not in src and \
+        "ViewTreeObserver$OnGlobalLayoutListener" not in src, \
+        "the v0.36.14 boot-killer listener must be retired from main.py"
+    assert "runOnUiThread" in src, \
+        "the window-mode dispatch (0.36.13) still rides the ui thread"
+
+    state = {"frames": []}
 
     class FakeRect:
         def __init__(self):
             self.bottom = 0
 
-    class FakeVTO:
-        def addOnGlobalLayoutListener(self, lsnr):
-            state["vto_adds"].append(lsnr)
-
     class FakeDecor:
-        def getViewTreeObserver(self):
-            return FakeVTO()
-
         def getWindowVisibleDisplayFrame(self, rect):
             rect.bottom = state["frames"][-1] if state["frames"] else 0
 
     _activity = _t.SimpleNamespace(
         getWindow=lambda: _t.SimpleNamespace(
-            getDecorView=lambda: FakeDecor()),
-        runOnUiThread=lambda r: state.setdefault(
-            "queued", []).append(r))
+            getDecorView=lambda: FakeDecor()))
     FakePythonActivity = _t.SimpleNamespace(mActivity=_activity)
 
     def autoclass(name):
@@ -1013,58 +1016,13 @@ def test_softinput_frame_meter_contract():
             return FakeRect
         raise ValueError("unexpected autoclass %s" % name)
 
-    class FakePyJC:
-        pass
-
-    def java_method(sig):
-        def deco(f):
-            f._jnius_sig = sig
-            return f
-        return deco
-
     fake = _t.ModuleType("jnius")
     fake.autoclass = autoclass
-    fake.PythonJavaClass = FakePyJC
-    fake.java_method = java_method
     _sys.modules["jnius"] = fake
     prev_state = dict(main_mod._SOFTINPUT)
+    prev_meter = kc._FRAME_METER
+    prev_reported = set(kc._FRAME_REPORTED)
     try:
-        buf = io.StringIO()
-        with _ctx.redirect_stdout(buf):
-            main_mod._start_softinput_meter()
-        assert "queued" in state and len(state["queued"]) == 1, \
-            "the install dispatches once on the ui thread: %s" % state
-        watcher = state["queued"][0]
-        assert getattr(type(watcher), "__javainterfaces__", None) == \
-            ["java/lang/Runnable",
-             "android/view/ViewTreeObserver$OnGlobalLayoutListener"], \
-            "the watcher is the runnable AND the layout listener"
-        assert "SOFTINPUT: frame meter queued on ui thread" in \
-            buf.getvalue()
-        # install leg: run() runs on the UI thread and registers self
-        state["frames"].append(2112)  # keyboard closed
-        watcher.run()
-        assert len(state["vto_adds"]) == 1 and \
-            state["vto_adds"][0] is watcher, \
-            "the listener registers itself once: %s" % state
-        assert main_mod.softinput_base() == 2112, main_mod._SOFTINPUT
-        assert main_mod.softinput_bottom() == 2112, main_mod._SOFTINPUT
-        # layout leg: the IME opens; base holds the no-IME max
-        state["frames"].append(1700)
-        watcher.onGlobalLayout()
-        assert main_mod.softinput_base() == 2112
-        assert main_mod.softinput_bottom() == 1700
-    finally:
-        import sys as _sys
-        del _sys.modules["jnius"]
-        main_mod._SOFTINPUT.clear()
-        main_mod._SOFTINPUT.update(prev_state)
-
-    # ---- the client tick: base - bottom becomes container padding ----
-    import kivy_client as kc
-    with _mock.patch("kivy.utils.platform", "android"):
-        main_mod._SOFTINPUT.update({"base": 2112, "bottom": 1700})
-
         class FakeCS:
             padding = [0, 0, 0, 0]
 
@@ -1078,18 +1036,59 @@ def test_softinput_frame_meter_contract():
                 return FakeScreen
 
         app = _t.SimpleNamespace(root=FakeRoot())
-        kc.sHadesClientApp._softinput_tick(app)
-        assert FakeCS.padding == [0, 0, 0, 412], \
-            "the composer group lifts by the IME height: %r" % \
-            (FakeCS.padding,)
-        main_mod._SOFTINPUT.update({"bottom": 2112})  # keyboard closed
-        kc.sHadesClientApp._softinput_tick(app)
-        assert FakeCS.padding == [0, 0, 0, 0], \
-            "the lift clears when the keyboard closes: %r" % \
-            (FakeCS.padding,)
-    main_mod._SOFTINPUT.clear()
-    main_mod._SOFTINPUT.update(prev_state)
-    print("PASS  softinput frame meter + lift")
+        buf = io.StringIO()
+        with _mock.patch("kivy.utils.platform", "android"):
+            with _ctx.redirect_stdout(buf):
+                # first tick: resolve, live receipt, closed-keyboard
+                # reading (2112) establishes the base
+                state["frames"].append(2112)
+                kc.sHadesClientApp._softinput_tick(app)
+                assert getattr(kc, "_FRAME_METER") is not None, \
+                    "the first tick resolves the jnius handles"
+                assert "SOFTINPUT: frame meter live (kivy thread " \
+                       "poll)" in buf.getvalue()
+                assert main_mod.softinput_base() == 2112
+                assert main_mod.softinput_live() is True
+                assert FakeCS.padding == [0, 0, 0, 0]
+                # the IME opens: the meter reads the drop and lifts
+                state["frames"].append(1700)
+                kc.sHadesClientApp._softinput_tick(app)
+                assert main_mod.softinput_bottom() == 1700
+                assert FakeCS.padding == [0, 0, 0, 412], \
+                    "the composer group lifts by the IME height: %r" % \
+                    (FakeCS.padding,)
+                # the IME closes: the lift clears
+                state["frames"].append(2112)
+                kc.sHadesClientApp._softinput_tick(app)
+                assert FakeCS.padding == [0, 0, 0, 0], \
+                    "the lift clears when the keyboard closes: %r" % \
+                    (FakeCS.padding,)
+            # a failing read reports exactly once, then stops spamming
+            boom = _t.ModuleType("jnius")
+
+            def broken(name):
+                raise ValueError("dead jnius")
+
+            boom.autoclass = broken
+            _sys.modules["jnius"] = boom
+            kc._FRAME_METER = None
+            kc._FRAME_REPORTED.clear()
+            seen = []
+            with _mock.patch.object(kc, "_boot_file",
+                                    side_effect=seen.append):
+                kc.sHadesClientApp._softinput_tick(app)
+                kc.sHadesClientApp._softinput_tick(app)
+            assert len(seen) == 1 and "frame read failed" in seen[0], \
+                "a failing tick reports once, not per tick: %r" % (seen,)
+    finally:
+        import sys as _sys
+        del _sys.modules["jnius"]
+        kc._FRAME_METER = prev_meter
+        kc._FRAME_REPORTED.clear()
+        kc._FRAME_REPORTED.update(prev_reported)
+        main_mod._SOFTINPUT.clear()
+        main_mod._SOFTINPUT.update(prev_state)
+    print("PASS  softinput frame meter (kivy-thread poll) + lift")
 
 
 def main():

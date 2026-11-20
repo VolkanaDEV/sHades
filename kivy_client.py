@@ -140,6 +140,21 @@ BOOT_DEBUG = False
 _boot_lines = []
 _boot_label = {"ref": None}
 
+# The IME lifting meter, v0.36.15: resolved jnius handles for the
+# kivy-thread visible-frame poll (None until the first tick), plus the
+# once-only report set for failures (a failing tick must not spam the
+# boot log).
+_FRAME_METER = None
+_FRAME_REPORTED = set()
+
+
+def _softinput_reported_once(tag):
+    """True the SECOND time a tag is seen; the first reports."""
+    if tag in _FRAME_REPORTED:
+        return True
+    _FRAME_REPORTED.add(tag)
+    return False
+
 
 def _boot_file(msg):
     """Append a milestone to the boot log file, then mirror it
@@ -2776,29 +2791,61 @@ class sHadesClientApp(MDApp):
     def _softinput_tick(self, *_dt):
         """Lift the composer group above the Android IME.
 
-        tay's 0.36.13 boot receipt: the window-mode dispatch legs are
-        green, but the ANGLE/Vulkan surface never propagates the IME
-        resize into the kivy layout. main.py's frame meter (a
-        ViewTreeObserver listener running on the UI thread) records the
-        visible-frame bottom; this Clock tick runs on the kivy thread
-        and reads it. lift = base - bottom is the IME height in pixels;
-        padding the bottom edge of the chat container lifts the reply
-        row and the composer row (input field, buttons, pfp) as one
-        group while the scroll view shrinks. Zero lift when the
-        keyboard is closed. Runs only on android.
+        tay's 0.36.13 boot (launch 1795165828s): the window-mode
+        dispatch legs are green, but the ANGLE/Vulkan surface never
+        propagates the IME resize into the kivy layout. v0.36.14 tried
+        a UI-thread OnGlobalLayoutListener and KILLED the boot (log 30,
+        launches 1795169468/71s: UI-thread python collided with the
+        main thread mid-import of kivy's pyx machinery -- system kill,
+        silence). v0.36.15 measures here, on the KIVY thread, post
+        app start -- the exact pattern _apply_system_gesture_exclusions
+        already runs: PythonActivity + Rect resolved once, then each
+        0.25s tick reads the decor's visible frame bottom directly.
+        lift = base - bottom is the IME height in pixels; padding the
+        bottom edge of the chat container lifts the reply row and the
+        composer row (input field, buttons, pfp) as one group while the
+        scroll view shrinks. Zero lift when the keyboard is closed.
+        Runs only on android.
         """
         from kivy.utils import platform
         if platform != "android":
             return
+        global _FRAME_METER
+        try:
+            if _FRAME_METER is None:
+                from jnius import autoclass
+                _FRAME_METER = {
+                    "PythonActivity": autoclass(
+                        "org.kivy.android.PythonActivity"),
+                    "Rect": autoclass("android.graphics.Rect"),
+                }
+                print("SOFTINPUT: frame meter live (kivy thread poll)",
+                      flush=True)
+            meter = _FRAME_METER
+            rect = meter["Rect"]()
+            meter["PythonActivity"].mActivity.getWindow().getDecorView() \
+                .getWindowVisibleDisplayFrame(rect)
+            bottom = rect.bottom
+        except Exception as e:
+            if not _softinput_reported_once("frame read"):
+                _boot_file("softinput frame read failed: %s" % e)
+            return
         try:
             import main as main_mod
-            bottom = main_mod.softinput_bottom()
-            base = main_mod.softinput_base()
+            state = main_mod._SOFTINPUT
         except Exception:
+            state = None
+        if state is None:
             return
+        # base = the no-IME frame bottom = the largest bottom seen; if
+        # the IME was already up at first layout the base self-corrects
+        # on the first keyboard close.
+        if bottom and bottom > state["base"]:
+            state["base"] = bottom
+        state["bottom"] = bottom
+        state["live"] = True
+        base = state["base"]
         if not base:
-            # no reading yet (meter not installed, or the IME was up at
-            # first layout and the base has not self-corrected)
             return
         lift = (base - bottom) if bottom else 0
         if lift < 0:
