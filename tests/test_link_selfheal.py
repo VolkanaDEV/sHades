@@ -966,6 +966,132 @@ def test_softinput_bridge_contract():
     print("PASS  softinput bridge contract")
 
 
+def test_softinput_frame_meter_contract():
+    """v0.36.14: main._start_softinput_meter() installs a
+    python-implemented ViewTreeObserver.OnGlobalLayoutListener on the
+    UI thread, reads the visible-frame bottom on every layout pass,
+    and keeps base (max seen) vs latest; kivy_client's
+    _softinput_tick turns base - bottom into chat container bottom
+    padding. tay's 0.36.13 boot fixed the window-mode dispatch but the
+    ANGLE/Vulkan surface never resized into kivy -- so the app moves
+    its own composer group."""
+    import io
+    import sys as _sys
+    import types as _t
+    import contextlib as _ctx
+    import unittest.mock as _mock
+    import main as main_mod
+
+    state = {"vto_adds": [], "frames": []}
+
+    class FakeRect:
+        def __init__(self):
+            self.bottom = 0
+
+    class FakeVTO:
+        def addOnGlobalLayoutListener(self, lsnr):
+            state["vto_adds"].append(lsnr)
+
+    class FakeDecor:
+        def getViewTreeObserver(self):
+            return FakeVTO()
+
+        def getWindowVisibleDisplayFrame(self, rect):
+            rect.bottom = state["frames"][-1] if state["frames"] else 0
+
+    _activity = _t.SimpleNamespace(
+        getWindow=lambda: _t.SimpleNamespace(
+            getDecorView=lambda: FakeDecor()),
+        runOnUiThread=lambda r: state.setdefault(
+            "queued", []).append(r))
+    FakePythonActivity = _t.SimpleNamespace(mActivity=_activity)
+
+    def autoclass(name):
+        if name == "org.kivy.android.PythonActivity":
+            return FakePythonActivity
+        if name == "android.graphics.Rect":
+            return FakeRect
+        raise ValueError("unexpected autoclass %s" % name)
+
+    class FakePyJC:
+        pass
+
+    def java_method(sig):
+        def deco(f):
+            f._jnius_sig = sig
+            return f
+        return deco
+
+    fake = _t.ModuleType("jnius")
+    fake.autoclass = autoclass
+    fake.PythonJavaClass = FakePyJC
+    fake.java_method = java_method
+    _sys.modules["jnius"] = fake
+    prev_state = dict(main_mod._SOFTINPUT)
+    try:
+        buf = io.StringIO()
+        with _ctx.redirect_stdout(buf):
+            main_mod._start_softinput_meter()
+        assert "queued" in state and len(state["queued"]) == 1, \
+            "the install dispatches once on the ui thread: %s" % state
+        watcher = state["queued"][0]
+        assert getattr(type(watcher), "__javainterfaces__", None) == \
+            ["java/lang/Runnable",
+             "android/view/ViewTreeObserver$OnGlobalLayoutListener"], \
+            "the watcher is the runnable AND the layout listener"
+        assert "SOFTINPUT: frame meter queued on ui thread" in \
+            buf.getvalue()
+        # install leg: run() runs on the UI thread and registers self
+        state["frames"].append(2112)  # keyboard closed
+        watcher.run()
+        assert len(state["vto_adds"]) == 1 and \
+            state["vto_adds"][0] is watcher, \
+            "the listener registers itself once: %s" % state
+        assert main_mod.softinput_base() == 2112, main_mod._SOFTINPUT
+        assert main_mod.softinput_bottom() == 2112, main_mod._SOFTINPUT
+        # layout leg: the IME opens; base holds the no-IME max
+        state["frames"].append(1700)
+        watcher.onGlobalLayout()
+        assert main_mod.softinput_base() == 2112
+        assert main_mod.softinput_bottom() == 1700
+    finally:
+        import sys as _sys
+        del _sys.modules["jnius"]
+        main_mod._SOFTINPUT.clear()
+        main_mod._SOFTINPUT.update(prev_state)
+
+    # ---- the client tick: base - bottom becomes container padding ----
+    import kivy_client as kc
+    with _mock.patch("kivy.utils.platform", "android"):
+        main_mod._SOFTINPUT.update({"base": 2112, "bottom": 1700})
+
+        class FakeCS:
+            padding = [0, 0, 0, 0]
+
+        class FakeScreen:
+            ids = {"chat_screen": FakeCS}
+
+        class FakeRoot:
+            def get_screen(self, name):
+                if name != "main":
+                    raise KeyError(name)
+                return FakeScreen
+
+        app = _t.SimpleNamespace(root=FakeRoot())
+        kc.sHadesClientApp._softinput_tick(app)
+        assert FakeCS.padding == [0, 0, 0, 412], \
+            "the composer group lifts by the IME height: %r" % \
+            (FakeCS.padding,)
+        main_mod._SOFTINPUT.update({"bottom": 2112})  # keyboard closed
+        kc.sHadesClientApp._softinput_tick(app)
+        assert FakeCS.padding == [0, 0, 0, 0], \
+            "the lift clears when the keyboard closes: %r" % \
+            (FakeCS.padding,)
+    main_mod._SOFTINPUT.clear()
+    main_mod._SOFTINPUT.update(prev_state)
+    print("PASS  softinput frame meter + lift")
+
+
 def main():
     test_link_dead_reported_and_signalled()
     test_link_raise_reported_and_signalled()
@@ -982,7 +1108,8 @@ def main():
     test_bootlog_bridge_contract()
     test_bootlog_clipboard_contract()
     test_softinput_bridge_contract()
-    print("PASS: 15  FAIL: 0")
+    test_softinput_frame_meter_contract()
+    print("PASS: 18  FAIL: 0")
 
 
 if __name__ == "__main__":

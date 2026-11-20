@@ -292,6 +292,78 @@ def _android_softinput_resize():
         print("SOFTINPUT: resize not dispatched (%r)" % (e,), flush=True)
 
 
+# Shared state of the visible-frame meter: {"base": frame bottom seen
+# without any IME (the largest bottom so far), "bottom": the latest
+# frame bottom}. The UI-thread layout callback writes; the kivy Clock
+# tick reads. Each read/write of a single int is GIL-atomic, so no
+# lock is needed for this one-slot handoff.
+_SOFTINPUT = {"base": 0, "bottom": 0}
+
+
+def softinput_base():
+    """Frame bottom measured with no IME visible (largest seen)."""
+    return _SOFTINPUT["base"]
+
+
+def softinput_bottom():
+    """Latest visible-frame bottom; base - bottom is the IME height."""
+    return _SOFTINPUT["bottom"]
+
+
+def _start_softinput_meter():
+    """tay's 0.36.13 boot receipt (launch 1795165828s): both dispatch
+    legs green -- 'dispatch queued' then 'set to ADJUST_RESIZE' -- yet
+    the composer row still sat behind the IME. The renderer is ANGLE
+    over Vulkan, and the window resize never propagated into the kivy
+    layout, so no window-mode fix is enough on that path.
+
+    The app therefore moves its own bottom group: a python-implemented
+    ViewTreeObserver.OnGlobalLayoutListener (installed once on the UI
+    thread, the same dispatch class the resize uses) measures the
+    decor's visible frame on every layout pass -- IME show and hide
+    among them -- and records its bottom. kivy_client's Clock tick
+    turns base - bottom into chat container padding, lifting the
+    composer, its buttons and its pfp above the keyboard. If the app
+    starts with the IME already up the base self-corrects on the first
+    keyboard close. Boot receipts name each leg."""
+    try:
+        from jnius import autoclass, PythonJavaClass, java_method
+
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        _Rect = autoclass("android.graphics.Rect")
+
+        class _FrameWatch(PythonJavaClass):
+            __javainterfaces__ = [
+                "java/lang/Runnable",
+                "android/view/ViewTreeObserver$OnGlobalLayoutListener"]
+
+            @java_method("()V")
+            def run(self):
+                # runs ON the UI thread exactly once: register as the
+                # layout listener and take the first reading
+                window = PythonActivity.mActivity.getWindow()
+                decor = window.getDecorView()
+                decor.getViewTreeObserver().addOnGlobalLayoutListener(
+                    self)
+                self.onGlobalLayout()
+
+            @java_method("()V")
+            def onGlobalLayout(self):
+                window = PythonActivity.mActivity.getWindow()
+                rect = _Rect()
+                window.getDecorView().getWindowVisibleDisplayFrame(rect)
+                bottom = rect.bottom
+                if bottom and bottom > _SOFTINPUT["base"]:
+                    _SOFTINPUT["base"] = bottom
+                _SOFTINPUT["bottom"] = bottom
+
+        PythonActivity.mActivity.runOnUiThread(_FrameWatch())
+        print("SOFTINPUT: frame meter queued on ui thread", flush=True)
+    except Exception as e:
+        print("SOFTINPUT: frame meter not installed (%r)" % (e,),
+              flush=True)
+
+
 def main():
     """Entry point called from Android activity. All Python execution
     is wrapped so any import/runtime crash is visible on-device."""
@@ -304,6 +376,7 @@ def main():
         pass
     print("PYTHON: main() starting", flush=True)
     _android_softinput_resize()
+    _start_softinput_meter()
     try:
         print("PYTHON: importing kivy_client", flush=True)
         from kivy_client import sHadesClientApp

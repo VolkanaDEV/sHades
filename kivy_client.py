@@ -2773,6 +2773,45 @@ class sHadesClientApp(MDApp):
             _boot_install(sm.get_screen(sm.current))
         return sm
 
+    def _softinput_tick(self, *_dt):
+        """Lift the composer group above the Android IME.
+
+        tay's 0.36.13 boot receipt: the window-mode dispatch legs are
+        green, but the ANGLE/Vulkan surface never propagates the IME
+        resize into the kivy layout. main.py's frame meter (a
+        ViewTreeObserver listener running on the UI thread) records the
+        visible-frame bottom; this Clock tick runs on the kivy thread
+        and reads it. lift = base - bottom is the IME height in pixels;
+        padding the bottom edge of the chat container lifts the reply
+        row and the composer row (input field, buttons, pfp) as one
+        group while the scroll view shrinks. Zero lift when the
+        keyboard is closed. Runs only on android.
+        """
+        from kivy.utils import platform
+        if platform != "android":
+            return
+        try:
+            import main as main_mod
+            bottom = main_mod.softinput_bottom()
+            base = main_mod.softinput_base()
+        except Exception:
+            return
+        if not base:
+            # no reading yet (meter not installed, or the IME was up at
+            # first layout and the base has not self-corrected)
+            return
+        lift = (base - bottom) if bottom else 0
+        if lift < 0:
+            lift = 0
+        screen = self.root.get_screen("main")
+        cs = screen.ids.get("chat_screen")
+        if cs is None:
+            return
+        cur = cs.padding
+        if len(cur) != 4 or cur[3] != lift:
+            # kivy padding is [left, top, right, bottom]
+            cs.padding = [cur[0], cur[1], cur[2], lift]
+
     def _apply_system_gesture_exclusions(self, *_args):
         """Exclude our drawer edge bands from the Android system back
         gesture (Android 10+).
@@ -2824,6 +2863,13 @@ class sHadesClientApp(MDApp):
         if BOOT_DEBUG:
             _boot_mark("on_start")
         self._apply_system_gesture_exclusions()
+        # 0.36.14: the frame meter (main.py, UI-thread listener) feeds
+        # this tick; it pads the chat container so the composer group
+        # rides above the keyboard.
+        try:
+            Clock.schedule_interval(self._softinput_tick, 0.25)
+        except Exception as e:
+            _boot_file("softinput meter not scheduled: %s" % e)
         # tay (2026-11): '/' pops the command palette for live selections.
         # The channel input watches its own text: a bare '/' opens the
         # palette with the filter seeded from the input, everything else
