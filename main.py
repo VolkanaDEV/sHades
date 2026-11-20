@@ -47,6 +47,7 @@ def _log_path():
 
 _EXPORT_MIN_INTERVAL = 30.0
 _LAST_EXPORT_TS = [0.0]
+_EXPORT_IN_FLIGHT = [False]
 
 
 def _export_bootlog_for_user():
@@ -76,7 +77,17 @@ def _export_bootlog_for_user():
     if _LAST_EXPORT_TS[0] and now - _LAST_EXPORT_TS[0] < \
             _EXPORT_MIN_INTERVAL:
         return False
+    # tay's crasher (0.36.22, 2026-11-20): a SLOW boot (>30 s) clears the
+    # throttle, and the second export fired from _boot_file inside the
+    # live kivy main loop; its native MediaStore copy opened the stream
+    # ("export: out-stream opened") and the process died before "nio
+    # copy ok" -- no python traceback (main()'s wrapper never saw it).
+    # Never run a second native copy while one is in flight; a reentrant
+    # jnius/MediaStore call on the UI thread is exactly what killed it.
+    if _EXPORT_IN_FLIGHT[0]:
+        return False
     _LAST_EXPORT_TS[0] = now
+    _EXPORT_IN_FLIGHT[0] = True
     try:
         act = autoclass("org.kivy.android.PythonActivity").mActivity
         SDK_INT = int(autoclass("android.os.Build$VERSION").SDK_INT)
@@ -145,6 +156,8 @@ def _export_bootlog_for_user():
     except Exception as e:
         print("bootlog export failed:", e, flush=True)
         return False
+    finally:
+        _EXPORT_IN_FLIGHT[0] = False
 
 
 class _Tee:

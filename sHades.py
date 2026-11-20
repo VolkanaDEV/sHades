@@ -15,6 +15,7 @@
 
 import os
 import re
+import sys
 import json
 import time
 import base64
@@ -142,7 +143,7 @@ FIELD_ATTACHMENTS = LXMF.FIELD_FILE_ATTACHMENTS  # 0x05 — envelope ours (plan 
 
 # P11 version bridge: the server knows its own version. Lockstep with
 # buildozer.spec and kivy_client.APP_VERSION (tests/test_update_meta.py).
-SERVER_VERSION = "0.36.23"
+SERVER_VERSION = "0.36.24"
 
 # ----------------------------------------------------------------------------------
 # Database
@@ -2854,12 +2855,17 @@ def api_v1_site_get(viewer, data, link_id):
     fpath = _site_file_path(cid, rel)
     if fpath is None:
         return {"ok": 0, "error": "invalid resource path", "code": 400}
+    # The read verdict rides the not-found response too (tay's device
+    # receipt: an admin on an empty site had no widget anywhere). The
+    # empty-state leg is the creation door; the viewer must know here
+    # whether they may enter it.
+    can_edit = is_moderator(viewer) or has_perm(viewer, cid, PERMS["SITE_EDIT"])
     offset, length = _chunk_params(data)
     total, chunk = _read_slice(fpath, offset, length)
     if total is None:
-        return {"ok": 0, "error": "resource not found", "code": 404}
+        return {"ok": 0, "error": "resource not found", "code": 404,
+                "can_edit": bool(can_edit)}
     ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
-    can_edit = is_moderator(viewer) or has_perm(viewer, cid, PERMS["SITE_EDIT"])
     return {"ok": 1, "channel": cid, "path": "/" + rel, "total": total,
             "offset": offset, "eof": offset + len(chunk) >= total,
             "mime": EXT_MIME.get(ext, "application/octet-stream"),
@@ -4478,7 +4484,12 @@ def run(argv=None):
     # Reap clients that miss two consecutive 4s announcements (8 s stale).
     threading.Thread(target=_node_reaper, daemon=True).start()
     global _BOOT_ARGV
-    _BOOT_ARGV = list(argv)
+    # tay's bare boot (2026-11-20): `python sHades.py` passes argv=None
+    # here and list(None) crashed the hub right after the announce
+    # banner on every bare boot since 0.36.21 (all CI boots passed
+    # argv, so the bare path had no receipt). A bare boot restarts
+    # bare instead of crashing.
+    _BOOT_ARGV = list(argv) if argv is not None else []
     _update_maybe_tick(force=True)
     threading.Thread(target=announce_all, daemon=True).start()
     try:
@@ -4489,4 +4500,9 @@ def run(argv=None):
         RNS.log("Shutting down.", RNS.LOG_NOTICE)
 
 if __name__ == "__main__":
-    run()
+    # tay's boot (0.36.24 fold-4): the flags live in sys.argv, not in
+    # the argv parameter - list(None) crashed AFTER the banner on
+    # every boot (bare or flagged) since P11 chain 2, and a guard
+    # alone would restart a flagged hub flagless. The entry feeds the
+    # real CLI here so _BOOT_ARGV carries the flags through a restart.
+    run(sys.argv[1:])

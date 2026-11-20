@@ -122,8 +122,15 @@ def test_update_applied_once():
     try:
         app._fetch_messages("general")
         from kivy.clock import Clock
-        for _ in range(20):
+        # The fetch apply runs on a worker thread; a loaded CI runner can
+        # start that thread after the whole tick budget burns (0 applies
+        # on run 44821647316 with the apply never scheduled yet). Spin
+        # until the apply lands, bounded.
+        for _ in range(60):
             Clock.tick()
+            if len(calls) >= 1:
+                break
+            time.sleep(0.01)
     finally:
         kc.sHadesClientApp._apply_update = orig
 

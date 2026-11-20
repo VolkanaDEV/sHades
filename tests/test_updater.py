@@ -27,6 +27,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -309,6 +310,97 @@ seen = (open(runlog, encoding="utf-8").read().split()
         if os.path.isfile(runlog) else [])
 check("launcher: BROKEN attempt then OLD recovery",
       seen == ["BROKEN", "OLD"], seen)
+
+# --- tay's bare boot (0.36.24 fold-3): `python sHades.py` with no args
+# crashed right after the announce banner since 0.36.21
+# (list(None)); every CI boot passed argv, so the bare path had no
+# receipt until now. Boot the hub with argv=None, wait for the
+# guild-active banner, then terminate. The crash string must never
+# appear and the banner must.
+
+
+def _boot_until_banner(args, cwd, deadline_s=90.0):
+    # A blocking readline would hang the whole lane (and CI) forever
+    # if the child ever boots quietly: pump in a daemon thread and
+    # poll against a hard deadline instead.
+    # The child must line-flush into the pipe: block-buffered stdout
+    # keeps the whole boot log in the child's own buffer, so the
+    # banner never reaches us and the timeout just kills it (the
+    # integration lane sets the same). HOME/USERPROFILE are pinned to
+    # the tmp cwd: DEFAULT_STORAGE is ~/.sHades, and without this the
+    # boot rewrites the real home's RNS config with the boot's flags.
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["HOME"] = cwd
+    env["USERPROFILE"] = cwd
+    env["HOMEDRIVE"] = ""
+    env["HOMEPATH"] = cwd
+    proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "sHades.py")] +
+                            args,
+                            cwd=cwd, env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+    assert proc.stdout is not None
+    stream = proc.stdout
+    buf = []
+
+    def _pump():
+        try:
+            for line in stream:
+                buf.append(line)
+        except (OSError, ValueError):
+            pass
+
+    pump_t = threading.Thread(target=_pump, daemon=True)
+    pump_t.start()
+    t0 = time.time()
+    while time.time() - t0 < deadline_s:
+        if any("active" in line for line in buf):
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.5)
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    return "".join(buf)
+
+
+bare_cwd = tempfile.mkdtemp(prefix="shades_bare_")
+
+
+def _read_flag_rns_config(cwd):
+    # the storage defaults to expanduser("~") + "/.sHades" and HOME is
+    # pinned to the boot's cwd, so the config lives in a known place.
+    cfg = os.path.join(cwd, ".sHades", "rns", "config")
+    return open(cfg, encoding="utf-8").read() if os.path.isfile(cfg) else ""
+
+
+out = _boot_until_banner([], bare_cwd)
+check("bare boot: hub came up without argv", "active" in out, out[-400:])
+check("bare boot: no argv crash",
+      "'NoneType' object is not iterable" not in out, out[-400:])
+
+# --- tay's flagged boot (0.36.24 fold-4): the CLI flags ride
+# sys.argv via run(sys.argv[1:]) so _BOOT_ARGV carries them through a
+# restart. Boot with listen + debug, wait for the banner, terminate.
+flag_cwd = tempfile.mkdtemp(prefix="shades_flag_")
+flag_out = _boot_until_banner(
+    ["--debug", "--listen", "127.0.0.1:49299"], flag_cwd)
+check("flag boot: hub came up with --debug --listen",
+      "active" in flag_out, flag_out[-400:])
+# the listen flag's real evidence: the RNS config the boot wrote
+# (the banner never names the listen target).
+cfg_txt = _read_flag_rns_config(flag_cwd)
+check("flag boot: TCPServerInterface in boot-written config",
+      "TCPServerInterface" in cfg_txt, cfg_txt[:400])
+check("flag boot: listen_ip 127.0.0.1 + port 49299 present",
+      "listen_ip = 127.0.0.1" in cfg_txt and
+      "listen_port = 49299" in cfg_txt, cfg_txt[:400])
+check("flag boot: no argv crash",
+      "'NoneType' object is not iterable" not in flag_out, flag_out[-400:])
 
 print()
 print("PASS: %d  FAIL: %d" % (len(PASS), len(FAIL)))
