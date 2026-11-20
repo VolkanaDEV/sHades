@@ -142,7 +142,7 @@ FIELD_ATTACHMENTS = LXMF.FIELD_FILE_ATTACHMENTS  # 0x05 — envelope ours (plan 
 
 # P11 version bridge: the server knows its own version. Lockstep with
 # buildozer.spec and kivy_client.APP_VERSION (tests/test_update_meta.py).
-SERVER_VERSION = "0.36.22"
+SERVER_VERSION = "0.36.23"
 
 # ----------------------------------------------------------------------------------
 # Database

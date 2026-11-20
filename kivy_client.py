@@ -35,7 +35,7 @@ from ui_theme import preset_colors
 # ---------------------------------------------------------------------------
 # P11 version bridge: the running build knows its own version.
 # ---------------------------------------------------------------------------
-APP_VERSION = "0.36.22"
+APP_VERSION = "0.36.23"
 
 # buildozer.spec, kivy_client.APP_VERSION and sHades.SERVER_VERSION must all
 # match (tests/test_update_meta.py keeps them in lockstep). On-device the
