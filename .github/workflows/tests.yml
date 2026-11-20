@@ -41,7 +41,6 @@ jobs:
           # P11's own lane was never registered here: the bare-boot
           # crasher (0.36.21-0.36.24, list(None) after the banner)
           # survived every CI boot because each one passed argv.
-          python tests/test_update_meta.py
           python tests/test_updater.py
 
   client-tests:
@@ -80,6 +79,9 @@ jobs:
         run: |
           xvfb-run -a python tests/test_admin_panel.py
           xvfb-run -a python tests/test_attachments.py
+          # P11 chain 1: the version-bridge pairing + the jnius legs
+          # (kivy_client import needs kivy+pillow = this job's env)
+          xvfb-run -a python tests/test_update_meta.py
           xvfb-run -a python tests/test_client_regressions.py
           xvfb-run -a python tests/test_embed_features.py
           xvfb-run -a python tests/test_embed_layout.py
