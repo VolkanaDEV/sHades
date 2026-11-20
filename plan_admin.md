@@ -298,6 +298,18 @@ PLANNED, priced, build order below. No code until tay calls it.
   **3** P11a core + rollback -> **4** P11b server wiring + toggle ->
   **5** P11c client -> **6** P11d carrier. Each its own ship chain;
   3 and 4 go together (the core is useless unwired).
+- **Chain 1 BUILT 2026-11-20, v0.36.20 `914dd30`**: kivy_client
+  APP_VERSION + _client_version() (jnius PackageManager on-device,
+  constant fallback); sHades SERVER_VERSION;
+  tests/test_update_meta.py 8/0 (three-way lockstep lane: spec ==
+  APP_VERSION == SERVER_VERSION, plus both _client_version halves —
+  no-jnius fallback and a fake-jnius shim returning the APK's
+  versionName). build.yml gains the server-bundle artifact job;
+  release.yml (new) attaches bundle + .sha256 to a published release
+  off the release TAG. Probes: the pairing lane CAUGHT the bump
+  before commit (constants 0.36.20 vs spec 0.36.19 red), battery
+  red=none after the bump. Artifacts of this chain verify via the
+  0.36.19 table + the pairing lane.
 - Standing risk named in the plan: auto-update is the one feature
   whose worst failure bricks the updater's own host — the toggle
   defaults OFF, the apply gates on sha + staged-import probe, and
