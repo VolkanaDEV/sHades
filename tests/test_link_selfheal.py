@@ -1091,6 +1091,110 @@ def test_softinput_frame_meter_contract():
     print("PASS  softinput frame meter (kivy-thread poll) + lift")
 
 
+def test_site_editor_publish_contract():
+    """P7c: the [ Edit page ] affordance reaches the micron editor with
+    the page's source; the publish leg posts the edited source to the
+    page the editor opened on and returns to the page on success; a
+    server refusal stays on the editor with the server error visible."""
+    import base64
+
+    cid, path = "c" * 64, "/index.mu"
+    source = "#!c=0\n> Owned page\n\nplain line\n"
+
+    class _NowClock(object):
+        @staticmethod
+        def schedule_once(fn, dt=0):
+            fn(0)
+
+    class _InlineThread(object):
+        def __init__(self, target=None, daemon=False, **k):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    class _FakeApi(object):
+        def __init__(self, res):
+            self.calls = []
+            self.res = res
+
+        def site_put(self, channel, pth, data_b64, mime=None):
+            self.calls.append((channel, pth, data_b64, mime))
+            return self.res
+
+    def _screen():
+        return types.SimpleNamespace(
+            _src=types.SimpleNamespace(text=""),
+            _status=types.SimpleNamespace(text=""),
+            _prev_holder=types.SimpleNamespace(
+                clear_widgets=lambda: None,
+                parent=types.SimpleNamespace(scroll_y=1.0)),
+            )
+    scr = _screen()
+    root = types.SimpleNamespace(current="main")
+
+    def get_screen(name):
+        if name == "site_editor":
+            return scr
+        raise KeyError(name)
+    root.get_screen = get_screen
+
+    app = types.SimpleNamespace(root=root, guild_api=None,
+                                _site_current=(cid, path),
+                                _site_src_text=source,
+                                _edit_cid=None, _edit_path=None,
+                                _site_load_page=lambda c, p: None)
+
+    # 1. the affordance ref opens the editor carrying the source
+    app._open_site_editor = types.MethodType(
+        kc.sHadesClientApp._open_site_editor, app)
+    app._enter_site_editor = types.MethodType(
+        kc.sHadesClientApp._enter_site_editor, app)
+    kc.sHadesClientApp._micron_link_tapped(app, "shades:site-edit")
+    assert root.current == "site_editor", root.current
+    assert scr._src.text == source, scr._src.text[:60]
+    assert getattr(app, "_edit_cid") == cid and \
+        getattr(app, "_edit_path") == path
+
+    # 2. publish posts the edited source and returns to the page
+    api = _FakeApi({"ok": 1, "channel": cid, "path": path})
+    reloaded_ = []
+    app.guild_api = api
+    app._site_load_page = lambda c, p: reloaded_.append((c, p))
+    app._site_editor_publish = types.MethodType(
+        kc.sHadesClientApp._site_editor_publish, app)
+    app._site_editor_publish_done = types.MethodType(
+        kc.sHadesClientApp._site_editor_publish_done, app)
+    scr._src.text = "#!c=0\n> Edited\n"
+    real_clock, real_thread = kc.Clock, kc.threading.Thread
+    try:
+        kc.Clock = _NowClock
+        kc.threading.Thread = _InlineThread
+        kc.sHadesClientApp._site_editor_publish(app)
+        assert api.calls == [(cid, path, base64.b64encode(
+            "#!c=0\n> Edited\n".encode("utf-8")).decode("ascii"), None)], api.calls
+        assert root.current == "main" and reloaded_ == [(cid, path)], \
+            (root.current, reloaded_)
+        assert scr._status.text == "published", scr._status.text
+
+        # 3. a refusal stays on the editor with the server error visible
+        api2 = _FakeApi({"ok": 0, "error": "site edit permission required",
+                         "code": 403})
+        app.guild_api = api2
+        reloaded_[:] = []
+        root.current = "site_editor"
+        kc.sHadesClientApp._site_editor_publish(app)
+        assert api2.calls and api2.calls[0][0] == cid
+        assert root.current == "site_editor", "a refusal must not leave the editor"
+        assert not reloaded_, "no reload after a refusal"
+        assert "publish failed" in scr._status.text \
+            and "site edit" in scr._status.text, scr._status.text
+    finally:
+        kc.Clock = real_clock
+        kc.threading.Thread = real_thread
+    print("PASS  site editor (affordance -> publish -> refusal)")
+
+
 def main():
     test_link_dead_reported_and_signalled()
     test_link_raise_reported_and_signalled()
@@ -1108,7 +1212,8 @@ def main():
     test_bootlog_clipboard_contract()
     test_softinput_bridge_contract()
     test_softinput_frame_meter_contract()
-    print("PASS: 18  FAIL: 0")
+    test_site_editor_publish_contract()
+    print("PASS: 19  FAIL: 0")
 
 
 if __name__ == "__main__":

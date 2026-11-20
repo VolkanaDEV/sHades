@@ -2805,9 +2805,11 @@ def api_v1_site_get(viewer, data, link_id):
     if total is None:
         return {"ok": 0, "error": "resource not found", "code": 404}
     ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
+    can_edit = is_moderator(viewer) or has_perm(viewer, cid, PERMS["SITE_EDIT"])
     return {"ok": 1, "channel": cid, "path": "/" + rel, "total": total,
             "offset": offset, "eof": offset + len(chunk) >= total,
             "mime": EXT_MIME.get(ext, "application/octet-stream"),
+            "can_edit": bool(can_edit),
             "data_b64": base64.b64encode(chunk).decode("ascii")}
 
 @api_route("/api/v1/site/manifest")

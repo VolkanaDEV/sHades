@@ -178,6 +178,25 @@ def main():
         check("moderator-class roles pass without SITE_EDIT",
               r5e.get("ok") == 1, r5e)
 
+        # 6. P7c: site/get publishes can_edit for the editor affordance
+        r6a = call_as(ident2, "/api/v1/site/get",
+                      {"channel": cid, "path": "/index.mu"})
+        check("site/get stamps can_edit for a SITE_EDIT holder",
+              r6a.get("ok") == 1 and r6a.get("can_edit") is True, r6a)
+        ident4, H4 = _mk_user()
+        sHades.db.execute("INSERT INTO users (dest_hash, username, "
+                          "registered_at) VALUES (?,?,?)",
+                          (H4, "reader", sHades.now()))
+        sHades.db.commit()
+        r6b = call_as(ident4, "/api/v1/site/get",
+                      {"channel": cid, "path": "/index.mu"})
+        check("site/get stamps can_edit=false for a plain reader",
+              r6b.get("ok") == 1 and r6b.get("can_edit") is False, r6b)
+        r6c = call_as(ident3, "/api/v1/site/get",
+                      {"channel": cid, "path": "/index.mu"})
+        check("site/get stamps can_edit for the moderator-class role",
+              r6c.get("ok") == 1 and r6c.get("can_edit") is True, r6c)
+
     print("PASS site seed suite: %d checks, %d failed"
           % (len(PASS) + len(FAIL), len(FAIL)))
     return 1 if FAIL else 0

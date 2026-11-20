@@ -961,6 +961,13 @@ class GuildAPI:
             data["len"] = length
         return self._request_json("/api/v1/site/get", data)
 
+    def site_put(self, channel, path, data_b64, mime=None):
+        """Store one site resource (P7b: moderator or channel SITE_EDIT)."""
+        data = {"channel": channel, "path": path, "data_b64": data_b64}
+        if mime:
+            data["mime"] = mime
+        return self._request_json("/api/v1/site/put", data, timeout=15)
+
     def site_manifest(self, channel):
         return self._request_json("/api/v1/site/manifest", {"channel": channel})
 
@@ -2129,6 +2136,49 @@ if KIVY:
 # Screens
 # ---------------------------------------------------------------------------
 if KIVY:
+    class SiteEditorScreen(Screen):
+        """P7c: micron source editor for a site page. The affordance
+        reaches this screen only for SITE_EDIT holders (the server stamps
+        site/get with can_edit). Holds the source TextInput, a one-tap
+        preview, and publish via site/put; the app carries the flow."""
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            col = BoxLayout(orientation="vertical", padding=dp(8),
+                            spacing=dp(6))
+            bar = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(6))
+            for text, meth in (("< Back", "_site_editor_back"),
+                               ("Preview", "_site_editor_preview"),
+                               ("Publish", "_site_editor_publish")):
+                btn = Button(text=text)
+                btn.bind(on_press=lambda inst, m=meth: self._tap(m))
+                bar.add_widget(btn)
+            self._src = TextInput(multiline=True, size_hint_y=0.5,
+                                  font_size=sp(13),
+                                  hint_text="micron source")
+            self._status = Label(size_hint_y=None, height=dp(24),
+                                 markup=True, halign="center",
+                                 font_size=sp(12))
+            self._status.bind(width=lambda inst, w: setattr(
+                inst, "text_size", (w, None)))
+            prev_scroll = ScrollView(size_hint_y=1)
+            prev_col = BoxLayout(orientation="vertical",
+                                 size_hint_y=None,
+                                 padding=(dp(4), dp(4)))
+            prev_col.bind(minimum_height=prev_col.setter("height"))
+            self._prev_holder = prev_col
+            prev_scroll.add_widget(prev_col)
+            col.add_widget(bar)
+            col.add_widget(self._src)
+            col.add_widget(self._status)
+            col.add_widget(prev_scroll)
+            self.add_widget(col)
+
+        def _tap(self, meth):
+            app = App.get_running_app()
+            if app and hasattr(app, meth):
+                getattr(app, meth)()
+
     class ConnectScreen(Screen):
         """Connect screen. The optional guild-hash fields live behind a
         disclosure so the screen fits a small window without pushing the
@@ -2773,6 +2823,7 @@ class sHadesClientApp(MDApp):
         sm.add_widget(MainScreen(name="main"))
         sm.add_widget(ProfileScreen(name="profile"))
         sm.add_widget(ConfigScreen(name="config"))
+        sm.add_widget(SiteEditorScreen(name="site_editor"))
         # Phase 1 task 5: the tabbed server-config screen replaces the U8
         # popup; its tabs are keyed to the caller's roles on entry.
         try:
@@ -7162,7 +7213,7 @@ class sHadesClientApp(MDApp):
             return
 
         def work():
-            text, err = None, "unknown"
+            text, err, can_edit = None, "unknown", False
             try:
                 if path.startswith("/page/"):
                     raw = self.guild_api.fetch_file(path)
@@ -7175,13 +7226,16 @@ class sHadesClientApp(MDApp):
                     if res.get("ok"):
                         text = base64.b64decode(
                             res.get("data_b64") or "").decode("utf-8", "replace")
+                        can_edit = bool(res.get("can_edit"))
                     else:
                         err = res.get("error", "not found")
             except Exception as e:
                 err = repr(e)
                 print("site page fetch failed:", err)
             if text is not None:
-                Clock.schedule_once(lambda dt: self._render_site_page(cid, text), 0)
+                Clock.schedule_once(
+                    lambda dt: self._render_site_page(cid, text,
+                                                      can_edit=can_edit), 0)
             else:
                 Clock.schedule_once(
                     lambda dt: self._site_empty_page(cid, err), 0)
@@ -7214,7 +7268,10 @@ class sHadesClientApp(MDApp):
             print("site empty-page render failed:", repr(e))
         self._set_status("page failed: %s" % (err or "unknown"))
 
-    def _render_site_page(self, cid, text):
+    def _render_site_page(self, cid, text, can_edit=False):
+        """Render one micron page into the main grid. Holds the fetched
+        source for the P7c editor and, when the server says the caller
+        carries SITE_EDIT, leads with the [ Edit page ] affordance."""
         try:
             main = self.root.get_screen("main")
         except Exception:
@@ -7222,43 +7279,163 @@ class sHadesClientApp(MDApp):
         cur = getattr(main, "_current_channel", None)
         if cur and self._channel_cid(cur) != cid:
             return   # user switched away while the page was in flight
+        self._site_src_text = text
         grid = main.ids.message_grid
         grid.clear_widgets()
         self._remove_skeleton(getattr(self, "_skeleton_cid", None))
         self._msg_widgets.clear()
         blocks = micron_parse(text)
         page = SitePage()
-        bg = micron_page_bg(blocks, self._site_theme)
-        if bg:
-            page.bg_color = self._hex6_to_rgba(bg)
         if self._site_stack:
             page.add_widget(self._micron_label(
                 "[ref=shades:back][b]< Back[/b][/ref]"))
-        for b in blocks:
-            t = b["type"]
-            if t == "directive":
-                continue
-            if t == "sep":
-                page.add_widget(MicronSep())
-                continue
-            if t == "heading":
-                page.add_widget(self._micron_label(
-                    runs_to_markup(b["runs"], _escape), heading=True))
-                continue
-            if t == "code":
-                page.add_widget(self._micron_label(_escape(b["text"]), code=True))
-                continue
-            runs = b.get("runs") or []
-            if len(runs) == 1 and micron_media_target(runs[0].get("link") or ""):
-                self._add_site_media(page, cid, runs[0])
-            else:
-                page.add_widget(self._micron_label(
-                    runs_to_markup(runs, _escape), center=b.get("center")))
+        if can_edit:
+            page.add_widget(self._micron_label(
+                "[ref=shades:site-edit][b][ Edit page ][/b][/ref]"))
+        self._micron_blocks_into(page, blocks, cid)
         grid.add_widget(page)
         try:
             main.ids.scroll.scroll_y = 1.0
         except Exception:
             pass
+
+    def _micron_blocks_into(self, container, blocks, cid, media_ok=True):
+        """The micron block loop shared by the main render and the site
+        editor's preview. media_ok=False (editor preview) renders media
+        runs as text so the preview never reaches for the network."""
+        bg = micron_page_bg(blocks, self._site_theme)
+        if bg and isinstance(container, SitePage):
+            container.bg_color = self._hex6_to_rgba(bg)
+        for b in blocks:
+            t = b["type"]
+            if t == "directive":
+                continue
+            if t == "sep":
+                container.add_widget(MicronSep())
+                continue
+            if t == "heading":
+                container.add_widget(self._micron_label(
+                    runs_to_markup(b["runs"], _escape), heading=True))
+                continue
+            if t == "code":
+                container.add_widget(self._micron_label(
+                    _escape(b["text"]), code=True))
+                continue
+            runs = b.get("runs") or []
+            if len(runs) == 1 and micron_media_target(runs[0].get("link") or ""):
+                if media_ok:
+                    self._add_site_media(container, cid, runs[0])
+                else:
+                    container.add_widget(self._micron_label(
+                        "[i][media: %s][/i]" % _escape(runs[0].get("link") or "")))
+            else:
+                container.add_widget(self._micron_label(
+                    runs_to_markup(runs, _escape), center=b.get("center")))
+
+    # -- site editor (P7c): edit the page on screen, then publish -------
+    def _open_site_editor(self):
+        """Enter the micron editor for the page currently on screen."""
+        cid, path = self._site_current or (None, None)
+        if not cid or not path:
+            self._set_status("no page on screen to edit")
+            return
+        src = getattr(self, "_site_src_text", None)
+        if src is None:
+            self._set_status("fetching page source…")
+
+            def work():
+                txt, err = None, "fetch failed"
+                try:
+                    res2 = self.guild_api.site_get(cid, path)
+                    if res2.get("ok"):
+                        txt = base64.b64decode(res2.get("data_b64") or "").decode(
+                            "utf-8", "replace")
+                    else:
+                        err = res2.get("error", "fetch failed")
+                except Exception as e2:
+                    err = repr(e2)
+                Clock.schedule_once(
+                    lambda dt: self._enter_site_editor(cid, path, txt,
+                                                       err=err), 0)
+            threading.Thread(target=work, daemon=True).start()
+            return
+        self._enter_site_editor(cid, path, src)
+
+    def _enter_site_editor(self, cid, path, src, err=None):
+        if src is None:
+            self._set_status("page source unavailable: %s" % (err or "unknown"))
+            return
+        self._edit_cid, self._edit_path = cid, path
+        scr = self.root.get_screen("site_editor")
+        scr._src.text = src
+        scr._status.text = "editing %s" % path
+        holder = scr._prev_holder
+        holder.clear_widgets()
+        holder.parent.scroll_y = 1.0
+        self.root.current = "site_editor"
+
+    def _site_editor_back(self):
+        """Return to the rendered page; _site_current is still live."""
+        if self.root is not None:
+            self.root.current = "main"
+
+    def _site_editor_preview(self):
+        """Render the editor's source into the in-screen preview column;
+        media runs stay text so the preview never reaches the network."""
+        try:
+            scr = self.root.get_screen("site_editor")
+        except Exception:
+            return
+        blocks = micron_parse(scr._src.text)
+        holder = scr._prev_holder
+        holder.clear_widgets()
+        page = SitePage()
+        holder.add_widget(page)
+        self._micron_blocks_into(page, blocks,
+                                 getattr(self, "_edit_cid", None),
+                                 media_ok=False)
+        scr._status.text = "preview: %d blocks" % len(blocks)
+
+    def _site_editor_publish(self):
+        """Store the edited source for the page the editor opened on."""
+        try:
+            scr = self.root.get_screen("site_editor")
+        except Exception:
+            return
+        cid = getattr(self, "_edit_cid", None)
+        path = getattr(self, "_edit_path", None)
+        if not cid or not path:
+            scr._status.text = "no page target"
+            return
+        src = scr._src.text
+        scr._status.text = "publishing…"
+
+        def work():
+            try:
+                res = self.guild_api.site_put(
+                    cid, path,
+                    base64.b64encode(src.encode("utf-8")).decode("ascii"))
+            except Exception as e:
+                res = {"ok": 0, "error": repr(e)}
+            ok = res.get("ok") == 1
+            err = "%s (code %s)" % (res.get("error", ""),
+                                    res.get("code", "?"))
+            Clock.schedule_once(
+                lambda dt: self._site_editor_publish_done(ok, err), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _site_editor_publish_done(self, ok, err):
+        try:
+            scr = self.root.get_screen("site_editor")
+        except Exception:
+            return
+        if ok:
+            scr._status.text = "published"
+            if self.root is not None:
+                self.root.current = "main"
+            self._site_load_page(self._edit_cid, self._edit_path)
+        else:
+            scr._status.text = "publish failed: %s" % err
 
     def _micron_label(self, markup, heading=False, center=False, code=False):
         lbl = Label(markup=True, text=markup)
@@ -7326,6 +7503,9 @@ class sHadesClientApp(MDApp):
             if self._site_stack:
                 cid, path = self._site_stack.pop()
                 self._site_load_page(cid, path)
+            return
+        if target == "shades:site-edit":
+            self._open_site_editor()
             return
         if micron_media_target(target):
             self._site_download_media(target)
