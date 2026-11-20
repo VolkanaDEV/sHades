@@ -322,6 +322,32 @@ PLANNED, priced, build order below. No code until tay calls it.
   off/rns on a live http seam; the happy path; mismatch refusal; the
   launcher rollback as a REAL subprocess — BROKEN->OLD runlog),
   battery red=none, lockstep lane green at 0.36.21.
+- **Chain 3 SHIPPED 2026-11-20, v0.36.22 `1144d0e`** (arrow 5, the client
+  updater): client_update.py (the one https-talking client file:
+  parse_version, update_decision, newest_client_asset with the .sha256
+  companion REQUIRED, parse_sha_file, download_with_dm via the system
+  DownloadManager, install_intent, save_candidate); the server payload
+  (whoami guild.app_version == SERVER_VERSION + update_channel, the flip
+  lane-proven); the client (client_update_version property, the red
+  strip under the motd strip, the consent popup, _update_start threading
+  fetch->sha->download->park->installer with every stage in
+  update_status). Receipts: test_client_update 30/0; CI pair
+  44765285956/44765285978 all 9 jobs GREEN; APK 39,617,385 B sha
+  a2a1a0a6...96ac73, BYTE-VERIFY PASS (kv 10, kivy_client 17); bundle
+  0.36.22 sha-verified 120 entries carrying updater.py, update_run.py,
+  client_update.py; 0.36.21-as-0.36.22 and 0.36.20 re-verifies hold.
+- **Chain 3b SHIPPED 2026-11-20, v0.36.23 `a684a65`** — the
+  account-transfer gate (tay: accounts must transfer between clients
+  during the upgrade): the consent popup offers "Save kit first" (the
+  recovery-kit sheet: identity + username + friends + servers through
+  recovery.create_kit) before "Download and install"; the sheet opens
+  over the still-open popup; the boot route for a fresh install is
+  already the restore sheet. Receipts: test_client_update 40/0; pair
+  44793968848/44793968920 (receipts recorded on close). Ship-note: the
+  first chain-3b push (f77d0a0) landed unbumped (the bump sed sat after
+  a lint gate that red in the same background chain) and was superseded
+  by the bump commit; pair 44793824399/44793824379 is cancelled evidence,
+  the 0.36.23 artifact of record comes from the TRUE head's pair.
 - Standing risk named in the plan: auto-update is the one feature
   whose worst failure bricks the updater's own host — the toggle
   defaults OFF, the apply gates on sha + staged-import probe, and
