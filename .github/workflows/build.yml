@@ -198,12 +198,29 @@ jobs:
           fi
           echo "p4a pinned to $P4A_PIN (the revision behind 0.36.15)"
           RECIPE="$P4A_DIR/python-for-android/pythonforandroid/recipes/python3/__init__.py"
-          grep -q "ac_cv_header_bzlib_h=no" "$RECIPE"
-          sed -i "/ac_cv_header_bzlib_h=no/d" "$RECIPE"
-          if grep -q "ac_cv_header_bzlib_h=no" "$RECIPE"; then
-            echo "::error::bzlib hardcode still present in python3 recipe"; exit 1
+          # BZ2 WAR, round two (receipts: run 44717730161 target probe
+          # "extension module _bz2... yes" vs run 44720664496
+          # "checking for bzlib.h... (cached) no" -> "_bz2... missing",
+          # SAME p4a commit 9562d1b, 20 minutes apart; on-device error
+          # ModuleNotFoundError: _bz2 via RNS/Buffer -> bz2 at boot,
+          # tay's screenshot 2026-11-20). Deleting the
+          # ac_cv_header_bzlib_h=no hardcode (the round-one fix) makes
+          # the probe live, but CPython's configure can serve the
+          # header answer from an autoconf cache seeded by an earlier
+          # pass in the same build dir, before the libbz2 recipe
+          # product reaches the include path. Deterministic repair:
+          # pin the cache variables to YES at the exact site the
+          # hardcode sat; command-line cache vars are authoritative in
+          # every pass and every recipe order.
+          sed -i 's/ac_cv_header_bzlib_h=no/ac_cv_header_bzlib_h=yes/' "$RECIPE"
+          sed -i "s/'ac_cv_header_sys_eventfd_h=no',/'ac_cv_header_sys_eventfd_h=no',\n        'ac_cv_lib_bz2_BZ2_bzCompress=yes',/" "$RECIPE"
+          if ! grep -q "ac_cv_header_bzlib_h=yes" "$RECIPE" || ! grep -q "ac_cv_lib_bz2_BZ2_bzCompress=yes" "$RECIPE"; then
+            echo "::error::bzlib cache-var injection failed"; exit 1
           fi
-          echo "bzlib hardcode removed from: $RECIPE"
+          if grep -q "ac_cv_header_bzlib_h=no" "$RECIPE"; then
+            echo "::error::bzlib no-form hardcode still present"; exit 1
+          fi
+          echo "bzlib cache vars pinned to yes: $RECIPE"
           # materialyoucolor recipe drift: p4a develop pins
           # recipes/materialyoucolor at version 2.0.10 (GitHub-release
           # sdist). KivyMD 2.0.0 requires >=3.0.3 (<4), but p4a installs
@@ -229,7 +246,23 @@ jobs:
           VERSION_python3: 3.11.5
           VERSION_hostpython3: 3.11.5
         run: |
-          buildozer android debug
+          set -o pipefail
+          buildozer android debug 2>&1 | tee buildlog.txt > /dev/null
+          # BZ2 gate, fail closed: this build's own log must carry a
+          # target-python _bz2 probe answered yes (live or cached), and
+          # no missing verdict may appear anywhere. A build that ships
+          # without the _bz2 extension boots dead (RNS/Buffer imports
+          # bz2 at module level); refuse the APK instead.
+          if grep -q "extension module _bz2... missing" buildlog.txt; then
+            echo "::error::python probed _bz2 as MISSING in this build"
+            tail -60 buildlog.txt; exit 1
+          fi
+          PROBES=$(grep -c "extension module _bz2... yes" buildlog.txt)
+          if [ "$PROBES" -lt 2 ]; then
+            echo "::error::_bz2 probe answered yes fewer than twice (host + target): $PROBES"
+            tail -60 buildlog.txt; exit 1
+          fi
+          echo "bz2 gate: _bz2 probe yes count = $PROBES"
       - name: Publish APK
         uses: actions/upload-artifact@v4
         with:
