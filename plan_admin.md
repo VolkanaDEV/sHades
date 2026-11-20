@@ -234,7 +234,76 @@ scope   : profile-screen delete-account; server toggles that bind live
   admin screen + silent-death hardening + SAF redraw").
 - Carried small: any NEW aesthetic asks go through this section.
 
-## Build order
+## P11 — Auto-update (tay directive, 2026-11-20: pull from GitHub
+## releases; contingency update with a server-side toggle riding
+## SSH-over-RNS, "which is mostly what GitHub is, after all")
+
+PLANNED, priced, build order below. No code until tay calls it.
+
+- **Arrow 1 (the version bridge): the running client does not know
+  its own version** — nothing carries it in-process today; the APK
+  filename and the manifest's versionName are the only carriers (the
+  byte-verify law: buildozer.spec is not packaged into private.tar).
+  Price: read versionName via jnius PackageManager on-device (the
+  proven bridge), plus a CI-injected APP_VERSION constant for the
+  desktop builds (PyInstaller env at package time). Without this no
+  updater can compare versions. ~30 lines + one static contract.
+- **Arrow 2 (the release channel gains a server artifact)**: releases
+  carry APKs only today. CI gains one build.yml job: package the
+  server bundle (git archive of the tree, sHades.py + deps) and write
+  sha256 lines for every asset INTO the release body (the updaters
+  parse the body; GitHub computes nothing client-side). ~30 workflow
+  lines. Must land BEFORE any updater points at it.
+- **P11a — the updater core (shared, transport-free)**: version
+  compare (tuple parse of "0.36.19"), fetch, sha256 verify against
+  the body'd line, stage into a sibling dir, atomic swap, os.execv
+  self-restart, previous bundle kept for rollback, boot-failure
+  fallback (staged-but-unimportable tree falls back to the previous
+  bundle before serving). ~120 lines + rollback lane.
+- **P11b — server auto-update from GitHub, toggled**: admin_config
+  `update_channel` = off|github|rns (default OFF) + `update_repo`
+  (default eldeucebag/sHades). A soft in-process check (boot + a
+  bounded interval); verdicts land on the diagnosis channel + the
+  admin UI's own id'd label (the status-mirror rule); apply only when
+  the toggle says so and the sha matches. ~80 lines wiring + ~120
+  contract lines (toggle off default-deny, on-apply, sha-mismatch
+  refuse, fallback).
+- **P11c — client auto-update from GitHub**: the isolated HTTPS
+  module reaches api.github.com only (outbound helper; HTTP never
+  enters the sHades protocol surfaces — the anti-pattern law holds
+  for OUR stack, GitHub is an external gateway tay named). Flow: soft
+  check -> "update available" verdict (banner + config-screen label,
+  never a silent self-modify — Android requires install consent
+  anyway) -> background download through the proven MediaStore bridge
+  into the public Downloads dir -> sha256 verify -> open the install
+  intent (ACTION_VIEW + FLAG_GRANT_READ), user taps Install. Mismatch
+  refuses and prints. ~120 lines + a fake-jnius functional lane (the
+  receipt-lanes recipe) asserting the intent ARGUMENTS.
+- **P11d — the contingency (RNS bundle carrier)**: tay's framing is
+  exact — git is SSH + blobs, so the mesh-carrier shape is the RNS
+  Link + Resource protocol, NOT HTTP-over-something. The wheel's
+  rncp proves the pattern (listener with an identity allowlist +
+  send/fetch over links); we adopt the PATTERN on raw RNS
+  primitives (~140 lines), not rncp's code (its license carries an
+  AI-training clause worth not entangling). A "software channel"
+  destination: a pinned peer serves the server bundle (and the APK);
+  the server pulls from a pinned peer when `update_channel` = rns.
+  Trust = the peer's RNS identity hash pinned in admin_config
+  (`update_channel_peer`); the link's peer identity is verified
+  before accepting bytes; then the same P11a core verifies, stages,
+  applies. The toggle covers the contingency exactly as tay priced
+  it. Lane: a fake link/resource session asserting the peer-pin
+  enforcement + sha gate.
+- Build order: **1** version bridge -> **2** CI release job ->
+  **3** P11a core + rollback -> **4** P11b server wiring + toggle ->
+  **5** P11c client -> **6** P11d carrier. Each its own ship chain;
+  3 and 4 go together (the core is useless unwired).
+- Standing risk named in the plan: auto-update is the one feature
+  whose worst failure bricks the updater's own host — the toggle
+  defaults OFF, the apply gates on sha + staged-import probe, and
+  rollback is kept, before any of this is trusted on tay's box.
+
+## Build order (addendum 2026-11-20)
 
 P1, P2, P3, P5, P9 in the v0.34.0-0.36.x ships (done: admin gate
 closed by tay's admin.txt seed 2026-11-19; bootlog diagnosis channel
@@ -242,6 +311,9 @@ v0.36.5, external_primary v0.36.6; the P9 gesture verified
 CI-only 2026-11-20). P6 (0.36.18) + P7a (0.36.12) + P7b (0.36.16) +
 P7c (0.36.17) shipped; device verdicts on the 0.36.17/0.36.18
 artifacts are owed from tay's installs. P10 closed at 0.36.7/0.36.10
-(see above). P4, P8 parked until tay calls them. PR merge stays tay's.
+(see above). P8 (0.36.19) built this day. P4 parked until tay calls
+it. P11 PLANNED above (version bridge -> CI release job -> core ->
+server toggle -> client -> RNS carrier); tay's Continue starts it.
+PR merge stays tay's.
 
 [END PLAN]
