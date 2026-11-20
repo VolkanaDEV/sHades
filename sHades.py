@@ -58,8 +58,8 @@ CHANNEL_KINDS     = ("chat", "site", "term")
 # (role_id 0 = @everyone). Missing @everyone row defaults to open reading
 # and posting, which preserves pre-roles behaviour.
 PERMS = {"VIEW": 1, "POST": 2, "MANAGE_MESSAGES": 4, "MANAGE_CHANNEL": 8,
-         "MANAGE_ROLES": 16, "ADMIN": 32}
-PERM_ALL = 63
+         "MANAGE_ROLES": 16, "ADMIN": 32, "SITE_EDIT": 64}
+PERM_ALL = 127
 DEFAULT_CHANNEL_PERMS = PERMS["VIEW"] | PERMS["POST"]
 _GUILD_MANAGE_BITS = (PERMS["MANAGE_MESSAGES"] | PERMS["MANAGE_CHANNEL"] |
                       PERMS["MANAGE_ROLES"] | PERMS["ADMIN"])
@@ -2745,12 +2745,15 @@ def _site_channel(cid):
 def api_v1_site_put(viewer, data, link_id):
     """Store one site resource (micron page, image, audio, video).
     {channel, path, data_b64, mime?} -> registers /file/sites/<cid>/<path> and
-    emits a site_patch event on the channel stream. Moderator-only."""
-    if not is_moderator(viewer):
-        return {"ok": 0, "error": "moderator required", "code": 403}
+    emits a site_patch event on the channel stream. P7b: moderator OR the
+    caller carries the channel-scoped PERMS["SITE_EDIT"] (channel_overwrites).
+    Wikipedia-style: the granted bits, not the moderator list, write the
+    channel's wiki."""
     cid = data.get("channel")
     if not _site_channel(cid):
         return {"ok": 0, "error": "unknown or non-site channel", "code": 404}
+    if not (is_moderator(viewer) or has_perm(viewer, cid, PERMS["SITE_EDIT"])):
+        return {"ok": 0, "error": "site edit permission required", "code": 403}
     rel = _site_safe_rel(data.get("path"))
     if not rel:
         return {"ok": 0, "error": "invalid resource path", "code": 400}
@@ -2825,13 +2828,14 @@ def api_v1_site_manifest(viewer, data, link_id):
 @api_route("/api/v1/site/manifest_put")
 @wrap_json_api
 def api_v1_site_manifest_put(viewer, data, link_id):
-    """Update a site manifest (mod-only): {channel, manifest} — emits a
-    site_patch event carrying the manifest so open clients re-theme."""
-    if not is_moderator(viewer):
-        return {"ok": 0, "error": "moderator required", "code": 403}
+    """Update a site manifest: {channel, manifest} — emits a site_patch
+    event carrying the manifest so open clients re-theme. P7b: moderator OR
+    the channel-scoped PERMS["SITE_EDIT"], same gate as site/put."""
     cid = data.get("channel")
     if not _site_channel(cid):
         return {"ok": 0, "error": "unknown or non-site channel", "code": 404}
+    if not (is_moderator(viewer) or has_perm(viewer, cid, PERMS["SITE_EDIT"])):
+        return {"ok": 0, "error": "site edit permission required", "code": 403}
     manifest = data.get("manifest")
     if not isinstance(manifest, dict):
         return {"ok": 0, "error": "manifest must be an object", "code": 400}
@@ -4154,7 +4158,7 @@ def api_v1_channels_patch(viewer, data, link_id):
                                "WHERE channel_id=? AND role_id=?", (cid, rid))
                 else:
                     if not isinstance(perms, int) or perms < 0 or perms > PERM_ALL:
-                        return {"ok": 0, "error": "perms must be a bitmask 0-63",
+                        return {"ok": 0, "error": "perms must be a bitmask 0-127",
                                 "code": 400}
                     db.execute("INSERT INTO channel_overwrites "
                                "(channel_id, role_id, perms) VALUES (?, ?, ?) "

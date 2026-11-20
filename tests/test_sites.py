@@ -61,6 +61,7 @@ def call(path, data=None):
 
 def main():
     import base64
+    cid = None
 
     # 1. fresh site create seeds /index.mu under the channel root
     r = call("/api/v1/channels/create", {"name": "wiki", "kind": "site"})
@@ -108,6 +109,74 @@ def main():
               r4.get("ok") == 0 and r4.get("code") == 409, r4)
         after = open(sHades._site_file_path(cid, "index.mu"), "rb").read()
         check("no reseed on duplicate create", after == before)
+
+    # 5. P7b: the channel-scoped SITE_EDIT bit gates site writes
+    #    (moderator OR the bit; the bit rides channel_overwrites and
+    #    works through the @everyone row, a role overwrite, or a role's
+    #    own guild perms; MANAGE_* carriers pass without the bit).
+    if r.get("ok"):
+        ident2, H2 = _mk_user()
+        sHades.db.execute("INSERT INTO users (dest_hash, username, "
+                          "registered_at) VALUES (?,?,?)",
+                          (H2, "editor", sHades.now()))
+        sHades.db.commit()
+
+        def call_as(the_ident, path, data=None):
+            payload = json.dumps(data or {}).encode("utf-8")
+            raw = sHades.API_ROUTES[path]("/api/v1/x", payload, "req-9", "L1",
+                                          the_ident, sHades.now())
+            return json.loads(raw.decode("utf-8"))
+
+        edit_put = {"channel": cid, "path": "/editor.mu",
+                    "data_b64": base64.b64encode(
+                        b"#!c=0\n> Editor page\n").decode("ascii")}
+        r5a = call_as(ident2, "/api/v1/site/put", edit_put)
+        check("no-bit member cannot site/put",
+              r5a.get("ok") == 0 and r5a.get("code") == 403, r5a)
+
+        grant = call("/api/v1/channels/patch",
+                     {"channel": cid, "overwrites":
+                      {"0": sHades.PERM_ALL}})
+        check("@everyone overwrite accepts 127 (PERM_ALL widened)",
+              grant.get("ok") == 1, grant)
+        too_high = call("/api/v1/channels/patch",
+                        {"channel": cid, "overwrites": {"0": 128}})
+        check("overwrite above PERM_ALL rejected",
+              too_high.get("ok") == 0 and too_high.get("code") == 400,
+              too_high)
+        r5b = call_as(ident2, "/api/v1/site/put", edit_put)
+        check("@everyone SITE_EDIT grants site/put", r5b.get("ok") == 1, r5b)
+        r5b2 = call_as(ident2, "/api/v1/site/manifest_put",
+                       {"channel": cid, "manifest": {"theme": "x"}})
+        check("@everyone SITE_EDIT grants manifest_put",
+              r5b2.get("ok") == 1, r5b2)
+
+        revoke = call("/api/v1/channels/patch",
+                      {"channel": cid, "overwrites": {"0": None}})
+        check("@everyone overwrite deletable (null perms)",
+              revoke.get("ok") == 1, revoke)
+        ident3, H3 = _mk_user()
+        sHades.db.execute("INSERT INTO users (dest_hash, username, "
+                          "registered_at) VALUES (?,?,?)",
+                          (H3, "plain", sHades.now()))
+        sHades.db.commit()
+        r5c = call_as(ident3, "/api/v1/site/put", edit_put)
+        check("default (open VIEW/POST) does not carry SITE_EDIT",
+              r5c.get("ok") == 0 and r5c.get("code") == 403, r5c)
+
+        editors = sHades._ensure_role("Editors", sHades.PERMS["SITE_EDIT"],
+                                      position=1)
+        sHades._assign_role(H2, editors)
+        r5d = call_as(ident2, "/api/v1/site/put", edit_put)
+        check("role-carried SITE_EDIT grants site/put", r5d.get("ok") == 1, r5d)
+
+        managers = sHades._ensure_role(
+            "Managers", sHades.PERMS["MANAGE_MESSAGES"]
+            | sHades.PERMS["MANAGE_CHANNEL"], position=2)
+        sHades._assign_role(H3, managers)
+        r5e = call_as(ident3, "/api/v1/site/put", edit_put)
+        check("moderator-class roles pass without SITE_EDIT",
+              r5e.get("ok") == 1, r5e)
 
     print("PASS site seed suite: %d checks, %d failed"
           % (len(PASS) + len(FAIL), len(FAIL)))
