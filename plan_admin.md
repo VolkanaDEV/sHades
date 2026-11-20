@@ -151,19 +151,29 @@ scope   : profile-screen delete-account; server toggles that bind live
     unseeded, overwrite republishes, duplicate create 409 never
     reseeds). Battery green. Ships as 0.36.12 together with the
     0.36.11 softinput lane (tests-only companion commit).
-  - **P7b (wikipedia-style permission)**: site/put is currently
-    moderator-only (site routes, sHades.py). Missing arrow: a
-    channel-scoped PERMS["SITE_EDIT"] bit carried in
-    channel_overwrites (the VIEW/POST table), gate = SITE_EDIT OR
-    moderator on site/put + site/manifest_put, overwrite rows
-    writable from the Channels/Roles tabs (pattern exists). Price:
-    small-medium.
-  - **P7c (the editor UI)**: P7's above editor flow + a wikipedia-
-    style [edit] affordance on rendered pages, visible to holders of
-    SITE_EDIT (the channel payload/whoami must carry the flag
-    client-side), landing on the micron source editor -> preview
-    (micron.py + SitePage) -> publish (site/put). Price: medium
-    (editor screen is the only new surface).
+  - **P7b (BUILT 2026-11-20, v0.36.16 `df4c6c2`)**: site/put and
+    site/manifest_put open as a wiki: moderator OR the new
+    channel-scoped PERMS["SITE_EDIT"]=64 (PERM_ALL 63->127,
+    channels/patch validates and stores the widened mask; the bit is
+    absent from _GUILD_MANAGE_BITS, so has_perm resolves it through
+    the channel_overwrites union exactly like VIEW/POST; overwrite
+    rows stay writable from the Channels/Roles tabs). Gate order in
+    both handlers: channel parsed -> kind=site verified ->
+    moderator OR SITE_EDIT -> 403 "site edit permission required".
+    Receipts: tests/test_sites.py 9 new checks, lane 19/0 (0 failed),
+    battery red=none, CI pair 44735628294/44735628178 superseded
+    mid-flight by the P7c push (concurrency cancel-in-progress); the
+    permission bit ships to the device inside the 0.36.17 artifact.
+  - **P7c (the editor UI, BUILT 2026-11-20, v0.36.17 `29a425b`)**: P7's editor
+    flow + a wikipedia-style [ Edit page ] affordance on rendered pages,
+    keyed off the new site/get "can_edit" stamp (moderator OR the bit;
+    zero new endpoints). Lands in SiteEditorScreen: micron source
+    TextInput, [Preview] (the block loop factorized into
+    _micron_blocks_into, media as inert text), [Publish] via site/put
+    (success returns to the page and reloads; refusal stays on the
+    editor with the server error). Receipts: test_sites lane 22/0,
+    selfheal lane 19/0 (site editor contract), battery red=none, pair
+    44736705426/44736705424.
 
 ## P8 — Announcements (priced, parked)
 

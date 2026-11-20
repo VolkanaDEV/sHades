@@ -2569,6 +2569,8 @@ class sHadesClientApp(MDApp):
     banner_config_path = StringProperty("")
     # P5: letter tile shown inside the banner strip when unset
     banner_letter = StringProperty("S")
+    # P6: the server's message-of-the-day; "" = the strip stays hidden
+    server_motd = StringProperty("")
     # tay (2026-11): the onboarding avatar slot and the connect-screen
     # username gate bind to these; preview mirrors my_avatar_small so
     # the onboarding card shows the pick (or the generated pattern)
@@ -6156,7 +6158,41 @@ class sHadesClientApp(MDApp):
                             Clock.schedule_once(
                                 lambda dt: self._ingest_banner(
                                     banner_blob, srv), 0)
+                # P6: the message-of-the-day strip under the banner
+                Clock.schedule_once(
+                    lambda dt: self._apply_motd(
+                        (guild.get("motd") or "").strip()), 0)
         threading.Thread(target=work, daemon=True).start()
+
+    def _apply_motd(self, value):
+        """Bind whoami's guild motd to the sidebar strip ('' hides it)."""
+        self.server_motd = value or ""
+
+    def _build_motd_popup(self):
+        """The full-text motd popup (the strip clips long messages)."""
+        box = BoxLayout(orientation="vertical", padding=dp(8),
+                        spacing=dp(6))
+        scroll_box = ScrollView()
+        full = Label(markup=True, font_size=sp(13),
+                     color=self.theme_colors.get("text",
+                                                 (0.92, 0.94, 0.96, 1)))
+        full.text = self.server_motd or ""
+        full.bind(width=lambda inst, w: setattr(
+            inst, "text_size", (w, None)))
+        full.bind(texture_size=full.setter("size"))
+        scroll_box.add_widget(full)
+        box.add_widget(scroll_box)
+        close = Button(text="Close", size_hint_y=None, height=dp(36))
+        box.add_widget(close)
+        popup = Popup(title="Server message", content=box,
+                      size_hint=(0.8, 0.5), auto_dismiss=True)
+        close.bind(on_press=lambda inst: popup.dismiss())
+        return popup
+
+    def _open_motd_popup(self):
+        if not self.server_motd:
+            return
+        self._build_motd_popup().open()
 
     def _can_manage_roles(self):
         """UI gate: any of my roles carries MANAGE_ROLES or ADMIN."""

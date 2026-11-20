@@ -804,6 +804,21 @@
                                     color: app.theme_colors['sidebar_ctrl']
                                     pos_hint: {'center_x': 0.5, 'center_y': 0.5}
                                     opacity: 0 if app.banner_channel_path else 1
+                            Button:
+                                id: motd_strip
+                                size_hint_y: None
+                                height: scaled(dp(22)) if app.server_motd else 0
+                                background_normal: ''
+                                background_color: (0, 0, 0, 0)
+                                disabled: not app.server_motd
+                                on_press: app._open_motd_popup()
+                                Label:
+                                    text: (app.server_motd or '')[:64]
+                                    font_size: sp(11)
+                                    color: app.theme_colors['text_dim']
+                                    text_size: self.width, None
+                                    halign: 'left'
+                                    valign: 'middle'
                             BoxLayout:
                                 size_hint_y: None
                                 height: dp(52)

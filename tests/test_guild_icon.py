@@ -11,7 +11,12 @@ Pins down:
   - the icon value round-trips: config read-back and whoami agree;
   - non-admin writes stay 403.
 """
-import os, sys, json, sqlite3, tempfile, base64, hashlib
+import os
+import sys
+import json
+import sqlite3
+import tempfile
+import base64
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import sHades  # noqa: E402
@@ -19,10 +24,12 @@ import RNS     # noqa: E402
 
 PASS, FAIL = [], []
 
+
 def check(name, cond, extra=""):
     (PASS if cond else FAIL).append(name)
     print(("PASS  " if cond else "FAIL  ") + name +
           (("  | " + str(extra)) if extra and not cond else ""))
+
 
 base = tempfile.mkdtemp(prefix="shades_guild_icon_test_")
 sHades.db = sqlite3.connect(os.path.join(base, "sHades.db"))
@@ -33,11 +40,13 @@ sHades.db.commit()
 sHades.STORAGE = base
 sHades.DEBUG = False
 
+
 def _mk_user(name):
     i = RNS.Identity()
     return i, sHades.hexstr(RNS.Destination(i, RNS.Destination.OUT,
                                             RNS.Destination.SINGLE,
                                             "lxmf", "delivery").hash)
+
 
 admin_ident, ADMIN = _mk_user("admin")
 plain_ident, PLAIN = _mk_user("plain")
@@ -72,6 +81,13 @@ def main():
           r.get("ok") == 1 and isinstance(r.get("guild"), dict), r)
     check("guild name flows through whoami", r["guild"].get("name"), r)
     check("no icon until one is set", not r["guild"].get("icon"), r)
+    check("no motd until one is set (P6)",
+          r["guild"].get("motd") == "", r.get("guild"))
+    sHades._cfg_set("motd", "Welcome to the node")
+    r = call("/api/v1/whoami", user=PLAIN)
+    check("whoami guild reflects the configured motd (P6)",
+          r["guild"].get("motd") == "Welcome to the node", r.get("guild"))
+    sHades._cfg_set("motd", "")
     check("no banner until one is set (P5)",
           not r["guild"].get("banner"), r)
 
@@ -111,6 +127,7 @@ def main():
 
     print("RESULT: %d PASS, %d FAIL" % (len(PASS), len(FAIL)))
     sys.exit(1 if FAIL else 0)
+
 
 if __name__ == "__main__":
     main()

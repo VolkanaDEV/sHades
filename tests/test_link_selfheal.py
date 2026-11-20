@@ -1195,6 +1195,43 @@ def test_site_editor_publish_contract():
     print("PASS  site editor (affordance -> publish -> refusal)")
 
 
+def test_motd_strip_contract():
+    """P6: whoami's guild motd binds to the sidebar strip; a set motd
+    yields a tappable strip opening the full-text popup, an empty one
+    hides the strip. The kv carries the strip between the banner and
+    the channel list."""
+    app = types.SimpleNamespace(server_motd="")
+    app._apply_motd = types.MethodType(kc.sHadesClientApp._apply_motd, app)
+    app._build_motd_popup = types.MethodType(
+        kc.sHadesClientApp._build_motd_popup, app)
+    app.theme_colors = {"text": (0.92, 0.94, 0.96, 1)}
+    kc.sHadesClientApp._apply_motd(app, "Welcome to the node")
+    assert app.server_motd == "Welcome to the node", app.server_motd
+    app._apply_motd("")
+    assert app.server_motd == "", "empty motd must hide the strip"
+    app._apply_motd("long motd: " + "x" * 200)
+
+    popup = kc.sHadesClientApp._build_motd_popup(app)
+    full_text = None
+    for child in popup.content.children:
+        for c in getattr(child, "children", []):
+            if hasattr(c, "text") and "long motd" in c.text:
+                full_text = c.text
+    assert popup.title == "Server message", popup.title
+    assert full_text and len(full_text) == len(app.server_motd), \
+        "the popup must carry the FULL motd, untruncated"
+
+    kvs = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "kv_md.kv"),
+        encoding="utf-8").read()
+    assert "id: motd_strip" in kvs, "strip absent from kv_md.kv"
+    assert "app.server_motd" in kvs, "strip does not bind app.server_motd"
+    # the strip sits between the banner strip and the channel list
+    assert kvs.index("id: banner_strip") < kvs.index("id: motd_strip") \
+        < kvs.index("id: channel_grid"), "strip is out of position"
+    print("PASS  motd strip (binds -> popup -> kv placement)")
+
+
 def main():
     test_link_dead_reported_and_signalled()
     test_link_raise_reported_and_signalled()
@@ -1213,7 +1250,8 @@ def main():
     test_softinput_bridge_contract()
     test_softinput_frame_meter_contract()
     test_site_editor_publish_contract()
-    print("PASS: 19  FAIL: 0")
+    test_motd_strip_contract()
+    print("PASS: 20  FAIL: 0")
 
 
 if __name__ == "__main__":

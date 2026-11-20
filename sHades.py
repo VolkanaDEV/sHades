@@ -3363,6 +3363,7 @@ def api_v1_whoami(viewer, data, link_id):
             "is_moderator": is_moderator(viewer) or is_admin,
             "is_admin": is_admin, "roles": roles,
             "guild": {"name": _cfg_get("guild_name", "") or GUILD_NAME,
+                      "motd": _cfg_get("motd", "") or "",
                       "icon": icon, "banner": banner}}
 
 def _register_mod_endpoint(path, verb, apply_fn):
