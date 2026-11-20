@@ -33,6 +33,26 @@ from mesh_ui import grouped_with, link_state, reply_wire, split_reply
 from ui_theme import preset_colors
 
 # ---------------------------------------------------------------------------
+# P11 version bridge: the running build knows its own version.
+# ---------------------------------------------------------------------------
+APP_VERSION = "0.36.20"
+
+# buildozer.spec, kivy_client.APP_VERSION and sHades.SERVER_VERSION must all
+# match (tests/test_update_meta.py keeps them in lockstep). On-device the
+# APK's own versionName (PackageManager) wins, so a sideloaded build always
+# reports what it really is; everywhere else the constant answers.
+def _client_version():
+    try:
+        from jnius import autoclass
+        activity = autoclass("org.kivy.android.PythonActivity").mActivity
+        info = activity.getPackageManager().getPackageInfo(
+            activity.getPackageName(), 0)
+        v = str(info.versionName)
+        return v if v else APP_VERSION
+    except Exception:
+        return APP_VERSION
+
+# ---------------------------------------------------------------------------
 # Kivy (guarded so the module can be imported for linting without Kivy present)
 # ---------------------------------------------------------------------------
 def _make_kivy_stub(name, err=None):

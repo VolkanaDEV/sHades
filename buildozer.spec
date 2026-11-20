@@ -17,7 +17,7 @@ icon.filename = icon_512.png
 # buildozer that honors it.
 android.window_soft_input_mode = adjustResize
 
-version = 0.36.19
+version = 0.36.20
 # Bump version on every android-facing fix so the installed build can be
 # verified on-device (Settings > Apps > sHades) without adb.
 # wasmtime runs the micron applet sandbox on-device (applet_bridge.py).

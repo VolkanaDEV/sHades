@@ -139,6 +139,10 @@ TYPING_LOCK   = threading.Lock()
 
 FIELD_ATTACHMENTS = LXMF.FIELD_FILE_ATTACHMENTS  # 0x05 — envelope ours (plan §14)
 
+# P11 version bridge: the server knows its own version. Lockstep with
+# buildozer.spec and kivy_client.APP_VERSION (tests/test_update_meta.py).
+SERVER_VERSION = "0.36.20"
+
 # ----------------------------------------------------------------------------------
 # Database
 # ----------------------------------------------------------------------------------

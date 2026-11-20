@@ -281,3 +281,24 @@ jobs:
           name: sHades-client-android
           path: bin/*.apk
           retention-days: 7
+
+  server-bundle:
+    name: package server bundle (P11)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bundle server source + sha256
+        run: |
+          set -e
+          V=$(grep -E '^version = ' buildozer.spec | sed 's/version = //')
+          git archive --format=tar.gz -o "sHades-server-$V.tar.gz" HEAD
+          sha256sum "sHades-server-$V.tar.gz" > "sHades-server-$V.sha256"
+          cat "sHades-server-$V.sha256"
+      - name: Publish bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: sHades-server-bundle
+          path: |
+            sHades-server-*.tar.gz
+            sHades-server-*.sha256
+          retention-days: 7
