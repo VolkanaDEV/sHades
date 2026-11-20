@@ -192,7 +192,19 @@ jobs:
           # Both recipe edits below are guarded by grep against this
           # revision; a future unpin must re-trigger them by hand.
           P4A_PIN=9562d1b4f306d0af1e76991c711114010dea4152
-          git -C "$P4A_DIR/python-for-android" checkout -q "$P4A_PIN"
+          # Re-attach the branch AT the pin instead of detaching HEAD:
+          # buildozer 1.5.0 (targets/android.py, lines ~669-676) runs
+          # 'git branch -vv', takes split()[1], and RMTREES the whole
+          # p4a dir unless the current branch name equals p4a.branch
+          # ("Detected old url/branch (...), deleting..." -- receipt:
+          # pin run 44720664496, log line 707). A detached HEAD from
+          # 'git checkout <pin>' reads '(HEAD detached at 9562d1b)' and
+          # the rmtree discards every prefetch edit made after the
+          # checkout (the bzlib recipe fix died with it twice). With
+          # 'checkout -B develop <pin>' the branch line reads
+          # 'develop', the dir is kept, and the tree still sits at the
+          # pin exactly as the rev-parse guard below requires.
+          git -C "$P4A_DIR/python-for-android" checkout -q -B develop "$P4A_PIN"
           if [ "$(git -C "$P4A_DIR/python-for-android" rev-parse HEAD)" != "$P4A_PIN" ]; then
             echo "::error::p4a pinned revision check-out failed"; exit 1
           fi
