@@ -438,9 +438,22 @@ PR merge stays tay's.
   reconnect would have wiped. Server untouched (register already
   upserts a returning identity). Lane: test_recovery_client
   transfer receipts (session keys, portable file, the live-enter
-  state, the hashless-reconnect inheritance). Pair closes with the
-  run on this head; fold-1's pair (44811578328/44811578581) is
-  superseded-BY-fold-2, not cancelled mid-run.
+  state, the hashless-reconnect inheritance). **Receipts of record:**
+  fold-2's head 87560dc flaked CI once (run 44821647316: the delta
+  lane saw 0 applies - its 20-tick budget raced the fetch worker
+  thread on a loaded runner; the thread had not started); the lane
+  now spins until the apply lands, bounded (fold-2b, 835ecf8; suite
+  44/0); **fold-2b pair 44822526395 + 44822526401 all green**
+  (buildozer 13m17s, Linux 1m34s, Windows 1m57s, lint+import 2m49s,
+  bundle 6s; integration mesh 1m8s, kivy client 50s, server unit
+  ubuntu 20s, windows 40s); **artifact 14674315228 =
+  shades-0.36.24-arm64-v8a-debug.apk, 39,716,980 B, sha256
+  daf5f0e191eaecfcea85dc606c8754a0bc1e27b9f2e720625a9e27197ad99452**;
+  **byte-verify PASS (0.36.24): kv 10, kivy_client 27** (= 21 floor
+  + 4 door + 2 transfer wants) and the fold-1 artifact misses
+  _prefill_connect_from_servers - the discriminator holds. Fold-1's
+  pair (44811578328/44811578581) is superseded-BY-fold-2, not
+  cancelled mid-run.
 - **tay's flight on this release (one merge, one tag):** merge PR #20
   -> tag v0.36.24 on main -> publish -> drop the named APK
   (+ .sha256 companion) as release assets so the auto-updaters can
