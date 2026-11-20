@@ -24,6 +24,7 @@ import sqlite3
 import hashlib
 import secrets
 import threading
+import updater
 from collections import defaultdict, deque
 
 import RNS
@@ -141,7 +142,7 @@ FIELD_ATTACHMENTS = LXMF.FIELD_FILE_ATTACHMENTS  # 0x05 — envelope ours (plan 
 
 # P11 version bridge: the server knows its own version. Lockstep with
 # buildozer.spec and kivy_client.APP_VERSION (tests/test_update_meta.py).
-SERVER_VERSION = "0.36.20"
+SERVER_VERSION = "0.36.21"
 
 # ----------------------------------------------------------------------------------
 # Database
@@ -695,6 +696,11 @@ def _node_reaper():
                 _reap_stale_uploads()
         except Exception as e:
             RNS.log("upload reaper error: %s" % e, RNS.LOG_ERROR)
+        try:
+            if _update_maybe_tick():
+                pass
+        except Exception as e:
+            RNS.log("update tick error: %s" % e, RNS.LOG_ERROR)
         try:
             if ATT_RAM:
                 _att_ram_sweep()
@@ -3492,7 +3498,59 @@ SERVER_CONFIG_KEYS = {
     "guild_icon": "",            # empty = no icon; else a stored blob_id
     "banner": "",                # empty = no banner; else a stored blob_id
     "attachments": "saved",      # saved | ephemeral (P2: RAM-only bytes)
+    "update_channel": "off",     # P11: off | github | rns (rns unwired yet)
+    "update_check_minutes": "360",  # P11: soft check interval; 0 = boot only
 }
+
+# ---------------------------------------------------------------------- P11 updater
+_UPDATE_LOCK = threading.Lock()
+_UPDATE_LAST = [0.0]
+_BOOT_ARGV = []
+
+
+def _update_worker():
+    with _UPDATE_LOCK:
+        try:
+            tree = os.path.dirname(os.path.abspath(__file__))
+            res = updater.check_and_apply(
+                tree, SERVER_VERSION, _cfg_get,
+                argv=(["sHades.py"] + _BOOT_ARGV), exec_restart=True)
+            RNS.log("updater: %s" % (res,), RNS.LOG_INFO)
+        except Exception as e:
+            RNS.log("updater: failed: %s" % e, RNS.LOG_ERROR)
+
+
+def _update_maybe_tick(force=False):
+    """Called by the reaper loop and at boot; honours the toggle + interval."""
+    ch = (_cfg_get("update_channel", "off") or "off").strip().lower()
+    if ch == "off":
+        return
+    now_t = now()
+    try:
+        iv = int(_cfg_get("update_check_minutes", "360") or 0)
+    except (TypeError, ValueError):
+        iv = 360
+    iv_s = max(iv, 1) * 60
+    if not force and _UPDATE_LAST[0] and (now_t - _UPDATE_LAST[0]) < iv_s:
+        return
+    _UPDATE_LAST[0] = now_t
+    if not _UPDATE_LOCK.acquire(False):
+        return  # a worker is already out; its result answers next tick
+    threading.Thread(target=_update_worker, daemon=True).start()
+
+
+@api_route("/api/v1/update_status")
+def api_v1_update_status(viewer, data, request_id, link_id,
+                         remote_identity, requested_at):
+    """P11: the updater's last verdict, admin-only read (the panel
+    consumes this in chain 5)."""
+    denied = _require_admin(viewer)
+    if denied:
+        return denied
+    out = updater.get_status()
+    out["channel"] = _cfg_get("update_channel", "off")
+    out["interval"] = _cfg_get("update_check_minutes", "360")
+    return out
 
 def _require_admin(viewer):
     """Admin gate for the panel endpoints (U8). ADMIN role only — the
@@ -4414,6 +4472,9 @@ def run(argv=None):
 
     # Reap clients that miss two consecutive 4s announcements (8 s stale).
     threading.Thread(target=_node_reaper, daemon=True).start()
+    global _BOOT_ARGV
+    _BOOT_ARGV = list(argv)
+    _update_maybe_tick(force=True)
     threading.Thread(target=announce_all, daemon=True).start()
     try:
         while True:
