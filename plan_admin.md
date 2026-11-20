@@ -401,10 +401,22 @@ PR merge stays tay's.
   (affordance / transport-error refusal / unauthorized refusal / the
   ref entering the editor with the target keys bound — the lane caught
   the creator missing the _edit_cid/_edit_path binding before ship).
-  Battery red=none at the fold. The fresh pair on the folded head
-  closes with the receipts of record; the earlier 0.36.24 pair
-  (44806741713/44806741981) documents the guard-only head and is
-  superseded BY this fold, not cancelled mid-run.
+  Battery red=none at the fold. Fold receipts: pair 44811578328 /
+  44811578581 green 8/8 on the folded head fd9925f; artifact
+  14669550149 (shades-0.36.24-arm64-v8a-debug.apk, 39,715,728 B,
+  sha256 f1577bee3b3b2f346df0b36ad7548da2dce16a8110a87f6fa5004c9a693e597b);
+  byte-verify PASS (kv 10, kivy_client 25 = the 21 floor + the four
+  door wants, ui_server_config 0, main present/manifest-absence ok);
+  the door wants MISS the guard-only head's artifact, discrimination
+  proven before quoting. The earlier 0.36.24 pair
+  (44806741713/44806741981; artifact 14663214777) documents the
+  guard-only head and is superseded BY this fold, not cancelled
+  mid-run. Release mechanics verified this day: CI's release job
+  names only sHades-*-main.apk on main-tag pushes (the folded PR's
+  debug APK has no updater asset yet), so tay's flight stays: merge
+  PR #20 -> tag v0.36.24 on main -> publish -> the release job drops
+  the named main APK (+ .sha256) as assets. tay: the branch is
+  receipts-complete; the merge click is yours.
 - **tay's flight on this release (one merge, one tag):** merge PR #20
   -> tag v0.36.24 on main -> publish -> drop the named APK
   (+ .sha256 companion) as release assets so the auto-updaters can
