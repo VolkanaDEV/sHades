@@ -183,12 +183,24 @@ scope   : profile-screen delete-account; server toggles that bind live
     selfheal lane 19/0 (site editor contract), battery red=none, pair
     44736705426/44736705424.
 
-## P8 — Announcements (priced, parked)
+## P8 — Announcements (BUILT 2026-11-20, v0.36.19)
 
-- True announcements = a pinned broadcast channel type or a pinned
-  message with a push emit to all members; real protocol surface
-  (schema, emit, catchup) — its own receipts round. motd (P6) is
-  the v1 stand-in.
+- Channel kind "announce" (new tuple entry): the open default never
+  confers POST there — moderators/admins always; explicit grants only
+  (@everyone overwrite row carrying POST, a role perm, or a role
+  overwrite). The union logic factored into _effective_perms; chat
+  semantics unchanged (lane-guarded).
+- Push emit + catchup inherit unchanged (the msg event still rides
+  ingest; the lane asserts the ring).
+- channels_list stamps can_post per channel (the site-edit verdict
+  shape; old servers default True). The client mirrors it into the
+  composer Properties: read-only input + "announcements only" hint for
+  non-grants, "Announce" send label for holders; ledger fetch + live
+  push run for announce channels (the chat flow, widened).
+- Receipts: tests/test_announce.py 13/0 (create, default-deny, mod
+  grant, @everyone grant, role grant, stamps on both kinds across
+  four viewers, emit, ledger read); selfheal lane 22/0 (+2
+  composer/flow contracts); battery red=none.
 
 ## P9 — Config entry point (VERIFIED 2026-11-20, contracts added
 ## CI-only: admin-panel lane 11/0)
