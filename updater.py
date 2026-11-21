@@ -265,6 +265,7 @@ def _handover(tree_dir, argv):
     runner = os.path.join(tree_dir, "update_run.py")
     args = list(argv if argv is not None else sys_argv())
     os.environ["SHADES_PIDFILE"] = ""  # exec'd process re-writes its own
+    os.environ["SHADES_UPDATE_RUN"] = "1"  # P11f: the supervised marker
     os.execv(sys_executable(), [sys_executable(), runner] + args)
 
 

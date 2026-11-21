@@ -3514,14 +3514,56 @@ SERVER_CONFIG_KEYS = {
     "update_channel_peer": "",   # P11d: the pinned peer's node destination
                                  # hash (64-hex); the software channel's
                                  # trust anchor for serve and pull
-    "update_channel_shapin": "",  # P11e: the admin-pinned artifact sha256
+    "update_channel_shapin": "",   # P11e: the admin-pinned artifact sha256
                                   # (64-hex); the pull's authority for what
                                   # bytes may run. Sourced out-of-band (the
                                   # release body, another admin). When set,
                                   # the serving peer is a courier only.
+    "update_trusted_hub": "",     # P11f: the DISTRIBUTED hub's node dest
+                                  # hash (64-hex) - the sole trusted
+                                  # initiating update source. Any other hub
+                                  # may be compromised; a non-trusted pull
+                                  # needs the artifact pin to run at all.
 }
 
 # ---------------------------------------------------------------------- P11 updater
+
+def _update_boot_guard(tree=None):
+    """P11f failback: a DIRECT boot (no update_run parent, marker still
+    set) restores the backup members BEFORE serving. The pending-version
+    marker means: a swap was interrupted mid-flight (power loss, a
+    process manager kill) or a previous update never proved its boot.
+    The supervised path (SHADES_UPDATE_RUN=1, from update_run.py) owns
+    its own rollback loop; the guard stands out of its way and covers
+    every other boot."""
+    root = tree or os.path.dirname(os.path.abspath(__file__))
+    marker = os.path.join(root, "update_staging", "pending_version")
+    if not os.path.isfile(marker):
+        return None
+    if (os.environ.get("SHADES_UPDATE_RUN") == "1"
+            and tree is None):
+        return None
+    bdir = os.path.join(root, "update_backup")
+    n = 0
+    try:
+        names = sorted(os.listdir(bdir))
+    except OSError:
+        names = []
+    for name in names:
+        src = os.path.join(bdir, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(root, name))
+            n += 1
+    try:
+        os.remove(marker)
+    except OSError:
+        pass
+    updater._note(
+        "rolled-back",
+        "the previous update never confirmed its boot; restored %d "
+        "backup members" % n)
+    return n
+
 _UPDATE_LOCK = threading.Lock()
 _UPDATE_LAST = [0.0]
 _BOOT_ARGV = []
@@ -3572,6 +3614,7 @@ def api_v1_update_status(viewer, data, request_id, link_id,
     out["interval"] = _cfg_get("update_check_minutes", "360")
     out["peer"] = _cfg_get("update_channel_peer", "")
     out["shapin"] = _cfg_get("update_channel_shapin", "")
+    out["trusted"] = _cfg_get("update_trusted_hub", "")
     return out
 
 
@@ -3729,11 +3772,17 @@ def _rns_pull():
         # pin, and the status line says so).
         shapin = (_cfg_get("update_channel_shapin", "") or
                   "").strip().lower()
+        trusted = (_cfg_get("update_trusted_hub", "") or "").strip().lower()
+        pin = (_cfg_get("update_channel_peer", "") or "").strip().lower()
         target_sha = shapin
         sha_source = "pin"
         if not shapin:
             target_sha = (info.get("bundle_sha256") or "").lower()
-            sha_source = "peer-only"
+            # P11f tiers: the DISTRIBUTED hub (the sole trusted
+            # initiating source) may act as the sha oracle by itself;
+            # any other hub without the artifact pin stays peer-only.
+            sha_source = ("trusted-hub" if trusted and pin == trusted
+                          else "peer-only")
         elif (info.get("bundle_sha256") or "").lower() != shapin:
             updater._note("refused",
                           "peer bundle disagrees with the pinned "
@@ -3820,6 +3869,14 @@ def api_v1_admin_config(viewer, data, link_id):
             return {"ok": 0,
                     "error": "update_channel_shapin must be a 64-hex "
                              "sha256 digest", "code": 400}
+        value = digest
+    if key == "update_trusted_hub" and value:
+        # P11f: the trusted hub is an RNS node destination hash
+        digest = value.strip().lower()
+        if not re.match(r"^[0-9a-f]{64}$", digest):
+            return {"ok": 0,
+                    "error": "update_trusted_hub must be a 64-hex node "
+                             "destination hash", "code": 400}
         value = digest
     if key == "guild_icon" and value:
         # the icon rides the standard blob store: the value must resolve to
@@ -4732,4 +4789,8 @@ if __name__ == "__main__":
     # every boot (bare or flagged) since P11 chain 2, and a guard
     # alone would restart a flagged hub flagless. The entry feeds the
     # real CLI here so _BOOT_ARGV carries the flags through a restart.
+    try:
+        _update_boot_guard()  # P11f: an interrupted swap never serves
+    except Exception as e:
+        RNS.log("boot guard: %s" % e, RNS.LOG_ERROR)
     run(sys.argv[1:])

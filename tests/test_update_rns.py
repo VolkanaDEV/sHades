@@ -308,6 +308,18 @@ def main():
               and serving5.chunks > 0
               and "pinned artifact" in st_detail(), st_detail())
 
+        # ------------------------------------------ P11f: the trusted hub tier
+        FAKE_CFG["update_channel_shapin"] = ""
+        FAKE_CFG["update_trusted_hub"] = PIN_HEX  # == the pin: tier 1
+        fake6, link6, serving6 = make_fake_rns()
+        sys.modules["RNS"] = fake6
+        got6 = sHades._rns_pull()
+        check("P11f: the pinned peer matching the trusted hub is the sole "
+              "sha oracle (trusted-hub source)",
+              isinstance(got6, dict)
+              and got6["sha_source"] == "trusted-hub", got6 is not None)
+        FAKE_CFG["update_trusted_hub"] = ""
+
         # ------------------------------------------------------ pin hygiene
         sys.modules["RNS"] = old_mod
         FAKE_CFG["update_channel_shapin"] = ""
@@ -333,6 +345,32 @@ def main():
         check("toggle: rns with no wired fetch hook stays pending",
               res3.get("skipped") is True
               and res3.get("reason") == "no-rns-fetch", res3)
+
+        # ------------------------------------------ P11f: the boot guard
+        guard_tree = tempfile.mkdtemp(prefix="shades-guard-")
+        os.makedirs(os.path.join(guard_tree, "update_backup"))
+        os.makedirs(os.path.join(guard_tree, "update_staging"))
+        with open(os.path.join(guard_tree, "sHades.py"), "w",
+                  encoding="utf-8") as f:
+            f.write("half-swapped")
+        with open(os.path.join(guard_tree, "update_backup", "sHades.py"),
+                  "w", encoding="utf-8") as f:
+            f.write("previous tree")
+        with open(os.path.join(
+                guard_tree, "update_staging", "pending_version"), "w",
+                encoding="ascii") as f:
+            f.write("sHades-server-0.36.26.tar.gz")
+        restored = sHades._update_boot_guard(guard_tree)
+        now = open(os.path.join(guard_tree, "sHades.py"),
+                   encoding="utf-8").read()
+        marker_gone = not os.path.isfile(os.path.join(
+            guard_tree, "update_staging", "pending_version"))
+        check("P11f: a direct boot under a pending marker restores the "
+              "backup and clears the marker",
+              restored == 1 and now == "previous tree" and marker_gone
+              and st_verdict() == "rolled-back", (restored, now))
+        check("P11f: a clean boot touches nothing",
+              sHades._update_boot_guard(guard_tree) is None, None)
     except Exception:
         traceback.print_exc()
         FAIL.append("lane crashed")

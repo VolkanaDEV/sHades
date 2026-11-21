@@ -171,7 +171,7 @@ class GeneralTab(_Tab):
 
     CONFIG_FIELDS = ("guild_name", "motd", "slowmode", "registration",
                      "update_channel", "update_channel_peer",
-                     "update_channel_shapin")
+                     "update_channel_shapin", "update_trusted_hub")
 
     def _build_controls(self):
         self.entries = {}
@@ -255,6 +255,20 @@ class GeneralTab(_Tab):
         h_row.add_widget(h_entry)
         h_row.add_widget(h_save)
         self.box.add_widget(h_row)
+
+        # the trusted hub (P11f): the DISTRIBUTED hub's node dest hash -
+        # the sole trusted initiating update source. Tay seeds it when
+        # the hub identity is provisioned; members never invent peers.
+        t_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
+        t_entry = TextInput(hint_text="trusted hub (64-hex node hash)",
+                            multiline=False, size_hint_x=0.6)
+        self.entries["update_trusted_hub"] = t_entry
+        t_save = _btn("save", 70, 30)
+        t_save.bind(
+            on_press=lambda _i: self.do_save_key("update_trusted_hub"))
+        t_row.add_widget(t_entry)
+        t_row.add_widget(t_save)
+        self.box.add_widget(t_row)
 
         # the updater's own status line (the status-mirror rule): the
         # verdict + channel + interval are this tab's business, not the

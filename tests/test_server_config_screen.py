@@ -388,7 +388,9 @@ def main():
     # ---------- P11 chain 5 tail: the software channel rides the phone ------
     check("general tab carries the update channel + peer entries",
           "update_channel" in gen.entries
-          and "update_channel_peer" in gen.entries, list(gen.entries)[:3])
+          and "update_channel_peer" in gen.entries
+          and "update_channel_shapin" in gen.entries
+          and "update_trusted_hub" in gen.entries, list(gen.entries)[:3])
     check("general tab renders the updater status line",
           gen.upd_state.text
           == "updater: current ch=off every 360m peer=- pin=peer-only",
@@ -410,6 +412,12 @@ def main():
     pump(1.0)
     check("saving the artifact pin posts admin_config(update_channel_shapin)",
           ("admin_config", "update_channel_shapin", "cd" * 32)
+          in client.guild_api.calls, client.guild_api.calls[-2:])
+    gen.entries["update_trusted_hub"].text = "ef" * 32
+    gen.do_save_key("update_trusted_hub")
+    pump(1.0)
+    check("saving the trusted hub posts admin_config(update_trusted_hub)",
+          ("admin_config", "update_trusted_hub", "ef" * 32)
           in client.guild_api.calls, client.guild_api.calls[-2:])
 
     # ---------- P10b: prettier receipts --------------------------------------
