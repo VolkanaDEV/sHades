@@ -93,14 +93,18 @@ class EditRefProbe(kc.sHadesClientApp):
                                        can_edit=True)
                 Clock.schedule_once(self.tap_edit_ref, 0.5)
             except Exception as exc:  # surface, do not pass silently
-                self.failures.append("boot: %r" % (exc,))
+                self.check(False, "boot: %r" % (exc,))
                 import traceback
                 traceback.print_exc()
                 self.stop()
 
         Clock.schedule_once(boot, 0.8)
 
-    def tap_edit_ref(self, dt0):
+    def tap_edit_ref(self, dt0, tries=0):
+        # 0.36.25 CI receipts (github runs 44898827484/44901925072): a
+        # fixed +0.5s tap races the render under a loaded xvfb runner
+        # and even the silent failure paths hide the why. Poll for the
+        # label (6s ceiling) and route EVERY failure through check().
         try:
             page, lbl = None, None
             grid = self.root.get_screen("main").ids.message_grid
@@ -113,8 +117,12 @@ class EditRefProbe(kc.sHadesClientApp):
                 if lbl:
                     break
             if lbl is None:
-                self.failures.append("site-edit ref label not rendered")
-                self.stop()
+                if tries < 40:
+                    Clock.schedule_once(
+                        lambda dt: self.tap_edit_ref(dt, tries + 1), 0.15)
+                    return
+                self.check(False, "site-edit ref label never rendered "
+                                  "within the 6s poll")
                 return
             z = lbl.refs["shades:site-edit"][0]
             cx, cy = (z[0] + z[2]) / 2.0, (z[1] + z[3]) / 2.0
@@ -130,18 +138,15 @@ class EditRefProbe(kc.sHadesClientApp):
             wx = ox + cx
             wy = oy + cy + scroll.y + pull
             print("NOTE tap at window (%.1f, %.1f) via %s (anchor %r, "
-                  "pull %.1f) [win %r scale %r dpi %r]" % (
+                  "pull %.1f) win=%dx%d scale=%r dpi=%r" % (
                       wx, wy, type(lbl).__name__, (ox, oy), pull,
-                      (Window.width, Window.height,
-                       getattr(Window, "left", None),
-                       getattr(Window, "top", None)),
-                      (getattr(Window, "scale", None),
-                       getattr(Window, "dpi", None))), flush=True)
+                      Window.width, Window.height,
+                      getattr(Window, "scale", None),
+                      getattr(Window, "dpi", None)), flush=True)
             # CI diagnostics: who claims the tap point, and does the
             # label itself collide under it
-            print("NOTE label collide=%s to_window=%s" % (
-                lbl.collide_point(wx, wy),
-                Window.to_window(Window.to_window(wx, wy))), flush=True)
+            print("NOTE label collide=%s" % lbl.collide_point(wx, wy),
+                  flush=True)
             seen = []
 
             def walk(w, depth):
@@ -165,15 +170,17 @@ class EditRefProbe(kc.sHadesClientApp):
             t.touch_down(0.5, 0.5)
             Clock.schedule_once(lambda dt1: self.finish(t, dt1), 0.15)
         except Exception as exc:
-            self.failures.append("tap: %r" % (exc,))
+            self.check(False, "tap: %r" % (exc,))
             self.stop()
 
     def finish(self, t, dt0):
         try:
+            print("NOTE grab_current=%r" % (getattr(t, "grab_current", None),
+                                            ), flush=True)
             t.touch_up(0.5, 0.5)
             Clock.schedule_once(self.verdict, 0.4)
         except Exception as exc:
-            self.failures.append("up: %r" % (exc,))
+            self.check(False, "up: %r" % (exc,))
             self.stop()
 
     def verdict(self, dt0):
@@ -189,6 +196,11 @@ def main():
     Window.size = (800, 600)
     probe = EditRefProbe()
     probe.run()
+    # nothing in this lane may fail silently: dump the tally at exit
+    for item in getattr(probe, "failures", []):
+        print("EXITFAILURE: " + item, flush=True)
+    print("EXITFAILCOUNT: %d" % len(getattr(probe, "failures", [])),
+          flush=True)
     sys.exit(bool(probe.failures))
 
 
