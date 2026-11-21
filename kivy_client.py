@@ -1765,6 +1765,52 @@ class SkeletonRow(Widget):
                              size=(width * 0.16, dp(10)), radius=[dp(5)] * 4)
 
 
+class MicronRefLabel(Label):
+    """Markup label whose ref taps survive nesting inside a ScrollView.
+
+    Kivy 2.3.1 walks site pages 2+ levels under the messages ScrollView
+    (scroll > GridLayout > SitePage > label), and the touch reaches those
+    widgets in the SCROLL's content frame (scrollview.py to_local folds a
+    single g_translate over the whole subtree; the walk applies no per-hop
+    pos transforms). Label.on_touch_down's ref check assumes its own
+    parent space, so the zones miss by the accumulated offsets and the
+    tap dies (0.36.x device receipt: [ Edit page ] did nothing).
+
+    Convert the delivered frame by subtracting this label's own offset
+    chain up to the wrapping ScrollView, then run kivy's ref-zone check
+    with the same top-down texture y that label.py uses. The scroll's own
+    translation stays in the delivered frame, so stopping the walk there
+    is both correct and the only cheap anchor kivy gives us.
+    """
+
+    def _content_anchor(self):
+        ox, oy = self.x, self.y  # offsets up to (and incl.) this label
+        node = self.parent
+        while node is not None and type(node).__name__ != "ScrollView":
+            ox += node.x
+            oy += node.y
+            node = node.parent
+        return ox, oy
+
+    def on_touch_down(self, touch):
+        if super().on_touch_down(touch):
+            return True
+        if not len(self.refs):
+            return False
+        ox, oy = self._content_anchor()
+        lx = touch.x - ox
+        ly = touch.y - oy
+        tex_h = self.texture_size[1] or 18.0
+        ty = tex_h - ly  # label zones are top-down like label.py's math
+        for uid, zones in self.refs.items():
+            for zone in zones:
+                x, y, w, h = zone
+                if x <= lx <= w and y <= ty <= h:
+                    self.dispatch('on_ref_press', uid)
+                    return True
+        return False
+
+
 class CtxHeaderLabel(ContextMenuMixin, Label):
     """Guild header: right-click/long-press offers the invite share-link
     and (for admins) the server settings panel."""
@@ -7747,7 +7793,7 @@ class sHadesClientApp(MDApp):
             scr._status.text = "publish failed: %s" % err
 
     def _micron_label(self, markup, heading=False, center=False, code=False):
-        lbl = Label(markup=True, text=markup)
+        lbl = MicronRefLabel(markup=True, text=markup)
         lbl.size_hint_y = None
         lbl.font_size = sp(18) if heading else (sp(13) if code else sp(15))
         lbl.halign = "center" if center else "left"

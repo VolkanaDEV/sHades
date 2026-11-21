@@ -750,7 +750,11 @@
                         BoxLayout:
                             id: server_sidebar
                             size_hint_x: None
-                            width: dp(64)
+                            # 0.36.25 (tay): the rail kept its 64dp box when the
+                            # drawer closed and, disabled+collide, ate every
+                            # tap in the left 64dp of the message area - the
+                            # site page's [ Edit page ] line lives there
+                            width: dp(64) if root.left_open else 0
                             orientation: 'vertical'
                             canvas.before:
                                 Color:
@@ -793,7 +797,7 @@
                                     source: app.banner_channel_path or ''
                                     size_hint: (None, None)
                                     height: dp(96)
-                                    width: dp(200)
+                                    width: min(dp(200), banner_strip.width)
                                     allow_stretch: False
                                     keep_ratio: True
                                     pos_hint: {'center_x': 0.5, 'center_y': 0.5}
