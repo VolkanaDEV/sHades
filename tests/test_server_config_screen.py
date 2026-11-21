@@ -56,7 +56,7 @@ class FakeApi:
     def update_status(self, timeout=10):
         return self._rec(("update_status",),
                          {"ok": 1, "verdict": "current", "channel": "off",
-                          "interval": "360", "peer": ""})
+                          "interval": "360", "peer": "", "shapin": ""})
 
     def channels_list(self):
         return self._rec(("channels_list",), {"ok": 1, "channels": [
@@ -390,7 +390,8 @@ def main():
           "update_channel" in gen.entries
           and "update_channel_peer" in gen.entries, list(gen.entries)[:3])
     check("general tab renders the updater status line",
-          gen.upd_state.text == "updater: current ch=off every 360m peer=-",
+          gen.upd_state.text
+          == "updater: current ch=off every 360m peer=- pin=peer-only",
           gen.upd_state.text)
     gen.entries["update_channel"].text = "github"
     gen.do_save_key("update_channel")
@@ -403,6 +404,12 @@ def main():
     pump(1.0)
     check("saving the peer pin posts admin_config(update_channel_peer)",
           ("admin_config", "update_channel_peer", "ab" * 32)
+          in client.guild_api.calls, client.guild_api.calls[-2:])
+    gen.entries["update_channel_shapin"].text = "cd" * 32
+    gen.do_save_key("update_channel_shapin")
+    pump(1.0)
+    check("saving the artifact pin posts admin_config(update_channel_shapin)",
+          ("admin_config", "update_channel_shapin", "cd" * 32)
           in client.guild_api.calls, client.guild_api.calls[-2:])
 
     # ---------- P10b: prettier receipts --------------------------------------

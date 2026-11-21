@@ -3514,6 +3514,11 @@ SERVER_CONFIG_KEYS = {
     "update_channel_peer": "",   # P11d: the pinned peer's node destination
                                  # hash (64-hex); the software channel's
                                  # trust anchor for serve and pull
+    "update_channel_shapin": "",  # P11e: the admin-pinned artifact sha256
+                                  # (64-hex); the pull's authority for what
+                                  # bytes may run. Sourced out-of-band (the
+                                  # release body, another admin). When set,
+                                  # the serving peer is a courier only.
 }
 
 # ---------------------------------------------------------------------- P11 updater
@@ -3566,6 +3571,7 @@ def api_v1_update_status(viewer, data, request_id, link_id,
     out["channel"] = _cfg_get("update_channel", "off")
     out["interval"] = _cfg_get("update_check_minutes", "360")
     out["peer"] = _cfg_get("update_channel_peer", "")
+    out["shapin"] = _cfg_get("update_channel_shapin", "")
     return out
 
 
@@ -3714,6 +3720,25 @@ def _rns_pull():
             updater._note("current",
                           "%s is the newest peer bundle" % info["version"])
             return None
+        # P11e: the artifact pin outranks the wire. The admin pins the
+        # sha out-of-band (the release body, another admin); a served
+        # fingerprint that disagrees with it is refused BEFORE any
+        # bytes move, and the assembled bytes are verified against the
+        # PIN, never against the peer's own claim. Empty pin =
+        # peer-only mode (integrity only; provenance rides the identity
+        # pin, and the status line says so).
+        shapin = (_cfg_get("update_channel_shapin", "") or
+                  "").strip().lower()
+        target_sha = shapin
+        sha_source = "pin"
+        if not shapin:
+            target_sha = (info.get("bundle_sha256") or "").lower()
+            sha_source = "peer-only"
+        elif (info.get("bundle_sha256") or "").lower() != shapin:
+            updater._note("refused",
+                          "peer bundle disagrees with the pinned "
+                          "artifact sha")
+            return None
         total = None
         parts = []
         offset = 0
@@ -3733,12 +3758,14 @@ def _rns_pull():
             updater._note("refused", "bundle size disagree: %d of %d"
                           % (len(data), total))
             return None
-        if not updater.verify_sha(data, info["bundle_sha256"]):
+        if not updater.verify_sha(data, target_sha):
             updater._note("refused",
-                          "bundle bytes disagree with the peer's sha256")
+                          "bundle bytes disagree with the %s sha"
+                          % ("pinned artifact" if shapin else "peer's"))
             return None
         return {"version": info["version"],
-                "sha256": info["bundle_sha256"],
+                "sha256": target_sha,
+                "sha_source": sha_source,
                 "bundle_name": info["bundle_name"],
                 "bundle_bytes": data}
     except Exception as e:
@@ -3783,6 +3810,16 @@ def api_v1_admin_config(viewer, data, link_id):
             return {"ok": 0,
                     "error": "update_channel_peer must be a 64-hex node "
                              "destination hash", "code": 400}
+        value = digest
+    if key == "update_channel_shapin" and value:
+        # P11e: the artifact pin is a sha256 hex digest: 64 hex. Empty
+        # is allowed (and means the pull trusts the peer's own sha -
+        # integrity only, provenance rides the identity pin).
+        digest = value.strip().lower()
+        if not re.match(r"^[0-9a-f]{64}$", digest):
+            return {"ok": 0,
+                    "error": "update_channel_shapin must be a 64-hex "
+                             "sha256 digest", "code": 400}
         value = digest
     if key == "guild_icon" and value:
         # the icon rides the standard blob store: the value must resolve to

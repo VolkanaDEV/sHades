@@ -170,7 +170,8 @@ class GeneralTab(_Tab):
     title = "General"
 
     CONFIG_FIELDS = ("guild_name", "motd", "slowmode", "registration",
-                     "update_channel", "update_channel_peer")
+                     "update_channel", "update_channel_peer",
+                     "update_channel_shapin")
 
     def _build_controls(self):
         self.entries = {}
@@ -240,6 +241,20 @@ class GeneralTab(_Tab):
         p_row.add_widget(p_entry)
         p_row.add_widget(p_save)
         self.box.add_widget(p_row)
+
+        # the artifact pin (P11e): the sha256 the pull verifies against.
+        # Source it out-of-band - the release body, another admin. With
+        # it set the serving peer is a courier, not an authority.
+        h_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
+        h_entry = TextInput(hint_text="artifact sha pin (64-hex)",
+                            multiline=False, size_hint_x=0.6)
+        self.entries["update_channel_shapin"] = h_entry
+        h_save = _btn("save", 70, 30)
+        h_save.bind(
+            on_press=lambda _i: self.do_save_key("update_channel_shapin"))
+        h_row.add_widget(h_entry)
+        h_row.add_widget(h_save)
+        self.box.add_widget(h_row)
 
         # the updater's own status line (the status-mirror rule): the
         # verdict + channel + interval are this tab's business, not the
@@ -358,11 +373,14 @@ class GeneralTab(_Tab):
                 self.upd_state.text = "updater: n/a"
                 return
             peer = (res.get("peer") or "").strip()
-            self.upd_state.text = "updater: %s ch=%s every %sm peer=%s" % (
+            shapin = (res.get("shapin") or "").strip()
+            self.upd_state.text = ("updater: %s ch=%s every %sm peer=%s "
+                                   "pin=%s") % (
                 res.get("verdict") or "never",
                 res.get("channel") or "off",
                 res.get("interval") or "?",
-                (peer[:12] + "...") if peer else "-")
+                (peer[:12] + "...") if peer else "-",
+                "artifact" if shapin else "peer-only")
 
         # _fetch swallows work exceptions into the status mirror; the
         # not-ok verdict lands in on_ok below

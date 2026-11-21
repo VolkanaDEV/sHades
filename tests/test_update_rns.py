@@ -83,7 +83,8 @@ class FakeReceipt(object):
 class Serving(object):
     """The fake serving peer behind the link: REAL routes, fake wire."""
 
-    def __init__(self, version_stamp="0.36.26", wrong_sha=False):
+    def __init__(self, version_stamp="0.36.26", wrong_sha=False,
+                 mangle=False):
         served = sHades.api_v1_update_serve_info(
             None, {}, 1, "fake-link", _FakeIdentity(PIN_HASH, "peer"), 0)
         if not served.get("ok"):
@@ -92,6 +93,8 @@ class Serving(object):
         self.served["version"] = version_stamp
         if wrong_sha:
             self.served["bundle_sha256"] = "0" * 64
+        self.mangle = mangle
+        self.chunks = 0
         self.identified = None
         self.payload = None
 
@@ -115,6 +118,13 @@ class _FakeLink(object):
                 _FakeIdentity(PIN_HASH, "peer"), 0)
             if not res.get("ok"):
                 raise RuntimeError("serve_chunk refused: %r" % res)
+            if s.mangle:
+                chunk = bytearray(base64.b64decode(res["data_b64"]))
+                chunk[0] ^= 0xFF
+                res = dict(res)
+                res["data_b64"] = base64.b64encode(
+                    bytes(chunk)).decode("ascii")
+            s.chunks += 1
             if s.payload is None:
                 s.payload = bytearray()
             s.payload.extend(base64.b64decode(res["data_b64"]))
@@ -205,7 +215,8 @@ def main():
               and got["version"] == "0.36.26"
               and got["bundle_name"]
               == "sHades-server-%s.tar.gz" % sHades.SERVER_VERSION
-              and len(got["bundle_bytes"]) > 0, got is not None)
+              and len(got["bundle_bytes"]) > 0
+              and got["sha_source"] == "peer-only", got is not None)
         check("pull: the puller identified this server's identity on the "
               "link",
               link.identified is not None
@@ -265,8 +276,41 @@ def main():
               and all(still[m] == placeholders[m] for m in still),
               (res2.get("reason"), st_verdict(), st_detail()))
 
+        # ---------------------------------------------- P11e: the artifact pin
+        real_sha = serving.served["bundle_sha256"]
+        FAKE_CFG["update_channel_shapin"] = real_sha
+        fake3, link3, serving3 = make_fake_rns()
+        sys.modules["RNS"] = fake3
+        got3 = sHades._rns_pull()
+        check("P11e: with the artifact pin set, a matching peer serves and "
+              "the authority is the pin",
+              isinstance(got3, dict) and got3["sha256"] == real_sha
+              and got3["sha_source"] == "pin", got3 is not None)
+
+        fake4, link4, serving4 = make_fake_rns()
+        sys.modules["RNS"] = fake4
+        FAKE_CFG["update_channel_shapin"] = "ab" * 32
+        got4 = sHades._rns_pull()
+        check("P11e: a served fingerprint disagreeing with the artifact pin "
+              "refuses before any bytes move",
+              got4 is None and st_verdict() == "refused"
+              and serving4.chunks == 0
+              and "pinned artifact sha" in st_detail(), st_detail())
+
+        fake5, link5, serving5 = make_fake_rns()
+        serving5.mangle = True
+        sys.modules["RNS"] = fake5
+        FAKE_CFG["update_channel_shapin"] = real_sha
+        got5 = sHades._rns_pull()
+        check("P11e: bytes mangled in flight refuse against the pin, not "
+              "the peer's claim",
+              got5 is None and st_verdict() == "refused"
+              and serving5.chunks > 0
+              and "pinned artifact" in st_detail(), st_detail())
+
         # ------------------------------------------------------ pin hygiene
         sys.modules["RNS"] = old_mod
+        FAKE_CFG["update_channel_shapin"] = ""
         saved_pin = FAKE_CFG["update_channel_peer"]
         FAKE_CFG["update_channel_peer"] = ""
         got_no_pin = sHades._rns_pull()
