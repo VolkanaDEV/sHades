@@ -130,8 +130,37 @@ class EditRefProbe(kc.sHadesClientApp):
             wx = ox + cx
             wy = oy + cy + scroll.y + pull
             print("NOTE tap at window (%.1f, %.1f) via %s (anchor %r, "
-                  "pull %.1f)" % (wx, wy, type(lbl).__name__, (ox, oy),
-                                  pull), flush=True)
+                  "pull %.1f) [win %r scale %r dpi %r]" % (
+                      wx, wy, type(lbl).__name__, (ox, oy), pull,
+                      (Window.width, Window.height,
+                       getattr(Window, "left", None),
+                       getattr(Window, "top", None)),
+                      (getattr(Window, "scale", None),
+                       getattr(Window, "dpi", None))), flush=True)
+            # CI diagnostics: who claims the tap point, and does the
+            # label itself collide under it
+            print("NOTE label collide=%s to_window=%s" % (
+                lbl.collide_point(wx, wy),
+                Window.to_window(Window.to_window(wx, wy))), flush=True)
+            seen = []
+
+            def walk(w, depth):
+                try:
+                    hit = w.collide_point(wx, wy)
+                except Exception:
+                    hit = False
+                if hit:
+                    seen.append("%s%s@%r,%r" % ("  " * depth,
+                                                type(w).__name__,
+                                                getattr(w, "x", None),
+                                                getattr(w, "y", None)))
+                for child in getattr(w, "children", []) or []:
+                    walk(child, depth + 1)
+
+            for top_child in Window.children:
+                walk(top_child, 0)
+            for line in seen:
+                print("NOTE hit: " + line, flush=True)
             t = UnitTestTouch(wx, wy)
             t.touch_down(0.5, 0.5)
             Clock.schedule_once(lambda dt1: self.finish(t, dt1), 0.15)
