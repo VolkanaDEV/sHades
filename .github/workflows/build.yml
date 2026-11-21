@@ -129,6 +129,10 @@ jobs:
     needs: lint-and-test
     runs-on: ubuntu-22.04
     timeout-minutes: 180
+    # fold-8 (0.36.25, tay): GITHUB_TOKEN needs contents:write so the
+    # release step below can publish the APK as release assets.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Set up Java 17 (required by Android Gradle plugin)
@@ -281,6 +285,38 @@ jobs:
           name: sHades-client-android
           path: bin/*.apk
           retention-days: 7
+      - name: Publish GitHub release (main pushes only)
+        # fold-8 (0.36.25, tay): the phone updater reads the assets of
+        # /releases/latest (client_update.py newest_client_asset:
+        # shades-<V>-arm64-v8a-debug.apk + a .sha256 companion, the
+        # name APP_APK_RE parses) -- and no terminal should be needed
+        # on any side to put one there. Buildozer already names the
+        # APK shades-<V>-arm64-v8a-debug.apk; hash it in place inside
+        # bin/ and ship both files. PR runs and manual dispatches do
+        # NOT release (fork PR tokens cannot and should not). A
+        # release that already exists for this version is left
+        # untouched (idempotent re-runs).
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          VER=$(grep -E '^version' buildozer.spec | sed 's/^[^=]*= *//')
+          APK=$(ls bin/shades-*.apk | head -1)
+          if [ -z "$APK" ]; then echo "::error::no bin/shades-*.apk built"; exit 1; fi
+          echo "APK: $APK (version $VER)"
+          ( cd "$(dirname "$APK")" \
+            && sha256sum "$(basename "$APK")" > "$(basename "$APK").sha256" )
+          if gh release view "V$VER" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release V$VER already exists -> idempotent skip (use --latest on the existing release if it got demoted)"
+            gh release edit "V$VER" -R "$GITHUB_REPOSITORY" --latest >/dev/null 2>&1 || true
+          else
+            gh release create "V$VER" "$APK" "$APK.sha256" \
+              -R "$GITHUB_REPOSITORY" \
+              --latest --title "V$VER" \
+              --notes "automatic release ($GITHUB_SHA); version lockstep $VER"
+            echo "release V$VER published with $(basename "$APK") + $(basename "$APK").sha256"
+          fi
 
   server-bundle:
     name: package server bundle (P11)

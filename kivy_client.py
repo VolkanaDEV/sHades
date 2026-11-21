@@ -35,7 +35,7 @@ from ui_theme import preset_colors
 # ---------------------------------------------------------------------------
 # P11 version bridge: the running build knows its own version.
 # ---------------------------------------------------------------------------
-APP_VERSION = "0.36.24"
+APP_VERSION = "0.36.25"
 
 # buildozer.spec, kivy_client.APP_VERSION and sHades.SERVER_VERSION must all
 # match (tests/test_update_meta.py keeps them in lockstep). On-device the
@@ -1085,6 +1085,12 @@ class GuildAPI:
     def admin_audit(self, limit=100):
         return self._request_json("/api/v1/admin/audit", {"limit": limit})
 
+    def update_status(self, timeout=10):
+        """P11 chain 5 tail: the updater's verdict + channel + peer pin,
+        admin-only read (the General tab's status line consumes this)."""
+        return self._request_json("/api/v1/update_status", {},
+                                  timeout=timeout)
+
     def member_moderation(self, limit=50):
         return self._request_json("/api/v1/moderation/public", {"limit": limit})
 
@@ -1763,6 +1769,52 @@ class SkeletonRow(Widget):
             RoundedRectangle(pos=(self.x + dp(58) + width * 0.64 * self.phase,
                                   self.y + dp(21)),
                              size=(width * 0.16, dp(10)), radius=[dp(5)] * 4)
+
+
+class MicronRefLabel(Label):
+    """Markup label whose ref taps survive nesting inside a ScrollView.
+
+    Kivy 2.3.1 walks site pages 2+ levels under the messages ScrollView
+    (scroll > GridLayout > SitePage > label), and the touch reaches those
+    widgets in the SCROLL's content frame (scrollview.py to_local folds a
+    single g_translate over the whole subtree; the walk applies no per-hop
+    pos transforms). Label.on_touch_down's ref check assumes its own
+    parent space, so the zones miss by the accumulated offsets and the
+    tap dies (0.36.x device receipt: [ Edit page ] did nothing).
+
+    Convert the delivered frame by subtracting this label's own offset
+    chain up to the wrapping ScrollView, then run kivy's ref-zone check
+    with the same top-down texture y that label.py uses. The scroll's own
+    translation stays in the delivered frame, so stopping the walk there
+    is both correct and the only cheap anchor kivy gives us.
+    """
+
+    def _content_anchor(self):
+        ox, oy = self.x, self.y  # offsets up to (and incl.) this label
+        node = self.parent
+        while node is not None and type(node).__name__ != "ScrollView":
+            ox += node.x
+            oy += node.y
+            node = node.parent
+        return ox, oy
+
+    def on_touch_down(self, touch):
+        if super().on_touch_down(touch):
+            return True
+        if not len(self.refs):
+            return False
+        ox, oy = self._content_anchor()
+        lx = touch.x - ox
+        ly = touch.y - oy
+        tex_h = self.texture_size[1] or 18.0
+        ty = tex_h - ly  # label zones are top-down like label.py's math
+        for uid, zones in self.refs.items():
+            for zone in zones:
+                x, y, w, h = zone
+                if x <= lx <= w and y <= ty <= h:
+                    self.dispatch('on_ref_press', uid)
+                    return True
+        return False
 
 
 class CtxHeaderLabel(ContextMenuMixin, Label):
@@ -3814,10 +3866,24 @@ class sHadesClientApp(MDApp):
         """tay's transfer contract (0.36.24): a restored kit whose server
         row is complete transfers the account ALIVE - dial the kit's
         last-active guild exactly as the device it came from. Returns
-        True when the attempt started."""
+        True when an attempt started.
+
+        P11h (device receipt, 0.36.24: the import parked on connect with
+        the hub field empty and 'Identity recovered. Connect to a saved
+        guild.'): a restored kit with NO dialable server row returned
+        False here and left the member on the connect screen - hub
+        blank, Connect disabled - while the restart path auto-dialed
+        the default hub through the portable-profile fallthrough
+        (_connect_default_hub's 'user' fallback). Post-import now
+        behaves exactly like post-restart: dial the default hub through
+        connect_to_guild (its Clock law keeps RNS.Reticulum on the main
+        thread even when the SAF result callback is not); the restored
+        identity rides _init_identity_and_lxmf unchanged."""
         first = self._servers[0] if self._servers else None
         if not (first and first.get("hub_address")):
-            return False
+            username = (self.username or "").strip() or "user"
+            self.connect_to_guild(DEFAULT_HUB_ADDRESS, username)
+            return True
         port = first.get("port")
         if not (isinstance(port, int) and port > 0):
             return False
@@ -7747,7 +7813,7 @@ class sHadesClientApp(MDApp):
             scr._status.text = "publish failed: %s" % err
 
     def _micron_label(self, markup, heading=False, center=False, code=False):
-        lbl = Label(markup=True, text=markup)
+        lbl = MicronRefLabel(markup=True, text=markup)
         lbl.size_hint_y = None
         lbl.font_size = sp(18) if heading else (sp(13) if code else sp(15))
         lbl.halign = "center" if center else "left"
@@ -7988,74 +8054,115 @@ class sHadesClientApp(MDApp):
         # Allow attachment-only messages (no text) when a file is pending.
         if not text and not getattr(self, "_pending_attachment", None):
             return
+        # fold-14 P11g: capture the reply BEFORE reply_wire consumes the
+        # card, and keep the RAW text: the restore hands back what the
+        # member typed, and the re-staged card re-applies the prefix on
+        # the retry (no double prefix ever lands on the wire).
+        old_reply = self._pending_reply
+        raw_text = text
         if self._pending_reply:
             text = reply_wire(*self._pending_reply, text)
             self.cancel_reply()
         cid = self._channel_cid(cid)
+        # fold-14 P11g: the composer text leaves the field at capture
+        # time and a dead link between here and the server must not
+        # swallow it.
         inp.text = ""
         # Capture ONCE here (main thread): a second send during this
         # worker's flight must not mutate what this one posts.
         att = getattr(self, "_pending_attachment", None)
 
+        def _send_failed(reason):
+            """fold-14 P11g: any send failure gives the compose back.
+
+            The field cleared at capture time; restoring the text (and
+            the reply card, which reply_wire consumed) means a dropped
+            link costs zero retyping. The attachment stays pending --
+            it never moved. Runs from the worker thread, so the field
+            write rides the Clock onto the main thread."""
+            def restore(dt=None):
+                try:
+                    inp.text = raw_text
+                except Exception:
+                    pass
+                if old_reply:
+                    self._pending_reply = old_reply
+                    self.reply_draft = "Replying to @%s · %s" % (
+                        old_reply[0], " ".join(old_reply[1].split())[:80])
+            Clock.schedule_once(restore, 0)
+            Clock.schedule_once(
+                lambda dt: self._set_status(
+                    "send failed: %s (text restored)" % str(reason)[:80]),
+                0)
+
         def work():
             atts_req = None
             atts_render = None
-            if att:
-                name, mime, blob = att
-                # v0.30: the blob NEVER rides the message packet. Inline
-                # triples exceed the link packet budget (receipt: tay,
-                # "packet size of 515 exceeds mtu of 500") -- the chunked
-                # blob API moves every byte; the post carries a reference.
-                # v0.32: progress is visible in the status line, so a slow
-                # mobile uplink reads as movement, not silence.
-                Clock.schedule_once(
-                    lambda dt: self._set_status("attach upload starting"),
-                    0)
-
-                def _up_progress(done, total):
+            try:
+                if att:
+                    name, mime, blob = att
+                    # v0.30: the blob NEVER rides the message packet. Inline
+                    # triples exceed the link packet budget (receipt: tay,
+                    # "packet size of 515 exceeds mtu of 500") -- the chunked
+                    # blob API moves every byte; the post carries a reference.
+                    # v0.32: progress is visible in the status line, so a slow
+                    # mobile uplink reads as movement, not silence.
                     Clock.schedule_once(
-                        lambda dt: self._set_status(
-                            "attach upload %d%%"
-                            % int(100 * done / max(total, 1))), 0)
+                        lambda dt: self._set_status("attach upload starting"),
+                        0)
 
-                self._up_active = True
-                try:
-                    up = self.guild_api.blobs_put(name, mime, blob,
-                                                  on_progress=_up_progress)
-                finally:
+                    def _up_progress(done, total):
+                        Clock.schedule_once(
+                            lambda dt: self._set_status(
+                                "attach upload %d%%"
+                                % int(100 * done / max(total, 1))), 0)
+
+                    self._up_active = True
+                    try:
+                        up = self.guild_api.blobs_put(
+                            name, mime, blob, on_progress=_up_progress)
+                    except Exception as exc:
+                        self._up_active = False
+                        _send_failed("attach upload failed: %r" % (exc,))
+                        return
                     self._up_active = False
-                if not up.get("ok"):
-                    Clock.schedule_once(
-                        lambda dt: self._set_status(
-                            "attach upload failed (%s): %s"
-                            % (up.get("phase", "init"),
-                               up.get("error", "unknown"))[:80]), 0)
+                    if not up.get("ok"):
+                        _send_failed("attach upload failed (%s): %s"
+                                     % (up.get("phase", "init"),
+                                        up.get("error", "unknown")))
+                        return
+                    atts_req = [{"blob_id": up.get("blob_id"),
+                                 "name": name, "mime": mime}]
+                try:
+                    if atts_req:
+                        res = self.guild_api.post_v1(cid, text,
+                                                     attachments=atts_req)
+                        # the server answers with stored metadata (name, mime,
+                        # size, path) and no bytes -- the optimistic render is
+                        # the same shape push delivers to everyone else, so it
+                        # renders lazily through _fetch_attachment like rows
+                        atts_render = res.get("attachments") or None
+                    else:
+                        res = self.guild_api.post(cid, text)
+                except Exception as exc:
+                    _send_failed("%r" % (exc,))
                     return
-                atts_req = [{"blob_id": up.get("blob_id"),
-                             "name": name, "mime": mime}]
-            if atts_req:
-                res = self.guild_api.post_v1(cid, text, attachments=atts_req)
-                # the server answers with stored metadata (name, mime,
-                # size, path) and no bytes -- the optimistic render is the
-                # same shape push delivers to everyone else, so it renders
-                # lazily through _fetch_attachment just like received rows
-                atts_render = res.get("attachments") or None
-            else:
-                res = self.guild_api.post(cid, text)
-            if res.get("ok"):
-                # optimistically show
-                msg_id = res.get("msg_id")
-                m = {"msg_id": msg_id, "author_hash": self.my_hash,
-                     "username": self.username, "content": text,
-                     "ts": now(), "channel_id": cid,
-                     "attachments": atts_render}
-                Clock.schedule_once(lambda dt: self._render_message(
-                    main.ids.message_grid, m), 0)
-                self._pending_attachment = None
-            else:
-                err = res.get("error", "unknown")
-                Clock.schedule_once(
-                    lambda dt: self._set_status("send failed: %s" % err), 0)
+                if res.get("ok"):
+                    # optimistically show
+                    msg_id = res.get("msg_id")
+                    m = {"msg_id": msg_id, "author_hash": self.my_hash,
+                         "username": self.username, "content": text,
+                         "ts": now(), "channel_id": cid,
+                         "attachments": atts_render}
+                    Clock.schedule_once(lambda dt: self._render_message(
+                        main.ids.message_grid, m), 0)
+                    self._pending_attachment = None
+                else:
+                    _send_failed(res.get("error", "unknown"))
+            except Exception as exc:
+                # last-ditch: the composer still gets restored - a send
+                # failure may never take the member's text.
+                _send_failed("%r" % (exc,))
         threading.Thread(target=work, daemon=True).start()
 
     def _on_key_down(self, window, key, scancode, codepoint, modifier):
@@ -9370,23 +9477,30 @@ class sHadesClientApp(MDApp):
         popup.open()
 
     def _route_purpose_file(self, path, purpose):
-        """P10: hand the picked file to the server config screen's
-        icon/banner upload flow (blobs_put -> admin_config)."""
-        panel = None
+        """P10: hand the picked file to the server config SCREEN's
+        icon/banner upload flow (blobs_put -> admin_config).
+
+        0.36.25 (tay, device): this used to fetch tab_content["General"]
+        and call _apply_icon_file on the TAB -- only the SCREEN carries
+        those methods, so every Android pick died with an AttributeError
+        swallowed by _on_file_selected's except: icon/banner stayed
+        white, nothing uploaded. The desktop path was already correct
+        (ui_server_config _icon_file_selected calls screen._apply...).
+        """
+        target = None
         try:
             root = App.get_running_app().root
-            scr = root.get_screen("server_config") if root else None
-            panel = getattr(scr, "tab_content", {}).get("General")
+            target = root.get_screen("server_config") if root else None
         except Exception:
-            panel = None
-        if panel is None:
+            target = None
+        if target is None:
             self._set_status("no server config screen to apply %s"
                              % purpose)
             return
         if purpose == "icon":
-            panel._apply_icon_file(path)
+            target._apply_icon_file(path)
         else:
-            panel._apply_banner_file(path)
+            target._apply_banner_file(path)
 
     def _on_file_selected(self, selection, popup):
         if popup is not None:

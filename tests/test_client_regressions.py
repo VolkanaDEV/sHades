@@ -764,6 +764,227 @@ def test_channel_management_gates_and_kinds():
     check("admin flag: gate open", app._can_create_channels() is True)
 
 
+def test_send_failure_restores_compose():
+    """fold-14 P11g: a dead link at send must not swallow the compose.
+
+    The connection-flow audit (tay: 'verify the connection state flow
+    at login, recovery, and elsewhere') found the only silent loss in
+    the chain: send_message cleared the field at capture time and its
+    worker had no except -- a GuildAPI raise lost the text with no
+    status line. Pins: (a) a post() raise restores the text, re-stages
+    the reply card reply_wire() consumed, and posts a
+    'send failed: ... (text restored)' status; (b) a server not-ok
+    reply restores too; (c) success keeps the field cleared and the
+    attachment consumed; (d) an attachment-uploader raise restores and
+    keeps the attachment pending."""
+
+    class _Inp(object):
+        text = ""
+        focus = False
+
+    class _Ids(object):
+        def __init__(self):
+            self.msg_input = _Inp()
+            self.message_grid = object()
+
+    class _Main(object):
+        ids = _Ids()
+        _current_channel = "general"
+
+    class _Root(object):
+        def get_screen(self, name):
+            assert name == "main"
+            return _Main()
+
+    class _Api(object):
+        def __init__(self, behavior):
+            self.behavior = behavior
+
+        def post(self, cid, text):
+            if self.behavior == "raise":
+                raise RuntimeError("link dead (RNS.Link.CLOSED)")
+            return {"ok": 0, "error": "channel read-only"}
+
+    class _App(object):
+        send_message = kc.sHadesClientApp.send_message
+        cancel_reply = kc.sHadesClientApp.cancel_reply
+        root = _Root()
+        guild_api = None
+        username = "ash"
+        my_hash = b"me"
+        _pending_attachment = None
+        _pending_reply = None
+        reply_draft = ""
+        _up_active = False
+        statuses = []
+        rendered = []
+
+        def _channel_cid(self, name):
+            return "cid-" + name
+
+        def _channel_kind(self, cid):
+            return "channel"
+
+        def _set_status(self, msg):
+            self.statuses.append(msg)
+
+        def _render_message(self, grid, m):
+            self.rendered.append(m)
+
+    real_clock = kc.Clock
+    real_kc_threading = getattr(kc, "threading", None)
+
+    class _SyncThread(object):
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    def _flush():
+        for fn, _delay in list(kc.Clock.scheduled):
+            fn(None)
+
+    import types as _types
+    kc.Clock = _KAStubClock()
+    kc.threading = _types.SimpleNamespace(Thread=_SyncThread)
+
+    try:
+        # ---- (a) the post raises: the compose + the reply come back
+        app = _App()
+        app.guild_api = _Api("raise")
+        inp = app.root.get_screen("main").ids.msg_input
+        app._pending_reply = ("tay", "the question in it")
+        inp.text = "hello there"
+        app.send_message()
+        _flush()
+        check("a dead link restores the composer text",
+              inp.text == "hello there", inp.text)
+        check("the consumed reply card re-stages",
+              app._pending_reply == ("tay", "the question in it")
+              and "Replying to @tay" in getattr(app, "reply_draft", ""),
+              app.reply_draft)
+        check("the failure names itself in the status line",
+              app.statuses
+              and app.statuses[-1].startswith("send failed:")
+              and "text restored" in app.statuses[-1], app.statuses)
+        check("the attachment stays pending (it never moved)",
+              app._pending_attachment is None, app._pending_attachment)
+
+        # ---- (b) the server rejects: the compose still comes back
+        del kc.Clock.scheduled[:]
+        app2 = _App()
+        app2.guild_api = _Api("not-ok")
+        inp2 = app2.root.get_screen("main").ids.msg_input
+        inp2.text = "second take"
+        app2.send_message()
+        _flush()
+        check("a server not-ok reply also restores the compose",
+              inp2.text == "second take"
+              and "send failed: channel read-only" in app2.statuses[-1],
+              app2.statuses)
+
+        # ---- (c) success: the field stays cleared, the render fires
+        del kc.Clock.scheduled[:]
+        app3 = _App()
+        import types as _t2
+        app3.guild_api = _t2.SimpleNamespace(
+            post=lambda cid, text: {"ok": 1, "msg_id": "m1"})
+        inp3 = app3.root.get_screen("main").ids.msg_input
+        inp3.text = "the good one"
+        app3.send_message()
+        _flush()
+        check("a success clears the field and renders optimistically",
+              inp3.text == ""
+              and len(app3.rendered) == 1
+              and app3.rendered[0]["content"] == "the good one"
+              and app3._pending_attachment is None, app3.rendered)
+
+        # ---- (d) an uploader raise: restored, attachment pending
+        del kc.Clock.scheduled[:]
+        app4 = _App()
+        import types as _t3
+        app4.guild_api = _t3.SimpleNamespace(
+            blobs_put=lambda name, mime, blob, on_progress=None:
+                (_ for _ in ()).throw(RuntimeError("link tore mid-upload")),
+            post=lambda cid, text: {"ok": 1, "msg_id": "m2"})
+        app4._pending_attachment = ("a.png", "image/png", b"x")
+        inp4 = app4.root.get_screen("main").ids.msg_input
+        inp4.text = "with pic"
+        app4.send_message()
+        _flush()
+        check("an uploader raise restores the compose and keeps the "
+              "attachment pending",
+              inp4.text == "with pic"
+              and app4._pending_attachment == ("a.png", "image/png", b"x")
+              and "send failed:" in app4.statuses[-1], app4.statuses)
+        check("the uploader raise clears _up_active",
+              app4._up_active is False, app4._up_active)
+    finally:
+        kc.Clock = real_clock
+        kc.threading = real_kc_threading
+
+
+def test_restore_without_server_row_dials_default():
+    """P11h: tay's import-stall receipt (0.36.24). A restored kit with no
+    dialable server row parked the member on connect (hub blank, Connect
+    disabled, 'Identity recovered. Connect to a saved guild.') while a
+    restart auto-dialed the default hub via the portable-profile
+    fallthrough. Pins: (a) no row -> the default hub is dialed with the
+    'user' fallback and the attempt reports started; (b) a kit row still
+    dials the kit's guild first (the transfer contract unchanged);
+    (c) a kit row with an invalid port stays parked with prefill (the
+    member must correct the address -- dialing a broken port would be
+    worse)."""
+
+    class _App(object):
+        _enter_restored_account = kc.sHadesClientApp._enter_restored_account
+        _servers = []
+        username = ""
+        hub_address = ""
+        hub_host = ""
+        hub_port = 0
+        guild_node_hash = None
+
+        def __init__(self):
+            self.deliveries = []
+
+        def connect_to_guild(self, hub_address, username,
+                             node_hash="", delivery_hash=""):
+            self.deliveries.append((hub_address, username,
+                                    node_hash, delivery_hash))
+
+        def _prefill_connect_from_servers(self):
+            pass
+
+        default_hub = kc.DEFAULT_HUB_ADDRESS
+
+    app = _App()
+    started = app._enter_restored_account()
+    check("a restored kit with no server row auto-dials the default hub",
+          started is True
+          and app.deliveries == [(kc.DEFAULT_HUB_ADDRESS, "user", "", "")],
+          app.deliveries)
+
+    app2 = _App()
+    app2.username = "ash"
+    app2._servers = [{"hub_address": "10.0.0.5:29221", "port": 29221,
+                      "username": "ash", "node_hash": "ab" * 16,
+                      "delivery_hash": "cd" * 16}]
+    started2 = app2._enter_restored_account()
+    check("a kit's own guild row is dialed before any default fallback",
+          started2 is True
+          and app2.deliveries == [("10.0.0.5:29221", "ash", "ab" * 16,
+                                   "cd" * 16)],
+          app2.deliveries)
+
+    app3 = _App()
+    app3._servers = [{"hub_address": "10.0.0.5:29221", "port": 0}]
+    started3 = app3._enter_restored_account()
+    check("an invalid kit port parks with prefill instead of dialing",
+          started3 is False and app3.deliveries == [], app3.deliveries)
+
+
 def main():
     for fn in (test_display_name_preserved,
                test_update_applied_once,
@@ -778,7 +999,9 @@ def main():
                test_dm_announce_interval_sane,
                test_keepalive_miss_not_counting_during_upload,
                test_resume_heal_rebuilds_lxmf_and_dead_links,
-               test_channel_management_gates_and_kinds):
+               test_channel_management_gates_and_kinds,
+               test_send_failure_restores_compose,
+               test_restore_without_server_row_dials_default):
         try:
             fn()
         except Exception as e:

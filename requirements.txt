@@ -2,8 +2,10 @@
 kivy[base]==2.3.1
 kivymd==2.0.0
 pillow
+pytest
 rns==1.1.3
 lxmf==0.9.4
+msgpack
 # Micron applet bridge (applet_bridge.py) runs page-supplied WebAssembly
 # inside wasmtime. Pinned to the version the CI jobs install.
 wasmtime==50.0.1

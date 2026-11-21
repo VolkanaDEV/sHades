@@ -169,7 +169,9 @@ class _Tab:
 class GeneralTab(_Tab):
     title = "General"
 
-    CONFIG_FIELDS = ("guild_name", "motd", "slowmode", "registration")
+    CONFIG_FIELDS = ("guild_name", "motd", "slowmode", "registration",
+                     "update_channel", "update_channel_peer",
+                     "update_channel_shapin", "update_trusted_hub")
 
     def _build_controls(self):
         self.entries = {}
@@ -213,6 +215,66 @@ class GeneralTab(_Tab):
         r_row.add_widget(r_entry)
         r_row.add_widget(r_save)
         self.box.add_widget(r_row)
+
+        # P11 chain 5 tail (0.36.25, tay): the software channel rides
+        # the phone too. Both keys save through do_save_key, so the
+        # verdicts mirror like every other config key. The peer pin is
+        # the 64-hex node destination hash of the trusted serving peer
+        # (P11d's gate compares the link identity's hash against it).
+        c_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
+        c_entry = TextInput(hint_text="update channel: off|github|rns",
+                            multiline=False, size_hint_x=0.6)
+        self.entries["update_channel"] = c_entry
+        c_save = _btn("save", 70, 30)
+        c_save.bind(on_press=lambda _i: self.do_save_key("update_channel"))
+        c_row.add_widget(c_entry)
+        c_row.add_widget(c_save)
+        self.box.add_widget(c_row)
+
+        p_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
+        p_entry = TextInput(hint_text="peer pin (64-hex node hash)",
+                            multiline=False, size_hint_x=0.6)
+        self.entries["update_channel_peer"] = p_entry
+        p_save = _btn("save", 70, 30)
+        p_save.bind(
+            on_press=lambda _i: self.do_save_key("update_channel_peer"))
+        p_row.add_widget(p_entry)
+        p_row.add_widget(p_save)
+        self.box.add_widget(p_row)
+
+        # the artifact pin (P11e): the sha256 the pull verifies against.
+        # Source it out-of-band - the release body, another admin. With
+        # it set the serving peer is a courier, not an authority.
+        h_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
+        h_entry = TextInput(hint_text="artifact sha pin (64-hex)",
+                            multiline=False, size_hint_x=0.6)
+        self.entries["update_channel_shapin"] = h_entry
+        h_save = _btn("save", 70, 30)
+        h_save.bind(
+            on_press=lambda _i: self.do_save_key("update_channel_shapin"))
+        h_row.add_widget(h_entry)
+        h_row.add_widget(h_save)
+        self.box.add_widget(h_row)
+
+        # the trusted hub (P11f): the DISTRIBUTED hub's node dest hash -
+        # the sole trusted initiating update source. Tay seeds it when
+        # the hub identity is provisioned; members never invent peers.
+        t_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
+        t_entry = TextInput(hint_text="trusted hub (64-hex node hash)",
+                            multiline=False, size_hint_x=0.6)
+        self.entries["update_trusted_hub"] = t_entry
+        t_save = _btn("save", 70, 30)
+        t_save.bind(
+            on_press=lambda _i: self.do_save_key("update_trusted_hub"))
+        t_row.add_widget(t_entry)
+        t_row.add_widget(t_save)
+        self.box.add_widget(t_row)
+
+        # the updater's own status line (the status-mirror rule): the
+        # verdict + channel + interval are this tab's business, not the
+        # composer's
+        self.upd_state = _row_label("updater: ...", w=0.9)
+        self.box.add_widget(self.upd_state)
 
         # attachments persistence (P3): the live mode, one tap to flip.
         # Ephemeral means bytes ride the server RAM registry (TTL +
@@ -314,6 +376,29 @@ class GeneralTab(_Tab):
         else:
             self.banner_widget.texture = None
         self._load_audit()
+        self._load_update_status()
+
+    def _load_update_status(self):
+        def work():
+            return self.client.guild_api.update_status()
+
+        def on_ok(res):
+            if not res.get("ok"):
+                self.upd_state.text = "updater: n/a"
+                return
+            peer = (res.get("peer") or "").strip()
+            shapin = (res.get("shapin") or "").strip()
+            self.upd_state.text = ("updater: %s ch=%s every %sm peer=%s "
+                                   "pin=%s") % (
+                res.get("verdict") or "never",
+                res.get("channel") or "off",
+                res.get("interval") or "?",
+                (peer[:12] + "...") if peer else "-",
+                "artifact" if shapin else "peer-only")
+
+        # _fetch swallows work exceptions into the status mirror; the
+        # not-ok verdict lands in on_ok below
+        self._fetch(work, on_ok)
 
     def _load_audit(self):
         def work():

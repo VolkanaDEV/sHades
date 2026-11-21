@@ -143,7 +143,7 @@ FIELD_ATTACHMENTS = LXMF.FIELD_FILE_ATTACHMENTS  # 0x05 — envelope ours (plan 
 
 # P11 version bridge: the server knows its own version. Lockstep with
 # buildozer.spec and kivy_client.APP_VERSION (tests/test_update_meta.py).
-SERVER_VERSION = "0.36.24"
+SERVER_VERSION = "0.36.25"
 
 # ----------------------------------------------------------------------------------
 # Database
@@ -3509,11 +3509,61 @@ SERVER_CONFIG_KEYS = {
     "guild_icon": "",            # empty = no icon; else a stored blob_id
     "banner": "",                # empty = no banner; else a stored blob_id
     "attachments": "saved",      # saved | ephemeral (P2: RAM-only bytes)
-    "update_channel": "off",     # P11: off | github | rns (rns unwired yet)
+    "update_channel": "off",     # P11: off | github | rns
     "update_check_minutes": "360",  # P11: soft check interval; 0 = boot only
+    "update_channel_peer": "",   # P11d: the pinned peer's node destination
+                                 # hash (64-hex); the software channel's
+                                 # trust anchor for serve and pull
+    "update_channel_shapin": "",  # P11e: the admin-pinned artifact sha256
+                                  # (64-hex); the pull's authority for what
+                                  # bytes may run. Sourced out-of-band (the
+                                  # release body, another admin). When set,
+                                  # the serving peer is a courier only.
+    "update_trusted_hub": "",     # P11f: the DISTRIBUTED hub's node dest
+                                  # hash (64-hex) - the sole trusted
+                                  # initiating update source. Any other hub
+                                  # may be compromised; a non-trusted pull
+                                  # needs the artifact pin to run at all.
 }
 
 # ---------------------------------------------------------------------- P11 updater
+
+def _update_boot_guard(tree=None):
+    """P11f failback: a DIRECT boot (no update_run parent, marker still
+    set) restores the backup members BEFORE serving. The pending-version
+    marker means: a swap was interrupted mid-flight (power loss, a
+    process manager kill) or a previous update never proved its boot.
+    The supervised path (SHADES_UPDATE_RUN=1, from update_run.py) owns
+    its own rollback loop; the guard stands out of its way and covers
+    every other boot."""
+    root = tree or os.path.dirname(os.path.abspath(__file__))
+    marker = os.path.join(root, "update_staging", "pending_version")
+    if not os.path.isfile(marker):
+        return None
+    if (os.environ.get("SHADES_UPDATE_RUN") == "1"
+            and tree is None):
+        return None
+    bdir = os.path.join(root, "update_backup")
+    n = 0
+    try:
+        names = sorted(os.listdir(bdir))
+    except OSError:
+        names = []
+    for name in names:
+        src = os.path.join(bdir, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(root, name))
+            n += 1
+    try:
+        os.remove(marker)
+    except OSError:
+        pass
+    updater._note(
+        "rolled-back",
+        "the previous update never confirmed its boot; restored %d "
+        "backup members" % n)
+    return n
+
 _UPDATE_LOCK = threading.Lock()
 _UPDATE_LAST = [0.0]
 _BOOT_ARGV = []
@@ -3525,7 +3575,8 @@ def _update_worker():
             tree = os.path.dirname(os.path.abspath(__file__))
             res = updater.check_and_apply(
                 tree, SERVER_VERSION, _cfg_get,
-                argv=(["sHades.py"] + _BOOT_ARGV), exec_restart=True)
+                argv=(["sHades.py"] + _BOOT_ARGV), exec_restart=True,
+                rns_fetch=_rns_pull)
             RNS.log("updater: %s" % (res,), RNS.LOG_INFO)
         except Exception as e:
             RNS.log("updater: failed: %s" % e, RNS.LOG_ERROR)
@@ -3561,7 +3612,217 @@ def api_v1_update_status(viewer, data, request_id, link_id,
     out = updater.get_status()
     out["channel"] = _cfg_get("update_channel", "off")
     out["interval"] = _cfg_get("update_check_minutes", "360")
+    out["peer"] = _cfg_get("update_channel_peer", "")
+    out["shapin"] = _cfg_get("update_channel_shapin", "")
+    out["trusted"] = _cfg_get("update_trusted_hub", "")
     return out
+
+
+# ------------------------------------------------------------------------ P11d
+# The RNS software channel: tay's contingency, rncp's PATTERN on raw RNS
+# primitives (no rncp code, no HTTP anywhere). A pinned peer's node
+# destination hash rides admin_config update_channel_peer; the serve
+# routes gate on an admin OR that pin; the pull side establishes an
+# outbound link, identifies this server's own identity on it, requests
+# serve_info + chunked bytes, verify's the sha, then hands
+# {version, sha256, bundle_bytes, bundle_name} to the same P11a core
+# the github channel uses. Each updated server serves its bundle, so
+# one GitHub seed propagates through the mesh peer to peer.
+_SERVE_CACHE = {"version": None, "path": None, "sha": None}
+_SERVE_EXCLUDE = {"update_staging", "update_backup", "__pycache__",
+                  "scratch_probes", ".git", "dist", "build", "bin",
+                  ".buildozer", ".github"}
+_SERVE_SKIP_EXT = (".pyc", ".log", ".sha256", ".tar.gz")
+
+
+def _serve_peer_ok(viewer, remote_identity):
+    """P11d gate: an admin, or the pin's identity identified on the link."""
+    if _require_admin(viewer) is None:
+        return True
+    pin = (_cfg_get("update_channel_peer", "") or "").strip().lower()
+    if not pin or remote_identity is None:
+        return False
+    try:
+        return remote_identity.hash.hex() == pin
+    except Exception:
+        return False
+
+
+def _build_update_bundle():
+    """Tar this running tree (the swap members + their data files),
+    name it sHades-server-<V>.tar.gz (the release-name contract),
+    memoize (version, path, sha)."""
+    if (_SERVE_CACHE["version"] == SERVER_VERSION
+            and _SERVE_CACHE["path"]
+            and os.path.isfile(_SERVE_CACHE["path"])):
+        return _SERVE_CACHE["path"], _SERVE_CACHE["sha"]
+    import tarfile
+    import tempfile
+    import hashlib
+    tree = os.path.dirname(os.path.abspath(__file__))
+    out = os.path.join(tempfile.mkdtemp(prefix="sHades-serve-"),
+                       "sHades-server-%s.tar.gz" % SERVER_VERSION)
+    with tarfile.open(out, "w:gz") as tf:
+        for root, dirs, files in os.walk(tree):
+            dirs[:] = sorted(d for d in dirs if d not in _SERVE_EXCLUDE)
+            for fn in sorted(files):
+                if fn.endswith(_SERVE_SKIP_EXT):
+                    continue
+                p = os.path.join(root, fn)
+                tf.add(p, arcname=os.path.relpath(p, tree))
+    b = open(out, "rb").read()
+    _SERVE_CACHE.update(version=SERVER_VERSION, path=out,
+                        sha=hashlib.sha256(b).hexdigest())
+    return out, _SERVE_CACHE["sha"]
+
+
+@api_route("/api/v1/update/serve_info")
+def api_v1_update_serve_info(viewer, data, request_id, link_id,
+                             remote_identity, requested_at):
+    """P11d: the software channel's fingerprint. Returns this running
+    tree's bundle name + version + sha256; the version gate rides the
+    puller, the bytes ride serve_chunk with the same gate."""
+    if not _serve_peer_ok(viewer, remote_identity):
+        return {"ok": 0, "error": "peer not allowed", "code": 403}
+    tree = os.path.dirname(os.path.abspath(__file__))
+    for m in updater.TREE_MEMBERS:
+        if not os.path.isfile(os.path.join(tree, m)):
+            return {"ok": 0, "error": "serving tree incomplete: missing %s"
+                    % m, "code": 500}
+    bpath, sha = _build_update_bundle()
+    return {"ok": 1, "version": SERVER_VERSION,
+            "bundle_name": os.path.basename(bpath),
+            "bundle_sha256": sha}
+
+
+@api_route("/api/v1/update/serve_chunk")
+def api_v1_update_serve_chunk(viewer, data, request_id, link_id,
+                              remote_identity, requested_at):
+    """P11d: chunked bundle read, the same shape as /api/v1/blobs/get."""
+    if not _serve_peer_ok(viewer, remote_identity):
+        return {"ok": 0, "error": "peer not allowed", "code": 403}
+    bpath, _ = _build_update_bundle()
+    offset, length = _chunk_params(data or {})
+    total, chunk = _read_slice(bpath, offset, length)
+    if total is None:
+        return {"ok": 0, "error": "bundle unreadable", "code": 500}
+    return {"ok": 1, "total": total, "offset": offset,
+            "eof": offset + len(chunk) >= total,
+            "data_b64": base64.b64encode(chunk).decode("ascii")}
+
+
+def _rns_pull():
+    """P11d pull: rncp's shape on raw RNS primitives. Link to the
+    pinned peer (the 64-hex update_channel_peer), identify with this
+    server's own identity, request serve_info -> serve_chunk slices,
+    verify the sha, return the fetch dict for updater.check_and_apply.
+    None on any refusal; verdicts ride the updater's status note."""
+    import RNS
+    import msgpack
+    pin = (_cfg_get("update_channel_peer", "") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", pin):
+        updater._note("refused", "update_channel_peer is not a 64-hex pin")
+        return None
+    nid = RNS.Identity.recall(bytes.fromhex(pin))
+    if nid is None:
+        updater._note("no-bundle", "pinned peer's announce not heard yet")
+        return None
+    nd = RNS.Destination(nid, RNS.Destination.OUT, RNS.Destination.SINGLE,
+                         "nomadnetwork", "node")
+    link = RNS.Link(nd)
+    for _ in range(200):
+        if link.status == RNS.Link.ACTIVE:
+            break
+        time.sleep(0.1)
+    if link.status != RNS.Link.ACTIVE:
+        updater._note("no-bundle", "link to pinned peer never went ACTIVE")
+        return None
+    # identify so the serving gate sees this server as the trusted peer
+    link.identify(node_destination.identity)
+
+    def _req(path, data=None, timeout=30.0):
+        receipt = link.request(path, data=data or {})
+        deadline = time.time() + timeout
+        while getattr(receipt, "response", None) is None \
+                and time.time() < deadline:
+            time.sleep(0.05)
+        resp = getattr(receipt, "response", None)
+        if resp is None:
+            raise TimeoutError(path)
+        return msgpack.unpackb(resp, raw=False)
+
+    try:
+        info = _req("/api/v1/update/serve_info")
+        if not info.get("ok"):
+            updater._note("no-bundle", "peer serve_info refused: %s"
+                          % info.get("error"))
+            return None
+        cur = updater.parse_version(SERVER_VERSION)
+        new = updater.parse_version(info.get("version") or "")
+        if cur is None or new is None:
+            updater._note("refused", "peer carried no parseable version")
+            return None
+        if new <= cur:
+            updater._note("current",
+                          "%s is the newest peer bundle" % info["version"])
+            return None
+        # P11e: the artifact pin outranks the wire. The admin pins the
+        # sha out-of-band (the release body, another admin); a served
+        # fingerprint that disagrees with it is refused BEFORE any
+        # bytes move, and the assembled bytes are verified against the
+        # PIN, never against the peer's own claim. Empty pin =
+        # peer-only mode (integrity only; provenance rides the identity
+        # pin, and the status line says so).
+        shapin = (_cfg_get("update_channel_shapin", "") or
+                  "").strip().lower()
+        trusted = (_cfg_get("update_trusted_hub", "") or "").strip().lower()
+        pin = (_cfg_get("update_channel_peer", "") or "").strip().lower()
+        target_sha = shapin
+        sha_source = "pin"
+        if not shapin:
+            target_sha = (info.get("bundle_sha256") or "").lower()
+            # P11f tiers: the DISTRIBUTED hub (the sole trusted
+            # initiating source) may act as the sha oracle by itself;
+            # any other hub without the artifact pin stays peer-only.
+            sha_source = ("trusted-hub" if trusted and pin == trusted
+                          else "peer-only")
+        elif (info.get("bundle_sha256") or "").lower() != shapin:
+            updater._note("refused",
+                          "peer bundle disagrees with the pinned "
+                          "artifact sha")
+            return None
+        total = None
+        parts = []
+        offset = 0
+        while True:
+            res = _req("/api/v1/update/serve_chunk", {"offset": offset})
+            if not res.get("ok"):
+                updater._note("refused", "peer chunk refused: %s"
+                              % res.get("error"))
+                return None
+            total = res["total"]
+            parts.append(base64.b64decode(res["data_b64"]))
+            offset += len(parts[-1])
+            if res.get("eof") or offset >= total:
+                break
+        data = b"".join(parts)
+        if len(data) != total:
+            updater._note("refused", "bundle size disagree: %d of %d"
+                          % (len(data), total))
+            return None
+        if not updater.verify_sha(data, target_sha):
+            updater._note("refused",
+                          "bundle bytes disagree with the %s sha"
+                          % ("pinned artifact" if shapin else "peer's"))
+            return None
+        return {"version": info["version"],
+                "sha256": target_sha,
+                "sha_source": sha_source,
+                "bundle_name": info["bundle_name"],
+                "bundle_bytes": data}
+    except Exception as e:
+        updater._note("no-bundle", "peer fetch failed: %s" % e)
+        return None
 
 def _require_admin(viewer):
     """Admin gate for the panel endpoints (U8). ADMIN role only — the
@@ -3594,6 +3855,32 @@ def api_v1_admin_config(viewer, data, link_id):
     if key == "registration" and value not in ("open", "code"):
         return {"ok": 0, "error": "registration must be 'open' or 'code'",
                 "code": 400}
+    if key == "update_channel_peer" and value:
+        # P11d: the pin is an RNS node destination hash: 32 bytes = 64 hex
+        digest = value.strip().lower()
+        if not re.match(r"^[0-9a-f]{64}$", digest):
+            return {"ok": 0,
+                    "error": "update_channel_peer must be a 64-hex node "
+                             "destination hash", "code": 400}
+        value = digest
+    if key == "update_channel_shapin" and value:
+        # P11e: the artifact pin is a sha256 hex digest: 64 hex. Empty
+        # is allowed (and means the pull trusts the peer's own sha -
+        # integrity only, provenance rides the identity pin).
+        digest = value.strip().lower()
+        if not re.match(r"^[0-9a-f]{64}$", digest):
+            return {"ok": 0,
+                    "error": "update_channel_shapin must be a 64-hex "
+                             "sha256 digest", "code": 400}
+        value = digest
+    if key == "update_trusted_hub" and value:
+        # P11f: the trusted hub is an RNS node destination hash
+        digest = value.strip().lower()
+        if not re.match(r"^[0-9a-f]{64}$", digest):
+            return {"ok": 0,
+                    "error": "update_trusted_hub must be a 64-hex node "
+                             "destination hash", "code": 400}
+        value = digest
     if key == "guild_icon" and value:
         # the icon rides the standard blob store: the value must resolve to
         # a committed blob (uploaded via blobs/put or the chunked flow)
@@ -4505,4 +4792,8 @@ if __name__ == "__main__":
     # every boot (bare or flagged) since P11 chain 2, and a guard
     # alone would restart a flagged hub flagless. The entry feeds the
     # real CLI here so _BOOT_ARGV carries the flags through a restart.
+    try:
+        _update_boot_guard()  # P11f: an interrupted swap never serves
+    except Exception as e:
+        RNS.log("boot guard: %s" % e, RNS.LOG_ERROR)
     run(sys.argv[1:])
