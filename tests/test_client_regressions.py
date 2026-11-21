@@ -925,6 +925,66 @@ def test_send_failure_restores_compose():
         kc.threading = real_kc_threading
 
 
+def test_restore_without_server_row_dials_default():
+    """P11h: tay's import-stall receipt (0.36.24). A restored kit with no
+    dialable server row parked the member on connect (hub blank, Connect
+    disabled, 'Identity recovered. Connect to a saved guild.') while a
+    restart auto-dialed the default hub via the portable-profile
+    fallthrough. Pins: (a) no row -> the default hub is dialed with the
+    'user' fallback and the attempt reports started; (b) a kit row still
+    dials the kit's guild first (the transfer contract unchanged);
+    (c) a kit row with an invalid port stays parked with prefill (the
+    member must correct the address -- dialing a broken port would be
+    worse)."""
+
+    class _App(object):
+        _enter_restored_account = kc.sHadesClientApp._enter_restored_account
+        _servers = []
+        username = ""
+        hub_address = ""
+        hub_host = ""
+        hub_port = 0
+        guild_node_hash = None
+
+        def __init__(self):
+            self.deliveries = []
+
+        def connect_to_guild(self, hub_address, username,
+                             node_hash="", delivery_hash=""):
+            self.deliveries.append((hub_address, username,
+                                    node_hash, delivery_hash))
+
+        def _prefill_connect_from_servers(self):
+            pass
+
+        default_hub = kc.DEFAULT_HUB_ADDRESS
+
+    app = _App()
+    started = app._enter_restored_account()
+    check("a restored kit with no server row auto-dials the default hub",
+          started is True
+          and app.deliveries == [(kc.DEFAULT_HUB_ADDRESS, "user", "", "")],
+          app.deliveries)
+
+    app2 = _App()
+    app2.username = "ash"
+    app2._servers = [{"hub_address": "10.0.0.5:29221", "port": 29221,
+                      "username": "ash", "node_hash": "ab" * 16,
+                      "delivery_hash": "cd" * 16}]
+    started2 = app2._enter_restored_account()
+    check("a kit's own guild row is dialed before any default fallback",
+          started2 is True
+          and app2.deliveries == [("10.0.0.5:29221", "ash", "ab" * 16,
+                                   "cd" * 16)],
+          app2.deliveries)
+
+    app3 = _App()
+    app3._servers = [{"hub_address": "10.0.0.5:29221", "port": 0}]
+    started3 = app3._enter_restored_account()
+    check("an invalid kit port parks with prefill instead of dialing",
+          started3 is False and app3.deliveries == [], app3.deliveries)
+
+
 def main():
     for fn in (test_display_name_preserved,
                test_update_applied_once,
@@ -940,7 +1000,8 @@ def main():
                test_keepalive_miss_not_counting_during_upload,
                test_resume_heal_rebuilds_lxmf_and_dead_links,
                test_channel_management_gates_and_kinds,
-               test_send_failure_restores_compose):
+               test_send_failure_restores_compose,
+               test_restore_without_server_row_dials_default):
         try:
             fn()
         except Exception as e:

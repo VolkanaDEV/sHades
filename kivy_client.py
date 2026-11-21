@@ -3866,10 +3866,24 @@ class sHadesClientApp(MDApp):
         """tay's transfer contract (0.36.24): a restored kit whose server
         row is complete transfers the account ALIVE - dial the kit's
         last-active guild exactly as the device it came from. Returns
-        True when the attempt started."""
+        True when an attempt started.
+
+        P11h (device receipt, 0.36.24: the import parked on connect with
+        the hub field empty and 'Identity recovered. Connect to a saved
+        guild.'): a restored kit with NO dialable server row returned
+        False here and left the member on the connect screen - hub
+        blank, Connect disabled - while the restart path auto-dialed
+        the default hub through the portable-profile fallthrough
+        (_connect_default_hub's 'user' fallback). Post-import now
+        behaves exactly like post-restart: dial the default hub through
+        connect_to_guild (its Clock law keeps RNS.Reticulum on the main
+        thread even when the SAF result callback is not); the restored
+        identity rides _init_identity_and_lxmf unchanged."""
         first = self._servers[0] if self._servers else None
         if not (first and first.get("hub_address")):
-            return False
+            username = (self.username or "").strip() or "user"
+            self.connect_to_guild(DEFAULT_HUB_ADDRESS, username)
+            return True
         port = first.get("port")
         if not (isinstance(port, int) and port > 0):
             return False
