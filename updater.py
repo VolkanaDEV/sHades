@@ -279,15 +279,46 @@ def sys_argv():
 
 
 def check_and_apply(tree_dir, current_version, cfg_get, argv=None,
-                    exec_restart=True, api_base=None):
-    """Full github round: toggle gate -> manifest -> compare -> download ->
-    sha -> stage -> swap -> handover. Returns a status dict either way."""
+                    exec_restart=True, api_base=None, rns_fetch=None):
+    """Full round: toggle gate -> manifest -> compare -> download ->
+    sha -> stage -> swap -> handover. Returns a status dict either way.
+    The github channel fetches the manifest itself; the rns channel
+    (P11d) hands fetching to the rns_fetch callable and reuses this
+    tail verbatim: verify -> apply. The core stays transport-free."""
     import time
     _status["last_check"] = time.time()
     ch = (cfg_get("update_channel", "off") or "off").strip().lower()
     if ch == "off":
         _note("off", "update_channel is off")
         return {"skipped": True, "reason": "off"}
+    if ch == "rns":
+        if rns_fetch is None:
+            _note("pending", "rns channel selected but no fetch hook wired")
+            return {"skipped": True, "reason": "no-rns-fetch"}
+        picked = rns_fetch()
+        if picked is None:
+            return {"skipped": True, "reason": "no-bundle"}
+        cur = parse_version(current_version)
+        new = parse_version(picked["version"])
+        if cur is None or new is None:
+            raise HttpError("unparseable version pair")
+        if new <= cur:
+            _note("current", "%s is the newest server bundle"
+                  % picked["version"])
+            return {"skipped": True, "reason": "current",
+                    "newest": picked["version"]}
+        tmp = tempfile.mkdtemp(prefix="sHades-dl-rns-")
+        bp = os.path.join(tmp, picked["bundle_name"])
+        with open(bp, "wb") as f:
+            f.write(picked["bundle_bytes"])
+        try:
+            res = apply_update(bp, picked["sha256"], tree_dir, argv=argv,
+                               exec_restart=exec_restart)
+            res["new_version"] = picked["version"]
+            res["carrier"] = "rns"
+            return res
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
     if ch != "github":
         _note("pending", "channel %r not wired yet (rns rides arrow 6)" % ch)
         return {"skipped": True, "reason": "channel-not-wired"}
