@@ -89,6 +89,7 @@ jobs:
           xvfb-run -a python tests/test_fullscreen_parent.py
           xvfb-run -a python tests/test_default_hub.py
           xvfb-run -a python tests/test_fresh_install.py
+          xvfb-run -a python tests/test_edit_ref_tap.py
           xvfb-run -a python tests/test_ui_layout.py
 
   integ-test:
