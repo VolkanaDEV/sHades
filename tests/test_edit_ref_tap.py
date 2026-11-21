@@ -124,6 +124,23 @@ class EditRefProbe(kc.sHadesClientApp):
                 self.check(False, "site-edit ref label never rendered "
                                   "within the 6s poll")
                 return
+            sm = self.root
+            trans_active = getattr(sm.transition, "is_active", False)
+            if trans_active or sm.current != "main":
+                # 0.36.25 github run 44902609197: on a starved runner the
+                # SM's 0.4s slide transition is still active when the tap
+                # lands, and ScreenManager.on_touch_down returns False
+                # mid-transition - the window-level tap is dropped by
+                # design (children hold screen_out + screen_in). Wait the
+                # transition out, then tap; the app-level question
+                # (NoTransition?) is tay's call.
+                if tries < 40:
+                    Clock.schedule_once(
+                        lambda dt: self.tap_edit_ref(dt, tries + 1), 0.15)
+                    return
+                self.check(False, "sm transition still active or "
+                                  "current=%r after the 6s poll"
+                           % (sm.current,))
             z = lbl.refs["shades:site-edit"][0]
             cx, cy = (z[0] + z[2]) / 2.0, (z[1] + z[3]) / 2.0
             ox, oy = lbl._content_anchor()
