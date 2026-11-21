@@ -53,6 +53,11 @@ class FakeApi:
         return self._rec(("admin_audit", limit),
                          {"ok": 1, "entries": [{"action": "x", "target": "", "detail": ""}]})
 
+    def update_status(self, timeout=10):
+        return self._rec(("update_status",),
+                         {"ok": 1, "verdict": "current", "channel": "off",
+                          "interval": "360", "peer": ""})
+
     def channels_list(self):
         return self._rec(("channels_list",), {"ok": 1, "channels": [
             {"id": "c" * 31 + "1", "name": "general", "kind": "chat",
@@ -379,6 +384,26 @@ def main():
     check("android banner pick uploads and configures banner",
           ("admin_config", "banner", "d" * 32) in client.guild_api.calls,
           client.guild_api.calls[-3:])
+
+    # ---------- P11 chain 5 tail: the software channel rides the phone ------
+    check("general tab carries the update channel + peer entries",
+          "update_channel" in gen.entries
+          and "update_channel_peer" in gen.entries, list(gen.entries)[:3])
+    check("general tab renders the updater status line",
+          gen.upd_state.text == "updater: current ch=off every 360m peer=-",
+          gen.upd_state.text)
+    gen.entries["update_channel"].text = "github"
+    gen.do_save_key("update_channel")
+    pump(1.0)
+    check("saving the channel posts admin_config(update_channel, github)",
+          ("admin_config", "update_channel", "github")
+          in client.guild_api.calls, client.guild_api.calls[-2:])
+    gen.entries["update_channel_peer"].text = "ab" * 32
+    gen.do_save_key("update_channel_peer")
+    pump(1.0)
+    check("saving the peer pin posts admin_config(update_channel_peer)",
+          ("admin_config", "update_channel_peer", "ab" * 32)
+          in client.guild_api.calls, client.guild_api.calls[-2:])
 
     # ---------- P10b: prettier receipts --------------------------------------
     check("banner preview widget exists on General",

@@ -1085,6 +1085,12 @@ class GuildAPI:
     def admin_audit(self, limit=100):
         return self._request_json("/api/v1/admin/audit", {"limit": limit})
 
+    def update_status(self, timeout=10):
+        """P11 chain 5 tail: the updater's verdict + channel + peer pin,
+        admin-only read (the General tab's status line consumes this)."""
+        return self._request_json("/api/v1/update_status", {},
+                                  timeout=timeout)
+
     def member_moderation(self, limit=50):
         return self._request_json("/api/v1/moderation/public", {"limit": limit})
 
