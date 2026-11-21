@@ -3514,7 +3514,7 @@ SERVER_CONFIG_KEYS = {
     "update_channel_peer": "",   # P11d: the pinned peer's node destination
                                  # hash (64-hex); the software channel's
                                  # trust anchor for serve and pull
-    "update_channel_shapin": "",   # P11e: the admin-pinned artifact sha256
+    "update_channel_shapin": "",  # P11e: the admin-pinned artifact sha256
                                   # (64-hex); the pull's authority for what
                                   # bytes may run. Sourced out-of-band (the
                                   # release body, another admin). When set,
@@ -3656,7 +3656,9 @@ def _build_update_bundle():
             and _SERVE_CACHE["path"]
             and os.path.isfile(_SERVE_CACHE["path"])):
         return _SERVE_CACHE["path"], _SERVE_CACHE["sha"]
-    import tarfile, tempfile, hashlib
+    import tarfile
+    import tempfile
+    import hashlib
     tree = os.path.dirname(os.path.abspath(__file__))
     out = os.path.join(tempfile.mkdtemp(prefix="sHades-serve-"),
                        "sHades-server-%s.tar.gz" % SERVER_VERSION)
@@ -3715,7 +3717,8 @@ def _rns_pull():
     server's own identity, request serve_info -> serve_chunk slices,
     verify the sha, return the fetch dict for updater.check_and_apply.
     None on any refusal; verdicts ride the updater's status note."""
-    import RNS, msgpack
+    import RNS
+    import msgpack
     pin = (_cfg_get("update_channel_peer", "") or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{64}", pin):
         updater._note("refused", "update_channel_peer is not a 64-hex pin")
