@@ -43,6 +43,7 @@ def _manifest_key(cfg_get):
     return (cfg_get("update_manifest_key", "") or
             RELEASE_PUBKEY_ED25519)
 
+
 _status = {"last_check": None, "verdict": "never", "detail": ""}
 
 
