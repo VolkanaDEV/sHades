@@ -4586,8 +4586,10 @@ def run(argv=None):
     else:
         guild_identity = RNS.Identity()
         guild_identity.to_file(ipath)
-        try: os.chmod(ipath, 0o600)
-        except OSError: pass
+        try:
+            os.chmod(ipath, 0o600)
+        except OSError:
+            pass
 
     # LXMF router: ingest + propagation (mesh reachability)
     router = LXMF.LXMRouter(identity=guild_identity, storagepath=STORAGE)
