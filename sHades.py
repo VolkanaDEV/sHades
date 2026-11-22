@@ -2053,6 +2053,8 @@ def api_v1_typing(viewer, data, link_id):
     active = bool(data.get("active"))
     if not store.channel_exists(db, db_lock, cid):
         return {"ok": 0, "error": "unknown channel", "code": 404}
+    if not has_perm(viewer, cid, PERMS["VIEW"]):
+        return {"ok": 0, "error": "view permission required", "code": 403}
     with TYPING_LOCK:
         bucket = TYPING.setdefault(cid, {})
         was_active = bucket.get(viewer, 0) >= now()
@@ -2275,7 +2277,13 @@ def api_v1_att_get(viewer, data, link_id):
 
 def serve_blob_file(path, data, request_id, link_id, remote_identity, requested_at):
     """Raw /file/blobs/<fname> handler (one per stored blob, attachments
-    pattern). Path is the registration key; validate before touching disk."""
+    pattern). Path is the registration key; validate before touching disk.
+    Unlike attachments there is no message linkage to gate on, so the
+    gate is: an identified link, and nothing else. Anonymous fetches are
+    refused. (Per-blob ACLs need blob<->message reference tracking; not
+    built. The digest is a 256-bit capability for identified members.)"""
+    if viewer_of(remote_identity) is None:
+        return b"not found"
     fname = path.rsplit("/", 1)[-1]
     if not re.match(r"^[0-9a-f]{32}\.[a-z0-9]{1,8}$", fname):
         return b"not found"
@@ -3133,6 +3141,10 @@ def _react_as(actor, msg_id, emoji):
     (human viewer, or a bot's owner). Validates, toggles the reaction
     as `actor` via the store, and emits kind "reaction". Returns a
     response dict."""
+    if is_banned(actor):
+        return {"ok": 0, "error": "banned", "code": 403}
+    if is_muted(actor):
+        return {"ok": 0, "error": "muted", "code": 403}
     emoji = (emoji or "").strip().lower() if isinstance(emoji, str) else ""
     if not _emoji_ok(emoji):
         return {"ok": 0, "error": "emoji must be an emoji or a shortcode (a-z0-9_+-)",
@@ -3647,33 +3659,6 @@ def api_v1_admin_config(viewer, data, link_id):
         if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
                 or not _blob_fname(digest):
             return {"ok": 0, "error": "guild_icon must be a stored blob_id",
-                    "code": 400}
-        value = digest
-    if key == "banner" and value:
-        # P5: same shape as guild_icon -- the asset rides the standard
-        # blob store; the config only references it
-        digest = value.strip().lower()
-        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
-                or not _blob_fname(digest):
-            return {"ok": 0, "error": "banner must be a stored blob_id",
-                    "code": 400}
-        value = digest
-    if key == "banner" and value:
-        # P5: same shape as guild_icon -- the asset rides the standard
-        # blob store; the config only references it
-        digest = value.strip().lower()
-        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
-                or not _blob_fname(digest):
-            return {"ok": 0, "error": "banner must be a stored blob_id",
-                    "code": 400}
-        value = digest
-    if key == "banner" and value:
-        # P5: same shape as guild_icon -- the asset rides the standard
-        # blob store; the config only references it
-        digest = value.strip().lower()
-        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
-                or not _blob_fname(digest):
-            return {"ok": 0, "error": "banner must be a stored blob_id",
                     "code": 400}
         value = digest
     if key == "banner" and value:
@@ -4601,6 +4586,8 @@ def run(argv=None):
     else:
         guild_identity = RNS.Identity()
         guild_identity.to_file(ipath)
+        try: os.chmod(ipath, 0o600)
+        except OSError: pass
 
     # LXMF router: ingest + propagation (mesh reachability)
     router = LXMF.LXMRouter(identity=guild_identity, storagepath=STORAGE)

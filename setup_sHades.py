@@ -103,6 +103,8 @@ def fresh_hub():
         import RNS
         ident = RNS.Identity()
         ident.to_file(ipath)
+        try: os.chmod(ipath, 0o600)
+        except OSError: pass
         print(f"  generated guild identity: {ipath}")
 
     # moderators.txt (optional seed)
@@ -191,6 +193,8 @@ def join_hub():
     ident = RNS.Identity()
     ipath = os.path.join(client_dir, "identity")
     ident.to_file(ipath)
+    try: os.chmod(ipath, 0o600)
+    except OSError: pass
     client_delivery = RNS.Destination(
         ident, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
     client_hash = RNS.hexrep(client_delivery.hash, delimit=False)
