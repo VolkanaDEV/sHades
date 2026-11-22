@@ -237,10 +237,12 @@ class GuildAPI:
             try:
                 st = getattr(receipt, "status", None)
                 if st is not None:
+                    print("[blob] timeout path=%s receipt_state=%s" % (path, st), flush=True)
                     return {"ok": 0, "error": "timeout",
                             "receipt_state": str(st)}
             except Exception:
                 pass
+            print("[blob] timeout path=%s receipt_state=unreadable" % path, flush=True)
             return {"ok": 0, "error": "timeout"}
         try:
             return json.loads(receipt.response.decode("utf-8"))
@@ -309,17 +311,20 @@ class GuildAPI:
         if size > 10 * 1024 * 1024:
             return {"ok": 0, "error": "payload too large: limit is 10 MB",
                     "size": size}
+        print("[blob] put begin name=%r size=%d" % (name, size), flush=True)
         res = self._request_json("/api/v1/blobs/put/init",
                                  {"name": name, "mime": mime, "size": size},
                                  timeout=15)
         if not res.get("ok"):
             res.setdefault("phase", "init")
+            print("[blob] init failed: %s" % (res,), flush=True)
             return res
         upload_id = res["upload_id"]
         step = int(res.get("chunk_size") or (256 * 1024))
         offset = 0
         fails = 0
         restarted = False
+        print("[blob] put init ok id=%s step=%d" % (upload_id[:8], step), flush=True)
         while offset < size:
             piece = data[offset:offset + step]
             body = {
@@ -332,6 +337,8 @@ class GuildAPI:
                                      timeout=15)
             if not res.get("ok"):
                 err = res.get("error", "chunk failed")
+                print("[blob] chunk off=%d step=%d fail=%s state=%s" % (
+                    offset, step, err, res.get("receipt_state")), flush=True)
                 # the staged handle aged out mid-upload (600s idle law):
                 # one deterministic restart, offsets driven anew
                 if err == "unknown upload_id" and not restarted:
@@ -353,8 +360,9 @@ class GuildAPI:
                 if err == "timeout" and fails < 3:
                     fails += 1
                     continue
-                print("blobs_put FAIL off=%s step=%s err=%s state=%s"
-                      % (offset, step, err, res.get("receipt_state")))
+                print("[blob] FAIL off=%s step=%s err=%s state=%s"
+                      % (offset, step, err, res.get("receipt_state")),
+                      flush=True)
                 res.setdefault("error", err or "chunk failed")
                 res["phase"] = "chunk@%d" % offset
                 return res
@@ -362,6 +370,7 @@ class GuildAPI:
             offset = int(res.get("next_offset") or (offset + len(piece)))
         res = self._request_json("/api/v1/blobs/put/finish",
                                  {"upload_id": upload_id}, timeout=15)
+        print("[blob] finish ok=%s %s" % (res.get("ok"), res.get("error") or res.get("blob_id") or ""), flush=True)
         if not res.get("ok"):
             res.setdefault("error", "finish failed")
             res["phase"] = "finish"

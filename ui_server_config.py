@@ -949,12 +949,15 @@ class ServerConfigScreen(Screen):
             mime = "image/webp"
         elif name.lower().endswith(".gif"):
             mime = "image/gif"
+        print("[icon] apply start path=%r" % path, flush=True)
         try:
             with open(path, "rb") as f:
                 data = f.read()
         except OSError as e:
+            print("[icon] read failed: %r" % e, flush=True)
             self._apply_status("icon read failed: %r" % e)
             return
+        print("[icon] read ok: %d bytes, uploading" % len(data), flush=True)
 
         def work():
             # v0.36.10: every path reports; a raise can no longer kill the
@@ -993,12 +996,15 @@ class ServerConfigScreen(Screen):
             mime = "image/webp"
         elif name.lower().endswith(".gif"):
             mime = "image/gif"
+        print("[banner] apply start path=%r" % path, flush=True)
         try:
             with open(path, "rb") as f:
                 data = f.read()
         except OSError as e:
+            print("[banner] read failed: %r" % e, flush=True)
             self._apply_status("banner read failed: %r" % e)
             return
+        print("[banner] read ok: %d bytes, uploading" % len(data), flush=True)
 
         def work():
             # v0.36.10: every path reports; a raise can no longer kill the
