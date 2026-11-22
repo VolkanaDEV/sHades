@@ -184,7 +184,7 @@ class BotsProbe(kc.sHadesClientApp):
         check("(a) Bots button opens the Bots screen",
               self.root.current == "bots", self.root.current)
         check("(b0) nine create-form permission checkboxes",
-              len(self.scr._create_checks) == 9,
+              len(self.scr._create_checks) == 10,
               len(self.scr._create_checks))
         texts = _label_texts(self.scr)
         check("(b1) list shows the active bot name",

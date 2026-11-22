@@ -66,9 +66,9 @@ PERMS = {"VIEW": 1, "POST": 2, "MANAGE_MESSAGES": 4, "MANAGE_CHANNEL": 8,
          "MANAGE_ROLES": 16, "ADMIN": 32, "SITE_EDIT": 64}
 PERM_ALL = 127
 
-# Bot permission bitmask (Group 1). Bits 1-32 gate which event kinds a bot
-# receives on the stream; bits 64-256 gate what a bot may do via the bot
-# data path. All OTHER event kinds the server emits — site_patch,
+# Bot permission bitmask (Group 1). Bits 1-32 and 512 gate which event
+# kinds a bot receives on the stream; bits 64-512 gate what a bot may do
+# via the bot data path. All OTHER event kinds the server emits —
 # term_data, channels_changed, channel_deleted, posts_purged — are NEVER
 # delivered to bots, by design (Group 2 enforces this in _bot_event_allowed,
 # applied in both _push_stream and _stream_collect); there is no bit that
@@ -82,9 +82,12 @@ PERM_ALL = 127
 #  64 POST         — bot may post messages
 # 128 REACT        — bot may react to messages
 # 256 READ_CHANNELS — bot may read channel list/info
+# 512 SITE         — receive site_patch events (kind "site_patch") and
+#                    read micron pages (bots/site_get, bots/site_manifest)
 BOT_PERMS = {"MSG": 1, "EDIT": 2, "DELETE": 4, "REACTION": 8, "PRESENCE": 16,
-             "TYPING": 32, "POST": 64, "REACT": 128, "READ_CHANNELS": 256}
-BOT_PERM_ALL = 511
+             "TYPING": 32, "POST": 64, "REACT": 128, "READ_CHANNELS": 256,
+             "SITE": 512}
+BOT_PERM_ALL = 1023
 BOT_NAME_MAX = 64
 DEFAULT_CHANNEL_PERMS = PERMS["VIEW"] | PERMS["POST"]
 _GUILD_MANAGE_BITS = (PERMS["MANAGE_MESSAGES"] | PERMS["MANAGE_CHANNEL"] |
@@ -1590,16 +1593,17 @@ def wrap_json_api(fn):
 # ---- stream internals -------------------------------------------------------------
 
 # Event kind -> BOT_PERMS receive bit. Every other kind the server emits —
-# site_patch, term_data, channels_changed, channel_deleted, posts_purged —
-# is NEVER delivered to bots (no bit opts into them), and unknown kinds
-# are denied by default. Applied in BOTH delivery paths: _push_stream
-# (the ticket wake-up) and _stream_collect (poll / gap recovery), so a
-# bot can never receive a disallowed event through the other path.
+# term_data, channels_changed, channel_deleted, posts_purged — is NEVER
+# delivered to bots (no bit opts into them), and unknown kinds are denied
+# by default. Applied in BOTH delivery paths: _push_stream (the ticket
+# wake-up) and _stream_collect (poll / gap recovery), so a bot can never
+# receive a disallowed event through the other path.
 _BOT_EVENT_BITS = {"msg": BOT_PERMS["MSG"], "edit": BOT_PERMS["EDIT"],
                    "delete": BOT_PERMS["DELETE"],
                    "reaction": BOT_PERMS["REACTION"],
                    "presence": BOT_PERMS["PRESENCE"],
-                   "typing": BOT_PERMS["TYPING"]}
+                   "typing": BOT_PERMS["TYPING"],
+                   "site_patch": BOT_PERMS["SITE"]}
 
 
 def _bot_event_allowed(perms, kind):
@@ -2753,10 +2757,10 @@ def api_v1_site_put(viewer, data, link_id):
     return {"ok": 1, "channel": cid, "path": "/" + rel, "size": len(blob),
             "mime": mime, "file_path": reg_path}
 
-@api_route("/api/v1/site/get")
-@wrap_json_api
-def api_v1_site_get(viewer, data, link_id):
-    """Chunked site resource read: {channel, path, offset?, len?}."""
+def _site_read_for(viewer, data):
+    """Chunked site resource read shared by human /api/v1/site/get and
+    bot /api/v1/bots/site_get (the bot passes its owner as viewer, so
+    VIEW and can_edit are the owner's)."""
     cid = data.get("channel")
     if not _site_channel(cid):
         return {"ok": 0, "error": "unknown or non-site channel", "code": 404}
@@ -2785,19 +2789,36 @@ def api_v1_site_get(viewer, data, link_id):
             "can_edit": bool(can_edit),
             "data_b64": base64.b64encode(chunk).decode("ascii")}
 
-@api_route("/api/v1/site/manifest")
+
+@api_route("/api/v1/site/get")
 @wrap_json_api
-def api_v1_site_manifest(viewer, data, link_id):
-    """Get a site channel's manifest: {channel} -> {manifest}."""
+def api_v1_site_get(viewer, data, link_id):
+    """Chunked site resource read: {channel, path, offset?, len?}."""
+    return _site_read_for(viewer, data)
+
+def _site_manifest_for(viewer, data, require_view=False):
+    """Site-manifest read shared by human /api/v1/site/manifest and bot
+    /api/v1/bots/site_manifest. The human endpoint is ungated (manifests
+    are public metadata); the bot one passes require_view=True so a bot
+    still needs its owner's VIEW on the channel."""
     cid = data.get("channel")
     r = store.channel_row(db, db_lock, cid)
     if not r or r["kind"] != "site":
         return {"ok": 0, "error": "unknown or non-site channel", "code": 404}
+    if require_view and not has_perm(viewer, cid, PERMS["VIEW"]):
+        return {"ok": 0, "error": "view permission required", "code": 403}
     try:
         manifest = json.loads(r["manifest"] or "{}")
     except Exception:
         manifest = {}
     return {"ok": 1, "channel": cid, "manifest": manifest}
+
+
+@api_route("/api/v1/site/manifest")
+@wrap_json_api
+def api_v1_site_manifest(viewer, data, link_id):
+    """Get a site channel's manifest: {channel} -> {manifest}."""
+    return _site_manifest_for(viewer, data)
 
 @api_route("/api/v1/site/manifest_put")
 @wrap_json_api
@@ -4306,7 +4327,11 @@ def _bot_gateway():
             "endpoints": {"subscribe": "/api/v1/stream/subscribe",
                           "poll": "/api/v1/stream/poll",
                           "post": "/api/v1/bots/post",
-                          "react": "/api/v1/bots/react"}}
+                          "react": "/api/v1/bots/react",
+                          "channels": "/api/v1/bots/channels",
+                          "channel_info": "/api/v1/bots/channel_info",
+                          "site_get": "/api/v1/bots/site_get",
+                          "site_manifest": "/api/v1/bots/site_manifest"}}
 
 
 def _bot_valid_name(data):
@@ -4551,6 +4576,35 @@ def api_v1_bots_channel_info(viewer, data, link_id):
         return err
     store.bot_touch_last_seen(db, db_lock, bot["bot_id"], now())
     return _channel_info(data.get("channel"), bot["owner_hash"])
+
+
+@api_route("/api/v1/bots/site_get")
+@wrap_json_api
+def api_v1_bots_site_get(viewer, data, link_id):
+    """Bot micron-page read — the hook's other half: a site_patch event
+    tells the bot a page changed, this fetches the new content. Requires
+    the SITE bit; the OWNER must hold VIEW on the site channel. Same
+    chunked read as human /api/v1/site/get, owner as viewer. Reads touch
+    last_seen like the other bot read endpoints; no audit entry (reads
+    are not attributed actions). No bot site_put exists by design:
+    publishing pages stays moderator / SITE_EDIT, human-only."""
+    bot, err = _bot_for_data(data, BOT_PERMS["SITE"], "read micron pages")
+    if err:
+        return err
+    store.bot_touch_last_seen(db, db_lock, bot["bot_id"], now())
+    return _site_read_for(bot["owner_hash"], data)
+
+
+@api_route("/api/v1/bots/site_manifest")
+@wrap_json_api
+def api_v1_bots_site_manifest(viewer, data, link_id):
+    """Bot site-manifest read. Same SITE-bit + owner-VIEW gate as
+    bots/site_get; the human endpoint is ungated, the bot one is not."""
+    bot, err = _bot_for_data(data, BOT_PERMS["SITE"], "read micron pages")
+    if err:
+        return err
+    store.bot_touch_last_seen(db, db_lock, bot["bot_id"], now())
+    return _site_manifest_for(bot["owner_hash"], data, require_view=True)
 
 @api_route("/api/v1/channels/patch")
 @wrap_json_api

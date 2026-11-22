@@ -5,7 +5,7 @@ Pins down:
   - create returns bot + one-time api key + gateway, and stores ONLY the
     SHA-256 hash of the key (raw key nowhere in the row);
   - the key is never retrievable via list/info (no key_hash, no raw key);
-  - create/update validation: name 1-64 chars, perms an int bitmask 0-511;
+  - create/update validation: name 1-64 chars, perms an int bitmask 0-1023;
   - ownership: list shows only the caller's bots; info/update/revoke on
     another owner's bot -> 403; unknown bot_id -> 404;
   - update renames + changes perms; revoke sets revoked_at, stays listed
@@ -101,7 +101,11 @@ def main():
           gw.get("endpoints") == {"subscribe": "/api/v1/stream/subscribe",
                                   "poll": "/api/v1/stream/poll",
                                   "post": "/api/v1/bots/post",
-                                  "react": "/api/v1/bots/react"}, gw)
+                                  "react": "/api/v1/bots/react",
+                                  "channels": "/api/v1/bots/channels",
+                                  "channel_info": "/api/v1/bots/channel_info",
+                                  "site_get": "/api/v1/bots/site_get",
+                                  "site_manifest": "/api/v1/bots/site_manifest"}, gw)
     check("bot dict has no key material",
           "key_hash" not in bot and "api_key" not in bot, bot)
     bot_id = bot["bot_id"]
@@ -131,7 +135,7 @@ def main():
 
     # ---------- create validation ----------
     for label, args, why in (
-            ("unknown bits 512", {"name": "x", "perms": 512}, "512"),
+            ("unknown bits 1024", {"name": "x", "perms": 1024}, "1024"),
             ("negative perms", {"name": "x", "perms": -1}, "-1"),
             ("string perms", {"name": "x", "perms": "7"}, "str"),
             ("bool perms", {"name": "x", "perms": True}, "bool"),
@@ -142,8 +146,8 @@ def main():
         r = call("/api/v1/bots/create", args)
         check("create rejects %s -> 400" % label,
               r.get("ok") == 0 and r.get("code") == 400, r)
-    r = call("/api/v1/bots/create", {"name": "n" * 64, "perms": 511})
-    check("create accepts 64-char name and perms 511", r.get("ok") == 1, r)
+    r = call("/api/v1/bots/create", {"name": "n" * 64, "perms": 1023})
+    check("create accepts 64-char name and perms 1023", r.get("ok") == 1, r)
     max_bot = (r.get("bot") or {}).get("bot_id")
     r = call("/api/v1/bots/create", {"name": "zero", "perms": 0})
     check("create accepts perms 0", r.get("ok") == 1, r)
@@ -181,7 +185,7 @@ def main():
     check("update renames + changes perms",
           r.get("ok") == 1 and r["bot"]["name"] == "renamed"
           and r["bot"]["perms"] == 3, r)
-    r = call("/api/v1/bots/update", {"bot_id": bot_id, "perms": 512})
+    r = call("/api/v1/bots/update", {"bot_id": bot_id, "perms": 1024})
     check("update rejects unknown perms bits -> 400",
           r.get("ok") == 0 and r.get("code") == 400, r)
     r = call("/api/v1/bots/update", {"bot_id": bot_id, "name": ""})

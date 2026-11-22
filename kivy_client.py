@@ -3420,9 +3420,10 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
                 main = self.root.get_screen("main")
                 grid = main.ids.message_grid
                 name = getattr(main, "_current_channel", "general")
+                had_rows, was_at_bottom = self._follow_snapshot(grid)
                 if self._show_cached_channel(grid, self._channel_cid(name)):
-                    Clock.schedule_once(
-                        lambda dt: self._scroll_to_bottom(), 0.1)
+                    self._scroll_to_bottom_if_following(
+                        had_rows, was_at_bottom)
             except Exception as e:
                 print("open main cache render error:", repr(e))
         except Exception as e:
@@ -3469,7 +3470,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
         # already atomic (tmp + os.replace); the session file now also
         # gets owner-only permissions so other local users cannot read
         # the stored hub address/hashes. This is NOT encryption -- a
-        # device-key scheme needs Jeffery's call, so none is designed
+        # device-key scheme needs the user's call, so none is designed
         # here. A failed write removes the stray tmp file and leaves
         # the previous session intact.
         tmp = None
@@ -3759,9 +3760,10 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
         if grid is None:
             Clock.schedule_once(self._load_history_ui, 0.5)
             return
+        had_rows, was_at_bottom = self._follow_snapshot(grid)
         for m in self._load_history():
             self._render_message(grid, m)
-        Clock.schedule_once(lambda dt: self._scroll_to_bottom(), 0.1)
+        self._scroll_to_bottom_if_following(had_rows, was_at_bottom)
         if not self._scroll_bound:
             self._scroll_bound = True
             try:
@@ -4790,6 +4792,19 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
                     main = self.root.get_screen("main")
                     grid = main.ids.message_grid
                     self._remove_skeleton(cid)
+                    # Polish 2 (scroll settle): snapshot the
+                    # follow-bottom state BEFORE this page renders --
+                    # the render itself moves both halves of it.
+                    # getattr: minimal test stubs bind _fetch_messages
+                    # without the rest of the app (see the
+                    # _clear_fetch_status call below); without the
+                    # helper, fall back to the old unconditional
+                    # scroll.
+                    _snap = getattr(self, "_follow_snapshot", None)
+                    if _snap is not None:
+                        had_rows, was_at_bottom = _snap(grid)
+                    else:
+                        had_rows, was_at_bottom = False, True
                     # H6: a later success clears a stale fetch-failure
                     # status -- the old code only ever set it. getattr:
                     # minimal test stubs bind _fetch_messages without
@@ -4862,8 +4877,17 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
                                 else:
                                     raise
                         self._regroup_messages(grid)
-                        Clock.schedule_once(
-                            lambda dt: self._scroll_to_bottom(), 0.1)
+                        # Polish 2 (scroll settle): scroll in this
+                        # same tick, not a 0.1s Clock hop later -- the
+                        # first frame that shows these rows already
+                        # shows them at the bottom. getattr: see the
+                        # snapshot above.
+                        _follow_scroll = getattr(
+                            self, "_scroll_to_bottom_if_following", None)
+                        if _follow_scroll is not None:
+                            _follow_scroll(had_rows, was_at_bottom)
+                        else:
+                            self._scroll_to_bottom()
                     # H7b: a fetch that returns nothing leaves an empty
                     # grid -- show the placeholder (a later render or
                     # push removes it via _render_message). getattr: see
@@ -5209,6 +5233,50 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
             # No embed rebuild: embeds come only from message attachments
             # (RNS-fetched bytes rendered at post time), never from URLs in
             # the text, so a text edit cannot add or remove one.
+
+    def _follow_snapshot(self, grid):
+        """Snapshot the follow-bottom state BEFORE a page renders.
+
+        Returns (had_rows, was_at_bottom): whether the grid already
+        held message rows, and whether the view was already at (or
+        within a hair of) the bottom. The snapshot is taken before
+        rendering because the render itself changes both halves of
+        it. A view that cannot be read (minimal test stubs without a
+        scroll view) defaults to following, which is the old
+        unconditional-scroll behaviour.
+        """
+        try:
+            had_rows = any(isinstance(c, MessageRow)
+                           for c in grid.children)
+        except Exception:
+            had_rows = False
+        try:
+            scroll = self.root.get_screen("main").ids.scroll
+            was_at_bottom = scroll.scroll_y <= 0.05
+        except Exception:
+            was_at_bottom = True
+        return had_rows, was_at_bottom
+
+    def _scroll_to_bottom_if_following(self, had_rows, was_at_bottom):
+        """Land at the bottom NOW (same tick), but only when following.
+
+        Polish 2 (scroll settle): the scroll used to be a separate
+        Clock hop 0.1s after the render, and that hop costs a whole
+        frame -- under software GL a frame carrying a fresh 40-row
+        list takes ~1s, so the rows appeared at the top and only
+        jumped to the bottom a beat later. Scrolling synchronously
+        at the end of the render means the first frame that shows
+        the new rows already shows them at the bottom. A reader
+        scrolled up (rows present, view not at bottom) is never
+        yanked; a fresh load (no rows yet) still lands at the bottom.
+        No delayed re-assert is scheduled: once scroll_y is 0 the
+        ScrollView re-pins it at the bottom whenever the grid grows
+        (its effect bounds track scroll_y), so rows that grow later
+        -- an image embed landing -- keep the view pinned.
+        """
+        if had_rows and not was_at_bottom:
+            return
+        self._scroll_to_bottom()
 
     def _scroll_to_bottom(self):
         try:
@@ -6727,22 +6795,29 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
 
     def _route_purpose_file(self, path, purpose):
         """P10: hand the picked file to the server config screen's
-        icon/banner upload flow (blobs_put -> admin_config)."""
+        icon/banner upload flow (blobs_put -> admin_config). The
+        upload methods live on the SCREEN, not the General tab:
+        calling them on the tab raised AttributeError, which
+        _on_file_selected caught and reported only via _set_status
+        (invisible on the admin screen) — every Android icon/banner
+        pick failed silently."""
+        scr = None
         panel = None
         try:
             root = App.get_running_app().root
             scr = root.get_screen("server_config") if root else None
             panel = getattr(scr, "tab_content", {}).get("General")
         except Exception:
+            scr = None
             panel = None
-        if panel is None:
+        if scr is None or panel is None:
             self._set_status("no server config screen to apply %s"
                              % purpose)
             return
         if purpose == "icon":
-            panel._apply_icon_file(path)
+            scr._apply_icon_file(path)
         else:
-            panel._apply_banner_file(path)
+            scr._apply_banner_file(path)
 
     def _on_file_selected(self, selection, popup):
         if popup is not None:

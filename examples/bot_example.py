@@ -32,6 +32,12 @@ The bot needs the MSG bit (1) to see messages and the POST bit (64)
 to post; without them the server answers 403. The channel id is the
 hex id from /api/v1/bots/channel_info (READ_CHANNELS bit, 256) — a
 name is not accepted, so look it up first if you only know the name.
+
+Micron hooks: give the bot the SITE bit (512) and it also receives
+site_patch events when a page on its subscribed site channel is
+published or the manifest changes, and can read the page back with
+/api/v1/bots/site_get (same chunked read as the human endpoint).
+There is no bot site_put — publishing stays human-only.
 """
 import json
 import os

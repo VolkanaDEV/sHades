@@ -125,6 +125,28 @@ def _fancy_button(variant, text, font_size=None, **kw):
     return btn
 
 
+#: Volume-slider theme fallbacks (DESIGN.md hex; theme_colors wins
+#: whenever it has the key -- it has no primary_hover key yet, so the
+#: pressed knob always resolves to the fallback, as with
+#: FancyMDButton). The slider stays a plain kivy Slider (the
+#: audio-row test pins the type), so the theming is configuration +
+#: canvas.after drawing, not a subclass.
+_VOLUME_FALLBACKS = {
+    "input_bg": "#172231",       # track base (bg-input)
+    "primary": "#F5B75F",        # fill + knob
+    "primary_hover": "#FFD090",  # knob while pressed/dragging
+}
+
+#: Volume-slider geometry (dp). The default cursor image is shrunk to
+#: _VOLUME_CURSOR_DP so the knob Ellipse covers it entirely; the
+#: default 36sp grey bar shrinks to _VOLUME_TRACK_DP and is
+#: overpainted by the themed track rect.
+_VOLUME_TRACK_DP = 6
+_VOLUME_KNOB_DP = 20
+_VOLUME_KNOB_PRESSED_DP = 22
+_VOLUME_CURSOR_DP = 12
+
+
 class _AudioAttachRow(BoxLayout):
     """Embedded audio attachment row (tay, v0.30): play/pause/stop,
     download and volume controls around the sound itself, rendered inside
@@ -163,6 +185,9 @@ class _AudioAttachRow(BoxLayout):
         self.add_widget(self.btn_save)
         self.vol = Slider(min=0, max=1, value=0.8, size_hint_x=None,
                           width=dp(80))
+        self._vol_pressed = False
+        self._vol_theme_app = None
+        self._theme_volume_slider()
         self.vol.bind(value=self._volume)
         self.add_widget(self.vol)
 
@@ -232,6 +257,190 @@ class _AudioAttachRow(BoxLayout):
                 mp.volume = float(v)
         except Exception:
             pass
+
+    # -- volume slider theming (polish round 2, item 1) ----------------
+    def _vol_theme_color(self, key):
+        """Theme colour for `key`, or the DESIGN.md hex fallback.
+
+        Never raises. Mirrors DownloadRow._theme_color /
+        FancyMDButton._theme_rgba: theme_colors is the source of
+        truth, the _VOLUME_FALLBACKS hex is the fallback."""
+        try:
+            app = App.get_running_app()
+            if app is not None:
+                colors = getattr(app, "theme_colors", None)
+                if colors:
+                    value = colors.get(key)
+                    if value is not None:
+                        return [float(c) for c in list(value)]
+        except Exception:
+            pass
+        try:
+            return list(get_color_from_hex(_VOLUME_FALLBACKS[key]))
+        except Exception:
+            return [1, 1, 1, 1]
+
+    def _theme_volume_slider(self):
+        """Theme the plain Kivy Slider in place.
+
+        Configuration + canvas.after drawing, no subclass (the
+        audio-row test pins the slider's type): the 36sp default grey
+        bar shrinks to a 6dp track and is overpainted in input_bg, the
+        filled portion is a primary-amber bar from the track start to
+        value_pos, and the knob is a primary-amber Ellipse
+        (primary-hover while pressed) drawn over the shrunken default
+        cursor image. Colours re-tint live when the app reassigns
+        theme_colors; the geometry repaints on pos/size/value. Never
+        raises."""
+        vol = self.vol
+        self._vol_track_color = None
+        self._vol_fill_color = None
+        self._vol_knob_color = None
+        self._vol_track_rect = None
+        self._vol_fill_rect = None
+        self._vol_knob = None
+        try:
+            vol.background_width = dp(_VOLUME_TRACK_DP)
+        except Exception:
+            pass
+        try:
+            vol.cursor_size = (dp(_VOLUME_CURSOR_DP),
+                               dp(_VOLUME_CURSOR_DP))
+        except Exception:
+            pass
+        try:
+            with vol.canvas.after:
+                self._vol_track_color = Color(rgba=(0, 0, 0, 1))
+                self._vol_track_rect = RoundedRectangle(
+                    pos=(0, 0), size=(0, 0), radius=[dp(3)] * 4)
+                self._vol_fill_color = Color(rgba=(0, 0, 0, 1))
+                self._vol_fill_rect = RoundedRectangle(
+                    pos=(0, 0), size=(0, 0), radius=[dp(3)] * 4)
+                self._vol_knob_color = Color(rgba=(0, 0, 0, 1))
+                self._vol_knob = Ellipse(pos=(0, 0), size=(0, 0))
+        except Exception:
+            pass
+        vol.bind(pos=self._vol_redraw, size=self._vol_redraw,
+                 value=self._vol_redraw)
+        self._vol_apply_theme()
+
+    def _bind_vol_theme(self):
+        """Bind once to the running app's theme_colors, if any.
+
+        Called on every theme application so a row built before the
+        app existed still picks up live re-tints once it appears.
+        Mirrors FancyMDButton._bind_theme."""
+        try:
+            app = App.get_running_app()
+            if app is not None and app is not self._vol_theme_app:
+                app.bind(theme_colors=self._on_vol_theme_changed)
+                self._vol_theme_app = app
+        except Exception:
+            pass
+
+    def _on_vol_theme_changed(self, *args):
+        self._vol_apply_theme()
+
+    def _vol_apply_theme(self):
+        """Re-resolve the slider colours from theme + fallbacks."""
+        self._bind_vol_theme()
+        for attr, key in (("_vol_track_color", "input_bg"),
+                          ("_vol_fill_color", "primary")):
+            try:
+                instr = getattr(self, attr)
+                if instr is not None:
+                    instr.rgba = self._vol_theme_color(key)
+            except Exception:
+                pass
+        try:
+            if self._vol_knob_color is not None:
+                self._vol_knob_color.rgba = self._vol_knob_rgba()
+        except Exception:
+            pass
+        self._vol_redraw()
+
+    def _vol_knob_rgba(self):
+        key = "primary_hover" if self._vol_pressed else "primary"
+        return self._vol_theme_color(key)
+
+    def _vol_redraw(self, *args):
+        """Repaint the track / fill / knob for the current geometry.
+
+        The geometry is derived from the raw pos/size/value, never
+        from center_y / value_pos: those are cached AliasProperties,
+        and inside a pos/size observer they can still hold the
+        pre-layout value (the observer fires before the alias cache
+        clears), which left the track and knob a row-height off after
+        the first layout."""
+        vol = self.vol
+        try:
+            pad = vol.padding
+            left = vol.x + pad
+            cy = vol.y + vol.height / 2
+            top = cy - dp(_VOLUME_TRACK_DP) / 2
+            width = max(0.0, vol.width - pad * 2)
+            if self._vol_track_rect is not None:
+                self._vol_track_rect.pos = (left, top)
+                self._vol_track_rect.size = (width,
+                                             dp(_VOLUME_TRACK_DP))
+            span = vol.max - vol.min
+            nval = (vol.value - vol.min) / span if span else 0.0
+            vx = left + nval * width
+            fill_w = max(0.0, vx - left)
+            if self._vol_fill_rect is not None:
+                self._vol_fill_rect.pos = (left, top)
+                self._vol_fill_rect.size = (fill_w,
+                                            dp(_VOLUME_TRACK_DP))
+            d = dp(_VOLUME_KNOB_PRESSED_DP if self._vol_pressed
+                   else _VOLUME_KNOB_DP)
+            if self._vol_knob is not None:
+                self._vol_knob.pos = (vx - d / 2, cy - d / 2)
+                self._vol_knob.size = (d, d)
+        except Exception:
+            pass
+
+    def _set_vol_pressed(self, pressed):
+        if pressed == self._vol_pressed:
+            return
+        self._vol_pressed = pressed
+        try:
+            if self._vol_knob_color is not None:
+                self._vol_knob_color.rgba = self._vol_knob_rgba()
+        except Exception:
+            pass
+        self._vol_redraw()
+
+    def on_touch_down(self, touch):
+        # Pressing the slider brightens the knob to primary-hover for
+        # the drag; the Slider itself still owns the value + grab.
+        try:
+            if self.vol.collide_point(*touch.pos):
+                self._set_vol_pressed(True)
+        except Exception:
+            pass
+        return super().on_touch_down(touch)
+
+    def on_touch_move(self, touch):
+        # The grab list (not grab_current) names the slider while it
+        # is dragged: post_dispatch_input only sets grab_current for
+        # the direct delivery to the grabbed widget, after the tree
+        # walk this handler runs in -- during the walk it is still
+        # None, so a grab_current check would never re-arm here.
+        try:
+            if not self._vol_pressed and any(
+                    w() is self.vol for w in touch.grab_list):
+                self._set_vol_pressed(True)
+        except Exception:
+            pass
+        return super().on_touch_move(touch)
+
+    def on_touch_up(self, touch):
+        try:
+            if self._vol_pressed:
+                self._set_vol_pressed(False)
+        except Exception:
+            pass
+        return super().on_touch_up(touch)
 
 
 class DownloadRow(ButtonBehavior, BoxLayout):

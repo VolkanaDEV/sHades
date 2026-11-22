@@ -575,9 +575,14 @@ class SiteMixin:
 
             def _land(dt):
                 emb.source = fpath
-                # Polish group 8: same fade-in as message embeds.
+                # Polish 2 item 3: fade only once the texture has
+                # landed. reveal() starts the fade at once, so on a
+                # cold load it finished on the empty box and the real
+                # image popped in after it. reveal_on_texture() holds
+                # the embed at opacity 0 until on_load fires (or the
+                # Loader-cached texture is already there).
                 import ui_fx
-                ui_fx.reveal(emb)
+                ui_fx.reveal_on_texture(emb)
 
             Clock.schedule_once(_land, 0)
         threading.Thread(target=work, daemon=True).start()

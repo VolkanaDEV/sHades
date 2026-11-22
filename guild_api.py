@@ -33,6 +33,7 @@ BOT_PERM_BITS = (
     (64, "Post messages"),
     (128, "React to messages"),
     (256, "Read channel list"),
+    (512, "Read micron pages"),
 )
 
 

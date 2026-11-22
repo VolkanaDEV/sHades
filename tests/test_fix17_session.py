@@ -9,7 +9,7 @@ the session file is owner-only (mode 0o600).
   (d) no .tmp file is left behind after a normal save or a failed one
 
 Full session encryption is deliberately NOT covered here: it needs a
-device-key decision from Jeffery.
+device-key decision from the user.
 
 Run: xvfb-run -a python tests/test_fix17_session.py
 """
