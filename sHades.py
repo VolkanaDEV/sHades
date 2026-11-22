@@ -2078,6 +2078,34 @@ def api_v1_presence(viewer, data, link_id):
     currently streaming."""
     return {"ok": 1, "mode": "link", "users": _presence_payload(), "now": now()}
 
+# ---- blob access control (tay: ACLs, not just identified links) ----------
+# A digest is a 256-bit capability, but capability was the only gate. The
+# rule: the uploader may read their own blob; guild-icon and banner blobs
+# (server_config) are readable by every identified member; guild admins
+# may read anything; everyone else gets the same "not found" silence as
+# an unknown blob. Chat attachments never ride this path (ingest copies
+# bytes into attachments/), so tightening blob reads cannot break posts.
+
+def blob_visible(viewer, digest):
+    """True if `viewer` may read blob `digest`."""
+    if not viewer or not re.match(r"^[0-9a-f]{32}$", digest or ""):
+        return False
+    try:
+        if store.user_has_role_perm(db, db_lock, viewer, PERMS["ADMIN"]):
+            return True
+    except Exception:
+        pass
+    owner = store.blob_owner(db, db_lock, digest)
+    if owner and owner == viewer:
+        return True
+    try:
+        for key in ("guild_icon", "banner"):
+            if (_cfg_get(key, "") or "").strip().lower() == digest:
+                return True
+    except Exception:
+        pass
+    return False
+
 # ---- blobs (phase 3): content-addressed image/media get+put ------------------------
 
 def _blob_dir():
@@ -2226,6 +2254,8 @@ def api_v1_blobs_get(viewer, data, link_id):
     """Chunked blob read: {blob_id, offset?, len?} ->
     {data_b64, total, offset, eof}. len is capped at BLOB_CHUNK_MAX."""
     digest = (data.get("blob_id") or "").strip().lower()
+    if not blob_visible(viewer, digest):
+        return {"ok": 0, "error": "unknown blob_id", "code": 404}
     fname = _blob_fname(digest)
     if not fname:
         return {"ok": 0, "error": "unknown blob_id", "code": 404}
@@ -2278,13 +2308,14 @@ def api_v1_att_get(viewer, data, link_id):
 def serve_blob_file(path, data, request_id, link_id, remote_identity, requested_at):
     """Raw /file/blobs/<fname> handler (one per stored blob, attachments
     pattern). Path is the registration key; validate before touching disk.
-    Unlike attachments there is no message linkage to gate on, so the
-    gate is: an identified link, and nothing else. Anonymous fetches are
-    refused. (Per-blob ACLs need blob<->message reference tracking; not
-    built. The digest is a 256-bit capability for identified members.)"""
-    if viewer_of(remote_identity) is None:
-        return b"not found"
+    Like attachments there is no message linkage to gate on, so the gate
+    is blob_visible(): uploader, guild admin, or a blob referenced by the
+    guild icon/banner config. Everyone else gets the same "not found"
+    silence as an unknown blob. (Digests are 256-bit capabilities, but
+    capability alone no longer grants a read.)"""
     fname = path.rsplit("/", 1)[-1]
+    if not blob_visible(viewer_of(remote_identity), fname.split(".")[0]):
+        return b"not found"
     if not re.match(r"^[0-9a-f]{32}\.[a-z0-9]{1,8}$", fname):
         return b"not found"
     entry = _att_ram_get(fname.split(".")[0])

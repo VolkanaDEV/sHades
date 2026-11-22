@@ -1239,3 +1239,10 @@ def bot_touch_last_seen(conn, lock, bot_id, ts):
         conn.commit()
         return conn.execute("SELECT * FROM bots WHERE bot_id=?",
                             (bot_id,)).fetchone()
+
+def blob_owner(conn, lock, digest):
+    """Uploader of one blob ('by' column), or None if unknown."""
+    with lock:
+        row = conn.execute("SELECT by FROM blobs WHERE id=?",
+                           (digest,)).fetchone()
+    return row["by"] if row else None
