@@ -13,6 +13,7 @@ import re
 import threading
 import webbrowser
 from client_util import _escape
+from client_widgets import MicronRefLabel
 
 # Kivy (guarded so the module can be imported for linting without Kivy present)
 try:
@@ -23,7 +24,6 @@ try:
     from kivy.uix.behaviors import ButtonBehavior
     from kivy.clock import Clock
     from kivy.graphics import Color
-    from kivy.uix.label import Label
     from kivy.properties import ListProperty
     from kivy.graphics import Rectangle
     from kivy.uix.widget import Widget
@@ -511,7 +511,14 @@ class SiteMixin:
             scr._status.text = "publish failed: %s" % err
 
     def _micron_label(self, markup, heading=False, center=False, code=False):
-        lbl = Label(markup=True, text=markup)
+        # MicronRefLabel (fold-18, verbatim from the pre-split base): the
+        # page labels are 2+ levels under the messages ScrollView, where
+        # kivy's own Label ref check reads the delivered touch in the
+        # scroll's content frame and misses the zones - the pre-split
+        # MessageLabel carried the offset-chain conversion; the plain
+        # label returned here after the split made every [ Edit page ]
+        # ref dead (lane receipt: downs=1, refs=0).
+        lbl = MicronRefLabel(markup=True, text=markup)
         lbl.size_hint_y = None
         lbl.font_size = sp(18) if heading else (sp(13) if code else sp(15))
         lbl.halign = "center" if center else "left"

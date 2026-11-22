@@ -5,6 +5,7 @@
 #:import scaled ui_scale.scaled
 #:import AuroraBackground ui_fx.AuroraBackground
 #:import FancyMDButton client_widgets.FancyMDButton
+#:import MicronRefLabel client_widgets.MicronRefLabel
 #:import MDLinearProgressIndicator kivymd.uix.progressindicator.MDLinearProgressIndicator
 
 # Button heights are written literally as dp(N) so they read at their
@@ -143,10 +144,17 @@
             height: self.minimum_height
             spacing: dp(6)
 
-        Label:
+        MicronRefLabel:
             id: content_lbl
             text: root.content_markup
             markup: True
+            # fold-5 receipt re-applied on the split base: the row's
+            # markup refs ([ Edit page ] etc.) are dead unless the
+            # content label routes on_ref_press - the pre-split custom
+            # MessageLabel did this in code; the split's plain label
+            # needs the kv binding back. The site panel label already
+            # routes the same way (app_site.py 522).
+            on_ref_press: app._micron_link_tapped(args[1])
             color: app.theme_colors['text']
             font_size: sp(14)
             text_size: self.width, None
@@ -864,10 +872,16 @@
                         pos: self.parent.pos
                         size: self.parent.size
                         # ---- server rail (guild list) ----
+                        # fold-18 (split base): the rail's fixed dp(64) box
+                        # survives the pane collapse and, disabled+collide
+                        # (widget.py eats before children), swallows every tap
+                        # on the left band - walk receipt: rail box=(0,0,64,544)
+                        # dis=True r=True while the chat never saw downs. The
+                        # column collapses with the pane like the art does.
                         BoxLayout:
                             id: server_sidebar
                             size_hint_x: None
-                            width: dp(64)
+                            width: dp(64) if root.left_open else 0
                             orientation: 'vertical'
                             canvas.before:
                                 Color:
@@ -908,7 +922,16 @@
                                     source: app.banner_channel_path or ''
                                     size_hint: (None, None)
                                     height: dp(96)
-                                    width: dp(200)
+                                    # fold-18 (split base): disabled art with a
+                                    # fixed dp(200) box overhangs a 0-wide strip
+                                    # when the drawer collapses, and kivy's
+                                    # disabled+collide (widget.py on_touch_down
+                                    # returns True BEFORE children) eats every
+                                    # tap under the overhang - walk receipt:
+                                    # banner Image box=(-36,448,200,96) at a tap
+                                    # (38.5,455) the chat never saw. The art
+                                    # must collapse WITH the strip.
+                                    width: min(dp(200), banner_strip.width)
                                     allow_stretch: False
                                     keep_ratio: True
                                     pos_hint: {'center_x': 0.5, 'center_y': 0.5}
