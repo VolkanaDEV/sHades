@@ -20,6 +20,8 @@ import urllib.request
 APP_APK_RE = re.compile(r"^shades-([0-9.]+)-arm64-v8a-debug\.apk$")
 UA = "sHades-client-updater"
 HTTP_TIMEOUT = 20
+MAX_FETCH_BYTES = 8 * 1024 * 1024    # manifest/sha fetches: 8 MB ceiling
+MAX_APK_BYTES = 300 * 1024 * 1024    # APK ceiling (the DM stream + RAM read)
 
 # the release repo this APK came from (the client updates along it)
 REPO = "eldeucebag/sHades"
@@ -92,13 +94,20 @@ def newest_client_asset(assets, since=None):
             "sha_url": sha.get("browser_download_url")}
 
 
-def fetch(url, timeout=HTTP_TIMEOUT):
-    """The one https/https-any-scheme GET the client is allowed."""
+def fetch(url, timeout=HTTP_TIMEOUT, limit=MAX_FETCH_BYTES):
+    """The one https/https-any-scheme GET the client is allowed. Reads are
+    capped: the release manifest and the .sha256 companion are tiny, and an
+    unbounded read into RAM is not an option on a phone."""
     req = urllib.request.Request(
         url, headers={"User-Agent": UA, "Accept": "application/octet-stream"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read()
+            body = r.read(limit + 1)
+            if len(body) > limit:
+                raise HttpError("fetch exceeds %d bytes" % limit)
+            return body
+    except HttpError:
+        raise
     except Exception as e:  # urllib raises too many shapes to count
         raise HttpError("fetch failed: %s" % e)
 
@@ -148,7 +157,15 @@ def download_with_dm(apk_url, apk_name, sha_hex,
             else:
                 raise HttpError("DownloadManager timed out")
             opened = dm.openDownloadedFile(sid)
+            try:
+                sz = opened.stat().getSize()
+            except Exception:
+                sz = -1  # stat unsupported: fall back to the read-time cap
+            if sz > MAX_APK_BYTES:
+                raise HttpError("downloaded apk exceeds %d bytes" % MAX_APK_BYTES)
             sha_bytes = opened.openInputStream().readBytes()
+            if len(sha_bytes) > MAX_APK_BYTES:
+                raise HttpError("downloaded apk exceeds %d bytes" % MAX_APK_BYTES)
         except HttpError:
             raise
         except Exception as e:

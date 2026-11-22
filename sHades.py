@@ -1793,12 +1793,24 @@ def _active_channels_by_user():
         return {uh: s["channel"] for uh, s in SUB_BY_USER.items()
                 if now() - s["at"] <= SUB_TTL_S}
 
-def _presence_payload():
-    """online_users() enriched with the channel each user is streaming."""
+def _presence_payload(viewer=None):
+    """online_users() enriched with the channel each user is streaming.
+
+    active_channel is only disclosed to a viewer who holds VIEW on that
+    channel; a broadcast (guild-wide) payload carries no channel at all."""
     active = _active_channels_by_user()
-    return [dict(u, active_channel=active.get(u["user_hash"]))
-            for u in sorted(online_users().values(),
-                            key=lambda x: x["username"].lower())]
+    out = []
+    for u in sorted(online_users().values(),
+                    key=lambda x: x["username"].lower()):
+        d = dict(u)
+        ch = active.get(u["user_hash"])
+        # stable shape: the key is always present; the value is the
+        # channel only when the viewer may see it, else None
+        d["active_channel"] = (
+            ch if (viewer is not None and ch and has_perm(viewer, ch, PERMS["VIEW"]))
+            else None)
+        out.append(d)
+    return out
 
 # ---- channels ---------------------------------------------------------------------
 
@@ -1821,12 +1833,14 @@ def _channels_list_for(viewer):
     return chans
 
 
-def _channel_info(cid):
+def _channel_info(cid, viewer=None):
     """Channel metadata response (or an error dict). Shared by the human
-    /api/v1/channels/info and the bot /api/v1/bots/channel_info. The human
-    endpoint never gated on VIEW — channel metadata is semi-public — so
-    the bot one doesn't either; a channel's messages stay behind the
-    stream/post VIEW gates either way."""
+    /api/v1/channels/info and the bot /api/v1/bots/channel_info. Gated on
+    VIEW: channel metadata (name/topic/manifest) is not for members who
+    cannot see the channel, and non-VIEW members must not be able to
+    probe its existence."""
+    if viewer is not None and not has_perm(viewer, cid, PERMS["VIEW"]):
+        return {"ok": 0, "error": "unknown channel", "code": 404}
     r = store.channel_row(db, db_lock, cid)
     if not r:
         return {"ok": 0, "error": "unknown channel", "code": 404}
@@ -1873,6 +1887,8 @@ def _create_channel_txn(viewer, name, kind, manifest=None):
     kind = (kind or "chat").strip().lower()
     if not re.match(r"^[a-zA-Z0-9_\-]{1,32}$", name):
         return None, "invalid channel name"
+    if not rate_ok(viewer, "_chancreate", 10, 3600):
+        return None, "rate limited: too many channels created"
     if kind not in CHANNEL_KINDS:
         return None, "kind must be one of: " + ", ".join(CHANNEL_KINDS)
     if kind in ("site", "term") and not is_moderator(viewer):
@@ -1898,7 +1914,9 @@ def api_v1_channels_create(viewer, data, link_id):
                                    data.get("manifest"))
     if err:
         return {"ok": 0, "error": err,
-                "code": 403 if "moderator" in err else (409 if "exists" in err else 400)}
+                "code": 403 if "moderator" in err
+                else (429 if "rate limited" in err
+                      else (409 if "exists" in err else 400))}
     kind = (data.get("kind") or "chat").strip().lower()
     manifest = data.get("manifest")
     return {"ok": 1, "channel": {"id": cid, "name": (data.get("name") or "").strip(),
@@ -1908,7 +1926,7 @@ def api_v1_channels_create(viewer, data, link_id):
 @api_route("/api/v1/channels/info")
 @wrap_json_api
 def api_v1_channels_info(viewer, data, link_id):
-    return _channel_info(data.get("channel"))
+    return _channel_info(data.get("channel"), viewer)
 
 # ---- stream -----------------------------------------------------------------------
 
@@ -2049,6 +2067,8 @@ def api_v1_stream_unsubscribe(viewer, data, link_id):
 @api_route("/api/v1/typing")
 @wrap_json_api
 def api_v1_typing(viewer, data, link_id):
+    if not rate_ok(viewer, "_typing", 30, 60):
+        return {"ok": 0, "error": "rate limited", "code": 429}
     cid = data.get("channel")
     active = bool(data.get("active"))
     if not store.channel_exists(db, db_lock, cid):
@@ -2076,7 +2096,7 @@ def api_v1_typing(viewer, data, link_id):
 def api_v1_presence(viewer, data, link_id):
     """Link-derived active users (v0.29) plus the channel each user is
     currently streaming."""
-    return {"ok": 1, "mode": "link", "users": _presence_payload(), "now": now()}
+    return {"ok": 1, "mode": "link", "users": _presence_payload(viewer), "now": now()}
 
 # ---- blob access control (tay: ACLs, not just identified links) ----------
 # A digest is a 256-bit capability, but capability was the only gate. The
@@ -2882,7 +2902,7 @@ def _dispatch_command(viewer, line):
             "  presence            the active user list",
             "  uptime              guild uptime",
             "  create <name> [kind]   new channel (site/term: moderator)",
-            "  delete <channel>    delete a channel (moderator)",
+            "  delete <channel>    delete a channel (admin)",
             "  rename <channel> <name>   rename (moderator)",
             "  topic <channel> <text>    set the channel topic (moderator)",
             "  ban <user> / unban <user>        moderator",
@@ -2899,7 +2919,9 @@ def _dispatch_command(viewer, line):
             out = "\r\n".join(
                 "  %s  node %s  in %s" % (
                     u["username"], u["node_hash"][:12],
-                    channel_name(active.get(u["user_hash"], "")) or "-")
+                    (channel_name(active.get(u["user_hash"], ""))
+                     if active.get(u["user_hash"]) and has_perm(viewer, active[u["user_hash"]], PERMS["VIEW"])
+                     else "-"))
                 for u in sorted(users.values(), key=lambda x: x["username"].lower()))
     elif cmd == "channels":
         rows = store.list_channel_name_kind(db, db_lock)
@@ -2929,7 +2951,7 @@ def _dispatch_command(viewer, line):
                                            ("  topic: " + row["topic"])
                                            if row["topic"] else "")
     elif cmd == "presence":
-        users = _presence_payload()
+        users = _presence_payload(viewer)
         out = "\r\n".join(
             "  %s%s" % (u["username"],
                        "  in " + channel_name(u["active_channel"])
@@ -3712,6 +3734,25 @@ def api_v1_admin_config(viewer, data, link_id):
     if key == "attachments" and value not in ("saved", "ephemeral"):
         return {"ok": 0, "error": "attachments must be 'saved' or "
                 "'ephemeral'", "code": 400}
+    if key == "update_channel" and value not in ("off", "github", "rns"):
+        return {"ok": 0, "error": "update_channel must be one of "
+                "'off', 'github', 'rns'", "code": 400}
+    if key == "update_check_minutes":
+        try:
+            mins = int(value)
+        except ValueError:
+            return {"ok": 0, "error": "update_check_minutes must be an integer",
+                    "code": 400}
+        if mins < 0 or mins > 10080:
+            return {"ok": 0, "error": "update_check_minutes must be 0-10080",
+                    "code": 400}
+        value = str(mins)
+    if key in ("update_channel_peer", "update_channel_shapin",
+               "update_trusted_hub"):
+        if value and not re.match(r"^[0-9a-f]{64}$", value):
+            return {"ok": 0, "error": key + " must be a 64-hex digest or empty",
+                    "code": 400}
+        value = value.lower()
     old = _cfg_get(key, SERVER_CONFIG_KEYS[key])
     _cfg_set(key, value)
     _audit(viewer, "config.set", key, "%s -> %s" % (old, value))
@@ -3895,9 +3936,11 @@ def api_v1_invites(viewer, data, link_id):
 
 def _delete_channel_txn(cid, viewer):
     """Shared channel deletion (API + slash command). Returns
-    (error_or_None, name_or_None)."""
-    if not has_perm(viewer, cid, PERMS["MANAGE_CHANNEL"]):
-        return "manage channel permission required", None
+    (error_or_None, name_or_None). Hard delete destroys messages,
+    attachments and site resources irreversibly, so it takes ADMIN,
+    not merely MANAGE_CHANNEL."""
+    if not has_role_perm(viewer, PERMS["ADMIN"]):
+        return "admin permission required", None
     err, name = store.delete_channel_data(db, db_lock, cid)
     if err:
         return err, None
@@ -4472,13 +4515,14 @@ def api_v1_bots_channels(viewer, data, link_id):
 def api_v1_bots_channel_info(viewer, data, link_id):
     """Bot channel info. Same READ_CHANNELS gate; the metadata shape is
     the human /api/v1/channels/info one via the shared _channel_info
-    helper (which, like the human endpoint, does not gate on VIEW)."""
+    helper (VIEW-gated the same way — a bot whose owner cannot see the
+    channel gets the same 404 a human would)."""
     bot, err = _bot_for_data(data, BOT_PERMS["READ_CHANNELS"],
                              "read channels")
     if err:
         return err
     store.bot_touch_last_seen(db, db_lock, bot["bot_id"], now())
-    return _channel_info(data.get("channel"))
+    return _channel_info(data.get("channel"), bot["owner_hash"])
 
 @api_route("/api/v1/channels/patch")
 @wrap_json_api
