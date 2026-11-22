@@ -370,7 +370,9 @@ class GuildAPI:
             offset = int(res.get("next_offset") or (offset + len(piece)))
         res = self._request_json("/api/v1/blobs/put/finish",
                                  {"upload_id": upload_id}, timeout=15)
-        print("[blob] finish ok=%s %s" % (res.get("ok"), res.get("error") or res.get("blob_id") or ""), flush=True)
+        print("[blob] finish ok=%s %s" % (
+            res.get("ok"), res.get("error") or res.get("blob_id") or ""),
+            flush=True)
         if not res.get("ok"):
             res.setdefault("error", "finish failed")
             res["phase"] = "finish"
