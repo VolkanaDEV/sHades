@@ -8,6 +8,8 @@ Everything here is cosmetic and fails soft: if an effect cannot run
   * reveal()            fade-in used for messages and screen sections
   * stagger()           reveal a list of widgets one after another
   * tap_feedback()      quick opacity dip on press
+  * slide_property()    animate one numeric property (drawer widths)
+  * popup_entrance()    open a Popup with a short opacity fade
   * ease constants      one motion language across the whole app
 """
 from kivy.animation import Animation
@@ -27,10 +29,146 @@ EASE_SPRING = "out_back"     # small, playful settles
 _TEX = {}
 REDUCED_MOTION = False
 
+# Screen fades use the same language as reveal(): short, out_quint ease.
+SCREEN_TRANSITION_DURATION = 0.18
+
+# Drawer slide + popup fade (polish group 3): same language, same rules
+# (opacity/width only, fail-soft, instant under REDUCED_MOTION).
+DRAWER_SLIDE_DURATION = 0.22
+POPUP_FADE_DURATION = 0.15
+
+# ScreenManagers that opted in via register_screen_manager(); WeakSet so a
+# discarded manager never keeps the module (or itself) alive.
+_SCREEN_MANAGERS = WeakSet()
+
+
+def register_screen_manager(manager):
+    """Track a ScreenManager so set_reduced_motion() retimes its fade.
+
+    The manager's transition duration is set to the current motion state
+    on registration, so a manager built while reduced motion is on starts
+    instant instead of fading.
+    """
+    _SCREEN_MANAGERS.add(manager)
+    _sync_manager_transition(manager)
+
+
+def _sync_manager_transition(manager):
+    transition = getattr(manager, "transition", None)
+    if transition is not None and hasattr(transition, "duration"):
+        transition.duration = 0 if REDUCED_MOTION else SCREEN_TRANSITION_DURATION
+
 
 def set_reduced_motion(enabled):
     global REDUCED_MOTION
     REDUCED_MOTION = bool(enabled)
+    for manager in list(_SCREEN_MANAGERS):
+        _sync_manager_transition(manager)
+    # Polish group 8: live SkeletonRows follow the flag too -- a row
+    # built while motion was on stops shimmering the moment the flag
+    # flips, and one built while it is off starts again.
+    for row in list(SkeletonRow._instances):
+        row._sync_motion()
+    # Polish group 8b: the near-duplicate SkeletonRow in client_widgets
+    # (history-loading skeleton, kivy_client._show_skeleton) follows the
+    # flag the same way. Lazy import: client_widgets imports ui_fx at
+    # module level, so a top-level import here would cycle.
+    try:
+        import client_widgets
+        for row in list(client_widgets.SkeletonRow._instances):
+            row._sync_motion()
+    except Exception:
+        pass
+
+
+def drawer_open_width(screen_width, side):
+    """Open width of a drawer for a screen of `screen_width`.
+
+    Mirrors the KV formula the drawers used before the slide: the left
+    (channels) drawer is 284dp capped at 80% of the screen, the right
+    (members) drawer 200dp capped at 72%.
+    """
+    if side == "right":
+        return min(dp(200), screen_width * 0.72)
+    return min(dp(284), screen_width * 0.8)
+
+
+def _anim_for(widget, prop):
+    """Running Animation for `prop` on `widget`, or None."""
+    try:
+        uid = widget.uid
+    except Exception:
+        return None
+    for anim in list(Animation._instances):
+        entry = getattr(anim, "_widgets", {}).get(uid)
+        if entry is not None and prop in entry.get("properties", {}):
+            return anim
+    return None
+
+
+def is_animating(widget, prop):
+    """True while an Animation is driving `prop` on `widget`."""
+    return _anim_for(widget, prop) is not None
+
+
+def slide_property(widget, prop, target, duration=DRAWER_SLIDE_DURATION):
+    """Animate one numeric property (drawer widths live on MainScreen).
+
+    REDUCED_MOTION lands at the target at once. A new slide cancels
+    the running one for the same property, so a mid-slide toggle
+    restarts from the current value and can never wedge half-open.
+    Returns the Animation, or None when the value landed at once.
+    """
+    if REDUCED_MOTION:
+        try:
+            Animation.cancel_all(widget, prop)
+        except Exception:
+            pass
+        try:
+            setattr(widget, prop, target)
+        except Exception:
+            pass
+        return None
+    try:
+        Animation.cancel_all(widget, prop)
+        anim = Animation(**{prop: target}, duration=duration, t=EASE_OUT)
+        anim.start(widget)
+        return anim
+    except Exception:
+        try:
+            setattr(widget, prop, target)
+        except Exception:
+            pass
+        return None
+
+
+def slide_width(widget, target, duration=DRAWER_SLIDE_DURATION):
+    """Animate a widget's own width (convenience over slide_property)."""
+    return slide_property(widget, "width", target, duration=duration)
+
+
+def popup_entrance(popup, duration=POPUP_FADE_DURATION):
+    """Open a Popup with a short opacity fade (ModalView: opacity only).
+
+    The popup is set to opacity 0 before open() so no full-opacity
+    frame flashes, then fades to 1. REDUCED_MOTION opens at opacity 1
+    at once. A failed open() restores opacity 1 and re-raises, so a
+    broken popup still fails loudly instead of failing silently.
+    """
+    if REDUCED_MOTION:
+        popup.opacity = 1
+        popup.open()
+        return
+    popup.opacity = 0
+    try:
+        popup.open()
+    except Exception:
+        popup.opacity = 1
+        raise
+    try:
+        Animation(opacity=1, duration=duration, t=EASE_OUT).start(popup)
+    except Exception:
+        popup.opacity = 1
 
 
 def brand_wordmark(accent, primary):
@@ -316,17 +454,44 @@ class MeshConstellation(Widget):
 
 
 class SkeletonRow(Widget):
-    """Two quiet shimmer bars while a history page is on its way."""
+    """Two quiet shimmer bars while a history page is on its way.
+
+    Polish group 8: the shimmer honours REDUCED_MOTION -- with it on,
+    the bars render statically (no repeating phase animation), the
+    same treatment reveal() and AuroraBackground give the flag. A row
+    built while reduced motion is on never starts the animation; one
+    already shimmering stops the moment set_reduced_motion() flips.
+    """
     phase = NumericProperty(0)
+    _instances = WeakSet()
 
     def __init__(self, **kw):
         super().__init__(**kw)
         self.size_hint_y = None
         self.height = dp(70)
         self.bind(pos=self._draw, size=self._draw, phase=self._draw)
+        self._anim = None
+        self._instances.add(self)
+        self._sync_motion()
+
+    def _sync_motion(self):
+        if REDUCED_MOTION:
+            self._stop()
+        else:
+            self._start()
+
+    def _start(self):
+        if REDUCED_MOTION:
+            return
+        self._stop()
         self._anim = Animation(phase=1, duration=1.6, t="linear")
         self._anim.repeat = True
         self._anim.start(self)
+
+    def _stop(self):
+        if self._anim is not None:
+            self._anim.cancel(self)
+            self._anim = None
 
     def _draw(self, *a):
         self.canvas.clear()

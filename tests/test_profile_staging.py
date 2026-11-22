@@ -35,6 +35,12 @@ def py_src():
         return f.read()
 
 
+def cw_src():
+    # ImageCache lives here since the phase-2 client split (2026-11-21).
+    with open(os.path.join(REPO, "client_widgets.py"), encoding="utf-8") as f:
+        return f.read()
+
+
 def kv_src():
     with open(os.path.join(REPO, "kv_md.kv"), encoding="utf-8") as f:
         return f.read()
@@ -42,6 +48,7 @@ def kv_src():
 
 def main():
     py = py_src()
+    cw = cw_src()
     kv = kv_src()
 
     # --- 1. fresh-install routing: staging precedes any auto-connect -----
@@ -178,8 +185,8 @@ def main():
           'root.get_screen("onboarding").stage = 0' in py
           and 'root.current = "onboarding"' in py)
     check("ImageCache.forget ships and unlinks the cached file",
-          "def forget(self, key):" in py
-          and "os.unlink(path)" in py)
+          "def forget(self, key):" in cw
+          and "os.unlink(path)" in cw)
     # the purge relies on the same file the boot gate checks at
     # :2866 -- keep both sides of that invariant honest
     check("boot gate and purge agree on the profile file",
