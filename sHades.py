@@ -3381,8 +3381,8 @@ def _update_maybe_tick(force=False):
 
 
 @api_route("/api/v1/update_status")
-def api_v1_update_status(viewer, data, request_id, link_id,
-                         remote_identity, requested_at):
+@wrap_json_api
+def api_v1_update_status(viewer, data, link_id):
     """P11: the updater's last verdict, admin-only read (the panel
     consumes this in chain 5)."""
     denied = _require_admin(viewer)
@@ -3528,7 +3528,12 @@ def _rns_pull():
         resp = getattr(receipt, "response", None)
         if resp is None:
             raise TimeoutError(path)
-        return msgpack.unpackb(resp, raw=False)
+        # RNS hands us the handler's return object already unpacked:
+        # the raw /api/v1/update/* handlers return dicts, which arrive
+        # here as dicts — not as bytes to unpack. Accept both.
+        if isinstance(resp, (bytes, bytearray)):
+            return msgpack.unpackb(resp, raw=False)
+        return resp
 
     try:
         info = _req("/api/v1/update/serve_info")
