@@ -34,9 +34,9 @@ references are to the tree this doc ships with.
 
 ## Permissions
 
-Bitmask, `BOT_PERMS` in `sHades.py:85-87`, `BOT_PERM_ALL = 511`.
-Bits 1–32 gate which stream event kinds a bot receives; bits 64–256
-gate what it may do. `BOT_PERM_BITS` in `guild_api.py:26-37` is the
+Bitmask, `BOT_PERMS` in `sHades.py:85-87`, `BOT_PERM_ALL = 1023`.
+Bits 1–32 and 512 gate which stream event kinds a bot receives; bits
+64–512 gate what it may do. `BOT_PERM_BITS` in `guild_api.py:26-37` is the
 client-side copy with the plain-language labels the Bots screen shows.
 
 | Bit | Name | Meaning |
@@ -50,8 +50,9 @@ client-side copy with the plain-language labels the Bots screen shows.
 | 64 | POST | May post messages |
 | 128 | REACT | May react to messages |
 | 256 | READ_CHANNELS | May read the channel list / channel info |
+| 512 | SITE | Receive `site_patch` events and read micron pages |
 
-Validation: `perms` must be an int in 0–511 (bools rejected);
+Validation: `perms` must be an int in 0–1023 (bools rejected);
 `name` is 1–64 chars after stripping (`sHades.py:3939-3945`,
 `BOT_NAME_MAX = 64`).
 
@@ -85,12 +86,11 @@ changes), `bot_revoke` (only the first revoke).
 `gateway` (`_bot_gateway`, `sHades.py:3916`) is the guild's
 `node_hash` / `delivery_hash` (from the guilds row via
 `store.get_guild`, `store.py:1145`; `None` until the guild has booted
-and saved its row) plus an `endpoints` dict. **Known gap:** the
-`endpoints` dict lists only `subscribe`, `poll`, `post`, `react` —
-the two bot-only channel endpoints below are NOT in it, because the
-Group 1 test pins that dict exactly and the endpoints were added in
-Group 2. The endpoints exist and work; they are listed here and in
-`examples/bot_example.py`. Do not "fix" the dict by editing the test.
+and saved its row) plus an `endpoints` dict with every bot endpoint:
+`subscribe`, `poll`, `post`, `react`, `channels`, `channel_info`,
+`site_get`, `site_manifest`. (The `channels` / `channel_info`
+entries were added after the first delivery — the Group 1 test
+pinned the original four-endpoint dict; it now pins all eight.)
 
 ### Stream — subscribe / poll
 
@@ -121,6 +121,8 @@ endpoint (`_bot_for_data`, `sHades.py:3961`); a missing bit → 403.
 | `react` | REACT (128) | `{bot_id, api_key, msg, emoji}` | the shared react response (toggle) |
 | `channels` | READ_CHANNELS (256) | `{bot_id, api_key}` | `{ok:1, channels:[...]}` — exactly the owner's VIEWable channels, with `can_post` + `unread` as the owner |
 | `channel_info` | READ_CHANNELS (256) | `{bot_id, api_key, channel}` | `{ok:1, channel:{id, name, kind, manifest, created, topic, seq}}` |
+| `site_get` | SITE (512) | `{bot_id, api_key, channel, path, offset?, len?}` | the human site read, owner as viewer: `{ok:1, channel, path, total, offset, eof, mime, can_edit, data_b64}` |
+| `site_manifest` | SITE (512) | `{bot_id, api_key, channel}` | `{ok:1, channel, manifest}` |
 
 `post` rules: the owner must hold VIEW + POST on the channel;
 content must be non-empty (unless attachments are present);
@@ -135,8 +137,8 @@ the message's channel is enforced there).
 
 `_bot_event_allowed` (`sHades.py:1605`) maps event kinds to bits
 (`_BOT_EVENT_BITS`, `sHades.py:1598`): `msg`→1, `edit`→2,
-`delete`→4, `reaction`→8, `presence`→16, `typing`→32. The filter is
-enforced in **both** delivery paths:
+`delete`→4, `reaction`→8, `presence`→16, `typing`→32,
+`site_patch`→512. The filter is enforced in **both** delivery paths:
 
 - `_push_stream` (`sHades.py:1655`, the ticket wake-up): a bot is
   only woken when the batch holds at least one event it may receive
@@ -156,10 +158,10 @@ enforced in **both** delivery paths:
   disallowed events are skipped over when the next allowed one
   arrives (or on resync).
 
-**Never delivered to bots, with any perms (even 511):**
-`site_patch`, `term_data`, `channels_changed`, `channel_deleted`,
-`posts_purged` — and unknown kinds are denied by default. There is
-no bit that opts into them.
+**Never delivered to bots, with any perms (even 1023):**
+`term_data`, `channels_changed`, `channel_deleted`, `posts_purged` —
+and unknown kinds are denied by default. There is no bit that opts
+into them.
 
 **Typing:** the typing snapshot rides the push ticket and the
 subscribe/poll responses, gated the same way as typing events
@@ -173,6 +175,32 @@ the presence machinery's per-user view — a bot subscribing as its
 owner would clobber the owner's own subscription and surface the
 bot's channel as the owner's `active_channel`. Bots never appear in
 presence (`_presence_payload` reads `SUB_BY_USER` only).
+
+## Micron page hooks
+
+A bot with the SITE bit (512) hooks into micron pages on a site
+channel: it receives `site_patch` events when a page is published or
+the manifest changes, and it can read the new content back.
+
+- **The hook event:** `site_put` emits `site_patch {path, mime,
+  size}` and `site_manifest_put` emits `site_patch {manifest}` on
+  the channel stream. A SITE bot subscribed to that site channel is
+  woken by the push ticket and sees the event on poll, exactly like a
+  message event — same filter, same watermark, same cursor rules
+  (see Push filtering above). A bot without the bit never sees
+  `site_patch`, on either path.
+- **The read half:** `POST /api/v1/bots/site_get {bot_id, api_key,
+  channel, path, offset?, len?}` and `POST
+  /api/v1/bots/site_manifest {bot_id, api_key, channel}`. Both
+  require the SITE bit **and** the owner's VIEW on the site channel
+  (the human manifest endpoint is ungated; the bot one is not).
+  `site_get` is the same chunked read as the human endpoint
+  (`_site_read_for`, shared code), owner as viewer — so `can_edit`
+  reflects the owner's edit rights. Reads touch `last_seen` and are
+  not audited.
+- **No bot writes:** there is no `bots/site_put`. Publishing pages
+  stays moderator / `SITE_EDIT`, human-only. A hook bot watches and
+  reads; it cannot publish.
 
 ## Attribution
 
@@ -203,9 +231,7 @@ supplies the gateway and the API key.
    the permissions it needs, Create. Copy the API key **now** — it is
    shown once and never again. The screen also shows the gateway
    block (hub address, guild node + delivery hashes, endpoint
-   paths). Note the gateway gap above: `channels` and `channel_info`
-   live at `/api/v1/bots/channels` and `/api/v1/bots/channel_info`
-   even though the create response's `endpoints` dict omits them.
+   paths).
 2. **Your bot needs its own RNS identity + link** to the guild
    (the same link setup the client uses: `RNS.Identity` +
    `RNS.Link`, see `GuildAPI._request_json` in `guild_api.py:195` —
@@ -241,7 +267,7 @@ supplies the gateway and the API key.
   `kivy_client.py:6601`). Lists the user's bots (name, owner hash
   truncated + Copy, plain-language perm labels, created/last seen;
   revoked rows dimmed at opacity 0.6 with actions disabled), a create
-  form (name + 9 permission checkboxes), a one-time key box with an
+  form (name + 10 permission checkboxes), a one-time key box with an
   ONCE warning + gateway block + Copy/Dismiss (dismissing refreshes
   the list — the key is gone for good), two-tap confirm revoke on the
   button itself, and an inline per-permissions editor per bot.
@@ -251,5 +277,8 @@ supplies the gateway and the API key.
 - `tests/test_bots_registry.py` — registry + management endpoints.
 - `tests/test_bots_stream.py` — auth, stream filtering (both paths),
   data path, presence exclusion, rate limiting, last_seen.
+- `tests/test_bots_site_hooks.py` — SITE bit: `site_patch` hook
+  (push + poll), `bots/site_get` / `bots/site_manifest`, human
+  handler regression.
 - `tests/test_bots_screen.py` — Bots screen against a fake GuildAPI
   (Xvfb).

@@ -67,7 +67,7 @@ def _row_label(text, w=0.5, h=26, fs=None):
     return lbl
 
 
-def _btn(text, width=70, h=30, fs=None):
+def _btn(text, width=70, h=40, fs=None):
     fs = fs or sp(11)
     return Button(text=text, size_hint_x=None, width=_scaled(width),
                   size_hint_y=None, height=_scaled(h), font_size=fs,
@@ -101,7 +101,11 @@ class _Tab:
 
     # -- widget scaffolding --------------------------------------------------
     def make_content(self):
-        self.box = BoxLayout(orientation="vertical", spacing=dp(8))
+        # Polish2 item 4: tab-content rows are 40px (the 40px touch
+        # target), so the scaffold spacing is 4px -- at 640x480 the
+        # General tab's eight 40px control rows + audit scroll only
+        # just fit, and 8px gaps would eat the scroll strip.
+        self.box = BoxLayout(orientation="vertical", spacing=dp(4))
         self._build_controls()
         scroll = ScrollView(size_hint=(1, 1))
         grid = GridLayout(cols=1, size_hint_y=None, spacing=dp(3),
@@ -175,41 +179,41 @@ class GeneralTab(_Tab):
     def _build_controls(self):
         self.entries = {}
 
-        m_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
+        m_row = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
         self.motd_entry = TextInput(hint_text="motd", multiline=False,
                                     size_hint_x=0.6)
         self.entries["motd"] = self.motd_entry
-        m_save = _btn("save", 70, 30)
+        m_save = _btn("save", 70, 40)
         m_save.bind(on_press=lambda _i: self.do_save_key("motd"))
         m_row.add_widget(self.motd_entry)
         m_row.add_widget(m_save)
         self.box.add_widget(m_row)
 
-        n_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
+        n_row = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
         n_entry = TextInput(hint_text="guild name", multiline=False,
                             size_hint_x=0.6)
         self.entries["guild_name"] = n_entry
-        n_save = _btn("save", 70, 30)
+        n_save = _btn("save", 70, 40)
         n_save.bind(on_press=lambda _i: self.do_save_key("guild_name"))
         n_row.add_widget(n_entry)
         n_row.add_widget(n_save)
         self.box.add_widget(n_row)
 
-        s_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
+        s_row = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
         s_entry = TextInput(hint_text="slowmode (s, 0=off)", multiline=False,
                             size_hint_x=0.6)
         self.entries["slowmode"] = s_entry
-        s_save = _btn("save", 70, 30)
+        s_save = _btn("save", 70, 40)
         s_save.bind(on_press=lambda _i: self.do_save_key("slowmode"))
         s_row.add_widget(s_entry)
         s_row.add_widget(s_save)
         self.box.add_widget(s_row)
 
-        r_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
+        r_row = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
         r_entry = TextInput(hint_text="registration: open|code",
                             multiline=False, size_hint_x=0.6)
         self.entries["registration"] = r_entry
-        r_save = _btn("save", 70, 30)
+        r_save = _btn("save", 70, 40)
         r_save.bind(on_press=lambda _i: self.do_save_key("registration"))
         r_row.add_widget(r_entry)
         r_row.add_widget(r_save)
@@ -218,11 +222,11 @@ class GeneralTab(_Tab):
         # attachments persistence (P3): the live mode, one tap to flip.
         # Ephemeral means bytes ride the server RAM registry (TTL +
         # cap) instead of disk: new uploads only, flip-back is safe.
-        a_row = BoxLayout(size_hint_y=None, height=_scaled(32),
+        a_row = BoxLayout(size_hint_y=None, height=_scaled(40),
                           spacing=dp(4))
-        self.att_state = _row_label("attachments: saved", w=0.35)
-        self.att_saved_btn = _btn("saved", 80, 30)
-        self.att_eph_btn = _btn("ephemeral", 110, 30)
+        self.att_state = _row_label("attachments: saved", w=0.35, h=40)
+        self.att_saved_btn = _btn("saved", 80, 40)
+        self.att_eph_btn = _btn("ephemeral", 110, 40)
         self.att_saved_btn.bind(
             on_press=lambda _i: self._save_attachments("saved"))
         self.att_eph_btn.bind(
@@ -236,8 +240,8 @@ class GeneralTab(_Tab):
                              spacing=dp(8))
         self.icon_widget = Image(size_hint_x=None, width=_scaled(56),
                                  allow_stretch=True, keep_ratio=True)
-        pick = _btn("set icon...", 110, 30)
-        clear = _btn("clear", 60, 30)
+        pick = _btn("set icon...", 110, 40)
+        clear = _btn("clear", 60, 40)
         pick.bind(on_press=lambda _i: self._open_icon_chooser())
         clear.bind(on_press=lambda _i: self._clear_icon())
         icon_row.add_widget(self.icon_widget)
@@ -253,8 +257,8 @@ class GeneralTab(_Tab):
         self.box.add_widget(self.banner_widget)
         banner_row = BoxLayout(size_hint_y=None, height=_scaled(40),
                                spacing=dp(8))
-        bpick = _btn("set banner...", 110, 30)
-        bclear = _btn("clear", 60, 30)
+        bpick = _btn("set banner...", 110, 40)
+        bclear = _btn("clear", 60, 40)
         bpick.bind(on_press=lambda _i: self._open_banner_chooser())
         bclear.bind(on_press=lambda _i: self._clear_banner())
         banner_row.add_widget(bpick)
@@ -343,9 +347,9 @@ class GeneralTab(_Tab):
         chooser = FileChooserListView(
             path=os.path.expanduser("~"),
             filters=["*.png", "*.jpg", "*.jpeg", "*.webp", "*.gif"])
-        cancel = _btn("cancel", 90, 30)
-        pick = _btn("use this file", 130, 30)
-        buttons = BoxLayout(size_hint_y=None, height=_scaled(34),
+        cancel = _btn("cancel", 90, 40)
+        pick = _btn("use this file", 130, 40)
+        buttons = BoxLayout(size_hint_y=None, height=_scaled(40),
                             spacing=dp(4))
         buttons.add_widget(cancel)
         buttons.add_widget(pick)
@@ -381,9 +385,9 @@ class GeneralTab(_Tab):
         chooser = FileChooserListView(
             path=os.path.expanduser("~"),
             filters=["*.png", "*.jpg", "*.jpeg", "*.webp", "*.gif"])
-        cancel = _btn("cancel", 90, 30)
-        pick = _btn("use this file", 130, 30)
-        buttons = BoxLayout(size_hint_y=None, height=_scaled(34),
+        cancel = _btn("cancel", 90, 40)
+        pick = _btn("use this file", 130, 40)
+        buttons = BoxLayout(size_hint_y=None, height=_scaled(40),
                             spacing=dp(4))
         buttons.add_widget(cancel)
         buttons.add_widget(pick)
@@ -414,11 +418,11 @@ class MembershipTab(_Tab):
     title = "Membership"
 
     def _build_controls(self):
-        row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
+        row = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
         self.hash_entry = TextInput(hint_text="user hash (32 hex)",
                                     multiline=False, size_hint_x=0.6)
-        addm = _btn("add mod", 80, 30)
-        adda = _btn("add admin", 90, 30)
+        addm = _btn("add mod", 80, 40)
+        adda = _btn("add admin", 90, 40)
         addm.bind(on_press=lambda _i: self._do_op("add"))
         adda.bind(on_press=lambda _i: self._do_op("admin_add"))
         row.add_widget(self.hash_entry)
@@ -440,9 +444,10 @@ class MembershipTab(_Tab):
         self.grid.clear_widgets()
         for h in sorted(set(mods) | set(admins)):
             kind = "admin" if h in admins else "mod"
-            r = BoxLayout(size_hint_y=None, height=_scaled(26), spacing=dp(4))
-            r.add_widget(_row_label("%s  %s..." % (kind, h[:12]), w=0.7))
-            rm = _btn("remove", 70, 26, sp(10))
+            r = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
+            r.add_widget(_row_label("%s  %s..." % (kind, h[:12]), w=0.7,
+                                    h=40))
+            rm = _btn("remove", 70, 40)
             rm.bind(on_press=lambda _i, hh=h, kk=kind: self._do_op(
                 "admin_remove" if kk == "admin" else "remove", hh))
             r.add_widget(rm)
@@ -478,22 +483,22 @@ class ChannelsTab(_Tab):
 
     def _channel_row(self, ch):
         cid = ch["id"]
-        row = BoxLayout(size_hint_y=None, height=_scaled(30), spacing=dp(2))
+        row = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(2))
         row.add_widget(_row_label("#%s  %s" % (ch["name"],
                                                ch.get("kind", "chat")),
-                                  w=0.35))
+                                  w=0.35, h=40))
         topic = TextInput(text=ch.get("topic") or "", multiline=False,
                           size_hint_x=0.35)
-        save_topic = _btn("topic", 60, 26, sp(10))
+        save_topic = _btn("topic", 60, 40)
         save_topic.bind(on_press=lambda _i, c=cid, t=topic:
                         self._save_topic(c, t.text))
-        ed = _btn("perms...", 70, 26, sp(10))
+        ed = _btn("perms...", 70, 40)
         ed.bind(on_press=lambda _i: self._open_perm_editor(ch))
         row.add_widget(topic)
         row.add_widget(save_topic)
         row.add_widget(ed)
         if getattr(self.client, "i_am_admin", False):
-            dele = _btn("delete", 60, 26, sp(10))
+            dele = _btn("delete", 60, 40)
             dele.bind(on_press=lambda _i, c=cid, n=ch["name"]:
                       self._delete(c, n))
             row.add_widget(dele)
@@ -561,7 +566,7 @@ class ChannelsTab(_Tab):
             self._post(job, on_ok=self.reload, label="overwrites")
             popup.dismiss()
 
-        apply_btn = _btn("apply", 90, 30)
+        apply_btn = _btn("apply", 90, 40)
         apply_btn.bind(on_press=lambda _i: do_apply())
         box.add_widget(apply_btn)
         popup = Popup(title="permissions: #%s" % ch["name"], content=box,
@@ -581,7 +586,7 @@ class RolesTab(_Tab):
 
     def _build_controls(self):
         self._perm_checks = {}
-        row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
+        row = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
         self.new_role_name = TextInput(hint_text="new role name",
                                        multiline=False, size_hint_x=0.25)
         row.add_widget(self.new_role_name)
@@ -591,21 +596,21 @@ class RolesTab(_Tab):
                           pos_hint={"center_y": 0.5})
             self._perm_checks[label] = cb
             row.add_widget(cb)
-        create = _btn("create", 70, 30)
+        create = _btn("create", 70, 40)
         create.bind(on_press=lambda _i: self.do_create_role())
         row.add_widget(create)
         self.box.add_widget(row)
 
-        assign_row = BoxLayout(size_hint_y=None, height=_scaled(32),
+        assign_row = BoxLayout(size_hint_y=None, height=_scaled(40),
                                spacing=dp(4))
         self.assign_user = TextInput(hint_text="user hash", multiline=False,
                                      size_hint_x=0.55)
         self.assign_role = TextInput(hint_text="role id", multiline=False,
                                      size_hint_x=0.25)
-        go = _btn("assign", 70, 30)
+        go = _btn("assign", 70, 40)
         go.bind(on_press=lambda _i: self.do_assign(
             _role_id_from(self.assign_role.text), self.assign_user.text))
-        go2 = _btn("unassign", 80, 30)
+        go2 = _btn("unassign", 80, 40)
         go2.bind(on_press=lambda _i: self.do_unassign(
             _role_id_from(self.assign_role.text), self.assign_user.text))
         assign_row.add_widget(self.assign_user)
@@ -664,12 +669,13 @@ class RolesTab(_Tab):
         for role in res.get("roles") or []:
             bits = ", ".join(lbl for lbl, bit in PERM_BITS
                              if role["perms"] & bit) or "no perms"
-            row = BoxLayout(size_hint_y=None, height=_scaled(26),
+            row = BoxLayout(size_hint_y=None, height=_scaled(40),
                             spacing=dp(2))
             row.add_widget(_row_label(
                 "%s  [%s]  members=%s" % (role["name"], bits,
-                                          role.get("members", "?")), w=0.85))
-            dele = _btn("delete", 60, 26, sp(10))
+                                          role.get("members", "?")), w=0.85,
+                h=40))
+            dele = _btn("delete", 60, 40)
             dele.bind(on_press=lambda _i, rid=role["role_id"]:
                       self._delete(rid))
             row.add_widget(dele)
@@ -686,7 +692,7 @@ class InvitesTab(_Tab):
     title = "Invites"
 
     def _build_controls(self):
-        row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
+        row = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
         self.label_in = TextInput(hint_text="label (optional)",
                                   multiline=False, size_hint_x=0.35)
         self.uses_in = TextInput(hint_text="max uses", multiline=False,
@@ -695,7 +701,7 @@ class InvitesTab(_Tab):
                                 size_hint_x=0.15)
         self.channel_in = TextInput(hint_text="channel cid (optional)",
                                     multiline=False, size_hint_x=0.25)
-        create = _btn("create", 70, 30)
+        create = _btn("create", 70, 40)
         create.bind(on_press=lambda _i: self.do_create())
         row.add_widget(self.label_in)
         row.add_widget(self.uses_in)
@@ -724,13 +730,13 @@ class InvitesTab(_Tab):
                    % (inv.get("code", ""), inv.get("label") or "-",
                       inv.get("uses", 0), inv.get("max_uses") or "*",
                       exp_txt, suffix))
-            row = BoxLayout(size_hint_y=None, height=_scaled(26),
+            row = BoxLayout(size_hint_y=None, height=_scaled(40),
                             spacing=dp(2))
-            row.add_widget(_row_label(txt, w=0.8, fs=sp(10)))
-            cp = _btn("copy", 55, 26, sp(10))
+            row.add_widget(_row_label(txt, w=0.8, h=40, fs=sp(10)))
+            cp = _btn("copy", 55, 40)
             cp.bind(on_press=lambda _i, code=inv.get("code", ""):
                     self._copy_link(code))
-            rv = _btn("revoke", 65, 26, sp(10))
+            rv = _btn("revoke", 65, 40)
             rv.bind(on_press=lambda _i, code=inv.get("code"):
                     self._revoke(code))
             row.add_widget(cp)
@@ -820,10 +826,9 @@ class ServerConfigScreen(Screen):
 
         root = BoxLayout(orientation="vertical", padding=dp(6))
         # G6 (UIX P2-1): the tab bar is 40px and its buttons are 40px
-        # tall -- 30px buttons are below the 40px touch target. (The
-        # _btn default stays 30px: tab-content rows are fixed 26-32px
-        # tall and would overflow with 40px buttons; that needs a
-        # row-height rework with a live connection to verify.)
+        # tall. Polish2 item 4: the tab-content rows are 40px too now
+        # (the _btn default is 40px), so no tab-content button is
+        # below the 40px touch target.
         bar = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
         back = _btn("< back", 90, 40, sp(12))
         back.bind(on_press=lambda _i: self._back())
@@ -833,6 +838,22 @@ class ServerConfigScreen(Screen):
         self._content_slot = BoxLayout()
         root.add_widget(bar)
         root.add_widget(self._content_slot)
+        # Status line for the admin screen. The screen is built in
+        # Python (no kv rule), so self.ids was always empty and the
+        # v0.36.10 status mirror (ids["config_status"]) never found
+        # its label: every icon/banner status — "icon set" and every
+        # failure — was invisible while standing on this screen.
+        # Registering the label in ids makes the existing lookups in
+        # _Tab._status and _apply_status_ui find it.
+        from kivy.uix.label import Label
+        accent = (app.theme_colors.get("accent", (0.345, 0.839, 0.765, 1))
+                  if app else (0.345, 0.839, 0.765, 1))
+        status = Label(text="", size_hint_y=None, height=_scaled(26),
+                       color=accent, halign="left", valign="middle")
+        status.bind(width=lambda inst, w: setattr(
+            inst, "text_size", (w, None)))
+        root.add_widget(status)
+        self.ids["config_status"] = status
         self.add_widget(root)
 
         for tab_cls in TAB_CLASSES:

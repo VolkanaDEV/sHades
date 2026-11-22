@@ -6,6 +6,7 @@ Everything here is cosmetic and fails soft: if an effect cannot run
   * soft_texture()      cached radial-glow texture used by every orb/halo
   * AuroraBackground    three slow-drifting colour orbs behind a screen
   * reveal()            fade-in used for messages and screen sections
+  * reveal_on_texture() fade an AsyncImage in once its texture lands
   * stagger()           reveal a list of widgets one after another
   * tap_feedback()      quick opacity dip on press
   * slide_property()    animate one numeric property (drawer widths)
@@ -350,6 +351,82 @@ def reveal(widget, delay=0.0, duration=0.42):
             go(0)
     except Exception:
         widget.opacity = 1
+
+
+def reveal_on_texture(widget, delay=0.0, duration=0.42):
+    """Fade a widget in once its image texture has actually landed.
+
+    Plain reveal() starts the fade the moment it is called, but an
+    AsyncImage loads its texture on a background thread: the fade can
+    finish on the empty box (or the 32x32 loading placeholder) and
+    the real image then pops in after it. This waits for the load
+    instead: the widget sits at opacity 0 until the texture arrives,
+    then fades, so the fade and the image land together.
+
+    Why on_load, not on_texture: setting an AsyncImage source fires
+    on_texture at once for the loading-placeholder texture, so
+    binding the fade to on_texture would still fade the placeholder.
+    on_load fires only when the real texture is assigned (AsyncImage
+    dispatches it from _on_source_load), and ProxyImage.loaded tells
+    whether the texture is already there -- a Loader-cached source
+    hands back a loaded proxy and never fires on_load again.
+
+    Already loaded (cached source, plain Image, empty/missing source
+    with no proxy to wait on) fades at once, exactly like reveal().
+    A load error also fades at once -- a failed image must not leave
+    a permanently invisible hole. REDUCED_MOTION lands at opacity 1
+    at once, like reveal(). Returns None; when the fade is deferred
+    there is no Animation yet to return.
+    """
+    if REDUCED_MOTION:
+        try:
+            widget.opacity = 1
+        except Exception:
+            pass
+        return None
+    try:
+        proxy = getattr(widget, "_coreimage", None)
+        waiting = (proxy is not None
+                   and not getattr(proxy, "loaded", True)
+                   and getattr(widget, "source", None))
+    except Exception:
+        waiting = False
+    if not waiting:
+        return reveal(widget, delay=delay, duration=duration)
+    try:
+        widget.opacity = 0
+    except Exception:
+        return reveal(widget, delay=delay, duration=duration)
+    state = {"done": False}
+
+    def _fire(*args):
+        if state["done"]:
+            return
+        state["done"] = True
+        handler = getattr(widget, "_ui_fx_reveal_handler", None)
+        if handler is not None:
+            try:
+                widget.unbind(on_load=handler, on_error=handler)
+            except Exception:
+                pass
+            try:
+                del widget._ui_fx_reveal_handler
+            except Exception:
+                pass
+        reveal(widget, delay=delay, duration=duration)
+
+    try:
+        old = getattr(widget, "_ui_fx_reveal_handler", None)
+        if old is not None:
+            try:
+                widget.unbind(on_load=old, on_error=old)
+            except Exception:
+                pass
+        widget._ui_fx_reveal_handler = _fire
+        widget.bind(on_load=_fire, on_error=_fire)
+    except Exception:
+        return reveal(widget, delay=delay, duration=duration)
+    return None
 
 
 def stagger(widgets, step=0.06, start=0.05, duration=0.45):

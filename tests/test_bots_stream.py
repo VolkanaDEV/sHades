@@ -5,8 +5,9 @@ Pins down:
   - _resolve_bot: good key ok; wrong key / unknown bot / revoked /
     non-string credentials -> None (callers map None to 403, never 404);
   - _bot_event_allowed: kind -> bit mapping; the never-delivered kinds
-    (site_patch, term_data, channels_changed, channel_deleted,
-    posts_purged) and unknown kinds -> False even with perms 511;
+    (term_data, channels_changed, channel_deleted, posts_purged) and
+    unknown kinds -> False even with perms 1023; site_patch is SITE-gated
+    (bit 512), not never-delivered;
   - subscribe accepts bot credentials in the data, authenticates AS the
     owner for VIEW (owner without VIEW -> 403; bad credentials -> 403,
     never 404), and records bot_id + bot_perms on the subscription;
