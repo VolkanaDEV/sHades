@@ -3368,6 +3368,10 @@ SERVER_CONFIG_KEYS = {
                                   # initiating update source. Any other hub
                                   # may be compromised; a non-trusted pull
                                   # needs the artifact pin to run at all.
+    "update_manifest_policy": "off",  # off | log | enforce (trust model s1)
+    "update_release_channel": "general",  # nightly | canary | general
+    "update_manifest_key": "",   # ed25519 PUBLIC key (PEM/base64/hex);
+                                 # empty = use compiled-in release key
 }
 
 # ---------------------------------------------------------------------- P11 updater
@@ -3459,6 +3463,9 @@ def api_v1_update_status(viewer, data, link_id):
     out["peer"] = _cfg_get("update_channel_peer", "")
     out["shapin"] = _cfg_get("update_channel_shapin", "")
     out["trusted"] = _cfg_get("update_trusted_hub", "")
+    out["manifest_policy"] = _cfg_get("update_manifest_policy", "off")
+    out["release_channel"] = _cfg_get("update_release_channel", "general")
+    out["manifest_key"] = bool(_cfg_get("update_manifest_key", ""))
     return out
 
 
@@ -3753,8 +3760,29 @@ def api_v1_admin_config(viewer, data, link_id):
             return {"ok": 0, "error": key + " must be a 64-hex digest or empty",
                     "code": 400}
         value = value.lower()
+    if key == "update_manifest_policy" and value not in ("off", "log",
+                                                         "enforce"):
+        return {"ok": 0, "error": "update_manifest_policy must be one of "
+                "'off', 'log', 'enforce'", "code": 400}
+    if key == "update_release_channel" and not re.match(
+            r"^[a-z0-9][a-z0-9._-]{0,31}$", value):
+        return {"ok": 0, "error": "update_release_channel must be 1-32 "
+                "chars of [a-z0-9._-]", "code": 400}
+    if key == "update_manifest_key" and value:
+        try:
+            import release_manifest
+            release_manifest.load_public_key(value)
+        except Exception:
+            return {"ok": 0, "error": "update_manifest_key is not a valid "
+                    "ed25519 public key (PEM, base64 or hex)",
+                    "code": 400}
     old = _cfg_get(key, SERVER_CONFIG_KEYS[key])
     _cfg_set(key, value)
+    if key == "update_manifest_key":
+        _audit(viewer, "config.set", key,
+               "%s -> %s" % ("<set>" if old else "<empty>",
+                             "<set>" if value else "<empty>"))
+        return {"ok": 1, "config": {key: "<redacted>"}}
     _audit(viewer, "config.set", key, "%s -> %s" % (old, value))
     return {"ok": 1, "config": {key: value}}
 

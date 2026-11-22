@@ -27,6 +27,23 @@ HTTP_TIMEOUT = 20
 # The members a server bundle must carry before anything swaps.
 TREE_MEMBERS = ("sHades.py", "updater.py", "update_run.py")
 
+# Release manifest trust (update-trust-model.md, step 1).
+# The compiled-in release public key lands here when the key ceremony
+# happens; until then it is empty and only cfg update_manifest_key or
+# policy=off make sense. Off is the shipped default: legacy sha256 path.
+RELEASE_PUBKEY_ED25519 = ""
+
+
+def _manifest_policy(cfg_get):
+    p = (cfg_get("update_manifest_policy", "off") or "off").strip().lower()
+    return p if p in ("off", "log", "enforce") else "off"
+
+
+def _manifest_key(cfg_get):
+    return (cfg_get("update_manifest_key", "") or
+            RELEASE_PUBKEY_ED25519)
+
+
 _status = {"last_check": None, "verdict": "never", "detail": ""}
 
 
@@ -142,6 +159,69 @@ def pick_assets(assets, sha_body=None):
 def verify_sha(data, sha):
     got = hashlib.sha256(data).hexdigest()
     return hmac.compare_digest(got, sha.lower())
+
+
+def _check_manifest(picked, cfg_get, current_version,
+                    manifest_bytes, sig_bytes):
+    """Verify the signed manifest against this release. policy=log warns
+    and proceeds (legacy sha256 path still gates bytes); policy=enforce
+    refuses. Returns the parsed manifest, or None when verification did
+    not succeed under log policy."""
+    import release_manifest
+    policy = _manifest_policy(cfg_get)
+    channel = (cfg_get("update_release_channel", "general") or
+               "general").strip()
+    try:
+        m = release_manifest.verify_manifest(
+            manifest_bytes, sig_bytes, _manifest_key(cfg_get),
+            current_version=current_version, channel=channel)
+        art = m["artifact"]
+        if art["name"] != picked["bundle_name"]:
+            raise release_manifest.ManifestError(
+                "manifest artifact %r != bundle asset %r" % (
+                    art["name"], picked["bundle_name"]))
+        if art["sha256"] != picked["sha256"]:
+            raise release_manifest.ManifestError(
+                "manifest sha256 does not match the .sha256 asset")
+        if m["version"] != picked["version"]:
+            raise release_manifest.ManifestError(
+                "manifest version %r != asset version %r" % (
+                    m["version"], picked["version"]))
+    except release_manifest.ManifestError as e:
+        if policy == "enforce":
+            _note("refused", "manifest verification failed: %s" % e)
+            raise HttpError("manifest verification failed: %s" % e)
+        _note("manifest-warn",
+              "%s (policy=log; proceeding on legacy sha256)" % e)
+        return None
+    _note("manifest-ok", "release manifest verified (%s)" % m["version"])
+    return m
+
+
+def _manifest_for_github(release, picked, cfg_get, current_version):
+    """Fetch and verify the manifest assets that sit next to the bundle.
+    Returns the parsed manifest, or None (log policy with the manifest
+    absent/invalid; off policy never reaches here)."""
+    policy = _manifest_policy(cfg_get)
+    mname = "sHades-server-%s.manifest.json" % picked["version"]
+    sname = mname + ".sig"
+    mbytes = sbytes = None
+    try:
+        if mname in release["assets"]:
+            mbytes = _get_bytes(release["assets"][mname])
+        if sname in release["assets"]:
+            sbytes = _get_bytes(release["assets"][sname])
+    except HttpError:
+        mbytes = sbytes = None
+    if mbytes is None or sbytes is None:
+        if policy == "enforce":
+            _note("refused", "release manifest or signature missing")
+            raise HttpError("manifest missing; refusing under "
+                            "update_manifest_policy=enforce")
+        _note("manifest-warn", "no signed manifest in release; "
+              "proceeding on legacy sha256 (policy=log)")
+        return None
+    return _check_manifest(picked, cfg_get, current_version, mbytes, sbytes)
 
 
 def _member_ok(name, ti):
@@ -299,6 +379,20 @@ def check_and_apply(tree_dir, current_version, cfg_get, argv=None,
         picked = rns_fetch()
         if picked is None:
             return {"skipped": True, "reason": "no-bundle"}
+        manifest = None
+        if _manifest_policy(cfg_get) != "off":
+            mb = picked.get("manifest_bytes")
+            sb = picked.get("manifest_sig")
+            if mb and sb:
+                manifest = _check_manifest(picked, cfg_get, current_version,
+                                           mb, sb)
+            elif _manifest_policy(cfg_get) == "enforce":
+                _note("refused", "rns bundle carries no signed manifest")
+                raise HttpError("manifest missing; refusing under "
+                                "update_manifest_policy=enforce")
+            else:
+                _note("manifest-warn", "rns bundle carried no manifest; "
+                      "proceeding on legacy sha256 (policy=log)")
         cur = parse_version(current_version)
         new = parse_version(picked["version"])
         if cur is None or new is None:
@@ -312,6 +406,19 @@ def check_and_apply(tree_dir, current_version, cfg_get, argv=None,
         bp = os.path.join(tmp, picked["bundle_name"])
         with open(bp, "wb") as f:
             f.write(picked["bundle_bytes"])
+        if manifest is not None:
+            import release_manifest
+            try:
+                release_manifest.check_artifact(manifest,
+                                                picked["bundle_bytes"])
+            except release_manifest.ManifestError as e:
+                if _manifest_policy(cfg_get) == "enforce":
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    _note("refused", "bundle failed the manifest check: %s"
+                          % e)
+                    raise HttpError("bundle bytes disagree with the "
+                                    "signed manifest")
+                _note("manifest-warn", "bundle vs manifest: %s" % e)
         try:
             res = apply_update(bp, picked["sha256"], tree_dir, argv=argv,
                                exec_restart=exec_restart)
@@ -330,6 +437,10 @@ def check_and_apply(tree_dir, current_version, cfg_get, argv=None,
     if picked is None:
         _note("no-bundle", "release carries no server bundle")
         return {"skipped": True, "reason": "no-bundle"}
+    manifest = None
+    if _manifest_policy(cfg_get) != "off":
+        manifest = _manifest_for_github(release, picked, cfg_get,
+                                        current_version)
     cur = parse_version(current_version)
     new = parse_version(picked["version"])
     if cur is None or new is None:
@@ -342,6 +453,16 @@ def check_and_apply(tree_dir, current_version, cfg_get, argv=None,
     if not verify_sha(data, picked["sha256"]):
         _note("refused", "bundle bytes disagree with the .sha256")
         raise HttpError("sha mismatch on download")
+    if manifest is not None:
+        import release_manifest
+        try:
+            release_manifest.check_artifact(manifest, data)
+        except release_manifest.ManifestError as e:
+            if _manifest_policy(cfg_get) == "enforce":
+                _note("refused", "bundle failed the manifest check: %s" % e)
+                raise HttpError("bundle bytes disagree with the "
+                                "signed manifest")
+            _note("manifest-warn", "bundle vs manifest: %s" % e)
     tmp = tempfile.mkdtemp(prefix="sHades-dl-")
     bp = os.path.join(tmp, picked["bundle_name"])
     with open(bp, "wb") as f:
