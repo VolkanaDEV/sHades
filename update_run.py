@@ -3,8 +3,9 @@
 update_run.py replaces the running sHades process (python sHades.py
 <args>), but through this script — spawned by updater's execv — so a
 bundle that cannot boot rolls itself back. The supervised tree is the
-CWD this launcher was started in (the server's tree, exactly where the
-execv handed over).
+directory this script lives in (the server's tree), resolved from
+__file__ — never from CWD, which under systemd is not the tree and
+silently disarming the rollback was the failure mode.
 
   marker update_staging/pending_version present = an update was swapped
   update_backup/                                = the previous members
@@ -38,7 +39,7 @@ def _restore(tree):
 
 
 def main():
-    tree = os.path.abspath(os.getcwd())
+    tree = os.path.dirname(os.path.abspath(__file__))
     app_args = sys.argv[1:]
     marker = os.path.join(tree, MARKER)
     attempt = 0

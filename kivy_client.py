@@ -254,7 +254,7 @@ import qr_tools  # noqa: E402
 import offline_store  # noqa: E402
 import profile_card  # noqa: E402
 import ui_geom  # noqa: E402
-from guild_api import GuildAPI  # noqa: E402
+from guild_api import GuildAPI, BOT_PERM_BITS  # noqa: E402
 from client_widgets import (  # noqa: E402, F401
     _AudioAttachRow, ImageCache, ContextMenuMixin, ContextMenuOverlay,
     MeshPulse, MeshConstellation, SkeletonRow, FancyMDButton,
@@ -1573,6 +1573,532 @@ if KIVY:
             if status:
                 status.text = "%s preset applied." % name
 
+    class BotsScreen(Screen):
+        """Bots setup/config screen (Group 3): list, create, revoke, edit.
+
+        The kv rule carries only the static chrome (title, scroll body,
+        status line, Refresh/Back bar); the create form, the one-time key
+        display and the bot rows are built in Python on first entry
+        (like ConfigScreen._ensure_color_rows), because the rows are
+        dynamic. All API traffic goes through app.guild_api
+        (bots_list / bots_create / bots_update / bots_revoke); when
+        there is no guild connection the screen shows a status error
+        and keeps whatever list was last fetched.
+
+        Revoke is a two-tap confirm on the button itself (no popup):
+        the first tap arms it ("Confirm revoke"), the second calls
+        bots_revoke. The arm clears whenever the list re-renders.
+        No animation here -- state changes only -- so REDUCED_MOTION
+        needs no special-casing.
+        """
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._built = False
+            self._bots = []            # last fetched bot dicts (or [])
+            self._create_checks = {}   # perm bit -> CheckBox
+            self._key = None           # one-time API key from last create
+            self._gateway_text = ""    # formatted gateway block, for copy
+            self._revoke_armed = {}    # bot_id -> bool (two-tap confirm)
+            self._edit_boxes = {}      # bot_id -> editor BoxLayout
+            self._edit_checks = {}     # bot_id -> {bit: CheckBox}
+
+        # -- lifecycle --------------------------------------------------
+        def on_pre_enter(self):
+            """Build the form (first entry) and refresh the list."""
+            self._build()
+            self.refresh()
+
+        # -- construction ------------------------------------------------
+        def _build(self):
+            """Build the create form, key box and list container (once)."""
+            if self._built:
+                return
+            try:
+                body = self.ids["bots_body"]
+            except Exception:
+                return
+            from kivy.app import App as _App
+            from kivy.uix.checkbox import CheckBox
+            from kivymd.uix.textfield import MDTextField
+            app = _App.get_running_app()
+            colors = getattr(app, "theme_colors", {}) if app else {}
+            text = colors.get("text", (1, 1, 1, 1))
+            muted = colors.get("text_muted", (0.6, 0.6, 0.6, 1))
+
+            body.add_widget(self._section("Create a bot"))
+            name_lbl = Label(text="Bot name", font_size=sp(13),
+                             color=muted, size_hint_y=None, height=dp(20),
+                             halign="left", valign="middle")
+            name_lbl.bind(width=lambda w, v: setattr(
+                w, "text_size", (v, None)))
+            body.add_widget(name_lbl)
+            self._name_field = MDTextField(text="", mode="filled",
+                                           size_hint_y=None, height=dp(56))
+            self._name_field.fill_color_normal = colors.get(
+                "input_bg", (0.09, 0.09, 0.09, 1))
+            self._name_field.fill_color_focus = colors.get(
+                "input_bg_focus", (0.11, 0.11, 0.11, 1))
+            self._name_field.text_color_normal = text
+            self._name_field.text_color_focus = text
+            self._name_field.cursor_color = text
+            body.add_widget(self._name_field)
+
+            body.add_widget(self._section("Permissions"))
+            for bit, label in BOT_PERM_BITS:
+                row = BoxLayout(size_hint_y=None, height=dp(40),
+                                spacing=dp(8))
+                cb = CheckBox(size_hint=(None, None), size=(dp(40), dp(40)))
+                row.add_widget(cb)
+                lbl = Label(text=label, font_size=sp(14), color=text,
+                            halign="left", valign="middle")
+                lbl.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+                row.add_widget(lbl)
+                self._create_checks[bit] = cb
+                body.add_widget(row)
+
+            create = self._fancy_button("Create bot", "primary")
+            create.size_hint_x = None
+            create.width = dp(160)
+            create.bind(on_press=lambda *_: self.create_bot())
+            body.add_widget(create)
+
+            # One-time key display: hidden (height 0, opacity 0) until a
+            # create succeeds. Children are static; Python fills the texts.
+            self._key_box = BoxLayout(orientation="vertical",
+                                      size_hint_y=None, height=0, opacity=0,
+                                      spacing=dp(8))
+            err = colors.get("error", (1, 0.42, 0.42, 1))
+            warn = Label(
+                text=("API key shown ONCE -- copy it now. It cannot be "
+                      "retrieved again."),
+                font_size=sp(13), bold=True, color=err,
+                size_hint_y=None, height=dp(40), halign="left",
+                valign="middle")
+            warn.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+            self._key_box.add_widget(warn)
+            self._key_label = Label(text="", font_size=sp(13), color=text,
+                                    size_hint_y=None, height=dp(56),
+                                    halign="left", valign="top")
+            self._key_label.bind(
+                width=lambda w, v: setattr(w, "text_size", (v, None)))
+            self._key_box.add_widget(self._key_label)
+            self._gateway_label = Label(text="", font_size=sp(11),
+                                        color=muted, size_hint_y=None,
+                                        height=dp(120), halign="left",
+                                        valign="top")
+            self._gateway_label.bind(
+                width=lambda w, v: setattr(w, "text_size", (v, None)))
+            self._key_box.add_widget(self._gateway_label)
+            key_row = BoxLayout(size_hint_y=None, height=dp(40),
+                                spacing=dp(10))
+            copy_key = self._fancy_button("Copy API key", "outlined")
+            copy_key.size_hint_x = None
+            copy_key.width = dp(150)
+            copy_key.bind(on_press=lambda *_: self.copy_api_key())
+            key_row.add_widget(copy_key)
+            copy_gw = self._fancy_button("Copy gateway info", "outlined")
+            copy_gw.size_hint_x = None
+            copy_gw.width = dp(180)
+            copy_gw.bind(on_press=lambda *_: self.copy_gateway())
+            key_row.add_widget(copy_gw)
+            dismiss = self._fancy_button("Dismiss", "primary")
+            dismiss.size_hint_x = None
+            dismiss.width = dp(110)
+            dismiss.bind(on_press=lambda *_: self.dismiss_key())
+            key_row.add_widget(dismiss)
+            self._key_box.add_widget(key_row)
+            body.add_widget(self._key_box)
+
+            body.add_widget(self._section("Your bots"))
+            self._list_box = BoxLayout(orientation="vertical",
+                                       size_hint_y=None, spacing=dp(8))
+            self._list_box.bind(
+                minimum_height=self._list_box.setter("height"))
+            body.add_widget(self._list_box)
+            self._built = True
+
+        def _section(self, text):
+            lbl = Label(text=text, font_size=sp(16), bold=True,
+                        color=(App.get_running_app().theme_colors.get(
+                            "text_muted", (0.6, 0.6, 0.6, 1))),
+                        size_hint_y=None, height=dp(28), halign="left",
+                        valign="middle")
+            lbl.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+            return lbl
+
+        def _fancy_button(self, text, variant):
+            """FancyMDButton with its MDButtonText child (40px tall).
+
+            The text child is kept as ``_bots_label`` so callers can
+            re-label the button (the revoke two-tap confirm does).
+            """
+            from kivymd.uix.button import MDButtonText
+            app = App.get_running_app()
+            colors = getattr(app, "theme_colors", {}) if app else {}
+            btn = FancyMDButton(variant=variant, size_hint_y=None,
+                                height=dp(40))
+            if variant == "primary":
+                fg = colors.get("btn_text", (1, 1, 1, 1))
+            elif variant == "danger":
+                fg = (1, 1, 1, 1)
+            else:
+                fg = colors.get("text", (1, 1, 1, 1))
+            label = MDButtonText(text=text, text_color=fg)
+            btn.add_widget(label)
+            btn._bots_label = label
+            return btn
+
+        # -- data ---------------------------------------------------------
+        def _api(self):
+            app = App.get_running_app()
+            return getattr(app, "guild_api", None) if app else None
+
+        def refresh(self):
+            """Re-fetch the bot list; on failure keep the last list."""
+            self._build()
+            api = self._api()
+            if api is None:
+                self._set_bots_status(
+                    "Bots unavailable: no guild connection.")
+                return
+            try:
+                res = api.bots_list()
+            except Exception as e:
+                self._set_bots_status("Bots unavailable: %s" % e)
+                return
+            if not res.get("ok"):
+                self._set_bots_status("Bots unavailable: %s" % res.get(
+                    "error", "unknown error"))
+                return
+            self._bots = res.get("bots") or []
+            self._render_bots()
+            if self._bots:
+                self._set_bots_status("Loaded %d bot(s)." % len(self._bots))
+            else:
+                self._set_bots_status("No bots yet -- create one above.")
+
+        def _render_bots(self):
+            self._list_box.clear_widgets()
+            self._revoke_armed = {}
+            self._edit_boxes = {}
+            self._edit_checks = {}
+            if not self._bots:
+                empty = Label(text="No bots fetched yet.", font_size=sp(13),
+                              color=(App.get_running_app().theme_colors.get(
+                                  "text_muted", (0.6, 0.6, 0.6, 1))),
+                              size_hint_y=None, height=dp(24), halign="left",
+                              valign="middle")
+                empty.bind(width=lambda w, v: setattr(
+                    w, "text_size", (v, None)))
+                self._list_box.add_widget(empty)
+                return
+            for bot in self._bots:
+                self._list_box.add_widget(self._bot_row(bot))
+
+        def _bot_row(self, bot):
+            from kivy.uix.checkbox import CheckBox
+            app = App.get_running_app()
+            colors = getattr(app, "theme_colors", {}) if app else {}
+            text = colors.get("text", (1, 1, 1, 1))
+            muted = colors.get("text_muted", (0.6, 0.6, 0.6, 1))
+            bot_id = bot.get("bot_id")
+            revoked = bool(bot.get("revoked_at"))
+            name = bot.get("name") or "(unnamed bot)"
+            row = BoxLayout(orientation="vertical", size_hint_y=None,
+                            spacing=dp(2))
+            row.bind(minimum_height=row.setter("height"))
+            if revoked:
+                # Revoked bots stay visible, dimmed, with their actions off.
+                row.opacity = 0.6
+
+            head = BoxLayout(size_hint_y=None, height=dp(28), spacing=dp(8))
+            nm = Label(text=name, font_size=sp(16), bold=True, color=text,
+                       halign="left", valign="middle")
+            nm.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+            head.add_widget(nm)
+            state = Label(text="Revoked" if revoked else "Active",
+                          font_size=sp(12),
+                          color=muted if revoked else colors.get(
+                              "accent", (0.35, 0.84, 0.76, 1)),
+                          size_hint_x=None, width=dp(80), halign="right",
+                          valign="middle")
+            head.add_widget(state)
+            row.add_widget(head)
+
+            owner = bot.get("owner_hash") or ""
+            own_row = BoxLayout(size_hint_y=None, height=dp(40),
+                                spacing=dp(8))
+            own = Label(text="Owner: %s" % self._trunc(owner),
+                        font_size=sp(12), color=muted, halign="left",
+                        valign="middle")
+            own.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+            own_row.add_widget(own)
+            copy_btn = self._fancy_button("Copy", "outlined")
+            copy_btn.size_hint_x = None
+            copy_btn.width = dp(80)
+            copy_btn.bind(on_press=lambda *_a, h=owner: self._copy(
+                h, "owner address"))
+            own_row.add_widget(copy_btn)
+            row.add_widget(own_row)
+
+            perms = Label(text=self._perm_text(bot.get("perms") or 0),
+                          font_size=sp(12), color=muted, size_hint_y=None,
+                          height=dp(40), halign="left", valign="top")
+            perms.bind(width=lambda w, v: setattr(
+                w, "text_size", (v, None)))
+            row.add_widget(perms)
+
+            meta = Label(
+                text=("Created %s  ·  Last seen %s"
+                      % (self._fmt_ts(bot.get("created_at")),
+                         self._fmt_ts(bot.get("last_seen")))),
+                font_size=sp(11), color=muted, size_hint_y=None,
+                height=dp(20), halign="left", valign="middle")
+            meta.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+            row.add_widget(meta)
+
+            actions = BoxLayout(size_hint_y=None, height=dp(40),
+                                spacing=dp(10))
+            edit = self._fancy_button("Edit permissions", "outlined")
+            edit.size_hint_x = None
+            edit.width = dp(180)
+            edit.disabled = revoked
+            edit.bind(on_press=lambda *_a, b=bot_id: self.toggle_edit(b))
+            actions.add_widget(edit)
+            revoke = self._fancy_button("Revoke", "danger")
+            revoke.size_hint_x = None
+            revoke.width = dp(120)
+            revoke.disabled = revoked
+            revoke.bind(on_press=lambda *_a, b=bot_id, n=name, btn=revoke:
+                        self.revoke_bot(b, n, btn))
+            actions.add_widget(revoke)
+            row.add_widget(actions)
+
+            editor = BoxLayout(orientation="vertical", size_hint_y=None,
+                               height=0, opacity=0, spacing=dp(2))
+            checks = {}
+            cur = bot.get("perms") or 0
+            for bit, label in BOT_PERM_BITS:
+                erow = BoxLayout(size_hint_y=None, height=dp(40),
+                                 spacing=dp(8))
+                cb = CheckBox(size_hint=(None, None), size=(dp(40), dp(40)))
+                cb.active = bool(cur & bit)
+                erow.add_widget(cb)
+                elbl = Label(text=label, font_size=sp(14), color=text,
+                             halign="left", valign="middle")
+                elbl.bind(width=lambda w, v: setattr(
+                    w, "text_size", (v, None)))
+                erow.add_widget(elbl)
+                checks[bit] = cb
+                editor.add_widget(erow)
+            save_row = BoxLayout(size_hint_y=None, height=dp(40),
+                                 spacing=dp(10))
+            save = self._fancy_button("Save", "primary")
+            save.size_hint_x = None
+            save.width = dp(110)
+            save.bind(on_press=lambda *_a, b=bot_id: self.save_edit(b))
+            save_row.add_widget(save)
+            cancel = self._fancy_button("Cancel", "outlined")
+            cancel.size_hint_x = None
+            cancel.width = dp(110)
+            cancel.bind(on_press=lambda *_a, b=bot_id: self.toggle_edit(b))
+            save_row.add_widget(cancel)
+            editor.add_widget(save_row)
+            self._edit_boxes[bot_id] = editor
+            self._edit_checks[bot_id] = checks
+            row.add_widget(editor)
+            return row
+
+        # -- create -------------------------------------------------------
+        def create_bot(self):
+            name = (self._name_field.text or "").strip()
+            if not name:
+                self._set_bots_status("Enter a bot name.")
+                return
+            perms = sum(bit for bit, cb in self._create_checks.items()
+                        if cb.active)
+            api = self._api()
+            if api is None:
+                self._set_bots_status(
+                    "Bots unavailable: no guild connection.")
+                return
+            try:
+                res = api.bots_create(name, perms)
+            except Exception as e:
+                self._set_bots_status("Create failed: %s" % e)
+                return
+            if not res.get("ok"):
+                self._set_bots_status("Create failed: %s" % res.get(
+                    "error", "unknown error"))
+                return
+            bot = res.get("bot") or {}
+            self._show_key(res.get("api_key") or "",
+                           res.get("gateway") or {})
+            self._name_field.text = ""
+            for cb in self._create_checks.values():
+                cb.active = False
+            self._set_bots_status(
+                "Bot '%s' created -- copy the API key now." % (
+                    bot.get("name") or name))
+
+        def _show_key(self, api_key, gateway):
+            """Reveal the one-time key + gateway block after a create."""
+            self._key = api_key
+            self._gateway_text = self._gateway_block(gateway)
+            self._key_label.text = "API key: %s" % api_key
+            self._gateway_label.text = self._gateway_text
+            self._key_box.opacity = 1
+            self._key_box.height = self._key_box.minimum_height
+
+        def _gateway_block(self, gateway):
+            """Gateway facts: the client's own hub/node/delivery hashes
+            plus the endpoint paths the create response supplies."""
+            app = App.get_running_app()
+            eps = (gateway or {}).get("endpoints") or {}
+            defaults = {"subscribe": "/api/v1/stream/subscribe",
+                        "poll": "/api/v1/stream/poll",
+                        "post": "/api/v1/bots/post",
+                        "react": "/api/v1/bots/react"}
+            lines = [
+                "Hub: %s" % (getattr(app, "hub_address", "") or ""),
+                "Guild node: %s" % (getattr(app, "guild_node_hash", "") or ""),
+                "Delivery: %s" % (getattr(app, "delivery_hash", "") or ""),
+            ]
+            for key in ("subscribe", "poll", "post", "react"):
+                lines.append("%s: %s" % (key, eps.get(key)
+                                         or defaults[key]))
+            return "\n".join(lines)
+
+        def copy_api_key(self):
+            if self._key:
+                self._copy(self._key, "API key")
+
+        def copy_gateway(self):
+            if self._gateway_text:
+                self._copy(self._gateway_text, "gateway info")
+
+        def dismiss_key(self):
+            """Hide the one-time key and refresh the list (the key is
+            gone for good once dismissed)."""
+            self._key = None
+            self._gateway_text = ""
+            self._key_box.opacity = 0
+            self._key_box.height = 0
+            self.refresh()
+
+        # -- per-bot actions ----------------------------------------------
+        def toggle_edit(self, bot_id):
+            editor = self._edit_boxes.get(bot_id)
+            if editor is None:
+                return
+            if editor.opacity:
+                editor.opacity = 0
+                editor.height = 0
+            else:
+                editor.opacity = 1
+                editor.height = editor.minimum_height
+
+        def save_edit(self, bot_id):
+            checks = self._edit_checks.get(bot_id)
+            if checks is None:
+                return
+            perms = sum(bit for bit, cb in checks.items() if cb.active)
+            api = self._api()
+            if api is None:
+                self._set_bots_status(
+                    "Bots unavailable: no guild connection.")
+                return
+            try:
+                res = api.bots_update(bot_id, perms=perms)
+            except Exception as e:
+                self._set_bots_status("Save failed: %s" % e)
+                return
+            if not res.get("ok"):
+                self._set_bots_status("Save failed: %s" % res.get(
+                    "error", "unknown error"))
+                return
+            # Refresh first: it writes its own "Loaded N bot(s)" line,
+            # then the confirmation lands on top of it.
+            self.refresh()
+            self._set_bots_status("Permissions saved.")
+
+        def revoke_bot(self, bot_id, name, btn):
+            """Two-tap confirm on the button itself: first tap arms it
+            (re-labels to 'Confirm revoke'), second tap revokes."""
+            if not self._revoke_armed.get(bot_id):
+                self._revoke_armed[bot_id] = True
+                btn._bots_label.text = "Confirm revoke"
+                self._set_bots_status(
+                    "Tap Confirm revoke to revoke '%s' -- this cannot "
+                    "be undone." % name)
+                return
+            api = self._api()
+            if api is None:
+                self._set_bots_status(
+                    "Bots unavailable: no guild connection.")
+                return
+            try:
+                res = api.bots_revoke(bot_id)
+            except Exception as e:
+                self._set_bots_status("Revoke failed: %s" % e)
+                return
+            if not res.get("ok"):
+                self._set_bots_status("Revoke failed: %s" % res.get(
+                    "error", "unknown error"))
+                return
+            # Refresh first: it writes its own "Loaded N bot(s)" line,
+            # then the confirmation lands on top of it.
+            self.refresh()
+            self._set_bots_status("Bot '%s' revoked." % name)
+
+        # -- helpers --------------------------------------------------------
+        def _set_bots_status(self, text):
+            try:
+                self.ids["bots_status"].text = str(text)
+            except Exception:
+                pass
+
+        def _copy(self, text, what):
+            """Copy via the app's clipboard helper (MenusMixin._copy_text),
+            falling back to Clipboard directly."""
+            try:
+                app = App.get_running_app()
+                if app is not None and hasattr(app, "_copy_text"):
+                    app._copy_text(text)
+                else:
+                    raise AttributeError("_copy_text missing")
+            except Exception:
+                try:
+                    from kivy.core.clipboard import Clipboard
+                    Clipboard.copy(text)
+                except Exception:
+                    self._set_bots_status("Copy failed.")
+                    return
+            self._set_bots_status("Copied %s to clipboard." % what)
+
+        @staticmethod
+        def _trunc(value):
+            value = value or ""
+            return value[:12] + "…" if len(value) > 12 else value
+
+        @staticmethod
+        def _perm_text(perms):
+            labels = [label for bit, label in BOT_PERM_BITS if perms & bit]
+            return ", ".join(labels) if labels else "No permissions"
+
+        @staticmethod
+        def _fmt_ts(value):
+            """created_at / last_seen: epoch seconds render as a date,
+            ISO strings pass through (first 19 chars), missing is never."""
+            if value in (None, "", 0):
+                return "never"
+            try:
+                return time.strftime("%Y-%m-%d %H:%M",
+                                     time.localtime(float(value)))
+            except (TypeError, ValueError, OverflowError):
+                return str(value)[:19]
+
 
 # ---------------------------------------------------------------------------
 # Main app
@@ -1846,6 +2372,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
         sm.add_widget(MainScreen(name="main"))
         sm.add_widget(ProfileScreen(name="profile"))
         sm.add_widget(ConfigScreen(name="config"))
+        sm.add_widget(BotsScreen(name="bots"))
         sm.add_widget(SiteEditorScreen(name="site_editor"))
         # Phase 1 task 5: the tabbed server-config screen replaces the U8
         # popup; its tabs are keyed to the caller's roles on entry.
@@ -6117,6 +6644,16 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
             self.root.current = "profile"
         except Exception:
             self._set_status("Could not switch to profile screen")
+
+    def open_bots(self, *_):
+        """Open the Bots setup/config screen (Group 3, submenu of Profile).
+
+        BotsScreen.on_pre_enter builds the form and refreshes the list.
+        """
+        try:
+            self.root.current = "bots"
+        except Exception:
+            self._set_status("Bots screen not available")
 
     def page_profile_handler(self, path, data, request_id, link_id,
                              remote_identity, requested_at):

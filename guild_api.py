@@ -21,6 +21,21 @@ import RNS
 from RNS.vendor import umsgpack as msgpack
 
 
+#: Bot permission bits (server-side BOT_PERMS) with the plain-language
+#: labels the Bots screen shows. BOT_PERM_ALL = 511.
+BOT_PERM_BITS = (
+    (1, "Read messages"),
+    (2, "Read edits"),
+    (4, "Read deletes"),
+    (8, "Read reactions"),
+    (16, "Read presence"),
+    (32, "Read typing"),
+    (64, "Post messages"),
+    (128, "React to messages"),
+    (256, "Read channel list"),
+)
+
+
 class GuildAPI:
     """Thin wrapper around an RNS Link to the sHades guild node."""
 
@@ -475,6 +490,28 @@ class GuildAPI:
     def roles_unassign(self, role_id, user):
         return self._request_json("/api/v1/roles/unassign",
                                   {"role_id": role_id, "user": user})
+
+    # ---- bots (Group 3) ----
+    def bots_list(self):
+        return self._request_json("/api/v1/bots/list", {})
+
+    def bots_create(self, name, perms):
+        return self._request_json("/api/v1/bots/create",
+                                  {"name": name, "perms": perms})
+
+    def bots_info(self, bot_id):
+        return self._request_json("/api/v1/bots/info", {"bot_id": bot_id})
+
+    def bots_update(self, bot_id, name=None, perms=None):
+        data = {"bot_id": bot_id}
+        if name is not None:
+            data["name"] = name
+        if perms is not None:
+            data["perms"] = perms
+        return self._request_json("/api/v1/bots/update", data)
+
+    def bots_revoke(self, bot_id):
+        return self._request_json("/api/v1/bots/revoke", {"bot_id": bot_id})
 
     # ---- admin panel (U8) ----
     def admin_config(self, key=None, value=None):
