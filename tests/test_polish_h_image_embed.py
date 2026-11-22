@@ -501,6 +501,10 @@ def main():
               repr(semb.source))
         check("site embed starts at opacity 0 on landing",
               semb.opacity == 0, repr(semb.opacity))
+        # polish2: the reveal now waits for the texture; the mock
+        # Loader never delivers one, so fire the on_load the real
+        # AsyncImage would once its source decodes.
+        semb.dispatch("on_load")
         check("site embed has a running opacity animation",
               _anim_for(semb, "opacity") is not None)
         check("site embed lands at opacity 1",
