@@ -244,6 +244,29 @@ def user_has_role_perm(conn, lock, user, bits):
     return row is not None
 
 
+def user_perm_union(conn, lock, user):
+    """OR of the perms of every role the user holds (0 for none)."""
+    if user is None:
+        return 0
+    with lock:
+        rows = conn.execute(
+            "SELECT r.perms FROM user_roles ur JOIN roles r "
+            "ON r.role_id = ur.role_id WHERE ur.user_hash = ?",
+            (user,)).fetchall()
+    union = 0
+    for r in rows:
+        union |= (r["perms"] or 0)
+    return union
+
+
+def role_perms(conn, lock, role_id):
+    """The perms bitmask of one role, or None for an unknown role."""
+    with lock:
+        row = conn.execute("SELECT perms FROM roles WHERE role_id=?",
+                           (role_id,)).fetchone()
+    return row["perms"] if row else None
+
+
 def effective_perms(conn, lock, user_hash, channel_id, base):
     """The union: base + each of the user's roles' perms + each role's
     per-channel overwrite."""

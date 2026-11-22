@@ -3932,6 +3932,20 @@ def _require_manage_roles(viewer):
         return {"ok": 0, "error": "manage roles permission required", "code": 403}
     return None
 
+def _actor_guild_perms(viewer):
+    """The viewer's own guild-wide permission union (roles + legacy
+    moderator set). Used to keep role management from escalating past
+    what the actor holds."""
+    perms = store.user_perm_union(db, db_lock, viewer)
+    if viewer in MODERATORS:
+        perms |= PERMS["MANAGE_MESSAGES"] | PERMS["MANAGE_CHANNEL"]
+    return perms
+
+def _may_grant(viewer, perms):
+    """True iff every bit in `perms` is held by the viewer. No one mints
+    or hands out authority they do not themselves hold."""
+    return (perms & ~_actor_guild_perms(viewer)) == 0
+
 def _role_row(r):
     members = store.role_members(db, db_lock, r["role_id"])
     return {"role_id": r["role_id"], "name": r["name"], "color": r["color"],
@@ -3956,6 +3970,9 @@ def api_v1_roles_create(viewer, data, link_id):
     perms = data.get("perms", 0)
     if not isinstance(perms, int) or perms < 0 or perms > PERM_ALL:
         return {"ok": 0, "error": "perms must be a bitmask 0-63", "code": 400}
+    if not _may_grant(viewer, perms):
+        return {"ok": 0, "error": "cannot grant permissions you do not hold",
+                "code": 403}
     color = (data.get("color") or "").strip().upper()
     if color and not re.match(r"^[0-9A-F]{3}$", color):
         return {"ok": 0, "error": "color must be 3-hex", "code": 400}
@@ -4113,6 +4130,12 @@ def api_v1_roles_delete(viewer, data, link_id):
     if denied:
         return denied
     role_id = data.get("role_id")
+    role_perms = store.role_perms(db, db_lock, role_id)
+    if role_perms is None:
+        return {"ok": 0, "error": "unknown role", "code": 404}
+    if not _may_grant(viewer, role_perms):
+        return {"ok": 0, "error": "cannot delete a role holding permissions you do not hold",
+                "code": 403}
     name = store.delete_role(db, db_lock, role_id)
     if name is None:
         return {"ok": 0, "error": "unknown role", "code": 404}
@@ -4129,6 +4152,12 @@ def api_v1_roles_assign(viewer, data, link_id):
     target = _resolve_user(data.get("user"))
     if not target:
         return {"ok": 0, "error": "unknown user", "code": 404}
+    role_perms = store.role_perms(db, db_lock, role_id)
+    if role_perms is None:
+        return {"ok": 0, "error": "unknown role", "code": 404}
+    if not _may_grant(viewer, role_perms):
+        return {"ok": 0, "error": "cannot assign a role holding permissions you do not hold",
+                "code": 403}
     if not store.assign_role_checked(db, db_lock, target, role_id):
         return {"ok": 0, "error": "unknown role", "code": 404}
     _audit(viewer, "role.assign", target, "role_id=%s" % role_id)
