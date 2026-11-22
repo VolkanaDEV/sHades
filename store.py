@@ -26,6 +26,13 @@ CHANNEL_KINDS = ("chat", "site", "term", "announce")
 # Schema
 # ----------------------------------------------------------------------------------
 
+# Bots table DDL lives in its own constant so SCHEMA (fresh DBs) and
+# migrate_schema (already-booted DBs) can never drift apart.
+BOTS_DDL = """CREATE TABLE IF NOT EXISTS bots (
+    bot_id TEXT PRIMARY KEY, owner_hash TEXT NOT NULL, name TEXT NOT NULL,
+    key_hash TEXT NOT NULL, perms INTEGER NOT NULL DEFAULT 0,
+    created_at REAL, revoked_at REAL, last_seen REAL);"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS guilds (
     id TEXT PRIMARY KEY, name TEXT, node_hash TEXT, delivery_hash TEXT, prop_hash TEXT);
@@ -89,6 +96,7 @@ CREATE INDEX IF NOT EXISTS idx_reactions_msg ON reactions(msg_id);
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, id);
 """
+SCHEMA += "\n" + BOTS_DDL + "\n"
 
 
 def migrate_schema(conn):
@@ -104,6 +112,12 @@ def migrate_schema(conn):
     have_inv = {r["name"] for r in conn.execute("PRAGMA table_info(invites)").fetchall()}
     if "channel_id" not in have_inv:
         conn.execute("ALTER TABLE invites ADD COLUMN channel_id TEXT")
+    # Bots (Group 1): a DB created before the bots table existed has no
+    # bots row in sqlite_master; CREATE TABLE IF NOT EXISTS adds it.
+    has_bots = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                            "AND name='bots'").fetchone()
+    if not has_bots:
+        conn.execute(BOTS_DDL)
 
 
 def open_db(path):
@@ -1126,3 +1140,79 @@ def save_guild(conn, lock, guild_id, name, node_hash, delivery_hash, prop_hash):
                      "VALUES (?, ?, ?, ?, ?)",
                      (guild_id, name, node_hash, delivery_hash, prop_hash))
         conn.commit()
+
+
+def get_guild(conn, lock, guild_id):
+    """The guilds row saved at boot (node/delivery/prop hashes), or None."""
+    with lock:
+        return conn.execute("SELECT * FROM guilds WHERE id=?",
+                            (guild_id,)).fetchone()
+
+
+# ----------------------------------------------------------------------------------
+# Bots (Group 1: registry). Only the SHA-256 hash of an API key is ever
+# stored; the raw key is shown to the owner once at creation and is never
+# retrievable afterwards (rotation = revoke + create anew).
+# ----------------------------------------------------------------------------------
+
+def bot_create(conn, lock, bot_id, owner_hash, name, key_hash, perms, created_at):
+    with lock:
+        conn.execute("INSERT INTO bots (bot_id, owner_hash, name, key_hash, "
+                     "perms, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                     (bot_id, owner_hash, name, key_hash, perms, created_at))
+        conn.commit()
+        return conn.execute("SELECT * FROM bots WHERE bot_id=?",
+                            (bot_id,)).fetchone()
+
+
+def bot_list_by_owner(conn, lock, owner_hash):
+    with lock:
+        return conn.execute("SELECT * FROM bots WHERE owner_hash=? "
+                            "ORDER BY created_at", (owner_hash,)).fetchall()
+
+
+def bot_get(conn, lock, bot_id):
+    with lock:
+        return conn.execute("SELECT * FROM bots WHERE bot_id=?",
+                            (bot_id,)).fetchone()
+
+
+def bot_revoke(conn, lock, bot_id, revoked_at):
+    """Set revoked_at if the bot is still active; an already-revoked bot
+    keeps its original revoked_at (revoke is idempotent). Returns the row."""
+    with lock:
+        conn.execute("UPDATE bots SET revoked_at=? WHERE bot_id=? "
+                     "AND revoked_at IS NULL", (revoked_at, bot_id))
+        conn.commit()
+        return conn.execute("SELECT * FROM bots WHERE bot_id=?",
+                            (bot_id,)).fetchone()
+
+
+def bot_update(conn, lock, bot_id, name=None, perms=None):
+    """Rename and/or change perms; a None argument leaves that field alone.
+    Returns the updated row, or None for an unknown bot_id."""
+    sets, vals = [], []
+    if name is not None:
+        sets.append("name=?")
+        vals.append(name)
+    if perms is not None:
+        sets.append("perms=?")
+        vals.append(perms)
+    with lock:
+        if sets:
+            conn.execute("UPDATE bots SET %s WHERE bot_id=?" % ", ".join(sets),
+                         (*vals, bot_id))
+            conn.commit()
+        return conn.execute("SELECT * FROM bots WHERE bot_id=?",
+                            (bot_id,)).fetchone()
+
+
+def bot_touch_last_seen(conn, lock, bot_id, ts):
+    """Record a bot's last authenticated use. Revoked bots are not touched.
+    Returns the row, or None for an unknown bot_id."""
+    with lock:
+        conn.execute("UPDATE bots SET last_seen=? WHERE bot_id=? "
+                     "AND revoked_at IS NULL", (ts, bot_id))
+        conn.commit()
+        return conn.execute("SELECT * FROM bots WHERE bot_id=?",
+                            (bot_id,)).fetchone()

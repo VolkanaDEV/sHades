@@ -462,6 +462,15 @@
                 MDButtonText:
                     text: 'Slash commands'
                     text_color: app.theme_colors['text']
+            FancyMDButton:
+                variant: 'outlined'
+                size_hint_x: None
+                width: dp(230)
+                pos_hint: {'center_x': 0.5}
+                on_press: app.open_bots()
+                MDButtonText:
+                    text: 'Bots'
+                    text_color: app.theme_colors['text']
             BoxLayout:
                 size_hint_y: None
                 height: dp(50)
@@ -503,6 +512,58 @@
                 MDButtonText:
                     text: 'Delete account'
                     text_color: 1, 1, 1, 1
+
+<BotsScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        canvas.before:
+            Color:
+                rgba: app.theme_colors['bg_main']
+            Rectangle:
+                pos: self.pos
+                size: self.size
+        Label:
+            text: 'Bots'
+            font_size: sp(24)
+            bold: True
+            color: app.theme_colors['text']
+            size_hint_y: None
+            height: dp(44)
+        ScrollView:
+            do_scroll_x: False
+            bar_width: dp(6)
+            # The create form, one-time key display and bot rows are
+            # built in Python (BotsScreen._build) into bots_body.
+            BoxLayout:
+                id: bots_body
+                orientation: 'vertical'
+                size_hint_y: None
+                height: self.minimum_height
+                padding: dp(12)
+                spacing: dp(8)
+        Label:
+            id: bots_status
+            text: ''
+            color: app.theme_colors['accent']
+            size_hint_y: None
+            height: dp(26)
+        BoxLayout:
+            size_hint_y: None
+            height: dp(56)
+            padding: dp(12)
+            spacing: dp(10)
+            FancyMDButton:
+                variant: 'primary'
+                on_press: root.refresh()
+                MDButtonText:
+                    text: 'Refresh'
+                    text_color: app.theme_colors['btn_text']
+            FancyMDButton:
+                variant: 'outlined'
+                on_press: app.root.current = 'profile'
+                MDButtonText:
+                    text: 'Back'
+                    text_color: app.theme_colors['text']
 
 <MainScreen>:
     BoxLayout:
