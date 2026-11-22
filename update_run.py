@@ -76,9 +76,12 @@ def main():
 
 def subprocess_run(tree, app_args):
     import subprocess
+    env = dict(os.environ)
+    env["SHADES_UPDATE_RUN"] = "1"  # P11f: marks the supervised child, so
+    # the tree's own boot guard stays out of the launcher's rollback way
     script = os.path.join(tree, "sHades.py")
     argv = [sys.executable, script] + list(app_args)
-    return subprocess.run(argv, cwd=tree)
+    return subprocess.run(argv, cwd=tree, env=env)
 
 
 if __name__ == "__main__":
