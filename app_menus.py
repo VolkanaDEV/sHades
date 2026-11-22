@@ -385,7 +385,9 @@ class MenusMixin:
         box = BoxLayout(orientation="vertical", padding=dp(8),
                         spacing=dp(6))
         scroll_box = ScrollView()
-        full = Label(markup=True, font_size=sp(13),
+        # server-controlled text: never kivy markup (a rogue MOTD could
+        # inject [ref]/[color] label markup into every client)
+        full = Label(markup=False, font_size=sp(13),
                      color=self.theme_colors.get("text",
                                                  (0.92, 0.94, 0.96, 1)))
         full.text = self.server_motd or ""
