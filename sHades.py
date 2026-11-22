@@ -145,7 +145,7 @@ FIELD_ATTACHMENTS = LXMF.FIELD_FILE_ATTACHMENTS  # 0x05 — envelope ours (plan 
 
 # P11 version bridge: the server knows its own version. Lockstep with
 # buildozer.spec and kivy_client.APP_VERSION (tests/test_update_meta.py).
-SERVER_VERSION = "0.36.24"
+SERVER_VERSION = "0.36.25"
 
 # ----------------------------------------------------------------------------------
 # Database
@@ -3942,7 +3942,7 @@ def run(argv=None):
         RNS.log("Shutting down.", RNS.LOG_NOTICE)
 
 if __name__ == "__main__":
-    # tay's boot (0.36.24 fold-4): the flags live in sys.argv, not in
+    # tay's boot (0.36.25 fold-4): the flags live in sys.argv, not in
     # the argv parameter - list(None) crashed AFTER the banner on
     # every boot (bare or flagged) since P11 chain 2, and a guard
     # alone would restart a flagged hub flagless. The entry feeds the

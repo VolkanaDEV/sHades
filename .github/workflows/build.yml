@@ -36,8 +36,8 @@ jobs:
           pip install -r requirements.txt
       - name: Lint
         run: |
-          python -m py_compile main.py kivy_client.py setup_sHades.py sHades.py ui_scale.py applet_bridge.py
-          python -m flake8 main.py kivy_client.py setup_sHades.py sHades.py ui_scale.py applet_bridge.py
+          python -m py_compile main.py kivy_client.py setup_sHades.py sHades.py ui_scale.py applet_bridge.py app_attachments.py app_channels.py app_menus.py app_settings.py app_site.py app_stream.py client_util.py client_widgets.py store.py guild_api.py ui_fx.py ui_geom.py ui_theme.py updater.py update_run.py offline_store.py profile_card.py dms.py micron.py invite.py recovery.py qr_tools.py mesh_ui.py
+          python -m flake8 main.py kivy_client.py setup_sHades.py sHades.py ui_scale.py applet_bridge.py app_attachments.py app_channels.py app_menus.py app_settings.py app_site.py app_stream.py client_util.py client_widgets.py store.py guild_api.py ui_fx.py ui_geom.py ui_theme.py updater.py update_run.py offline_store.py profile_card.py dms.py micron.py invite.py recovery.py qr_tools.py mesh_ui.py
       - name: Import smoke test (headless)
         run: xvfb-run -a python -c "import kivy_client; app = kivy_client.sHadesClientApp(); app.build(); print('client builds OK')"
       - name: Test suite

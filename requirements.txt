@@ -10,3 +10,8 @@ wasmtime==50.0.1
 flake8
 pygments
 qrcode==8.2
+# CI env parity (fold-13d/13f): build.yml duplicates the client test
+# suite against THIS file's env. The pytest-based lanes and the update
+# lanes (bare msgpack imports) must stay importable here too.
+pytest
+msgpack
