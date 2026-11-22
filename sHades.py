@@ -23,6 +23,7 @@ import shutil
 import argparse
 import sqlite3
 import hashlib
+import hmac
 import secrets
 import threading
 import updater
@@ -64,6 +65,27 @@ CHANNEL_KINDS = store.CHANNEL_KINDS
 PERMS = {"VIEW": 1, "POST": 2, "MANAGE_MESSAGES": 4, "MANAGE_CHANNEL": 8,
          "MANAGE_ROLES": 16, "ADMIN": 32, "SITE_EDIT": 64}
 PERM_ALL = 127
+
+# Bot permission bitmask (Group 1). Bits 1-32 gate which event kinds a bot
+# receives on the stream; bits 64-256 gate what a bot may do via the bot
+# data path. All OTHER event kinds the server emits — site_patch,
+# term_data, channels_changed, channel_deleted, posts_purged — are NEVER
+# delivered to bots, by design (Group 2 enforces this in _bot_event_allowed,
+# applied in both _push_stream and _stream_collect); there is no bit that
+# opts into them.
+#   1 MSG          — receive message events (kind "msg")
+#   2 EDIT         — receive edit events (kind "edit")
+#   4 DELETE       — receive delete events (kind "delete")
+#   8 REACTION     — receive reaction events (kind "reaction")
+#  16 PRESENCE     — receive presence events (kind "presence")
+#  32 TYPING       — receive typing events (kind "typing")
+#  64 POST         — bot may post messages
+# 128 REACT        — bot may react to messages
+# 256 READ_CHANNELS — bot may read channel list/info
+BOT_PERMS = {"MSG": 1, "EDIT": 2, "DELETE": 4, "REACTION": 8, "PRESENCE": 16,
+             "TYPING": 32, "POST": 64, "REACT": 128, "READ_CHANNELS": 256}
+BOT_PERM_ALL = 511
+BOT_NAME_MAX = 64
 DEFAULT_CHANNEL_PERMS = PERMS["VIEW"] | PERMS["POST"]
 _GUILD_MANAGE_BITS = (PERMS["MANAGE_MESSAGES"] | PERMS["MANAGE_CHANNEL"] |
                       PERMS["MANAGE_ROLES"] | PERMS["ADMIN"])
@@ -136,6 +158,9 @@ EVENT_COND    = threading.Condition()   # guards EVENT_LOG and wakes stream poll
 EVENT_LOG     = {}                      # channel_id -> deque[(seq, event)], maxlen EVENT_LOG_MAX
 EVENT_SEQ     = 0                       # single global sequence; cursors are per-channel views of it
 SUBSCRIPTIONS = {}                      # link_id -> {user_hash, channel, cursor, at}
+# Bot subs additionally carry bot_id + bot_perms + ticket_seq (the head seq
+# of the last push ticket sent; the push watermark — see _push_stream).
+# They NEVER enter SUB_BY_USER (see subscribe) — bots are not users.
 SUB_BY_USER   = {}                      # user_hash -> {channel, link_id, at}
 SUB_LOCK      = threading.Lock()
 TYPING        = {}                      # channel_id -> {user_hash: expires_at}
@@ -305,6 +330,23 @@ def check_token(user, scope, token):
             del _tokens[token]
             return True
     return False
+
+def _resolve_bot(bot_id, api_key):
+    """Data-path bot auth (Group 2). Returns the bot row, or None unless
+    the row exists, revoked_at is NULL, and the presented key hashes to
+    the stored key_hash (timing-safe compare). Callers map None -> 403
+    and never distinguish unknown / revoked / wrong-key: the response
+    must not leak whether a bot_id exists. A bot authenticates AS its
+    owner's node for channel VIEW checks (owner_hash is the actor)."""
+    if not isinstance(bot_id, str) or not isinstance(api_key, str):
+        return None
+    row = store.bot_get(db, db_lock, bot_id)
+    if row is None or row["revoked_at"] is not None:
+        return None
+    digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(row["key_hash"], digest):
+        return None
+    return row
 
 # ----------------------------------------------------------------------------------
 # Rate limiting + moderation
@@ -1547,6 +1589,35 @@ def wrap_json_api(fn):
 
 # ---- stream internals -------------------------------------------------------------
 
+# Event kind -> BOT_PERMS receive bit. Every other kind the server emits —
+# site_patch, term_data, channels_changed, channel_deleted, posts_purged —
+# is NEVER delivered to bots (no bit opts into them), and unknown kinds
+# are denied by default. Applied in BOTH delivery paths: _push_stream
+# (the ticket wake-up) and _stream_collect (poll / gap recovery), so a
+# bot can never receive a disallowed event through the other path.
+_BOT_EVENT_BITS = {"msg": BOT_PERMS["MSG"], "edit": BOT_PERMS["EDIT"],
+                   "delete": BOT_PERMS["DELETE"],
+                   "reaction": BOT_PERMS["REACTION"],
+                   "presence": BOT_PERMS["PRESENCE"],
+                   "typing": BOT_PERMS["TYPING"]}
+
+
+def _bot_event_allowed(perms, kind):
+    """May a bot holding `perms` receive an event of `kind`?"""
+    bit = _BOT_EVENT_BITS.get(kind)
+    return bit is not None and (perms & bit) != 0
+
+
+def _typing_snapshot_for(cid, bot_perms):
+    """Typing snapshot for one subscriber: a bot sees it only with the
+    TYPING bit (bot_perms None = human, always). The snapshot rides the
+    push ticket and the subscribe/poll responses, so it is gated the
+    same way as the typing events themselves."""
+    if bot_perms is not None and not (bot_perms & BOT_PERMS["TYPING"]):
+        return []
+    return _typing_snapshot(cid)
+
+
 def _emit_event(channel_id, kind, data, guild_wide=False):
     """Append an event to the rings that should carry it. A single global
     EVENT_SEQ keeps cursors ordered; each channel's deque is a window over
@@ -1589,15 +1660,45 @@ def _push_stream(cid):
     receives it. The poll endpoint stays for one-shot gap recovery.
     """
     with SUB_LOCK:
-        subs = [(lid, s["cursor"], s.get("user_hash")) for lid, s in SUBSCRIPTIONS.items()
-                if s["channel"] == cid]
-    for lid, cursor, user_hash in subs:
+        subs = [(lid, s["cursor"], s.get("user_hash"), s.get("bot_id"),
+                 s.get("bot_perms"), s.get("ticket_seq", s["cursor"]))
+                for lid, s in SUBSCRIPTIONS.items() if s["channel"] == cid]
+    for lid, cursor, user_hash, bot_id, bot_perms, ticket_seq in subs:
+        if bot_perms is not None:
+            # Bot subscription: re-check the row on every push (a PK
+            # lookup; bot subs are few) so a revoke stops the flow on
+            # the next event instead of waiting for a poll or TTL reap.
+            row = store.bot_get(db, db_lock, bot_id)
+            if row is None or row["revoked_at"] is not None:
+                _drop_subscription(lid)
+                continue
         if not has_perm(user_hash, cid, PERMS["VIEW"]):
             # a revoked or never-granted VIEW must not keep a live push
-            # flowing down the link (tay fork tier-1)
+            # flowing down the link (tay fork tier-1); for a bot sub
+            # user_hash is the OWNER, so this is the owner's VIEW
             _drop_subscription(lid)
             continue
-        events, head, reset = _stream_collect(cid, cursor)
+        events, head, reset = _stream_collect(cid, cursor, perms=bot_perms)
+        if bot_perms is not None and not reset \
+                and not any(ev["seq"] > ticket_seq for ev in events):
+            # Bandwidth point: never wake a bot unless there is an event
+            # it may receive that it has not already been ticketed for.
+            # The push path never advances the poll cursor (the ticket
+            # only prompts a delta-fetch), so without the ticket_seq
+            # watermark a stale allowed event still sitting after the
+            # cursor would re-wake the bot for every later event —
+            # including disallowed ones. The sub stays alive, the
+            # watermark advances to head, and the poll cursor is
+            # untouched, so nothing is ever lost to the poll path. A
+            # reset IS still sent: it carries no event content, only
+            # "your cursor is stale, resync" — without it the bot's
+            # cursor could never advance past a rotated ring.
+            with SUB_LOCK:
+                s = SUBSCRIPTIONS.get(lid)
+                if s and s["channel"] == cid:
+                    s["at"] = now()
+                    s["ticket_seq"] = head
+            continue
         # v0.31 ticket protocol: the push frame carries REFERENCES, never
         # bodies. The frame rides a raw RNS.Packet with the 500-byte link
         # MTU; a single serialized message row (say 400 chars of content,
@@ -1611,7 +1712,7 @@ def _push_stream(cid):
         # snapshot capped at eight identities always packs under MTU.
         frame = {"k": "stream", "channel": cid, "seq": head,
                  "reset": reset, "ticket": True,
-                 "typing": _typing_snapshot(cid)[:8]}
+                 "typing": _typing_snapshot_for(cid, bot_perms)[:8]}
         out_cursor = cursor
         packed = msgpack.packb(frame, raw=False)
         sent = False
@@ -1629,6 +1730,8 @@ def _push_stream(cid):
             if s and s["channel"] == cid:
                 if sent:
                     s["cursor"] = out_cursor   # mirror the poll's advance
+                    if bot_perms is not None:
+                        s["ticket_seq"] = head
                 s["at"] = now()                # push keeps the sub alive
 
 def _emit_presence_if_changed(before):
@@ -1656,9 +1759,15 @@ def _drop_subscription(link_id):
                 del SUB_BY_USER[sub["user_hash"]]
     return sub
 
-def _stream_collect(cid, cursor):
+def _stream_collect(cid, cursor, perms=None):
     """(events after cursor, head seq, gap?) for one channel's ring.
-    A gap means the ring rotated past the client's cursor: it must resync."""
+    A gap means the ring rotated past the client's cursor: it must resync.
+    perms is a bot's BOT_PERMS bitmask (None = human, unfiltered): when
+    given, only events the bot may receive are returned — the poll / gap
+    recovery path enforces the same filter as the push path, so a bot can
+    never get a disallowed event through either one. The cursor still
+    advances only to the last returned event; disallowed events are
+    skipped over when the next allowed one arrives (or on resync)."""
     with EVENT_COND:
         head = EVENT_SEQ
         ring = EVENT_LOG.get(cid)
@@ -1667,7 +1776,11 @@ def _stream_collect(cid, cursor):
         oldest = ring[0][0]
         if cursor < oldest - 1:
             return [], head, True
-        return [ev for seq, ev in ring if seq > cursor], head, False
+        events = [ev for seq, ev in ring if seq > cursor]
+        if perms is not None:
+            events = [ev for ev in events
+                      if _bot_event_allowed(perms, ev["kind"])]
+        return events, head, False
 
 def _typing_snapshot(cid):
     cutoff = now()
@@ -1689,9 +1802,10 @@ def _presence_payload():
 
 # ---- channels ---------------------------------------------------------------------
 
-@api_route("/api/v1/channels/list")
-@wrap_json_api
-def api_v1_channels_list(viewer, data, link_id):
+def _channels_list_for(viewer):
+    """Channel list for one user: VIEW-filtered, with can_post + unread.
+    Shared by the human /api/v1/channels/list and the bot
+    /api/v1/bots/channels (which passes the bot's owner as viewer)."""
     chans = store.list_channels(db, db_lock)
     # VIEW permission: channels the viewer cannot read are absent entirely
     chans = [c for c in chans if has_perm(viewer, c["id"], PERMS["VIEW"])]
@@ -1704,7 +1818,32 @@ def api_v1_channels_list(viewer, data, link_id):
             c["can_post"] = bool(has_perm(viewer, c["id"], PERMS["POST"]))
         last_id = _receipt_last_id(c["id"], viewer)
         c["unread"] = _unread_count(c["id"], last_id)
-    return {"ok": 1, "channels": chans}
+    return chans
+
+
+def _channel_info(cid):
+    """Channel metadata response (or an error dict). Shared by the human
+    /api/v1/channels/info and the bot /api/v1/bots/channel_info. The human
+    endpoint never gated on VIEW — channel metadata is semi-public — so
+    the bot one doesn't either; a channel's messages stay behind the
+    stream/post VIEW gates either way."""
+    r = store.channel_row(db, db_lock, cid)
+    if not r:
+        return {"ok": 0, "error": "unknown channel", "code": 404}
+    seq = get_seq(cid)
+    try:
+        manifest = json.loads(r["manifest"] or "{}")
+    except Exception:
+        manifest = {}
+    return {"ok": 1, "channel": {"id": r["id"], "name": r["name"], "kind": r["kind"],
+                                 "manifest": manifest, "created": r["created"],
+                                 "topic": r["topic"], "seq": seq}}
+
+
+@api_route("/api/v1/channels/list")
+@wrap_json_api
+def api_v1_channels_list(viewer, data, link_id):
+    return {"ok": 1, "channels": _channels_list_for(viewer)}
 
 @api_route("/api/v1/channels/reorder")
 @wrap_json_api
@@ -1769,18 +1908,7 @@ def api_v1_channels_create(viewer, data, link_id):
 @api_route("/api/v1/channels/info")
 @wrap_json_api
 def api_v1_channels_info(viewer, data, link_id):
-    cid = data.get("channel")
-    r = store.channel_row(db, db_lock, cid)
-    if not r:
-        return {"ok": 0, "error": "unknown channel", "code": 404}
-    seq = get_seq(cid)
-    try:
-        manifest = json.loads(r["manifest"] or "{}")
-    except Exception:
-        manifest = {}
-    return {"ok": 1, "channel": {"id": r["id"], "name": r["name"], "kind": r["kind"],
-                                 "manifest": manifest, "created": r["created"],
-                                 "topic": r["topic"], "seq": seq}}
+    return _channel_info(data.get("channel"))
 
 # ---- stream -----------------------------------------------------------------------
 
@@ -1791,7 +1919,20 @@ def api_v1_stream_subscribe(viewer, data, link_id):
     chan = store.channel_row(db, db_lock, cid)
     if not chan:
         return {"ok": 0, "error": "unknown channel", "code": 404}
-    if not has_perm(viewer, cid, PERMS["VIEW"]):
+    bot = None
+    if "bot_id" in data or "api_key" in data:
+        # Bot subscription: credentials travel in the request data — the
+        # bot's link identity is its own RNS identity, not the owner's,
+        # so viewer_of would give the bot's own delivery hash. Bad,
+        # revoked or unknown credentials -> 403, never 404: the response
+        # must not leak whether a bot_id exists.
+        bot = _resolve_bot(data.get("bot_id"), data.get("api_key"))
+        if bot is None:
+            return {"ok": 0, "error": "invalid bot credentials", "code": 403}
+        # The bot streams AS its owner: the owner must hold VIEW.
+        if not has_perm(bot["owner_hash"], cid, PERMS["VIEW"]):
+            return {"ok": 0, "error": "view permission required", "code": 403}
+    elif not has_perm(viewer, cid, PERMS["VIEW"]):
         return {"ok": 0, "error": "view permission required", "code": 403}
     _purge_subs()
     with EVENT_COND:
@@ -1801,16 +1942,36 @@ def api_v1_stream_subscribe(viewer, data, link_id):
     # One subscription per link: this replaces whatever the link streamed before,
     # which is what makes "only the active channel flows" a server-side rule.
     with SUB_LOCK:
-        old = SUBSCRIPTIONS.get(link_id)
-        if old and old["user_hash"] == viewer:
-            cur = SUB_BY_USER.get(viewer)
-            if cur and cur.get("link_id") == link_id:
-                del SUB_BY_USER[viewer]
-        SUBSCRIPTIONS[link_id] = {"user_hash": viewer, "channel": cid,
-                                  "cursor": cursor, "at": now()}
-        SUB_BY_USER[viewer] = {"channel": cid, "link_id": link_id, "at": now()}
+        if bot is not None:
+            # Bot subs are keyed by the OWNER's hash (that is what the
+            # VIEW checks read), but they NEVER enter SUB_BY_USER: that
+            # index is the presence machinery's per-user view — a bot
+            # subscribing as its owner would clobber the owner's own
+            # subscription and surface the bot's channel as the owner's
+            # active_channel. Bots are not users; _presence_payload must
+            # never list them. _drop_subscription / unsubscribe only
+            # clear SUB_BY_USER when the link_id matches, so a stale
+            # human entry pointing at this link is cleaned up, never a
+            # live one on another link.
+            SUBSCRIPTIONS[link_id] = {"user_hash": bot["owner_hash"],
+                                      "channel": cid, "cursor": cursor,
+                                      "at": now(), "bot_id": bot["bot_id"],
+                                      "bot_perms": bot["perms"],
+                                      "ticket_seq": cursor}
+        else:
+            old = SUBSCRIPTIONS.get(link_id)
+            if old and old["user_hash"] == viewer:
+                cur = SUB_BY_USER.get(viewer)
+                if cur and cur.get("link_id") == link_id:
+                    del SUB_BY_USER[viewer]
+            SUBSCRIPTIONS[link_id] = {"user_hash": viewer, "channel": cid,
+                                      "cursor": cursor, "at": now()}
+            SUB_BY_USER[viewer] = {"channel": cid, "link_id": link_id, "at": now()}
+    if bot is not None:
+        store.bot_touch_last_seen(db, db_lock, bot["bot_id"], now())
     return {"ok": 1, "channel": cid, "kind": chan["kind"],
-            "seq": head, "cursor": cursor, "typing": _typing_snapshot(cid)}
+            "seq": head, "cursor": cursor,
+            "typing": _typing_snapshot_for(cid, bot["perms"] if bot else None)}
 
 @api_route("/api/v1/stream/poll")
 @wrap_json_api
@@ -1821,13 +1982,30 @@ def api_v1_stream_poll(viewer, data, link_id):
     except (TypeError, ValueError):
         wait_s = STREAM_WAIT_S
     deadline = now() + wait_s
+    touched_bot = None    # bot_id whose last_seen this request already touched
     while True:
         with SUB_LOCK:
             sub = SUBSCRIPTIONS.get(link_id)
         if not sub:
             return {"ok": 0, "error": "not subscribed", "code": 409}
         cid = sub["channel"]
-        if sub["user_hash"] != viewer or not has_perm(viewer, cid, PERMS["VIEW"]):
+        bot_perms = sub.get("bot_perms")
+        if bot_perms is not None:
+            # Bot subscription: the link identity is the bot's own, not
+            # the owner's, so the viewer check below cannot apply —
+            # authenticate as the owner instead, and re-check the row
+            # on every pass (a PK lookup) so a revoke mid-long-poll
+            # drops the sub with a 403 instead of draining events.
+            row = store.bot_get(db, db_lock, sub["bot_id"])
+            if row is None or row["revoked_at"] is not None \
+                    or not has_perm(sub["user_hash"], cid, PERMS["VIEW"]):
+                _drop_subscription(link_id)
+                return {"ok": 0, "error": "invalid bot credentials",
+                        "code": 403}
+            if touched_bot is None:
+                store.bot_touch_last_seen(db, db_lock, sub["bot_id"], now())
+                touched_bot = sub["bot_id"]
+        elif sub["user_hash"] != viewer or not has_perm(viewer, cid, PERMS["VIEW"]):
             # identity swap on this link, or a permission revoke: the sub
             # must not outlive the VIEW grant (tay fork tier-1)
             _drop_subscription(link_id)
@@ -1836,7 +2014,7 @@ def api_v1_stream_poll(viewer, data, link_id):
         pc = data.get("cursor")
         if isinstance(pc, (int, float)) and pc >= 0:
             cursor = int(pc)          # client override (reconnect/resync)
-        events, head, reset = _stream_collect(cid, cursor)
+        events, head, reset = _stream_collect(cid, cursor, perms=bot_perms)
         if events or reset or now() >= deadline:
             out_cursor = events[-1]["seq"] if events else (head if reset else cursor)
             with SUB_LOCK:
@@ -1849,7 +2027,7 @@ def api_v1_stream_poll(viewer, data, link_id):
                 return {"ok": 1, "channel": cid, "events": [], "cursor": head,
                         "seq": head, "reset": True}
             return {"ok": 1, "channel": cid, "events": events, "cursor": out_cursor,
-                    "reset": False, "typing": _typing_snapshot(cid)}
+                    "reset": False, "typing": _typing_snapshot_for(cid, bot_perms)}
         # Long-poll: sleep on the event condition in short slices so a
         # resubscribe from this link is honoured promptly.
         with EVENT_COND:
@@ -2949,31 +3127,39 @@ def api_v1_receipts(viewer, data, link_id):
     return {"ok": 1, "channel": cid, "last_read_id": last_id,
             "unread": _unread_count(cid, last_id)}
 
-@api_route("/api/v1/react")
-@wrap_json_api
-def api_v1_react(viewer, data, link_id):
-    """Toggle a reaction (one emoji per user per message). Emoji are unicode
-    emoji characters (BMP symbols, supplementary plane, ZWJ composites) or
-    legacy ASCII shortcodes ('+1', 'laugh', ...) for older rows."""
-    msg_id = data.get("msg")
-    emoji = (data.get("emoji") or "").strip().lower()
+def _react_as(actor, msg_id, emoji):
+    """Shared react path: the human /api/v1/react and the bot
+    /api/v1/bots/react both toggle through here, passing the actor
+    (human viewer, or a bot's owner). Validates, toggles the reaction
+    as `actor` via the store, and emits kind "reaction". Returns a
+    response dict."""
+    emoji = (emoji or "").strip().lower() if isinstance(emoji, str) else ""
     if not _emoji_ok(emoji):
         return {"ok": 0, "error": "emoji must be an emoji or a shortcode (a-z0-9_+-)",
                 "code": 400}
     row = store.message_by_msg_id(db, db_lock, msg_id)
     if not row:
         return {"ok": 0, "error": "unknown message", "code": 404}
-    if not has_perm(viewer, row["channel_id"], PERMS["VIEW"]):
+    if not has_perm(actor, row["channel_id"], PERMS["VIEW"]):
         return {"ok": 0, "error": "view permission required", "code": 403}
-    err, active, counts = store.toggle_reaction(db, db_lock, msg_id, viewer, emoji,
+    err, active, counts = store.toggle_reaction(db, db_lock, msg_id, actor, emoji,
                                                 MAX_EMOJI_PER_MSG, now())
     if err:
         return {"ok": 0, "error": err, "code": 400}
     _emit_event(row["channel_id"], "reaction", {
-        "msg_id": msg_id, "emoji": emoji, "user_hash": viewer,
-        "username": get_username(viewer), "active": active, "counts": counts,
+        "msg_id": msg_id, "emoji": emoji, "user_hash": actor,
+        "username": get_username(actor), "active": active, "counts": counts,
     })
     return {"ok": 1, "active": active, "counts": counts}
+
+
+@api_route("/api/v1/react")
+@wrap_json_api
+def api_v1_react(viewer, data, link_id):
+    """Toggle a reaction (one emoji per user per message). Emoji are unicode
+    emoji characters (BMP symbols, supplementary plane, ZWJ composites) or
+    legacy ASCII shortcodes ('+1', 'laugh', ...) for older rows."""
+    return _react_as(viewer, data.get("msg"), data.get("emoji"))
 
 @api_route("/api/v1/search")
 @wrap_json_api
@@ -3961,6 +4147,288 @@ def api_v1_roles_unassign(viewer, data, link_id):
     store.unassign_role(db, db_lock, target, role_id)
     _audit(viewer, "role.unassign", target, "role_id=%s" % role_id)
     return {"ok": 1, "role_id": role_id, "user": target}
+
+# ----------------------------------------------------------------------------------
+# Bots (Group 1: registry + management; Group 2: data path). Management
+# endpoints are user-authenticated by link identity; the caller IS the
+# owner (viewer). Owners only ever see/manage their own bots. Key format:
+# bot_id = secrets.token_hex(16) (32 hex chars);
+# api key = "sk-" + secrets.token_hex(32) (64 hex chars of entropy).
+# Only sha256(key) is stored; the key is shown ONCE at creation and is never
+# retrievable afterwards (rotation = revoke + create anew).
+#
+# Data path (Group 2): the bot endpoints below authenticate with bot_id +
+# api_key in the request data (NOT the link identity — a bot's link is its
+# own RNS identity, so viewer_of would give the bot's own delivery hash,
+# not the owner's). A bot acts AS its owner: channel VIEW/POST are the
+# owner's, posts carry the owner as author_hash, and every successful bot
+# post / react writes an audit row (actor = owner hash, target = bot_id,
+# detail = msg_id) so the bot is on the record without changing
+# attribution. Every successful bot request also touches last_seen.
+# ----------------------------------------------------------------------------------
+
+def _bot_row(row):
+    """Public bot shape — never includes key_hash or the raw key."""
+    return {"bot_id": row["bot_id"], "name": row["name"],
+            "owner_hash": row["owner_hash"], "perms": row["perms"],
+            "created_at": row["created_at"], "revoked_at": row["revoked_at"],
+            "last_seen": row["last_seen"]}
+
+
+def _bot_gateway():
+    """Gateway info for a newly created bot: the guild's node/delivery
+    hashes (saved to the guilds row at boot) plus the stream/data endpoints.
+    Hashes are None until the guild has booted and saved its row."""
+    row = store.get_guild(db, db_lock, GUILD_ID)
+    return {"node_hash": row["node_hash"] if row else None,
+            "delivery_hash": row["delivery_hash"] if row else None,
+            "endpoints": {"subscribe": "/api/v1/stream/subscribe",
+                          "poll": "/api/v1/stream/poll",
+                          "post": "/api/v1/bots/post",
+                          "react": "/api/v1/bots/react"}}
+
+
+def _bot_valid_name(data):
+    """Validated bot name (stripped, 1..BOT_NAME_MAX chars), or None."""
+    name = data.get("name")
+    if not isinstance(name, str):
+        return None
+    name = name.strip()
+    return name if 1 <= len(name) <= BOT_NAME_MAX else None
+
+
+def _bot_valid_perms(data):
+    """Validated perms bitmask (int, no unknown bits outside BOT_PERM_ALL),
+    or None. Bools are rejected — True is an int in Python, not a bitmask."""
+    perms = data.get("perms")
+    if isinstance(perms, bool) or not isinstance(perms, int):
+        return None
+    return perms if 0 <= perms <= BOT_PERM_ALL else None
+
+
+def _bot_for_owner(viewer, data):
+    """Load a bot the caller owns. Returns (row, error-dict-or-None):
+    missing bot_id -> 400, unknown bot_id -> 404, another owner's -> 403."""
+    bot_id = data.get("bot_id")
+    if not bot_id or not isinstance(bot_id, str):
+        return None, {"ok": 0, "error": "bot_id required", "code": 400}
+    row = store.bot_get(db, db_lock, bot_id)
+    if row is None:
+        return None, {"ok": 0, "error": "unknown bot", "code": 404}
+    if row["owner_hash"] != viewer:
+        return None, {"ok": 0, "error": "not your bot", "code": 403}
+    return row, None
+
+
+def _bot_for_data(data, bit, what):
+    """Load a bot by its data-path credentials for an action needing
+    BOT_PERMS `bit`. Returns (row, error-dict-or-None): bad, revoked or
+    unknown credentials -> 403 (never 404, so the response cannot leak
+    whether a bot_id exists); missing bit -> 403."""
+    bot = _resolve_bot(data.get("bot_id"), data.get("api_key"))
+    if bot is None:
+        return None, {"ok": 0, "error": "invalid bot credentials", "code": 403}
+    if not (bot["perms"] & bit):
+        return None, {"ok": 0, "error": "bot may not %s" % what, "code": 403}
+    return bot, None
+
+
+@api_route("/api/v1/bots/create")
+@wrap_json_api
+def api_v1_bots_create(viewer, data, link_id):
+    name = _bot_valid_name(data)
+    if name is None:
+        return {"ok": 0, "error": "name required (1-%d chars)" % BOT_NAME_MAX,
+                "code": 400}
+    if "perms" not in data:
+        return {"ok": 0, "error": "perms required", "code": 400}
+    perms = _bot_valid_perms(data)
+    if perms is None:
+        return {"ok": 0, "error": "perms must be a bitmask 0-%d" % BOT_PERM_ALL,
+                "code": 400}
+    bot_id = secrets.token_hex(16)
+    api_key = "sk-" + secrets.token_hex(32)
+    key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    row = store.bot_create(db, db_lock, bot_id, viewer, name, key_hash,
+                           perms, now())
+    _audit(viewer, "bot_create", bot_id, name)
+    return {"ok": 1, "bot": _bot_row(row), "api_key": api_key,
+            "gateway": _bot_gateway()}
+
+
+@api_route("/api/v1/bots/list")
+@wrap_json_api
+def api_v1_bots_list(viewer, data, link_id):
+    rows = store.bot_list_by_owner(db, db_lock, viewer)
+    return {"ok": 1, "bots": [_bot_row(r) for r in rows]}
+
+
+@api_route("/api/v1/bots/info")
+@wrap_json_api
+def api_v1_bots_info(viewer, data, link_id):
+    row, err = _bot_for_owner(viewer, data)
+    if err:
+        return err
+    return {"ok": 1, "bot": _bot_row(row)}
+
+
+@api_route("/api/v1/bots/update")
+@wrap_json_api
+def api_v1_bots_update(viewer, data, link_id):
+    row, err = _bot_for_owner(viewer, data)
+    if err:
+        return err
+    name = None
+    perms = None
+    if "name" in data:
+        name = _bot_valid_name(data)
+        if name is None:
+            return {"ok": 0, "error": "name must be 1-%d chars" % BOT_NAME_MAX,
+                    "code": 400}
+    if "perms" in data:
+        perms = _bot_valid_perms(data)
+        if perms is None:
+            return {"ok": 0,
+                    "error": "perms must be a bitmask 0-%d" % BOT_PERM_ALL,
+                    "code": 400}
+    if name is None and perms is None:
+        return {"ok": 0, "error": "nothing to update", "code": 400}
+    changes = []
+    if name is not None and name != row["name"]:
+        changes.append("name: %s -> %s" % (row["name"], name))
+    if perms is not None and perms != row["perms"]:
+        changes.append("perms: %d -> %d" % (row["perms"], perms))
+    row = store.bot_update(db, db_lock, row["bot_id"], name=name, perms=perms)
+    if changes:
+        _audit(viewer, "bot_update", row["bot_id"], "; ".join(changes))
+    return {"ok": 1, "bot": _bot_row(row)}
+
+
+@api_route("/api/v1/bots/revoke")
+@wrap_json_api
+def api_v1_bots_revoke(viewer, data, link_id):
+    row, err = _bot_for_owner(viewer, data)
+    if err:
+        return err
+    already = row["revoked_at"] is not None
+    row = store.bot_revoke(db, db_lock, row["bot_id"], now())
+    if not already:
+        _audit(viewer, "bot_revoke", row["bot_id"], row["name"])
+    return {"ok": 1, "bot": _bot_row(row)}
+
+
+def _bot_attachments(data):
+    """Decode a bot post's attachments — [{name, mime, data}] with data
+    base64 — into the (name, mime, bytes) triples ingest takes. Returns
+    (atts, error-dict-or-None). Absent attachments is fine (plain post)."""
+    raw = data.get("attachments")
+    if raw is None:
+        return [], None
+    if not isinstance(raw, list) or len(raw) > MAX_ATTACHMENTS:
+        return None, {"ok": 0, "error": "attachments must be a list of at most %d"
+                      % MAX_ATTACHMENTS, "code": 400}
+    atts = []
+    for att in raw:
+        if not isinstance(att, dict):
+            return None, {"ok": 0, "error": "attachment must be an object",
+                          "code": 400}
+        blob = _b64_decode(att.get("data"))
+        if blob is None or len(blob) > MAX_ATTACHMENT_SZ:
+            return None, {"ok": 0,
+                          "error": "attachment data must be base64 under %d bytes"
+                          % MAX_ATTACHMENT_SZ, "code": 400}
+        atts.append((str(att.get("name") or "file")[:128],
+                     str(att.get("mime") or "application/octet-stream")[:64],
+                     blob))
+    return atts, None
+
+
+@api_route("/api/v1/bots/post")
+@wrap_json_api
+def api_v1_bots_post(viewer, data, link_id):
+    """Bot post. Auth is bot_id + api_key in the data (the link identity
+    is the bot's own, not the owner's). Requires the POST bit; the OWNER
+    must hold VIEW + POST on the channel. The post is ingested as the
+    owner (author_hash = owner_hash) so attribution converges with human
+    posts; the bot_id lands in the audit trail instead. The rate limit
+    is keyed by the bot ("bot:" + bot_id), independent of the owner's,
+    so a chatty bot cannot silence its owner (or vice versa)."""
+    bot, err = _bot_for_data(data, BOT_PERMS["POST"], "post")
+    if err:
+        return err
+    cid = data.get("channel")
+    if not store.channel_exists(db, db_lock, cid):
+        return {"ok": 0, "error": "unknown channel", "code": 404}
+    content = data.get("content")
+    atts, err = _bot_attachments(data)
+    if err:
+        return err
+    if not isinstance(content, str) or (not content.strip() and not atts):
+        return {"ok": 0, "error": "empty content", "code": 400}
+    owner = bot["owner_hash"]
+    if not has_perm(owner, cid, PERMS["VIEW"]) \
+            or not has_perm(owner, cid, PERMS["POST"]):
+        return {"ok": 0, "error": "owner lacks view/post permission",
+                "code": 403}
+    if not rate_ok("bot:" + bot["bot_id"], cid):
+        return {"ok": 0, "error": "rate limited", "code": 429}
+    msg_id = ingest(cid, owner, content, attachments=atts[:MAX_ATTACHMENTS])
+    if msg_id is None:
+        return {"ok": 0, "error": "rejected", "code": 400}
+    _audit(owner, "bot_post", bot["bot_id"], msg_id)
+    store.bot_touch_last_seen(db, db_lock, bot["bot_id"], now())
+    return {"ok": 1, "msg_id": msg_id}
+
+
+@api_route("/api/v1/bots/react")
+@wrap_json_api
+def api_v1_bots_react(viewer, data, link_id):
+    """Bot react. Same auth as /api/v1/bots/post; requires the REACT bit.
+    Toggles through the shared _react_as path with the owner as actor,
+    so the reaction is stored and emitted exactly as the owner's own
+    (the owner's VIEW on the message's channel is enforced there)."""
+    bot, err = _bot_for_data(data, BOT_PERMS["REACT"], "react")
+    if err:
+        return err
+    msg_id = data.get("msg")
+    resp = _react_as(bot["owner_hash"], msg_id, data.get("emoji"))
+    if resp.get("ok") != 1:
+        return resp
+    _audit(bot["owner_hash"], "bot_react", bot["bot_id"], msg_id)
+    store.bot_touch_last_seen(db, db_lock, bot["bot_id"], now())
+    return resp
+
+
+@api_route("/api/v1/bots/channels")
+@wrap_json_api
+def api_v1_bots_channels(viewer, data, link_id):
+    """Bot channel list. A bot-only endpoint, not the shared human list:
+    the shared handler's viewer is the link identity, which for a bot is
+    its own hash rather than the owner's, so the bot path authenticates
+    in the data and passes the owner into the same _channels_list_for
+    query the human endpoint uses. Requires the READ_CHANNELS bit; the
+    list is exactly the owner's VIEWable channels, with can_post +
+    unread as the owner."""
+    bot, err = _bot_for_data(data, BOT_PERMS["READ_CHANNELS"],
+                             "read channels")
+    if err:
+        return err
+    store.bot_touch_last_seen(db, db_lock, bot["bot_id"], now())
+    return {"ok": 1, "channels": _channels_list_for(bot["owner_hash"])}
+
+
+@api_route("/api/v1/bots/channel_info")
+@wrap_json_api
+def api_v1_bots_channel_info(viewer, data, link_id):
+    """Bot channel info. Same READ_CHANNELS gate; the metadata shape is
+    the human /api/v1/channels/info one via the shared _channel_info
+    helper (which, like the human endpoint, does not gate on VIEW)."""
+    bot, err = _bot_for_data(data, BOT_PERMS["READ_CHANNELS"],
+                             "read channels")
+    if err:
+        return err
+    store.bot_touch_last_seen(db, db_lock, bot["bot_id"], now())
+    return _channel_info(data.get("channel"))
 
 @api_route("/api/v1/channels/patch")
 @wrap_json_api
