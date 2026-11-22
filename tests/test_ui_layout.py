@@ -146,15 +146,37 @@ class LayoutProbe(sHadesClientApp):
         drawer = main.ids.left_sidebar
         overlay_width = drawer.width
         main.left_open = True
-        self.check(abs(chat.width - main.width) <= 1,
-                   "chat stays full width under the open drawer")
-        self.check(drawer.width >= overlay_width
-                   and drawer.x >= 0 and drawer.right >= pfp.x,
-                   "open drawer covers the composer rail")
-        main.left_open = False
+        # fold-13c law (CI receipt, tests.yml on refactor/client-split
+        # 45007776177: "open drawer covers the composer rail" failed on
+        # a starved xvfb runner while green locally): on_left_open ->
+        # _slide_drawer ANIMATES left_width toward
+        # ui_fx.drawer_open_width(); the old synchronous assert raced
+        # the slide mid-flight. Poll until the width lands (or report),
+        # then run the geometry checks and continue to check_config.
+        try:
+            import ui_fx
+            target = ui_fx.drawer_open_width(main.width, "left")
+        except Exception:
+            target = main._drawer_target("left")
+        state = {"tries": 0}
 
-        self.root.current = "config"
-        Clock.schedule_once(self.check_config, 0.3)
+        def check_open_drawer_geometry(dt=None):
+            landed = (abs(drawer.width - target) <= 1
+                      and abs(main.left_width - target) <= 1)
+            if not landed and state["tries"] < 30:
+                state["tries"] += 1
+                Clock.schedule_once(check_open_drawer_geometry, 0.12)
+                return
+            self.check(abs(chat.width - main.width) <= 1,
+                       "chat stays full width under the open drawer")
+            self.check(drawer.width >= overlay_width
+                       and drawer.x >= 0 and drawer.right >= pfp.x,
+                       "open drawer covers the composer rail")
+            main.left_open = False
+            self.root.current = "config"
+            Clock.schedule_once(self.check_config, 0.3)
+
+        Clock.schedule_once(check_open_drawer_geometry, 0)
 
     def check_config(self, dt):
         config = self.root.get_screen("config")
