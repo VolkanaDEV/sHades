@@ -4429,8 +4429,9 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
 
         return None
 
-    _up_active = False  # an attachment/blob upload is in flight (set at both
-    # blobs_put call sites); while true, keepalive misses are ignored --
+    _up_active = False  # an attachment/blob upload is in flight (held by
+    # blob_put_healed, the one standard upload path); while true, keepalive
+    # misses are ignored --
     # an upload monopolizes the priority-agnostic link FIFO and legitimately
     # delays the poll's receipt past its deadline (manual receipt: RNS is
     # priority-agnostic on general traffic). Two counting misses here would
@@ -4728,6 +4729,86 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
             pass
         self._stream_cid = self._channel_cid(name)
         self._stream_cursor = None
+
+    def blob_put_healed(self, name, mime, data, on_progress=None,
+                        status_fn=None, attempt_cb=None, label="blob"):
+        """THE standard blob-upload entry (tay: "all attachments/uploads
+        should follow roughly the same path"). One retry policy for every
+        upload: message attachments (v1), site attachments, icon/banner.
+
+        Receipted mechanism: the SAF picker stop aborts the TCP interface
+        ([Errno 103]) -- RNS reconnects in ~5-15 s, but a link request
+        in flight inside the window is lost and its receipt sticks at
+        RequestReceipt.SENT (boot receipts: receipt_state=1, init phase).
+        The per-flow gates then gave up in one real case: 0.31.8 retried
+        only while the RNS link object still reported ACTIVE, and the
+        object drops when the server's link-closed aftereffect lands
+        ~15-25 s later (boot_2/boot_3) -- the banner pick showed exactly
+        that (attempt 0 timeout + link object gone -> status line, no
+        retry) while the icon pick in the same boot absorbed its 5 s gap
+        and landed on attempt 2.
+
+        Unified rule: retry "timeout" as long as attempts remain. When
+        the link object is down, poke the re-establish machinery and
+        keep the window open: every attempt re-reads self.guild_api, so
+        a retry lands on the re-established link when one comes up
+        (idempotent by construction: the chunked upload is offset-
+        addressed and an orphaned upload id expires server-side).
+        Non-timeout errors (server rejects, payload limit) are final.
+        Gate: holds _up_active so the keepalive reaper does not tear the
+        link under a waiting retry (no counting, like both legacy call
+        sites; concurrent uploads are rare and the last finisher may
+        lower the gate early -- pre-existing accepted race)."""
+
+        def _dead(api):
+            return getattr(getattr(api, "link", None), "status",
+                           None) != RNS.Link.ACTIVE
+
+        up = None
+        self._up_active = True
+        try:
+            for attempt in range(4):
+                if attempt_cb is not None:
+                    attempt_cb(attempt + 1)
+                api = getattr(self, "guild_api", None)
+                if api is None:
+                    up = {"ok": 0, "error": "no link to the guild",
+                          "phase": "init"}
+                    break
+                try:
+                    up = api.blobs_put(name, mime, data,
+                                       on_progress=on_progress)
+                except Exception as e:
+                    # A raise is a protocol/endpoint problem (or a link
+                    # tear mid-call), not a retryable receipt: no retry,
+                    # mark it so the v1 send flow can still fall back to
+                    # the legacy inline post for pre-/api/v1 guilds
+                    # (LegacyApi doctrine: blobs_put raising there is the
+                    # deterministic "no v1 here" signal). Transport
+                    # timeout/dead failures stay final for that flow
+                    # (0.31.9 boot_2: never re-push the blob inline).
+                    up = {"ok": 0, "error": repr(e)[:120], "phase": "init",
+                          "raise": True}
+                    break
+                if up.get("ok"):
+                    return up
+                err = up.get("error", "unknown")
+                if attempt < 3 and err == "timeout":
+                    if _dead(api):
+                        self._do_reestablish()
+                    if status_fn is not None:
+                        status_fn(label + " upload: waiting for the link "
+                                  "(%s, attempt %d of 4)"
+                                  % (err, attempt + 1))
+                    time.sleep(8.0)
+                    continue
+                break
+            if up is not None and status_fn is not None:
+                status_fn(label + " upload: %s" % up.get("error", "failed"))
+            return up if up is not None else {"ok": 0, "error": "unknown",
+                                              "phase": "init"}
+        finally:
+            self._up_active = False
 
     def _ka_miss(self):
         # Uploads in flight: no counting (see _up_active note). A busy link
@@ -6155,12 +6236,9 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
                             "attach upload %d%%"
                             % int(100 * done / max(total, 1))), 0)
 
-                self._up_active = True
-                try:
-                    up = self.guild_api.blobs_put(name, mime, blob,
-                                                  on_progress=_up_progress)
-                finally:
-                    self._up_active = False
+                # Standard path (tay): one retry policy for every upload.
+                up = self.blob_put_healed(name, mime, blob,
+                                          on_progress=_up_progress)
                 if not up.get("ok"):
                     _send_failed("attach upload (%s): %s"
                                  % (up.get("phase", "init"),
@@ -6321,49 +6399,31 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
                 # reaper from stacking a second tear, and hold the retry
                 # alive through the sleep so it lands on the re-established
                 # link (boot_3: the mp3 posted on attempt 2).
-                self._up_active = True
-                try:
-                    for attempt in range(4):
-                        # polish (g): the bar shows from 0% at the
-                        # start of every attempt (a retry re-uploads
-                        # from scratch, so a stale pct would lie).
-                        if set_progress is not None:
-                            Clock.schedule_once(
-                                lambda dt: set_progress(0), 0)
-                        bstage("attachment: uploading %s (%d KB)%s"
-                               % (name, len(blob) // 1024,
-                                  "" if attempt == 0 else " (attempt %d)" % (attempt + 1)))
-                        try:
-                            up = self.guild_api.blobs_put(name, mime, blob,
-                                                          on_progress=pstage)
-                        except Exception as e:
-                            dlog("v1 blob path failed: %r" % (e,))
-                            print("[TRACE] v1 blob path failed, falling back:",
-                                  repr(e), flush=True)
-                            break
-                        if up.get("ok"):
-                            break
-                        err = up.get("error", "unknown")
-                        print("[TRACE] blob upload attempt %d failed: %s"
-                              % (attempt + 1, err), flush=True)
-                        link = getattr(getattr(self, "guild_api", None),
-                                       "link", None)
-                        dead = link is None or getattr(
-                            link, "status", None) not in (None, RNS.Link.ACTIVE)
-                        if attempt < 3 and err == "timeout" and not dead:
-                            # Only the receipted socket-gap timeout retries; a
-                            # dead link is the re-establish path's job.
-                            bstage("attachment: waiting for the link (%s, "
-                                   "attempt %d) -- will not give up for "
-                                   "%d s" % (err, attempt + 1,
-                                             (3 - attempt) * 8))
-                            time.sleep(8.0)
-                            continue
-                        bstage("attachment: upload failed (%s); link lost "
-                               "-- retry the attach" % err)
-                        break
-                finally:
-                    self._up_active = False
+                # Standard path (tay): one retry policy for every upload.
+                # attempt_cb: the polish (g) bar shows from 0% at the
+                # start of every attempt (a retry re-uploads from
+                # scratch, so a stale pct would lie).
+                # 0.31.9 doctrine, restated on the standard path: a
+                # blobs_put timeout/dead is final (no inline re-push);
+                # a deterministic blobs_put raise is the pre-/api/v1
+                # "no v1 here" signal and keeps its legacy fallback.
+                blob_status = (lambda txt: bstage("attachment: %s"
+                                                  % txt.split(": ", 1)[1]))
+
+                def attempt_cb(n):
+                    if set_progress is not None:
+                        Clock.schedule_once(
+                            lambda dt: set_progress(0), 0)
+                    bstage("attachment: uploading %s (%d KB)%s"
+                           % (name, len(blob) // 1024,
+                              "" if n == 1 else " (attempt %d)" % n))
+
+                up = self.blob_put_healed(
+                    name, mime, blob, on_progress=pstage,
+                    status_fn=blob_status, attempt_cb=attempt_cb)
+                if not up.get("ok"):
+                    bstage("attachment: upload failed (%s); retry the "
+                           "attach" % up.get("error", "unknown"))
                 if up is not None and up.get("ok"):
                     bstage("attachment: blob ok, posting %s" % name)
                     try:
@@ -6385,13 +6445,16 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
                         return
                 if res is None or not res.get("ok"):
                     # 0.31.9: the legacy inline post is the pre-/api/v1
-                    # fallback only. ANY blobs_put failure after the retry
-                    # loop (timeout or link dead) must never fall through:
+                    # fallback only. A blobs_put timeout/dead failure
+                    # after the standard path must never fall through:
                     # boot_2 receipt at 13:23:22 -- a "link dead" race
                     # between attempts bypassed the timeout-only guard and
                     # the inline post pushed the full blob again.
                     if res is None and up is not None and not up.get("ok"):
-                        return
+                        if up.get("raise"):
+                            pass  # deterministic no-v1 raise: legacy below
+                        else:
+                            return
                     try:
                         stage("attachment: posting inline %s ..." % name)
                         legacy = self.guild_api.post(

@@ -15,11 +15,12 @@ Pins down:
   - Roles tab: create posts the checked bitmask; assign posts role+user;
   - Invites tab: create posts label/max_uses/expires_in/channel.
 """
-import os, sys, time, json
+import os, sys, time, json, functools
 
 os.environ.setdefault("KIVY_GL_BACKEND", "mock")
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import kivy_client as kivy_client  # noqa: E402  (the standard upload path)
 
 PASS, FAIL = [], []
 
@@ -108,6 +109,10 @@ class FakeClient:
         self.PERM_MANAGE_ROLES = 16
         self.PERM_ADMIN = 32
         self.status = []
+        # the standard upload path; bind the real method so the screen's
+        # icon/banner flows run production retry wiring against the fake
+        self.blob_put_healed = functools.partial(
+            kivy_client.sHadesClientApp.blob_put_healed, self)
 
     def _set_status(self, txt):
         self.status.append(txt)

@@ -937,70 +937,6 @@ class ServerConfigScreen(Screen):
         except Exception:
             pass
 
-    @staticmethod
-    def _blob_upload_with_heal(client, name, mime, data, label="blob",
-                               status_fn=None):
-        """blobs_put with the 0.31.8 socket-gap retry.
-
-        Receipted (Android boot logs): the SAF picker stop aborts the
-        TCP interface ([Errno 103]); RNS reconnects in ~5-15 s, but a
-        link request in flight inside that window is lost and the
-        receipt is stuck at RequestReceipt.SENT (0x01) -- blobs_put
-        reports "timeout" and the call gave up. Message attachments
-        got the retry loop (_send_with_attachment, 0.31.8/0.31.10);
-        the icon/banner pick flows did not, so every icon/banner
-        upload that followed a pick died once (receipt_state=1 twice,
-        init phase, on a 95 KB file -- size was never the problem).
-
-        Retry shape mirrors the attachment flow: up to 4 attempts,
-        retry only on "timeout" while the RNS link object itself is
-        still usable (st not ACTIVE is the re-establish path's job),
-        8 s between attempts so the reconnect finishes. Idempotent:
-        chunked upload is offset-addressed and an orphaned upload id
-        simply expires server-side."""
-        import time
-        active = 2
-        try:
-            import RNS  # noqa: E402  (cheap: module is already loaded)
-            active = RNS.Link.ACTIVE  # 0x02
-        except Exception:
-            pass
-        res = None
-        try:
-            if hasattr(client, "_up_active"):
-                client._up_active = True
-        except AttributeError:
-            pass
-        try:
-            for attempt in range(4):
-                api = getattr(client, "guild_api", None)
-                if api is None:
-                    return {"ok": 0, "error": "no link to the guild"}
-                res = api.blobs_put(name, mime, data)
-                if res.get("ok"):
-                    return res
-                err = res.get("error", "unknown")
-                print("[blob] upload attempt %d failed: %s (phase=%s state=%s)"
-                      % (attempt + 1, err, res.get("phase"),
-                         res.get("receipt_state")), flush=True)
-                link = getattr(api, "link", None)
-                st = getattr(link, "status", None)
-                dead = link is None or (st is not None and st != active)
-                if attempt < 3 and err == "timeout" and not dead:
-                    if status_fn is not None:
-                        status_fn("%s upload: waiting for the link "
-                                  "(attempt %d of 4)" % (label, attempt + 2))
-                    time.sleep(8.0)
-                    continue
-                break
-            return res if res is not None else {"ok": 0, "error": "upload failed"}
-        finally:
-            try:
-                if hasattr(client, "_up_active"):
-                    client._up_active = False
-            except AttributeError:
-                pass
-
     def _apply_icon_file(self, path):
         """FileChooser result: upload through the standard blob flow, then
         set guild_icon to the returned blob_id (the blob store carries the
@@ -1027,17 +963,14 @@ class ServerConfigScreen(Screen):
             # v0.36.10: every path reports; a raise can no longer kill the
             # worker silently (tay's "returns without setting").
             try:
-                res = self._blob_upload_with_heal(self.client, name, mime,
-                                                  data, label="icon",
-                                                  status_fn=self._apply_status)
+                res = self.client.blob_put_healed(
+                    name, mime, data, label="icon",
+                    status_fn=self._apply_status)
             except Exception as e:
                 self._apply_status("icon upload: %r" % e)
                 return
             if not res.get("ok"):
-                # The heal wrapper sets the status line for its own
-                # failures (attempts exhausted or real errors).
-                self._apply_status("icon upload: %s" % res.get("error"))
-                return
+                return  # the standard path already set the status line
             blob_id = res.get("blob_id")
             try:
                 res2 = self.client.guild_api.admin_config("guild_icon",
@@ -1078,15 +1011,14 @@ class ServerConfigScreen(Screen):
             # v0.36.10: every path reports; a raise can no longer kill the
             # worker silently (tay's "returns without setting").
             try:
-                res = self._blob_upload_with_heal(self.client, name, mime,
-                                                  data, label="banner",
-                                                  status_fn=self._apply_status)
+                res = self.client.blob_put_healed(
+                    name, mime, data, label="banner",
+                    status_fn=self._apply_status)
             except Exception as e:
                 self._apply_status("banner upload: %r" % e)
                 return
             if not res.get("ok"):
-                self._apply_status("banner upload: %s" % res.get("error"))
-                return
+                return  # the standard path already set the status line
             blob_id = res.get("blob_id")
             try:
                 res2 = self.client.guild_api.admin_config("banner", blob_id)

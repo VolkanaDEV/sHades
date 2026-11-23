@@ -230,6 +230,8 @@ def test_blob_upload_retries_timeout_then_posts():
             return {"ok": 1}
 
     app.guild_api = _API()
+    reestablish_calls = []
+    app._do_reestablish = lambda *a, **k: reestablish_calls.append(1)
 
     real_threading = kc.threading
     real_time = kc.time
@@ -274,6 +276,10 @@ def test_blob_upload_retries_timeout_then_posts():
     assert calls["sleep"], "no backoff between retries"
     for s in calls["sleep"]:
         assert 0 < s <= 8.0, calls["sleep"]
+    # standard path: two dead-ish attempts poked the re-establisher
+    # (liveness-unknown link object reads as not-ACTIVE), then the
+    # successful attempt ended the loop
+    assert len(reestablish_calls) == 2, reestablish_calls
 
     # 0.31.10: the composer helper text must have shown the upload percent
     # during the flow and be cleared when the message lands.
@@ -286,10 +292,17 @@ def test_blob_upload_retries_timeout_then_posts():
         "composer not cleared after delivery: %r" % seen_input()
 
 
-def test_blob_retry_never_inlines_big_blob_on_timeout():
-    """Retries exhausted with the link still unresolvable -> the worker must
-    NOT push the full blob inline (the receipted 7 MB failure mode); it
-    surfaces a status instead.
+def test_blob_dead_link_retries_through_heal_and_never_inlines():
+    """Banner receipt (next boot, post-0.31.10 flow): the icon pick
+    absorbed its 5 s gap on attempt 2 while the banner pick died on
+    attempt 0 -- the link object went down (server's link-closed
+    aftereffect, boot_2/boot_3) and the old "not dead" gate gave up
+    instead of riding the re-establish. The standard path: with the
+    link object down, poke the re-establisher and keep the retry
+    window open; every attempt re-reads guild_api so the retry lands
+    on the fresh link when it comes up. What stays pinned: a
+    still-unresolvable link NEVER pushes the full blob inline; the
+    worker surfaces a status instead.
     """
 
     app = kc.sHadesClientApp.__new__(kc.sHadesClientApp)
@@ -331,6 +344,8 @@ def test_blob_retry_never_inlines_big_blob_on_timeout():
             return {"ok": 1}
 
     app.guild_api = _API()
+    reestablish_calls = []
+    app._do_reestablish = lambda *a, **k: reestablish_calls.append(1)
 
     real_threading = kc.threading
     real_time = kc.time
@@ -366,7 +381,8 @@ def test_blob_retry_never_inlines_big_blob_on_timeout():
         kc.time = real_time
         kc.Clock = real_clock
 
-    assert calls["blob"] == 1, "retried against a dead link"
+    assert calls["blob"] == 4, calls
+    assert len(reestablish_calls) == 3, calls
     assert calls["legacy"] == 0, "inline blob pushed at a dead link"
     assert calls["post_v1"] == 0, calls
     assert any("upload failed" in m and "retry the attach" in m
@@ -428,6 +444,8 @@ def test_blob_linkdead_never_falls_through():
             return {"ok": 1}
 
     app.guild_api = _API()
+    reestablish_calls = []
+    app._do_reestablish = lambda *a, **k: reestablish_calls.append(1)
 
     real_threading = kc.threading
     real_time = kc.time
@@ -1463,7 +1481,7 @@ def main():
     test_heal_never_nulls_healthy_router()
     test_heal_rebuild_only_when_router_gone()
     test_blob_upload_retries_timeout_then_posts()
-    test_blob_retry_never_inlines_big_blob_on_timeout()
+    test_blob_dead_link_retries_through_heal_and_never_inlines()
     test_blob_linkdead_never_falls_through()
     test_wait_path_mtu_bounded_and_uses_live_path()
     test_wait_path_mtu_bounded_gives_up()
