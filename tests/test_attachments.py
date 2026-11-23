@@ -173,6 +173,10 @@ class StubApp:
         # send_message() checks the channel kind before posting.
         self._channel_kind = functools.partial(
             kivy_client.sHadesClientApp._channel_kind, self)
+        # the standard upload path (blob_put_healed) is the one the send
+        # flow calls; bind the real method to the stub
+        self.blob_put_healed = functools.partial(
+            kivy_client.sHadesClientApp.blob_put_healed, self)
 
     def _set_status(self, text):
         self.status.append(text)

@@ -897,21 +897,34 @@ class ServerConfigScreen(Screen):
             return
 
         def work():
+            raw = None
             try:
                 import io
-                import base64
-                res = self.client.guild_api.blobs_get(blob_id)
-                if not res.get("ok"):
-                    return
-                raw = base64.b64decode(res.get("data_b64") or "")
+                api = self.client.guild_api
+                if hasattr(api, "blobs_get_full"):
+                    raw = api.blobs_get_full(blob_id)
+                else:
+                    import base64
+                    res = api.blobs_get(blob_id)
+                    if res.get("ok"):
+                        raw = base64.b64decode(res.get("data_b64") or "")
                 if not raw:
                     return
                 from kivy.core.image import Image as CoreImage
-                ci = CoreImage(io.BytesIO(raw), ext="png")
+                ext = "png"
+                if raw[:2] == bytes([0xff, 0xd8]):
+                    ext = "jpg"
+                try:
+                    ci = CoreImage(io.BytesIO(raw), ext=ext)
+                except Exception as e:
+                    self._apply_status(
+                        "banner image load failed (%d bytes ext=%s): %s"
+                        % (len(raw), ext, e))
+                    return
                 Clock.schedule_once(
                     lambda _dt: self._set_texture(widget, ci), 0)
-            except Exception:
-                pass
+            except Exception as e:
+                print("[blob] render fetch failed (%s): %r" % (blob_id[:12], e))
         threading.Thread(target=work, daemon=True).start()
 
     def _set_texture(self, widget, core_image):
@@ -949,24 +962,28 @@ class ServerConfigScreen(Screen):
             mime = "image/webp"
         elif name.lower().endswith(".gif"):
             mime = "image/gif"
+        print("[icon] apply start path=%r" % path, flush=True)
         try:
             with open(path, "rb") as f:
                 data = f.read()
         except OSError as e:
+            print("[icon] read failed: %r" % e, flush=True)
             self._apply_status("icon read failed: %r" % e)
             return
+        print("[icon] read ok: %d bytes, uploading" % len(data), flush=True)
 
         def work():
             # v0.36.10: every path reports; a raise can no longer kill the
             # worker silently (tay's "returns without setting").
             try:
-                res = self.client.guild_api.blobs_put(name, mime, data)
+                res = self.client.blob_put_healed(
+                    name, mime, data, label="icon",
+                    status_fn=self._apply_status)
             except Exception as e:
                 self._apply_status("icon upload: %r" % e)
                 return
             if not res.get("ok"):
-                self._apply_status("icon upload: %s" % res.get("error"))
-                return
+                return  # the standard path already set the status line
             blob_id = res.get("blob_id")
             try:
                 res2 = self.client.guild_api.admin_config("guild_icon",
@@ -993,24 +1010,28 @@ class ServerConfigScreen(Screen):
             mime = "image/webp"
         elif name.lower().endswith(".gif"):
             mime = "image/gif"
+        print("[banner] apply start path=%r" % path, flush=True)
         try:
             with open(path, "rb") as f:
                 data = f.read()
         except OSError as e:
+            print("[banner] read failed: %r" % e, flush=True)
             self._apply_status("banner read failed: %r" % e)
             return
+        print("[banner] read ok: %d bytes, uploading" % len(data), flush=True)
 
         def work():
             # v0.36.10: every path reports; a raise can no longer kill the
             # worker silently (tay's "returns without setting").
             try:
-                res = self.client.guild_api.blobs_put(name, mime, data)
+                res = self.client.blob_put_healed(
+                    name, mime, data, label="banner",
+                    status_fn=self._apply_status)
             except Exception as e:
                 self._apply_status("banner upload: %r" % e)
                 return
             if not res.get("ok"):
-                self._apply_status("banner upload: %s" % res.get("error"))
-                return
+                return  # the standard path already set the status line
             blob_id = res.get("blob_id")
             try:
                 res2 = self.client.guild_api.admin_config("banner", blob_id)

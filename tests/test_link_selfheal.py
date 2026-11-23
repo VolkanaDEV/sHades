@@ -22,6 +22,9 @@ Pins:
 import sys
 import os
 import types
+import base64
+
+PAYLOAD = (b"sHades-banner-slice-payload-" * 20000)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -230,6 +233,8 @@ def test_blob_upload_retries_timeout_then_posts():
             return {"ok": 1}
 
     app.guild_api = _API()
+    reestablish_calls = []
+    app._do_reestablish = lambda *a, **k: reestablish_calls.append(1)
 
     real_threading = kc.threading
     real_time = kc.time
@@ -274,6 +279,10 @@ def test_blob_upload_retries_timeout_then_posts():
     assert calls["sleep"], "no backoff between retries"
     for s in calls["sleep"]:
         assert 0 < s <= 8.0, calls["sleep"]
+    # standard path: two dead-ish attempts poked the re-establisher
+    # (liveness-unknown link object reads as not-ACTIVE), then the
+    # successful attempt ended the loop
+    assert len(reestablish_calls) == 2, reestablish_calls
 
     # 0.31.10: the composer helper text must have shown the upload percent
     # during the flow and be cleared when the message lands.
@@ -286,10 +295,17 @@ def test_blob_upload_retries_timeout_then_posts():
         "composer not cleared after delivery: %r" % seen_input()
 
 
-def test_blob_retry_never_inlines_big_blob_on_timeout():
-    """Retries exhausted with the link still unresolvable -> the worker must
-    NOT push the full blob inline (the receipted 7 MB failure mode); it
-    surfaces a status instead.
+def test_blob_dead_link_retries_through_heal_and_never_inlines():
+    """Banner receipt (next boot, post-0.31.10 flow): the icon pick
+    absorbed its 5 s gap on attempt 2 while the banner pick died on
+    attempt 0 -- the link object went down (server's link-closed
+    aftereffect, boot_2/boot_3) and the old "not dead" gate gave up
+    instead of riding the re-establish. The standard path: with the
+    link object down, poke the re-establisher and keep the retry
+    window open; every attempt re-reads guild_api so the retry lands
+    on the fresh link when it comes up. What stays pinned: a
+    still-unresolvable link NEVER pushes the full blob inline; the
+    worker surfaces a status instead.
     """
 
     app = kc.sHadesClientApp.__new__(kc.sHadesClientApp)
@@ -331,6 +347,8 @@ def test_blob_retry_never_inlines_big_blob_on_timeout():
             return {"ok": 1}
 
     app.guild_api = _API()
+    reestablish_calls = []
+    app._do_reestablish = lambda *a, **k: reestablish_calls.append(1)
 
     real_threading = kc.threading
     real_time = kc.time
@@ -366,7 +384,8 @@ def test_blob_retry_never_inlines_big_blob_on_timeout():
         kc.time = real_time
         kc.Clock = real_clock
 
-    assert calls["blob"] == 1, "retried against a dead link"
+    assert calls["blob"] == 4, calls
+    assert len(reestablish_calls) == 3, calls
     assert calls["legacy"] == 0, "inline blob pushed at a dead link"
     assert calls["post_v1"] == 0, calls
     assert any("upload failed" in m and "retry the attach" in m
@@ -428,6 +447,8 @@ def test_blob_linkdead_never_falls_through():
             return {"ok": 1}
 
     app.guild_api = _API()
+    reestablish_calls = []
+    app._do_reestablish = lambda *a, **k: reestablish_calls.append(1)
 
     real_threading = kc.threading
     real_time = kc.time
@@ -466,14 +487,176 @@ def test_blob_linkdead_never_falls_through():
         kc.time = real_time
         kc.Clock = real_clock
 
-    assert calls["blob"] == 2, calls
-    assert calls["up_at_rest"] == [True], \
-        "gate released between attempts; reaper tore the link mid-retry"
-    assert calls["legacy"] == 0, \
-        '"link dead" fell through to the legacy inline post'
+    assert calls["blob"] == 4, calls
+    assert calls["up_at_rest"] == [True, True, True], (
+        "gate released between attempts; reaper tore the link mid-retry")
+    assert calls["legacy"] == 0, (
+        '"link dead" fell through to the legacy inline post')
     assert calls["post_v1"] == 0, calls
     assert any("link dead" in m for m in calls.get("status", [])), calls
     assert not app._up_active, "gate stuck held after the flow finished"
+
+
+def test_blob_linkdead_retries_and_lands_on_the_healed_link():
+    """Banner log 2026-11-22 19:40 receipt: attempt 1 timeout at init
+    (receipt_state=1), attempt 2 link dead at init phase, the guild
+    link re-established 8 s later at 19:40:24 with attempts unused --
+    the old timeout-only gate gave up inside a window the heal was
+    already closing. The standard path now treats 'link dead' in the
+    same window as the re-establish (poke + wait + re-read guild_api)
+    and the retry lands on the fresh Link. What stays pinned: the
+    retry never touches the legacy inline post; the fresh guild_api
+    carries the post; the gate holds under every wait.
+    """
+
+    calls = {"blob": 0, "post_v1": 0, "legacy": 0, "up_at_rest": []}
+
+    app = kc.sHadesClientApp.__new__(kc.sHadesClientApp)
+    app.guild_api = None
+    app._up_active = False
+
+    class _Fakes(object):
+        pass
+
+    main_screen = _Fakes()
+    main_screen._current_channel = "general"
+    main_screen.ids = _Fakes()
+    main_screen.ids.message_grid = object()
+    main_screen.ids.msg_input = _Fakes()
+    main_screen.ids.msg_input.helper_text = None
+
+    class _Root(object):
+        def get_screen(self, *_a, **_k):
+            return main_screen
+
+    app.root = _Root()
+    app._channel_cid = lambda cid: cid
+    app._set_status = lambda msg: calls.setdefault("status", []).append(msg)
+    app.my_hash = "aa" * 16
+    app.username = "tester"
+    app._add_to_history = lambda m: None
+    app._save_history = lambda: None
+    app._render_message = lambda *a, **k: None
+    app._save_attachment_blob = lambda blob, name: "/tmp/fake"
+
+    class _HealAPI(object):
+        link = object()  # liveness-unknown: reads as dead-ish while down
+
+        def blobs_put(self, name, mime, blob, on_progress=None):
+            calls["blob"] += 1
+            if calls["blob"] < 3:
+                return {"ok": 0, "error": "link dead", "phase": "init"}
+            return {"ok": 1, "blob_id": "b2" * 16, "size": len(blob)}
+
+        def post_v1(self, *a, **k):
+            calls["post_v1"] += 1
+            return {"ok": 1}
+
+        def post(self, *a, **k):
+            calls["legacy"] += 1
+            return {"ok": 1}
+
+    app.guild_api = _HealAPI()
+    reestablish_calls = []
+    app._do_reestablish = lambda *a, **k: reestablish_calls.append(1)
+
+    real_threading = kc.threading
+    real_time = kc.time
+    real_clock = kc.Clock
+
+    class _NowClock(object):
+        @staticmethod
+        def schedule_once(cb, dt=0):
+            cb(dt)
+
+    shim = types.ModuleType("shim-threading")
+
+    class _SyncThread(object):
+        def __init__(self, target=None, daemon=False):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    shim.Thread = _SyncThread
+    kc.threading = shim
+
+    def _sleep(_s):
+        calls["up_at_rest"].append(app._up_active)
+
+    shim_time = types.ModuleType("shim-time")
+    shim_time.time = lambda *_a, **_k: 0.0
+    shim_time.sleep = _sleep
+    kc.time = shim_time
+    kc.Clock = _NowClock
+    try:
+        app._send_with_attachment("hi", "f.bin",
+                                  "application/octet-stream",
+                                  b"data", kc.ATT_SERVER)
+    finally:
+        kc.threading = real_threading
+        kc.time = real_time
+        kc.Clock = real_clock
+
+    assert calls["blob"] == 3, calls
+    assert len(reestablish_calls) == 2, calls
+    assert calls["legacy"] == 0, "link-dead retry fell through to legacy"
+    assert calls["post_v1"] == 1, calls
+    assert calls["up_at_rest"] == [True, True], calls
+    assert not app._up_active, "gate stuck held after the flow finished"
+    print("PASS  blob link-dead retry lands on the healed link")
+
+def test_blob_get_full_assembles_all_slices():
+    """Banner log 2026-11-22 20:12 receipt: a 2.6 MB banner uploaded
+    intact (10/10 chunks, finish sha ce0218f3...), but the render
+    fetch took ONE /api/v1/blobs/get slice (256 KiB default,
+    BLOB_CHUNK_DEFAULT) and CoreImage failed on the truncated PNG --
+    white box on the config preview and the sidebar strip, while the
+    icon (~93 KB, single slice) rendered. The full reader assembles
+    every slice, follows the server's {total, eof} echoes, and stops
+    exactly at total.
+    """
+
+    calls = []
+
+    class _SlicedApi(object):
+        def blobs_get(self, blob_id, offset=0, length=None):
+            calls.append(offset)
+            chunk = PAYLOAD[offset:offset + 262144]
+            eof = offset + len(chunk) >= len(PAYLOAD)
+            return {"ok": 1, "blob_id": blob_id, "total": len(PAYLOAD),
+                    "offset": offset, "eof": eof,
+                    "data_b64": base64.b64encode(chunk).decode("ascii")}
+
+    import guild_api as _ga
+    api = _SlicedApi()
+    api.blobs_get_full = types.MethodType(_ga.GuildAPI.blobs_get_full, api)
+    raw = api.blobs_get_full("ce" * 16)
+    assert raw == PAYLOAD, (len(raw), len(PAYLOAD))
+    assert calls == [0, 262144, 524288], calls
+    print("PASS  blob get-full assembles all slices")
+
+
+def test_blob_get_full_rejects_slice_overrun():
+    """A server echoing a total shorter than the slice math claims
+    must raise a named error, never hand the renderer a corrupt
+    buffer."""
+
+    class _BadApi(object):
+        def blobs_get(self, blob_id, offset=0, length=None):
+            return {"ok": 1, "blob_id": blob_id, "total": 100, "eof": True,
+                    "data_b64": base64.b64encode(b"x" * 256).decode("ascii")}
+
+    import guild_api as _ga
+    api = _BadApi()
+    api.blobs_get_full = types.MethodType(_ga.GuildAPI.blobs_get_full, api)
+    raised = False
+    try:
+        api.blobs_get_full("cc" * 16)
+    except OSError:
+        raised = True
+    assert raised, "overrun slice slipped through"
+    print("PASS  blob get-full rejects slice overrun")
 
 
 def test_wait_path_mtu_bounded_and_uses_live_path():
@@ -1463,8 +1646,11 @@ def main():
     test_heal_never_nulls_healthy_router()
     test_heal_rebuild_only_when_router_gone()
     test_blob_upload_retries_timeout_then_posts()
-    test_blob_retry_never_inlines_big_blob_on_timeout()
+    test_blob_dead_link_retries_through_heal_and_never_inlines()
     test_blob_linkdead_never_falls_through()
+    test_blob_linkdead_retries_and_lands_on_the_healed_link()
+    test_blob_get_full_assembles_all_slices()
+    test_blob_get_full_rejects_slice_overrun()
     test_wait_path_mtu_bounded_and_uses_live_path()
     test_wait_path_mtu_bounded_gives_up()
     test_bootlog_export_contract()
@@ -1478,7 +1664,7 @@ def main():
     test_motd_strip_contract()
     test_announce_composer_contract()
     test_announce_fetch_guard_contract()
-    print("PASS: 22  FAIL: 0")
+    print("PASS: 25  FAIL: 0")
 
 
 if __name__ == "__main__":

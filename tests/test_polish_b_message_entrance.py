@@ -171,6 +171,9 @@ def make_app():
         kc.sHadesClientApp.send_message, app)
     app._send_with_attachment = types.MethodType(
         kc.sHadesClientApp._send_with_attachment, app)
+    # the standard upload path the send flow now calls
+    app.blob_put_healed = types.MethodType(
+        kc.sHadesClientApp.blob_put_healed, app)
     app._show_notice = types.MethodType(
         app_menus.MenusMixin._show_notice, app)
     # Recording wrapper around the real renderer: every caller is
