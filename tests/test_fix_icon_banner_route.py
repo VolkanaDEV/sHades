@@ -74,7 +74,9 @@ state = {"icon_blob": None, "banner_blob": None}
 
 
 class FakeAPI:
-    def blobs_put(self, name, mime, data):
+    def blobs_put(self, name, mime, data, on_progress=None):
+        # on_progress: the standard upload path (blob_put_healed) passes
+        # it exactly like the real GuildAPI.blobs_put signature
         calls.append(("blobs_put", name, mime, len(data)))
         blob = "a" * 32 if "icon" in name else "b" * 32
         return {"ok": 1, "blob_id": blob, "size": len(data)}
