@@ -4754,8 +4754,12 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
         a retry lands on the re-established link when one comes up
         (idempotent by construction: the chunked upload is offset-
         addressed and an orphaned upload id expires server-side).
-        Non-timeout errors (server rejects, payload limit) are final.
-        Gate: holds _up_active so the keepalive reaper does not tear the
+        Retryable: 'timeout' and 'link dead' -- both link-layer, both
+        idempotent to redo (banner log 2026-11-22 19:40: attempt 1
+        timeout at init receipt_state=1, attempt 2 link dead, link
+        re-established 8 s later, attempts unused). Non-retryable:
+        protocol errors (server rejects, payload limit). Gate: holds
+        _up_active so the keepalive reaper does not tear the
         link under a waiting retry (no counting, like both legacy call
         sites; concurrent uploads are rare and the last finisher may
         lower the gate early -- pre-existing accepted race)."""
@@ -4793,7 +4797,21 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
                 if up.get("ok"):
                     return up
                 err = up.get("error", "unknown")
-                if attempt < 3 and err == "timeout":
+                # Retry the receipted link-layer failures: 'timeout'
+                # (receipt stuck at SENT, request lost in the gap) and
+                # 'link dead' (the link object torn mid-window by the
+                # server's link-closed aftereffect). Banner log
+                # 2026-11-22 19:40 receipt: attempt 1 timeout at init
+                # (receipt_state=1), attempt 2 link dead at init, the
+                # guild link re-established 8 s later at 19:40:24 while
+                # two attempts remained -- the old timeout-only gate
+                # gave up inside a window that the heal was already
+                # closing. Both responses are link-layer and idempotent
+                # to redo (offset-addressed chunks; orphaned upload ids
+                # expire server-side). The legacy-flow protection stays
+                # exactly where 0.31.9 pinned it: only a raise falls
+                # through to the inline post.
+                if attempt < 3 and err in ("timeout", "link dead"):
                     if _dead(api):
                         self._do_reestablish()
                     if status_fn is not None:

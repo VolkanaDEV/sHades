@@ -484,15 +484,124 @@ def test_blob_linkdead_never_falls_through():
         kc.time = real_time
         kc.Clock = real_clock
 
-    assert calls["blob"] == 2, calls
-    assert calls["up_at_rest"] == [True], \
-        "gate released between attempts; reaper tore the link mid-retry"
-    assert calls["legacy"] == 0, \
-        '"link dead" fell through to the legacy inline post'
+    assert calls["blob"] == 4, calls
+    assert calls["up_at_rest"] == [True, True, True], (
+        "gate released between attempts; reaper tore the link mid-retry")
+    assert calls["legacy"] == 0, (
+        '"link dead" fell through to the legacy inline post')
     assert calls["post_v1"] == 0, calls
     assert any("link dead" in m for m in calls.get("status", [])), calls
     assert not app._up_active, "gate stuck held after the flow finished"
 
+
+def test_blob_linkdead_retries_and_lands_on_the_healed_link():
+    """Banner log 2026-11-22 19:40 receipt: attempt 1 timeout at init
+    (receipt_state=1), attempt 2 link dead at init phase, the guild
+    link re-established 8 s later at 19:40:24 with attempts unused --
+    the old timeout-only gate gave up inside a window the heal was
+    already closing. The standard path now treats 'link dead' in the
+    same window as the re-establish (poke + wait + re-read guild_api)
+    and the retry lands on the fresh Link. What stays pinned: the
+    retry never touches the legacy inline post; the fresh guild_api
+    carries the post; the gate holds under every wait.
+    """
+
+    calls = {"blob": 0, "post_v1": 0, "legacy": 0, "up_at_rest": []}
+
+    app = kc.sHadesClientApp.__new__(kc.sHadesClientApp)
+    app.guild_api = None
+    app._up_active = False
+
+    class _Fakes(object):
+        pass
+
+    main_screen = _Fakes()
+    main_screen._current_channel = "general"
+    main_screen.ids = _Fakes()
+    main_screen.ids.message_grid = object()
+    main_screen.ids.msg_input = _Fakes()
+    main_screen.ids.msg_input.helper_text = None
+
+    class _Root(object):
+        def get_screen(self, *_a, **_k):
+            return main_screen
+
+    app.root = _Root()
+    app._channel_cid = lambda cid: cid
+    app._set_status = lambda msg: calls.setdefault("status", []).append(msg)
+    app.my_hash = "aa" * 16
+    app.username = "tester"
+    app._add_to_history = lambda m: None
+    app._save_history = lambda: None
+    app._render_message = lambda *a, **k: None
+    app._save_attachment_blob = lambda blob, name: "/tmp/fake"
+
+    class _HealAPI(object):
+        link = object()  # liveness-unknown: reads as dead-ish while down
+
+        def blobs_put(self, name, mime, blob, on_progress=None):
+            calls["blob"] += 1
+            if calls["blob"] < 3:
+                return {"ok": 0, "error": "link dead", "phase": "init"}
+            return {"ok": 1, "blob_id": "b2" * 16, "size": len(blob)}
+
+        def post_v1(self, *a, **k):
+            calls["post_v1"] += 1
+            return {"ok": 1}
+
+        def post(self, *a, **k):
+            calls["legacy"] += 1
+            return {"ok": 1}
+
+    app.guild_api = _HealAPI()
+    reestablish_calls = []
+    app._do_reestablish = lambda *a, **k: reestablish_calls.append(1)
+
+    real_threading = kc.threading
+    real_time = kc.time
+    real_clock = kc.Clock
+
+    class _NowClock(object):
+        @staticmethod
+        def schedule_once(cb, dt=0):
+            cb(dt)
+
+    shim = types.ModuleType("shim-threading")
+
+    class _SyncThread(object):
+        def __init__(self, target=None, daemon=False):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    shim.Thread = _SyncThread
+    kc.threading = shim
+
+    def _sleep(_s):
+        calls["up_at_rest"].append(app._up_active)
+
+    shim_time = types.ModuleType("shim-time")
+    shim_time.time = lambda *_a, **_k: 0.0
+    shim_time.sleep = _sleep
+    kc.time = shim_time
+    kc.Clock = _NowClock
+    try:
+        app._send_with_attachment("hi", "f.bin",
+                                  "application/octet-stream",
+                                  b"data", kc.ATT_SERVER)
+    finally:
+        kc.threading = real_threading
+        kc.time = real_time
+        kc.Clock = real_clock
+
+    assert calls["blob"] == 3, calls
+    assert len(reestablish_calls) == 2, calls
+    assert calls["legacy"] == 0, "link-dead retry fell through to legacy"
+    assert calls["post_v1"] == 1, calls
+    assert calls["up_at_rest"] == [True, True], calls
+    assert not app._up_active, "gate stuck held after the flow finished"
+    print("PASS  blob link-dead retry lands on the healed link")
 
 def test_wait_path_mtu_bounded_and_uses_live_path():
     """0.31.8 (boot.log receipt): re-establishes ran with an invalidated
@@ -1483,6 +1592,7 @@ def main():
     test_blob_upload_retries_timeout_then_posts()
     test_blob_dead_link_retries_through_heal_and_never_inlines()
     test_blob_linkdead_never_falls_through()
+    test_blob_linkdead_retries_and_lands_on_the_healed_link()
     test_wait_path_mtu_bounded_and_uses_live_path()
     test_wait_path_mtu_bounded_gives_up()
     test_bootlog_export_contract()
@@ -1496,7 +1606,7 @@ def main():
     test_motd_strip_contract()
     test_announce_composer_contract()
     test_announce_fetch_guard_contract()
-    print("PASS: 22  FAIL: 0")
+    print("PASS: 23  FAIL: 0")
 
 
 if __name__ == "__main__":
