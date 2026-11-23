@@ -16,8 +16,13 @@ Transport is injected (send_packet/receive hooks) so the unit bench can
 run the whole loop with a fake and the client with real RNS.
 """
 
+import os
 import threading
 import time
+
+import RNS
+
+VOICE_DEBUG = os.environ.get("SHADES_VOICE_DEBUG") == "1"
 
 try:
     import voice_codec as vc
@@ -79,8 +84,14 @@ class VoiceEngine(object):
         self._send = None         # cb(peer_dest_hex, body) transport hook
         self._verify_member = None  # cb(identity_or_viewer) -> bool
         self._out_links = {}      # peer dest hex -> FakeLink-like
+        self._in_links = {}       # listeners' inbound links (speakers)
         self._jitter = {}         # speaker dest hex -> packet deque
         self._speakers_pinned = set()
+        self._link_factory = None  # cb(peer_hex) -> link-like (blocking)
+        self._dial_q = []         # peers queued for the dialer thread
+        self._dial_failures = {}  # peer hex -> failed dial count
+        self._dialer = None
+        self._dialing = threading.Event()
         self._pacer = None
         self._player = None
         self._pacing = threading.Event()
@@ -124,6 +135,14 @@ class VoiceEngine(object):
             r = self.hub.join(cid, self._dest_hex, muted)
             if not r or not r.get("ok"):
                 return r
+            self.room_cid = cid
+            self.muted = muted
+            self.start()
+            # the join response carries the room's live roster: callers
+            # seed their engines from it (push events only cover the
+            # post-subscribe window)
+            r["room"] = cid
+            return r
         self.room_cid = cid
         self.muted = muted
         self.start()
@@ -147,7 +166,8 @@ class VoiceEngine(object):
 
     def on_roster(self, cid, members):
         """From the room's voice_state push. Peers = roster minus self,
-        each with its own declared voice destination."""
+        each with its own declared voice destination. Dialing runs on the
+        dialer thread (path discovery can block); this stays O(1)."""
         if cid != self.room_cid:
             return
         alive = set()
@@ -156,11 +176,15 @@ class VoiceEngine(object):
                 continue
             dest = m["dest"]
             alive.add(dest)
-            if dest not in self._out_links:
-                link = FakeLink(self, dest)
-                self._out_links[dest] = link
-                self._jitter[dest] = {
-                    "buf": [], "last": time.time()}
+            if dest not in self._out_links and dest not in self._dial_q:
+                if self._link_factory is not None:
+                    self._dial_q.append(dest)
+                else:
+                    # bench lane: a fake link stands in for the dialer
+                    link = FakeLink(self, dest)
+                    self._out_links[dest] = link
+                    self._jitter.setdefault(
+                        dest, {"buf": [], "last": time.time()})
         for dest in list(self._out_links):
             if dest not in alive:
                 self._out_links.pop(dest).teardown()
@@ -168,6 +192,9 @@ class VoiceEngine(object):
         # pinned speakers: expected-active peers, so playback gaps in
         # their streams raise PLC frames instead of bare silence
         self._speakers_pinned = alive.copy()
+        if VOICE_DEBUG:
+            print("roster %s: pinned=%s queued=%s" % (
+                cid, self._speakers_pinned, self._dial_q), flush=True)
 
     # ---- speaker side ---------------------------------------------------
 
@@ -186,7 +213,11 @@ class VoiceEngine(object):
             body = vc.encode_packet(self.codec, frames)
             body = self._out_seq.to_bytes(2, "big") + body
             self._out_seq = (self._out_seq + 1) & 0xFFFF
-            for peer, link in list(self._out_links.items()):
+            # a peer linked both ways (out dial + inbound dial) receives
+            # one packet, not two
+            targets = dict(self._in_links)
+            targets.update(self._out_links)
+            for peer, link in list(targets.items()):
                 try:
                     if not link.alive:
                         continue
@@ -204,14 +235,69 @@ class VoiceEngine(object):
         try:
             frames = vc.decode_packet(body[2:])
         except ValueError:
+            if VOICE_DEBUG:
+                print("demux %s: decode rejected %d bytes %s..." % (
+                    speaker_dest_hex[:8], len(body),
+                    (body[2:12] or b"").hex()), flush=True)
             return
         j = self._jitter.get(speaker_dest_hex)
         if j is None:
+            if VOICE_DEBUG:
+                print("demux %s: no jitter, keys=%s" % (
+                    speaker_dest_hex[:8],
+                    [k[:8] for k in self._jitter]), flush=True)
             return
         j["buf"].append((seq, time.time(), frames))
         if len(j["buf"]) > JITTER_MAX_PACKETS:
             j["buf"].pop(0)   # a clogged peer loses its oldest packet
         self.frames_in += len(frames)
+
+    # ---- dialer (listener connects to each roster peer) -----------------
+
+    def set_link_factory(self, cb):
+        """cb(peer_dest_hex) -> link-like (alive/send/teardown) or None.
+        Blocking calls live on the dialer thread, never the roster demux."""
+        if cb is not None:
+            self._link_factory = cb
+
+    def accept_inbound(self, peer_dest_hex, link):
+        """A listener dialed this engine's voice destination: register the
+        inbound link for fan-out. The transport verifies roster membership
+        BEFORE calling; the engine trusts that gate."""
+        if peer_dest_hex and link is not None:
+            self._in_links[peer_dest_hex] = link
+            return True
+        return False
+
+    def _dialer_loop(self):
+        while not self._dialing.wait(0.05):
+            if not self._dial_q:
+                continue
+            dest = self._dial_q.pop(0)
+            if self.room_cid is None or self._link_factory is None:
+                continue
+            try:
+                link = self._link_factory(dest)
+            except Exception as e:
+                link = None
+                print("voice dial %s failed: %r" % (dest[:8], e))
+            if link is None:
+                # retried on a backoff, capped: a permanently failed pair
+                # stops dialing until the next roster push re-lists it
+                self._dial_failures[dest] = self._dial_failures.get(dest, 0) + 1
+                if self._dial_failures[dest] <= 8:
+                    self._dialing.wait(1.0)
+                    self._dial_q.append(dest)
+                continue
+            self._dial_failures.pop(dest, None)
+            if dest not in self._speakers_pinned:
+                try:
+                    link.teardown()
+                except Exception:
+                    pass
+                continue    # the roster moved on while we dialed
+            self._out_links[dest] = link
+            self._jitter.setdefault(dest, {"buf": [], "last": time.time()})
 
     def _deliver(self, peer, body):
         """FakeLink's receive side; the real layer routes packets on its
@@ -260,12 +346,163 @@ class VoiceEngine(object):
             self._player = threading.Thread(
                 target=self._player_loop, daemon=True, name="voice-player")
             self._player.start()
+        if self._link_factory is not None and self._dialer is None:
+            self._dialing = threading.Event()
+            self._dialer = threading.Thread(
+                target=self._dialer_loop, daemon=True, name="voice-dialer")
+            self._dialer.start()
 
     def stop(self):
         self._out_seq = 0
+        self._in_links.clear()
         if self._pacer is not None:
             self._pacing.set()
             self._pacer = None
         if self._player is not None:
             self._playing.set()
             self._player = None
+        if self._dialer is not None:
+            self._dialing.set()
+            self._dialer = None
+            self._dial_q = []
+
+
+class RNSLinkProxy(object):
+    """One established RNS.Link, shaped like the engine's FakeLink."""
+    __slots__ = ("link", "peer", "engine")
+
+    def __init__(self, engine, peer_hex, link):
+        self.engine = engine
+        self.peer = peer_hex
+        self.link = link
+
+    @property
+    def alive(self):
+        return self.link.status == RNS.Link.ACTIVE
+
+    def send(self, body):
+        # this RNS version carries link frames as packets
+        # (the hub's own push path at sHades.py:1741 does the same)
+        return RNS.Packet(self.link, body).send()
+
+    def teardown(self):
+        try:
+            self.link.teardown()
+        except Exception:
+            pass
+
+
+class RNSVoiceTransport(object):
+    """RNS-backed transport: the engine's own hades/voice inbound
+    destination (speaker accepts listener links against the roster) and
+    outbound dials to each roster peer's voice destination."""
+
+    def __init__(self, engine, identity, verifier=None, wait_secs=20.0):
+        self.engine = engine
+        self.identity = identity
+        self.verifier = verifier       # cb(viewer_hex) -> bool
+        self.wait_secs = wait_secs
+        self.dest = RNS.Destination(
+            identity, RNS.Destination.IN, RNS.Destination.SINGLE,
+            "hades", "voice")
+        self.dest_hash_hex = RNS.hexrep(self.dest.hash, delimit=False)
+        engine.set_dest(self.dest_hash_hex)
+        self.dest.announce()           # mesh-wide discovery for listeners
+        self.dest.set_link_established_callback(self._on_in_link)
+        engine.set_link_factory(self.dial)
+
+    @staticmethod
+    def viewer_hash_of_identity(nid):
+        """The roster's viewer hashes are lxmf delivery hashes."""
+        return RNS.hexrep(
+            RNS.Destination(
+                nid, RNS.Destination.OUT, RNS.Destination.SINGLE,
+                "lxmf", "delivery").hash, delimit=False)
+
+    @classmethod
+    def voice_hash_of_identity(cls, nid):
+        return RNS.hexrep(
+            RNS.Destination(
+                nid, RNS.Destination.OUT, RNS.Destination.SINGLE,
+                "hades", "voice").hash, delimit=False)
+
+    def _on_in_link(self, link):
+        """Inbound listener link. Verify against the roster; refuse
+        everyone else. The caller's identity is known only after it
+        identifies; until then acceptance waits on the identified
+        callback (get_remote_identity is None before that)."""
+        nid = link.get_remote_identity()
+        if nid is None and not link.initiator:
+            link.set_remote_identified_callback(self._on_identified)
+            return
+        self._accept(link, nid)
+
+    def _on_identified(self, link, nid):
+        self._accept(link, nid)
+
+    def _accept(self, link, nid):
+        accepted = None
+        if nid is not None:
+            vhash = self.viewer_hash_of_identity(nid)
+            if self.verifier is None or self.verifier(vhash):
+                vdest = self.voice_hash_of_identity(nid)
+                accepted = vdest
+                link.set_packet_callback(
+                    lambda plaintext, packet=None, v=vdest:
+                    self.engine.packet_received(v, plaintext))
+                self.engine.accept_inbound(vdest, RNSLinkProxy(
+                    self.engine, vdest, link))
+        if accepted is None:
+            try:
+                link.teardown()
+            except Exception:
+                pass
+
+    def dial(self, peer_hex):
+        """Blocking dial to one roster peer (dialer thread + bench)."""
+        try:
+            h = bytes.fromhex(peer_hex)
+        except ValueError:
+            return None
+        deadline = time.time() + self.wait_secs
+        nid = RNS.Identity.recall(h)
+        if VOICE_DEBUG:
+            print("voice dial %s: recall-now=%s path-now=%s (t=%.1f)" % (
+                peer_hex[:12], nid is not None,
+                RNS.Transport.has_path(h), time.time() % 1000.0), flush=True)
+        while nid is None and time.time() < deadline:
+            RNS.Transport.request_path(h)
+            time.sleep(0.4)
+            nid = RNS.Identity.recall(h)
+        if nid is None:
+            print("voice dial %s: identity never announced in time "
+                  "(no recall)" % peer_hex[:12])
+            return None    # probe-failed pair; relay fallback is later
+        peer_dest = RNS.Destination(
+            nid, RNS.Destination.OUT, RNS.Destination.SINGLE,
+            "hades", "voice")
+        if not RNS.Transport.has_path(peer_dest.hash):
+            RNS.Transport.request_path(peer_dest.hash)
+            while not RNS.Transport.has_path(peer_dest.hash):
+                if time.time() > deadline:
+                    print("voice dial %s: no transport path in time"
+                          % peer_hex[:12])
+                    return None
+                time.sleep(0.4)
+        link = RNS.Link(peer_dest)
+        dead = {s for s in (getattr(RNS.Link, "CLOSED", None),
+                            getattr(RNS.Link, "FAILED", None))
+                if s is not None}
+        while link.status != RNS.Link.ACTIVE:
+            if time.time() > deadline or link.status in dead:
+                try:
+                    link.teardown()
+                except Exception:
+                    pass
+                return None
+            time.sleep(0.1)
+        link.identify(self.identity)
+        link.set_packet_callback(
+            lambda plaintext, packet=None, v=peer_hex:
+            self.engine.packet_received(v, plaintext))
+        return RNSLinkProxy(self.engine, peer_hex, link)
