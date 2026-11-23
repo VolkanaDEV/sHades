@@ -182,9 +182,10 @@
             radius: [dp(7), dp(7), dp(7), dp(7)]
         Color:
             rgba: app.theme_colors['primary'] if root.selected else (0, 0, 0, 0)
-        Rectangle:
+        RoundedRectangle:
             pos: self.x, self.y + dp(8)
             size: dp(3), self.height - dp(16)
+            radius: [dp(1), dp(1), dp(1), dp(1)]
     BoxLayout:
         orientation: 'horizontal'
         size_hint_y: 1
@@ -223,6 +224,15 @@
             pos: self.pos
             size: self.size
             radius: [dp(12), dp(12), dp(12), dp(12)]
+        StencilPush:
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(12), dp(12), dp(12), dp(12)]
+        StencilUse:
+    canvas.after:
+        StencilUnUse:
+        StencilPop:
 
 <FullScreenImageOverlay>:
     size_hint: 1, 1
@@ -243,6 +253,18 @@
             keep_ratio: True
             size_hint: 1, 1
             pos_hint: {'center_x': 0.5, 'center_y': 0.5}
+            # tay 2026-11-23: images are blircles; the overlay image is
+            # inset dp(40), so its own corners get the same mask.
+            canvas.before:
+                StencilPush
+                RoundedRectangle:
+                    pos: self.pos
+                    size: self.size
+                    radius: [dp(12), dp(12), dp(12), dp(12)]
+                StencilUse
+            canvas.after:
+                StencilUnUse
+                StencilPop
         FancyMDButton:
             variant: 'primary'
             size_hint_y: None
