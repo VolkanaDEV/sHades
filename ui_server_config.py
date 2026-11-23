@@ -897,21 +897,34 @@ class ServerConfigScreen(Screen):
             return
 
         def work():
+            raw = None
             try:
                 import io
-                import base64
-                res = self.client.guild_api.blobs_get(blob_id)
-                if not res.get("ok"):
-                    return
-                raw = base64.b64decode(res.get("data_b64") or "")
+                api = self.client.guild_api
+                if hasattr(api, "blobs_get_full"):
+                    raw = api.blobs_get_full(blob_id)
+                else:
+                    import base64
+                    res = api.blobs_get(blob_id)
+                    if res.get("ok"):
+                        raw = base64.b64decode(res.get("data_b64") or "")
                 if not raw:
                     return
                 from kivy.core.image import Image as CoreImage
-                ci = CoreImage(io.BytesIO(raw), ext="png")
+                ext = "png"
+                if raw[:2] == bytes([0xff, 0xd8]):
+                    ext = "jpg"
+                try:
+                    ci = CoreImage(io.BytesIO(raw), ext=ext)
+                except Exception as e:
+                    self._apply_status(
+                        "banner image load failed (%d bytes ext=%s): %s"
+                        % (len(raw), ext, e))
+                    return
                 Clock.schedule_once(
                     lambda _dt: self._set_texture(widget, ci), 0)
-            except Exception:
-                pass
+            except Exception as e:
+                print("[blob] render fetch failed (%s): %r" % (blob_id[:12], e))
         threading.Thread(target=work, daemon=True).start()
 
     def _set_texture(self, widget, core_image):

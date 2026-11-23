@@ -3982,14 +3982,17 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
 
         def work():
             try:
-                res = api.blobs_get(blob_id)
+                if hasattr(api, "blobs_get_full"):
+                    raw = api.blobs_get_full(blob_id)
+                else:
+                    import base64 as _b64
+                    res = api.blobs_get(blob_id)
+                    if not res.get("ok"):
+                        return
+                    raw = _b64.b64decode(res.get("data_b64") or b"")
             except Exception as e:
                 print("asset fetch failed (%s):" % subdir, repr(e))
                 return
-            if not res.get("ok"):
-                return
-            import base64 as _b64
-            raw = _b64.b64decode(res.get("data_b64") or b"")
             if not raw:
                 return
             ext = "png"

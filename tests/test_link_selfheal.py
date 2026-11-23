@@ -22,6 +22,9 @@ Pins:
 import sys
 import os
 import types
+import base64
+
+PAYLOAD = (b"sHades-banner-slice-payload-" * 20000)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -602,6 +605,59 @@ def test_blob_linkdead_retries_and_lands_on_the_healed_link():
     assert calls["up_at_rest"] == [True, True], calls
     assert not app._up_active, "gate stuck held after the flow finished"
     print("PASS  blob link-dead retry lands on the healed link")
+
+def test_blob_get_full_assembles_all_slices():
+    """Banner log 2026-11-22 20:12 receipt: a 2.6 MB banner uploaded
+    intact (10/10 chunks, finish sha ce0218f3...), but the render
+    fetch took ONE /api/v1/blobs/get slice (256 KiB default,
+    BLOB_CHUNK_DEFAULT) and CoreImage failed on the truncated PNG --
+    white box on the config preview and the sidebar strip, while the
+    icon (~93 KB, single slice) rendered. The full reader assembles
+    every slice, follows the server's {total, eof} echoes, and stops
+    exactly at total.
+    """
+
+    calls = []
+
+    class _SlicedApi(object):
+        def blobs_get(self, blob_id, offset=0, length=None):
+            calls.append(offset)
+            chunk = PAYLOAD[offset:offset + 262144]
+            eof = offset + len(chunk) >= len(PAYLOAD)
+            return {"ok": 1, "blob_id": blob_id, "total": len(PAYLOAD),
+                    "offset": offset, "eof": eof,
+                    "data_b64": base64.b64encode(chunk).decode("ascii")}
+
+    import guild_api as _ga
+    api = _SlicedApi()
+    api.blobs_get_full = types.MethodType(_ga.GuildAPI.blobs_get_full, api)
+    raw = api.blobs_get_full("ce" * 16)
+    assert raw == PAYLOAD, (len(raw), len(PAYLOAD))
+    assert calls == [0, 262144, 524288], calls
+    print("PASS  blob get-full assembles all slices")
+
+
+def test_blob_get_full_rejects_slice_overrun():
+    """A server echoing a total shorter than the slice math claims
+    must raise a named error, never hand the renderer a corrupt
+    buffer."""
+
+    class _BadApi(object):
+        def blobs_get(self, blob_id, offset=0, length=None):
+            return {"ok": 1, "blob_id": blob_id, "total": 100, "eof": True,
+                    "data_b64": base64.b64encode(b"x" * 256).decode("ascii")}
+
+    import guild_api as _ga
+    api = _BadApi()
+    api.blobs_get_full = types.MethodType(_ga.GuildAPI.blobs_get_full, api)
+    raised = False
+    try:
+        api.blobs_get_full("cc" * 16)
+    except OSError:
+        raised = True
+    assert raised, "overrun slice slipped through"
+    print("PASS  blob get-full rejects slice overrun")
+
 
 def test_wait_path_mtu_bounded_and_uses_live_path():
     """0.31.8 (boot.log receipt): re-establishes ran with an invalidated
@@ -1593,6 +1649,8 @@ def main():
     test_blob_dead_link_retries_through_heal_and_never_inlines()
     test_blob_linkdead_never_falls_through()
     test_blob_linkdead_retries_and_lands_on_the_healed_link()
+    test_blob_get_full_assembles_all_slices()
+    test_blob_get_full_rejects_slice_overrun()
     test_wait_path_mtu_bounded_and_uses_live_path()
     test_wait_path_mtu_bounded_gives_up()
     test_bootlog_export_contract()
@@ -1606,7 +1664,7 @@ def main():
     test_motd_strip_contract()
     test_announce_composer_contract()
     test_announce_fetch_guard_contract()
-    print("PASS: 23  FAIL: 0")
+    print("PASS: 25  FAIL: 0")
 
 
 if __name__ == "__main__":

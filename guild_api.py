@@ -395,6 +395,49 @@ class GuildAPI:
             data["len"] = length
         return self._request_json("/api/v1/blobs/get", data)
 
+    def blobs_get_full(self, blob_id, max_total=10 * 1024 * 1024):
+        """Assemble a whole blob from /api/v1/blobs/get slices; the
+        standard reader for any code that renders blob bytes.
+
+        Banner log 2026-11-22 20:12 receipt: the single-slice reader
+        fetched 256 KiB of a 2.6 MB banner (BLOB_CHUNK_DEFAULT), the
+        truncated PNG failed CoreImage ('Unable to load image,
+        BytesIO') and the banner rendered white on the config preview
+        and the sidebar strip -- while the uploaded bytes were intact
+        (10/10 chunks, finish sha ce0218f3...). Icons fit one slice,
+        which is why they render. The loop follows the receipted
+        att_get doctrine (app_attachments._att_get_chunked): one slice
+        per request, each with its own deadline, driven by the
+        server's {total, eof} echoes; bounded slices, nothing
+        timer-based beyond the per-request deadline.
+        """
+        import base64 as _b64
+        raw = b""
+        for _slice in range(64):   # 64 slices at the 1 MiB cap >> 10 MB law
+            res = self.blobs_get(blob_id, len(raw))
+            if not res.get("ok"):
+                raise OSError("blob slice %d failed: %s"
+                              % (len(raw), res.get("error")
+                                 or res.get("code") or "unknown"))
+            chunk = _b64.b64decode(res.get("data_b64") or "")
+            if not chunk:
+                raise OSError("blob slice %d empty" % len(raw))
+            total_seen = res.get("total")
+            if total_seen is not None and \
+                    len(raw) + len(chunk) > int(total_seen):
+                raise OSError("blob slice %d overruns total" % len(raw))
+            raw += chunk
+            total = res.get("total")
+            if total is not None and len(raw) >= int(total):
+                break
+            if res.get("eof"):
+                break
+        import hashlib
+        print("[blob] fetched %s %d bytes sha=%s"
+              % (blob_id[-12:], len(raw),
+                 hashlib.sha256(raw).hexdigest()[:32]))
+        return raw
+
     def att_get(self, path, offset=0, length=None):
         """Chunked attachment read (v0.31). Returns {data_b64, total,
         offset, eof} for a /file/attachments/... path — the same slice
