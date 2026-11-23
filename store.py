@@ -20,7 +20,7 @@ import time
 import RNS
 
 # Channel kinds: chat, a NomadNet micron "site", or a terminal stream.
-CHANNEL_KINDS = ("chat", "site", "term", "announce")
+CHANNEL_KINDS = ("chat", "site", "term", "announce", "voice")
 
 # ----------------------------------------------------------------------------------
 # Schema

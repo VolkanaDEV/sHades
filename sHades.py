@@ -568,7 +568,22 @@ def _reap_stale_nodes():
             for h in stale:
                 del NODE_REGISTRY[h]
                 RNS.log("dropped node %s (link down)" % h[:12], RNS.LOG_NOTICE)
+    # Voice rooms: a member without a live link is out of the room (the
+    # roster ride the event ring, so callers see the change on push).
+    voice_touched = []
+    with VOICE_ROOMS_LOCK:
+        for cid, members in list(VOICE_ROOMS.items()):
+            for v in [v for v in members if v not in live_users]:
+                members.pop(v, None)
+                voice_touched.append(cid)
+            if cid in VOICE_ROOMS and not VOICE_ROOMS[cid]:
+                del VOICE_ROOMS[cid]
     after = set(online_users())
+    for cid in sorted(set(voice_touched)):
+        try:
+            _voice_emit_roster(cid, "left")
+        except Exception as e:
+            RNS.log("voice roster push failed: %s" % e, RNS.LOG_ERROR)
     if after != before:
         _emit_event(None, "presence", {"users": _presence_payload()},
                     guild_wide=True)
@@ -2065,6 +2080,109 @@ def api_v1_stream_unsubscribe(viewer, data, link_id):
             if cur and cur.get("link_id") == link_id:
                 del SUB_BY_USER[sub["user_hash"]]
     return {"ok": 1}
+
+# ---- voice rooms ------------------------------------------------------------------
+#
+# tay, 2026-11-23: the hub is the directory, never the relay. A voice room
+# is a roster on the channel: who is in, each member's voice destination
+# hash, mute flag, last refresh. Roster changes ride the event ring on the
+# room's own channel (k:"voice_state"), so room members get pushed through
+# the same path that carries chat. Audio frames link peer-to-peer between
+# member voice destinations; this process never reads or forwards them.
+
+VOICE_ROOMS = {}        # cid -> {viewer: {"dest": hex, "muted": bool, "at": ts}}
+VOICE_ROOMS_LOCK = threading.RLock()
+VOICE_ROOMS_SWEEP_S = 900.0   # no refreshes for this long -> dropped from rooms
+
+
+def _voice_leave_all(viewer):
+    """Remove a viewer from every room. Returns the touched channel ids."""
+    touched = []
+    with VOICE_ROOMS_LOCK:
+        for cid, members in list(VOICE_ROOMS.items()):
+            if viewer in members:
+                members.pop(viewer, None)
+                touched.append(cid)
+                if not members:
+                    del VOICE_ROOMS[cid]
+    return touched
+
+
+def _voice_room_roster(cid):
+    with VOICE_ROOMS_LOCK:
+        members = VOICE_ROOMS.get(cid, {})
+        return [dict({"viewer": v}, **{
+            "dest": m["dest"], "muted": m["muted"], "at": m["at"]})
+            for v, m in members.items()]
+
+
+def _voice_emit_roster(cid, reason="change"):
+    _emit_event(cid, "voice_state", {
+        "channel": cid, "reason": reason,
+        "members": _voice_room_roster(cid)}, guild_wide=False)
+
+
+def _sweep_voice_rooms():
+    cutoff = now() - VOICE_ROOMS_SWEEP_S
+    touched = []
+    with VOICE_ROOMS_LOCK:
+        for cid, members in list(VOICE_ROOMS.items()):
+            for v in [v for v, m in members.items() if m["at"] < cutoff]:
+                members.pop(v, None)
+                touched.append(cid)
+            if cid in VOICE_ROOMS and not VOICE_ROOMS[cid]:
+                del VOICE_ROOMS[cid]
+    for cid in sorted(set(touched)):
+        _voice_emit_roster(cid, "sweep")
+
+
+@api_route("/api/v1/voice/join")
+@wrap_json_api
+def api_v1_voice_join(viewer, data, link_id):
+    cid = data.get("channel")
+    dest = data.get("dest") or ""
+    muted = data.get("muted") or False
+    chan = store.channel_row(db, db_lock, cid)
+    if not chan:
+        return {"ok": 0, "error": "unknown channel", "code": 404}
+    if chan["kind"] != "voice":
+        return {"ok": 0, "error": "channel is not a voice channel", "code": 400}
+    if not dest or len(dest) < 10:
+        # The roster hands out peer link targets; an empty one is useless.
+        return {"ok": 0, "error": "dest required", "code": 400}
+    if not has_perm(viewer, cid, PERMS["VIEW"]):
+        return {"ok": 0, "error": "view permission required", "code": 403}
+    _sweep_voice_rooms()
+    touched = _voice_leave_all(viewer)
+    with VOICE_ROOMS_LOCK:
+        VOICE_ROOMS.setdefault(cid, {})[viewer] = {
+            "dest": dest, "muted": muted, "at": now()}
+    for t in sorted(set(touched) - {cid}):
+        _voice_emit_roster(t, "left")
+    _voice_emit_roster(cid, "joined")
+    return {"ok": 1, "channel": cid, "members": _voice_room_roster(cid)}
+
+
+@api_route("/api/v1/voice/leave")
+@wrap_json_api
+def api_v1_voice_leave(viewer, data, link_id):
+    touched = _voice_leave_all(viewer)
+    for t in sorted(set(touched)):
+        _voice_emit_roster(t, "left")
+    return {"ok": 1, "left": sorted(set(touched))}
+
+
+@api_route("/api/v1/voice/rooms")
+@wrap_json_api
+def api_v1_voice_rooms(viewer, data, link_id):
+    """Rail counts: one voice channel id per room, with member rosters."""
+    _sweep_voice_rooms()
+    with VOICE_ROOMS_LOCK:
+        rooms = {cid: {"members": [m for m in [
+            dict({"viewer": v}, **mm) for v, mm in members.items()]]}
+            for cid, members in list(VOICE_ROOMS.items())}
+    return {"ok": 1, "rooms": rooms}
+
 
 # ---- typing -----------------------------------------------------------------------
 
