@@ -169,7 +169,18 @@ jobs:
       - name: Install buildozer + deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt buildozer==1.5.0 cython
+          # NO -r requirements.txt on the android build host (receipt,
+          # main push run 45440829050 at 11e6dde, job 138615157496):
+          # the full desktop requirements install here carried pyaudio
+          # (unpinned, line 24), and pyaudio only ever installed on
+          # this job via the shared pip cache's prebuilt
+          # pyaudio-0.2.14-cp310-cp310-linux_x86_64.whl (pull_request
+          # runs rode it: "Using cached ...", job 138609320507). On a
+          # fresh cache scope pip rebuilds the sdist and dies on
+          # "portaudio.h: No such file or directory". Android drives
+          # audio through the jnius/opus path, not pyaudio; the build
+          # host needs only the p4a toolchain deps.
+          pip install buildozer==1.5.0 cython
       - name: Install gettext + autopoint (needed by liblzma recipe)
         # p4a's liblzma recipe runs `autoreconf -vif` on the xz sources;
         # xz's configure.ac uses gettext, so autoreconf invokes autopoint.
