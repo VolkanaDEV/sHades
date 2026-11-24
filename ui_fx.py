@@ -179,11 +179,19 @@ def popup_entrance(popup, duration=POPUP_FADE_DURATION):
     """
     try:
         from kivy.app import App
+        from kivy.clock import Clock
         import client_diag
         app = App.get_running_app()
         if app is not None:
             client_diag.report(app, "sheet-open " + type(popup).__name__)
             client_diag.medicine(app, "sheet-open")
+            client_diag.force_rebind(popup, "sheet-" + type(popup).__name__)
+            # a second pass after open+animation settles: if the blanking
+            # happens at open/draw time (not texture-creation time), the
+            # post-open rebind is the one that can heal it
+            Clock.schedule_once(
+                lambda dt: client_diag.force_rebind(popup, "sheet-post-open"),
+                0.5)
     except Exception:
         pass
     if REDUCED_MOTION or POPUP_FADE_SKIP:
