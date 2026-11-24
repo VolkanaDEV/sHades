@@ -268,7 +268,18 @@ jobs:
           VERSION_hostpython3: 3.11.5
         run: |
           set -o pipefail
-          buildozer android debug 2>&1 | tee buildlog.txt > /dev/null
+          # tee drains stdout so the step log would stay silent for the
+          # whole 13-minute build; a failure would leave nothing in this
+          # job's log. Capture the exit and print the build's own tail,
+          # then let the gates still run as before.
+          if buildozer android debug 2>&1 | tee buildlog.txt > /dev/null; then
+            echo "buildozer exited 0"
+          else
+            BUILD_EXIT=$?
+            echo "::error::buildozer exited $BUILD_EXIT; last 100 lines follow"
+            tail -100 buildlog.txt
+            exit $BUILD_EXIT
+          fi
           # BZ2 gate, fail closed: this build's own log must carry a
           # target-python _bz2 probe answered yes (live or cached), and
           # no missing verdict may appear anywhere. A build that ships
