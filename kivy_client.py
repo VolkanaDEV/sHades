@@ -6189,23 +6189,30 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
         ui_fx.popup_entrance(popup)
 
     def _route_purpose_file(self, path, purpose):
-        """P10: hand the picked file to the server config screen's
-        icon/banner upload flow (blobs_put -> admin_config)."""
-        panel = None
+        """P10: hand the picked file to the server config SCREEN's
+        icon/banner upload flow (blobs_put -> admin_config).
+
+        0.36.25 (tay, device): this used to fetch tab_content["General"]
+        and call _apply_icon_file on the TAB -- only the SCREEN carries
+        those methods, so every Android pick died with an AttributeError
+        swallowed by _on_file_selected's except: icon/banner stayed
+        white, nothing uploaded. The desktop path was already correct
+        (ui_server_config _icon_file_selected calls screen._apply...).
+        """
+        target = None
         try:
             root = App.get_running_app().root
-            scr = root.get_screen("server_config") if root else None
-            panel = getattr(scr, "tab_content", {}).get("General")
+            target = root.get_screen("server_config") if root else None
         except Exception:
-            panel = None
-        if panel is None:
+            target = None
+        if target is None:
             self._set_status("no server config screen to apply %s"
                              % purpose)
             return
         if purpose == "icon":
-            panel._apply_icon_file(path)
+            target._apply_icon_file(path)
         else:
-            panel._apply_banner_file(path)
+            target._apply_banner_file(path)
 
     def _on_file_selected(self, selection, popup):
         if popup is not None:
