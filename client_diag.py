@@ -133,6 +133,11 @@ def report(app, tag):
             return
         chains = _panel_chains(root)
         install_batch_separators(app)
+        try:
+            import fbo_drawers
+            fbo_drawers.install(app)
+        except Exception as e:
+            print("DIAG fbo-drawers hook error %s" % e, flush=True)
         labels = []
         _walk_labels(root, labels)
         blanks = []
