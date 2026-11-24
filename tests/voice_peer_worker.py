@@ -21,16 +21,25 @@ from voice_codec import FRAME_SAMPLES, SAMPLE_RATE  # noqa: E402
 def parse_args(argv):
     args = {"store": None, "name": "peer", "speak_s": 6.0, "room": None,
             "wait_s": 30.0, "receipt": None, "hub_ip": "127.0.0.1",
-            "hub_port": 42431}
+            "hub_port": 42431, "join_dest": None, "trans_wait_s": 20.0,
+            "fake_peer": None, "hold": False}
     argv = list(argv)
     i = 0
     while i < len(argv):
         a = argv[i]
         if a.startswith("--"):
             key = a[2:].replace("-", "_")
-            if key in ("store", "name", "receipt", "room"):
-                args[key] = argv[i + 1]
-            elif key in ("speak_s", "wait_s"):
+            # the harness passes --wait-seconds; the parser's float list
+            # only knows wait_s, so B ran on the 30s default every run
+            if key == "wait_seconds":
+                key = "wait_s"
+            if key in ("store", "name", "receipt", "room", "join_dest",
+                       "fake_peer") or key == "hold_until_deadline":
+                if key == "hold_until_deadline":
+                    args["hold"] = True
+                else:
+                    args[key] = argv[i + 1]
+            elif key in ("speak_s", "wait_s", "trans_wait_s"):
                 args[key] = float(argv[i + 1])
             elif key == "hub_port":
                 args[key] = int(argv[i + 1])
@@ -72,11 +81,24 @@ def sine_source(name):
 
 
 def main():
+    import faulthandler
+    import threading as _th
+
+    def _dump():
+        faulthandler.dump_traceback(file=sys.stderr)
+        t = _th.Timer(40.0, _dump)
+        t.daemon = True
+        t.start()
+
+    t0 = _th.Timer(35.0, _dump)
+    t0.daemon = True
+    t0.start()
     args = parse_args(sys.argv[1:])
     store = args["store"]
     cfg_dir = os.path.join(store, "rns-peer")
 
-    RNS.Reticulum(configdir=cfg_dir)   # boots the instance
+    RNS.Reticulum(configdir=cfg_dir,
+                  loglevel=int(os.environ.get("SHADES_PEER_RNS_LOGLEVEL", 3)))
 
     # hub identity from guild_info.json (written at hub boot)
     hub_store = os.path.join(store, "guild") if os.path.isdir(
@@ -103,6 +125,9 @@ def main():
             break
         time.sleep(0.1)
     assert link.status == RNS.Link.ACTIVE, "hub link inactive"
+    link.set_link_closed_callback(lambda lk: print(
+        "B-LINK-CLOSED reason=%s status=%s at=%.1f" % (
+            lk.teardown_reason, lk.status, time.time()), flush=True))
 
     # the hub derives the user hash from the identified identity
     identity = RNS.Identity()
@@ -133,10 +158,33 @@ def main():
     cid = args["room"]
     assert cid, "worker needs --room"
 
-    engine = BenchEngine(viewer=viewer, hub=_HubFace(api, cid))
-    transport = app_voice.RNSVoiceTransport(engine, identity)
+    # relay lane: hub "voice" push frames ride this api link raw; the
+    # speaker's voice destination tags the frame (direct wins over the
+    # relay inside the engine)
+    def _on_voice_frame(plaintext, packet=None):
+        try:
+            frame = msgpack.unpackb(plaintext, raw=False)
+        except Exception:
+            return
+        if isinstance(frame, dict) and frame.get("k") == "voice":
+            engine.packet_relayed(frame["dest"], frame["body"])
+
+    link.set_packet_callback(_on_voice_frame)
+
+    engine = BenchEngine(viewer=viewer, hub=_HubFace(
+        api, cid, link=link, join_dest=args["join_dest"]))
+    transport = app_voice.RNSVoiceTransport(engine, identity,
+                                            wait_secs=args["trans_wait_s"])
     engine.attach_source(sine_source(args["name"]))
     joined = engine.join(cid)
+    if not joined.get("ok"):
+        # bench rooms live one boot: create and retry once
+        created = api("/api/v1/channels/create",
+                      {"kind": "voice", "name": "Bisect-%s" % args["name"]})
+        if created.get("ok"):
+            cid = created["channel"]["id"]
+            engine.hub.cid = cid
+            joined = engine.join(cid)
     assert joined.get("ok"), joined
     # live-stream semantics: events before the subscribe never replay,
     # so the join response is the roster seed
@@ -148,6 +196,12 @@ def main():
     assert r.get("ok"), r
     if isinstance(r.get("members"), list):
         engine.on_roster(cid, r["members"])
+    if args["fake_peer"]:
+        # the dying scenario's shape: one unreachable roster peer whose
+        # dial probe floods the hub with path requests for 3s/attempt
+        engine.on_roster(cid, [{"viewer": "fakepeer",
+                                "dest": args["fake_peer"],
+                                "muted": False}])
     cursor = None
     peer_seen = False
     deadline = time.time() + args["wait_s"]
@@ -167,7 +221,7 @@ def main():
                 engine.on_roster(cid, [
                     dict(m, viewer=str(m["viewer"]).lower())
                     for m in members])
-        if time.time() > speak_until and peer_seen:
+        if time.time() > speak_until and peer_seen and not args["hold"]:
             break
     # let the tail drain
     time.sleep(0.5)
@@ -177,14 +231,11 @@ def main():
         print("B-DIAG packets=%d frames_in=0 jitter_keys=%s arrivals=%s"
               % (len(engine.arrivals), list(engine._jitter)[:3],
                  [round(g, 3) for g in engine.arrivals[:4]]), flush=True)
-    arrivals = [a for a in engine.arrivals if a > 0]
-    gaps = list(arrivals)
-    gaps.sort()
-    # gaps are absolute packet timestamps until the second packet, so
-    # drop the first; with fewer than 3 packets the gap stats mean
-    # nothing and stay None
-    if len(gaps) >= 3:
-        gaps = gaps[1:]
+    arrivals = list(engine.arrivals)
+    # every entry the wrapper records is an inter-arrival delta (the
+    # first callback appends nothing), so the stats run on the raw
+    # order: no sorting and no first-entry drop
+    if len(arrivals) >= 2:
         receipt = {
             "ok": 1,
             "viewer": viewer,
@@ -193,9 +244,10 @@ def main():
             "frames_in": engine.frames_in,
             "frames_out": engine.frames_out,
             "plc_frames": engine.plc_frames,
-            "gap_avg_ms": round(1000.0 * sum(gaps) / len(gaps), 1),
-            "gap_p95_ms": round(1000.0 * gaps[int(len(gaps) * 0.95)], 1),
-            "gap_max_ms": round(1000.0 * gaps[-1], 1),
+            "gap_avg_ms": round(1000.0 * sum(arrivals) / len(arrivals), 1),
+            "gap_p95_ms": round(1000.0 *
+                                sorted(arrivals)[int(len(arrivals) * 0.95)], 1),
+            "gap_max_ms": round(1000.0 * max(arrivals), 1),
             "peer_seen": peer_seen,
         }
     else:
@@ -215,19 +267,40 @@ def main():
 
 
 class _HubFace(object):
-    """Metadata only: join/leave to the hub over the api link."""
+    """Metadata only: join/leave to the hub over the api link; the
+    relay lane publishes as a raw voice-pub packet on the same link
+    (no request table, no response wait) with the request route as
+    fallback when no link is in hand. join_dest lets a bench scenario
+    replace the roster's dial target for this peer."""
 
-    def __init__(self, api, cid):
+    def __init__(self, api, cid, link=None, join_dest=None):
         self.api = api
         self.cid = cid
+        self._link = link
+        self._join_dest = join_dest
 
     def join(self, cid, dest_hex, muted):
         return self.api("/api/v1/voice/join",
-                        {"channel": self.cid, "dest": dest_hex,
+                        {"channel": self.cid,
+                         "dest": self._join_dest or dest_hex,
                          "muted": bool(muted)})
 
     def leave(self):
         return self.api("/api/v1/voice/leave", {})
+
+    def voice_publish(self, cid, body):
+        if self._link is not None:
+            frame = msgpack.packb({"k": "voice-pub", "body": body})
+            try:
+                RNS.Packet(self._link, frame).send()
+            except Exception as e:
+                if app_voice.VOICE_DEBUG:
+                    print("publish send failed: %s" % e, flush=True)
+            return {"ok": 1}
+        import base64
+        return self.api("/api/v1/voice/publish",
+                        {"channel": self.cid,
+                         "body": base64.b64encode(body).decode("ascii")})
 
 
 if __name__ == "__main__":

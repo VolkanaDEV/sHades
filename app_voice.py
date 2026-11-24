@@ -24,6 +24,10 @@ import RNS
 
 VOICE_DEBUG = os.environ.get("SHADES_VOICE_DEBUG") == "1"
 
+# a peer still undialed after this many attempts rides the hub relay
+# unless or until a roster push re-lists it and a dial succeeds
+DIAL_MAX_TRIES = 8
+
 try:
     import voice_codec as vc
 except Exception:  # pragma: no cover - keeps lint import paths sane
@@ -97,6 +101,7 @@ class VoiceEngine(object):
         self._pacing = threading.Event()
         self._playing = threading.Event()
         self._out_seq = 0
+        self._relay_pubs = 0
         self.frames_in = 0
         self.frames_out = 0
         self.plc_frames = 0
@@ -189,6 +194,11 @@ class VoiceEngine(object):
             if dest not in alive:
                 self._out_links.pop(dest).teardown()
                 self._jitter.pop(dest, None)
+        # a departed peer's dial-failure count outlives it pointlessly;
+        # if they rejoin, the dial starts fresh
+        for dest in list(self._dial_failures):
+            if dest not in alive:
+                self._dial_failures.pop(dest, None)
         # pinned speakers: expected-active peers, so playback gaps in
         # their streams raise PLC frames instead of bare silence
         self._speakers_pinned = alive.copy()
@@ -200,6 +210,7 @@ class VoiceEngine(object):
 
     def _pacer_loop(self):
         while not self._pacing.wait(PACKET_INTERVAL_S):
+            t_tick = time.time()
             if self.room_cid is None or self.muted or self._source is None:
                 continue
             frames = []
@@ -224,6 +235,36 @@ class VoiceEngine(object):
                     self._send(peer, body) if self._send else link.send(body)
                 except Exception:
                     pass
+            if VOICE_DEBUG and self.frames_out % 250 == 0:
+                dt = time.time() - t_tick
+                print("pacer state: pinned=%s fails=%s dial_q=%s "
+                      "targets=%s tick_dt=%.3f" % (
+                          sorted(self._speakers_pinned)[:1],
+                          dict(self._dial_failures),
+                          list(self._dial_q)[:2],
+                          list(targets)[:2], dt), flush=True)
+            # probe-failed pairs: one relay publish covers every roster
+            # peer we could never link. The hub tags the frame with our
+            # voice destination and fans it out itself.
+            if self._relay_peers(targets):
+                pub = getattr(self.hub, "voice_publish", None)
+                if pub is not None:
+                    try:
+                        pub(self.room_cid, body)
+                        if VOICE_DEBUG:
+                            self._relay_pubs += 1
+                            print("relay publish n=%d peers=%s" % (
+                                self._relay_pubs,
+                                self._relay_peers(targets)), flush=True)
+                    except Exception:
+                        pass
+
+    def _relay_peers(self, targets):
+        """Roster-active peers with no link, no pending dial, and a
+        dial-failure count at the cap: their only route is the relay."""
+        return [d for d in self._speakers_pinned
+                if d not in targets and d not in self._dial_q
+                and self._dial_failures.get(d, 0) >= DIAL_MAX_TRIES]
 
     # ---- listener side --------------------------------------------------
 
@@ -251,6 +292,21 @@ class VoiceEngine(object):
         if len(j["buf"]) > JITTER_MAX_PACKETS:
             j["buf"].pop(0)   # a clogged peer loses its oldest packet
         self.frames_in += len(frames)
+
+    def packet_relayed(self, speaker_dest_hex, body):
+        """Hub-relayed voice entry point (the "voice" push frame). A
+        speaker whose stream arrives directly is not fed twice: relayed
+        copies of a directly linked speaker are dropped here, direct
+        wins."""
+        if speaker_dest_hex in self._out_links or \
+                speaker_dest_hex in self._in_links:
+            return
+        # a dialed speaker builds its jitter on link-up; a relayed-only
+        # speaker (undialable pair, hub fallback) has no buffer yet, so
+        # seed one here or the frame is dropped in packet_received
+        self._jitter.setdefault(
+            speaker_dest_hex, {"buf": [], "last": time.time()})
+        return self.packet_received(speaker_dest_hex, body)
 
     # ---- dialer (listener connects to each roster peer) -----------------
 
@@ -285,7 +341,7 @@ class VoiceEngine(object):
                 # retried on a backoff, capped: a permanently failed pair
                 # stops dialing until the next roster push re-lists it
                 self._dial_failures[dest] = self._dial_failures.get(dest, 0) + 1
-                if self._dial_failures[dest] <= 8:
+                if self._dial_failures[dest] <= DIAL_MAX_TRIES:
                     self._dialing.wait(1.0)
                     self._dial_q.append(dest)
                 continue

@@ -13,6 +13,7 @@ Receipts:
   arrivals while A streams sine; the receipt must show frames flowing
   peer-to-peer with ~100ms packet pacing and hub metadata only.
 """
+import base64
 import json
 import math
 import os
@@ -60,11 +61,12 @@ def boot_hub(base):
     os.makedirs(g_store, exist_ok=True)
     os.makedirs(os.path.join(g_store, "rns-guild"), exist_ok=True)
     with open(os.path.join(g_store, "rns-guild", "config"), "w") as f:
-        f.write("[reticulum]\n  enable_transport = yes\n"
-                "  share_instance = no\n\n[interfaces]\n"
-                "  [[TCP Server Interface]]\n    type = TCPServerInterface\n"
-                "    enabled = yes\n    listen_ip = 127.0.0.1\n"
-                "    listen_port = %d\n" % HUB_PORT)
+        cfg = ("[reticulum]\n  enable_transport = yes\n"
+               "  share_instance = no\n\n[interfaces]\n"
+               "  [[TCP Server Interface]]\n    type = TCPServerInterface\n"
+               "    enabled = yes\n    listen_ip = 127.0.0.1\n"
+               "    listen_port = %d\n") % HUB_PORT
+        f.write(cfg)
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
     log = open(os.path.join(g_store, "hub.log"), "ab")
@@ -90,8 +92,10 @@ def boot_hub(base):
     return proc, info, g_store
 
 
-def main():
+def main(relay=False):
     base = tempfile.mkdtemp(prefix="voice_loopback_")
+    relay_a_dest = os.urandom(16).hex()
+    relay_b_dest = os.urandom(16).hex()
     hub_proc, info, g_store = boot_hub(base)
     try:
         check("hub booted", info is not None)
@@ -135,6 +139,9 @@ def main():
         check("hub link active", link.status == RNS.Link.ACTIVE)
         if link.status != RNS.Link.ACTIVE:
             return
+        link.set_link_closed_callback(lambda lk: print(
+            "A-LINK-CLOSED reason=%s status=%s at=%.1f" % (
+                lk.teardown_reason, lk.status, time.time()), flush=True))
 # push frames arrive on this link
         pushed = {}
 
@@ -175,10 +182,14 @@ def main():
         r = api("/api/register", {"username": "loopa"})
         check("A register", r.get("ok") == 1, r)
 
-        # A's voice room, pre-announced voice destination
-        a_engine = app_voice.VoiceEngine(viewer=a_viewer, hub=_HubAPI(api))
+        # A's voice room, pre-announced voice destination. In relay mode
+        # the roster declares a dial target neither side can recall.
+        a_engine = app_voice.VoiceEngine(
+            viewer=a_viewer, hub=_HubAPI(
+                api, force_dest=relay_a_dest if relay else None, link=link))
         app_voice.RNSVoiceTransport(
-            a_engine, a_identity, verifier=lambda v: True)
+            a_engine, a_identity, verifier=lambda v: True,
+            wait_secs=3.0 if relay else 20.0)
         r = api("/api/v1/channels/create",
                 {"kind": "voice", "name": "Lounge-%d" % int(time.time() % 1e5)})
         check("A creates the voice room", r.get("ok") == 1, r)
@@ -205,19 +216,33 @@ def main():
                     "    target_host = 127.0.0.1\n"
                     "    target_port = %d\n" % (HUB_PORT, PEER_PORT))
         receipt_path = os.path.join(base, "peer_receipt.json")
+        b_worker_args = ["--store", base, "--room", cid, "--name", "loopb",
+                         "--speak-seconds", "6" if relay else "4",
+                         "--wait-seconds", "100" if relay else "40",
+                         "--receipt", receipt_path]
+        if relay:
+            b_worker_args += ["--join-dest", relay_b_dest,
+                              "--trans-wait-s", "3.0",
+                              "--hold-until-deadline"]
+        # B's stdout goes to a file: a PIPE wedges the worker in a
+        # blocking print once its buffer fills (the harness only drains
+        # the pipe after the process exits), which froze B's poll loop
+        # mid-run and starved its request stream.  No pipe, no wedge.
+        b_log_path = os.path.join(base, "peer_b.log")
+        b_log = open(b_log_path, "wb")
         b_proc = subprocess.Popen(
             [sys.executable, os.path.join(RETI_DIR, "tests",
-                                          "voice_peer_worker.py"),
-             "--store", base, "--room", cid, "--name", "loopb",
-             "--speak-seconds", "4", "--wait-seconds", "40",
-             "--receipt", receipt_path],
+                                          "voice_peer_worker.py")]
+            + b_worker_args,
             cwd=RETI_DIR, env=dict(os.environ),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            stdout=b_log, stderr=subprocess.STDOUT)
 
-        # A's poll loop: feed rosters into A's engine; wait for B + audio
+        # A's poll loop: feed rosters into A's engine; wait for B (relay
+        # mode: until the dial cap is spent and the relay is engaged)
         cursor = None
         b_roster = None
-        end = time.time() + 50
+        relay_deadline = None
+        end = time.time() + (95 if relay else 50)
         a_ran = time.time() + 12
         while time.time() < end:
             ev = api("/api/v1/stream/poll",
@@ -233,55 +258,98 @@ def main():
                     a_engine.on_roster(cid, [
                         dict(m, viewer=str(m["viewer"]).lower())
                         for m in members])
-            if b_roster and time.time() > a_ran and \
+            if b_roster and relay_deadline is None:
+                # from roster arrival: 9 dials x (3s recall + 1s) + margin
+                relay_deadline = time.time() + 42.0
+            if relay and b_roster and time.time() > relay_deadline:
+                break   # dial cap spent by now either way
+            if not relay and b_roster and time.time() > a_ran and \
                     len(a_engine._out_links) == 1:
                 break
         check("A saw B on the roster", b_roster is not None, str(b_roster))
 
         # A's engine: direct link to B was dialed through the roster only
         b_voice = _peer_voice_dest(b_roster, a_viewer)
-        check("A holds one direct voice link",
-              list(a_engine._out_links) == [b_voice],
-              "out=%s dial_q=%s fails=%s pinned=%s expected=%s" % (
-                  list(a_engine._out_links), list(a_engine._dial_q),
-                  a_engine._dial_failures, a_engine._speakers_pinned,
-                  b_voice))
-        # pacing in wall time, on the direct link only
-        while not a_engine._out_links and time.time() < end:
-            time.sleep(0.2)
-        a_frames = a_engine.frames_out
-        time.sleep(6.0)
-        delta = a_engine.frames_out - a_frames
-        check("A paced one voice packet per 100ms on the direct link",
-              160 <= delta <= 400,  # 5 frames x 10Hz x 6s window
-              "delta_frames/6s=%d" % delta)
+        if relay:
+            check("roster staged the undialable dest for B",
+                  b_voice == relay_b_dest,
+                  "%s != %s" % (b_voice, relay_b_dest))
+            check("A's direct dial spent to the cap",
+                  a_engine._dial_failures.get(b_voice, 0)
+                  >= app_voice.DIAL_MAX_TRIES
+                  or a_engine.hub.pubs > 0,
+                  "fails=%s pubs=%d" % (a_engine._dial_failures,
+                                        a_engine.hub.pubs))
+            check("A holds no direct voice links",
+                  not a_engine._out_links, str(list(a_engine._out_links)))
+            # the relay lane: A publishes until B's window closes.
+            # A's relay phase starts when its dialer spends to the cap,
+            # which races the fixed 6s window: wait until the pub stream
+            # is actually moving before sampling, so the delta measures
+            # throughput, not phase-start timing.
+            a_frames = a_engine.frames_out
+            pub_before = a_engine.hub.pubs
+            if a_engine.hub.pubs == pub_before:
+                for _ in range(100):
+                    if (a_engine.hub.pubs - pub_before > 2
+                            or a_engine.frames_out - a_frames >= 40):
+                        break
+                    time.sleep(0.1)
+            pub_before = a_engine.hub.pubs
+            time.sleep(6.0)
+            pub_delta = a_engine.hub.pubs - pub_before
+            check("A relayed packets through the hub", pub_delta > 12,
+                  "pubs/6s=%d total=%d" % (
+                      pub_delta, a_engine.hub.pubs))
+        else:
+            check("A holds one direct voice link",
+                  list(a_engine._out_links) == [b_voice],
+                  "out=%s dial_q=%s fails=%s pinned=%s expected=%s" % (
+                      list(a_engine._out_links), list(a_engine._dial_q),
+                      a_engine._dial_failures, a_engine._speakers_pinned,
+                      b_voice))
+            # pacing in wall time, on the direct link only
+            while not a_engine._out_links and time.time() < end:
+                time.sleep(0.2)
+            a_frames = a_engine.frames_out
+            time.sleep(6.0)
+            delta = a_engine.frames_out - a_frames
+            check("A paced one voice packet per 100ms on the direct link",
+                  160 <= delta <= 400,  # 5 frames x 10Hz x 6s window
+                  "delta_frames/6s=%d" % delta)
 
-        # B's receipt lands via its receipt file + stdout
+        # B's stdout goes to peer_b.log (no pipe); the drain below reads
+        # receipts from the file, so communicate() is vestigial. B's
+        # file-backed stream carries both stdout and stderr.
         try:
-            out = b_proc.communicate(timeout=60)[0]
+            b_proc.wait(timeout=60)
         except subprocess.TimeoutExpired:
             b_proc.kill()
-            out = b_proc.communicate()[0]
+            b_proc.wait()
+        receipt_line = ""
+        with open(b_log_path, "rb") as _bbuf:
+            receipt_line = _bbuf.read().decode("utf-8", "replace")
         receipt = None
-        for line in out.decode("utf-8", "replace").splitlines():
+        for line in receipt_line.splitlines():
             if line.startswith("PEER-RECEIPT "):
                 try:
                     receipt = json.loads(line.split(" ", 1)[1])
                 except ValueError:
                     receipt = None
         check("worker completed", b_proc.poll() == 0,
-              (out or b"").decode("utf-8", "replace")[-400:])
-        diag = [ln for ln in (out or b"").decode("utf-8", "replace").splitlines()
+              receipt_line[-400:])
+        diag = [ln for ln in receipt_line.splitlines()
                 if ln.strip() and "PEER-RECEIPT" not in ln]
         for ln in diag[-8:]:
             print("B >", ln, flush=True)
-        check("B receipt parsed", receipt is not None, out)
+        check("B receipt parsed", receipt is not None, receipt_line[-400:])
         if not receipt:
             return
         b_frames_in = receipt["frames_in"]
         print("B receipt:", json.dumps(receipt), flush=True)
-        check("B heard frames over the direct link", b_frames_in > 40,
-              "frames_in=%s" % b_frames_in)
+        check("B heard frames over the %s link (relay staged)" % (
+            "hub relay" if relay else "direct"), b_frames_in > 40,
+            "frames_in=%s" % b_frames_in)
         if b_frames_in > 40:
             check("B's arrivals paced ~100ms",
                   60.0 <= (receipt["gap_avg_ms"] or 1e9) <= 400.0,
@@ -309,20 +377,48 @@ def _peer_voice_dest(roster, me):
 
 
 class _HubAPI(object):
-    """Metadata-only hub face for A's engine (join/leave ride the api)."""
+    """Metadata-only hub face for A's engine (join/leave ride the api).
+    force_dest stages a probe-failure: the roster then declares a dial
+    target neither side can ever recall. voice_publish is the relay
+    lane's outbound route; the bench counts publishes."""
 
-    def __init__(self, api):
+    def __init__(self, api, force_dest=None, link=None):
         self.api = api
         self.cid = None
+        self.force_dest = force_dest
+        self._link = link
+        self.pubs = 0
 
     def join(self, cid, dest_hex, muted):
         self.cid = cid
         return self.api("/api/v1/voice/join",
-                        {"channel": cid, "dest": dest_hex, "muted": muted})
+                        {"channel": cid, "dest": self.force_dest or dest_hex,
+                         "muted": muted})
 
     def leave(self):
         return self.api("/api/v1/voice/leave", {})
 
+    def voice_publish(self, cid, body):
+        self.pubs += 1
+        if self._link is not None:
+            frame = RNS.vendor.umsgpack.packb(
+                {"k": "voice-pub", "body": body})
+            try:
+                if RNS.Packet(self._link, frame).send() is not False:
+                    return {"ok": 1}
+            except Exception:
+                pass
+            # The raw path refused (link not in an RNS ACTIVE moment).
+            # The relay is precisely the route for links that cannot be
+            # trusted lane-live, so fall back to the encoded api path --
+            # which is also an identified request and feeds the link.
+            return self.api("/api/v1/voice/publish",
+                            {"channel": cid,
+                             "body": base64.b64encode(body).decode("ascii")})
+        return self.api("/api/v1/voice/publish",
+                        {"channel": cid,
+                         "body": base64.b64encode(body).decode("ascii")})
+
 
 if __name__ == "__main__":
-    main()
+    main(relay="--relay" in sys.argv)
