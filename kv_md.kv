@@ -213,7 +213,13 @@
     size_hint_y: None
     height: dp(200)
     size_hint_x: None
-    width: dp(400)
+    # tay 2026-11-24 (phone shots): the fixed dp(400) width is WIDER than
+    # the chat pane on a ~360dp portrait phone, so the embed spans the
+    # full window and paints across the open People drawer (the phone's
+    # GLES pass paints the row canvas before the drawer bg covers it).
+    # Clamp to the container: wide panes keep the 400 cap, narrow panes
+    # shrink the embed to the pane. Keep_ratio keeps the image inside.
+    width: min(dp(400), self.parent.width) if self.parent else dp(400)
     allow_stretch: False
     keep_ratio: True
     canvas.before:
