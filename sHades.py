@@ -558,13 +558,20 @@ def _reap_stale_nodes():
               if l.status == RNS.Link.ACTIVE}
     # Presence is traffic, not status: a link the request dispatcher
     # identified recently is live even when its RNS status snapshot
-    # reads STALE (short keepalive on fast links, traffic gaps).
+    # reads STALE (short keepalive on fast links, traffic gaps) -- the
+    # 10 Hz relay frames keep the spot warm for voice speakers. The
+    # grace only extends links the hub knows as real link objects
+    # (HUB_SEEN_LINKS): a presence entry with no known object is a
+    # synthetic bind, and absence from active_links is that link's
+    # death -- the v0.29 contract pinned by test_streams, where the
+    # death transition must fire on the same reap, not after a grace.
     with ONLINE_LINKS_LOCK:
-        fresh = {lid for lid in list(ONLINE_LINKS)
-                 if time.time() - ONLINE_LINK_SPOT.get(lid, 0.0)
-                 < VOICE_RNS_STALE_GRACE_S}
-    active |= fresh
-    with HUB_SEEN_LOCK:
+        with HUB_SEEN_LOCK:
+            fresh = {lid for lid in list(ONLINE_LINKS)
+                     if lid in HUB_SEEN_LINKS
+                     and time.time() - ONLINE_LINK_SPOT.get(lid, 0.0)
+                     < VOICE_RNS_STALE_GRACE_S}
+        active |= fresh
         vanished = [HUB_SEEN_LINKS.pop(lid) for lid in list(HUB_SEEN_LINKS)
                     if lid not in active]
         for l in list(RNS.Transport.active_links):
