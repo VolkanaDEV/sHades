@@ -55,7 +55,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
+import time
 
 BCH_NAME = "bch.exe" if sys.platform == "win32" else "bch"
 INTERP_NAME = "interp.bc"
@@ -241,52 +241,43 @@ def run_script(source, bindings=None, timeout=10.0):
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(_format_bindings(bindings))
             argv.append(bindingsfile)
-        # The timeout rides a watchdog thread instead of
-        # subprocess.run(timeout=...): communicate(timeout) on the
-        # uv cpython 3.12 Windows build raises AttributeError
-        # ("_CaptureThread object has no attribute join") in the
-        # stdlib's own _communicate, which killed every real-runner
-        # script run on this host. Same contract: a run that exceeds
-        # `timeout` is killed and returns the "script timed out"
-        # shape; stderr detail is only read on a clean exit.
+        # The timeout rides a poll deadline instead of
+        # subprocess.run(timeout=...) or a watchdog Thread. Two
+        # receipts for why: (a) the uv cpython 3.12 Windows build
+        # raises "_CaptureThread object has no attribute join" inside
+        # the stdlib's own _communicate(timeout); (b) CI's test
+        # fixtures replace threading.Thread globally (a capture
+        # double), so ANY Thread created inside run_script is the
+        # double and its .join call crashes (github lint+import red on
+        # test_anim_frames). Poll + kill keeps the exact contract: a
+        # run that exceeds `timeout` is killed and returns the
+        # "script timed out" shape; stderr detail is only read on a
+        # clean exit.
         proc = None
-        watch_done = threading.Event()
-        timed_out = {"v": False}
-
-        def _watchdog():
-            watch_done.wait(timeout)
-            if not watch_done.is_set():
-                timed_out["v"] = True
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-
         try:
             proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE,
                                     stdin=subprocess.DEVNULL, text=True)
         except OSError as e:
             return _failure("could not start bch: %r" % e)
-        watcher = threading.Thread(target=_watchdog, daemon=True)
-        watcher.start()
-        try:
-            out, err = proc.communicate()
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            proc.communicate()
-            watch_done.set()
-            watcher.join(timeout=1)
-            raise
-        rc = proc.returncode
-        watch_done.set()
-        watcher.join(timeout=2)
-        if timed_out["v"]:
+        timed_out = False
+        if timeout is not None:
+            deadline = time.monotonic() + timeout
+            while proc.poll() is None:
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    break
+                time.sleep(min(0.01, max(0.001, deadline
+                                         - time.monotonic())))
+        out, err = proc.communicate()
+        if timed_out:
             return {"ok": 0.0, "result": "script timed out",
                     "out": [], "gpu": [], "audio": []}
+        rc = proc.returncode
         if rc != 0:
             detail = (err or "").strip().splitlines()
             msg = "bch exited %d" % rc
