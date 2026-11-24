@@ -314,10 +314,15 @@ def main():
           and res_garbage["backend"] in ("opengl", "cpu", "custom"),
           res_garbage)
 
-    # ---- rings shader source (no GL needed to extract it) ----
-    rings = rings_shader()
-    check("rings shader extracted from demo page block 1",
-          "sin(r * 20.0" in rings and "u_frame" in rings, rings[:60])
+    # ---- rings shader source (needs tay's demo page asset) ----
+    if os.path.isfile(DEMO_PAGE):
+        rings = rings_shader()
+        check("rings shader extracted from demo page block 1",
+              "sin(r * 20.0" in rings and "u_frame" in rings, rings[:60])
+    else:
+        rings = None
+        skip("rings shader extracted from demo page block 1",
+             "asset missing: %s" % DEMO_PAGE)
 
     # ---- real GL: skip the whole section cleanly without EGL ----
     backend, reason = select_backend()
@@ -383,39 +388,47 @@ def main():
         check("gradient bottom-right is bright red/green",
               False, "no image")
 
-    gl_rings = GLESBackend()
-    try:
-        res_rings = drain_gpu_commands(
-            [["gpu_open", 1.0], ["gpu_program", 1.0, rings],
-             ["gpu_upload_f32", 1.0, [-0.5, 0.0, 2.0, 48.0, 0.0, 1.0]],
-             ["gpu_dispatch", 1.0, 0.0], ["gpu_close", 1.0]],
-            width=160, height=120, backend=gl_rings)
-    finally:
-        gl_rings.release()
-    img_rings = res_rings["image"]
-    check("rings shader from demo page block 1 shades on GL",
-          res_rings["backend"] == "opengl" and img_rings is not None,
-          (res_rings["backend"], res_rings["notes"][:2]))
-    if img_rings is not None:
-        centre = img_rings.getpixel((80, 60))
-        print("  rings centre: %s" % (centre,))
-        # Centre pixel FragCoord is (80.5, 60.5): r ~ 0.01, so
-        # rings ~ 0.5 + 0.5*sin(0.2) ~ 0.60 and the mix lands at
-        # (0.639, 0.559, 0.380) * 255 = (163, 143, 97).
-        check("rings centre pixel is the mid-mix colour",
-              all(abs(c - e) <= 6 for c, e in zip(
-                  centre, (163, 143, 97))), centre)
-        cpu_rings = drain_gpu_commands(
-            [["gpu_open", 1.0],
-             ["gpu_upload_f32", 1.0, [-0.5, 0.0, 2.0, 48.0, 0.0, 1.0]],
-             ["gpu_dispatch", 1.0, 0.0], ["gpu_close", 1.0]],
-            width=160, height=120, backend=CpuPixelBackend())
-        within, _exact = compare(img_rings, cpu_rings["image"])
-        check("rings image differs from CPU Mandelbrot",
-              within < 50.0, within)
+    if rings is None:
+        for name in ["rings shader from demo page block 1 shades on GL",
+                     "rings centre pixel is the mid-mix colour",
+                     "rings image differs from CPU Mandelbrot"]:
+            skip(name, "asset missing: %s" % DEMO_PAGE)
     else:
-        check("rings centre pixel is the mid-mix colour", False, "no image")
-        check("rings image differs from CPU Mandelbrot", False, "no image")
+        gl_rings = GLESBackend()
+        try:
+            res_rings = drain_gpu_commands(
+                [["gpu_open", 1.0], ["gpu_program", 1.0, rings],
+                 ["gpu_upload_f32", 1.0, [-0.5, 0.0, 2.0, 48.0, 0.0, 1.0]],
+                 ["gpu_dispatch", 1.0, 0.0], ["gpu_close", 1.0]],
+                width=160, height=120, backend=gl_rings)
+        finally:
+            gl_rings.release()
+        img_rings = res_rings["image"]
+        check("rings shader from demo page block 1 shades on GL",
+              res_rings["backend"] == "opengl" and img_rings is not None,
+              (res_rings["backend"], res_rings["notes"][:2]))
+        if img_rings is not None:
+            centre = img_rings.getpixel((80, 60))
+            print("  rings centre: %s" % (centre,))
+            # Centre pixel FragCoord is (80.5, 60.5): r ~ 0.01, so
+            # rings ~ 0.5 + 0.5*sin(0.2) ~ 0.60 and the mix lands at
+            # (0.639, 0.559, 0.380) * 255 = (163, 143, 97).
+            check("rings centre pixel is the mid-mix colour",
+                  all(abs(c - e) <= 6 for c, e in zip(
+                      centre, (163, 143, 97))), centre)
+            cpu_rings = drain_gpu_commands(
+                [["gpu_open", 1.0],
+                 ["gpu_upload_f32", 1.0, [-0.5, 0.0, 2.0, 48.0, 0.0, 1.0]],
+                 ["gpu_dispatch", 1.0, 0.0], ["gpu_close", 1.0]],
+                width=160, height=120, backend=CpuPixelBackend())
+            within, _exact = compare(img_rings, cpu_rings["image"])
+            check("rings image differs from CPU Mandelbrot",
+                  within < 50.0, within)
+        else:
+            check("rings centre pixel is the mid-mix colour", False,
+                  "no image")
+            check("rings image differs from CPU Mandelbrot", False,
+                  "no image")
 
     # ---- bad custom shader -> fatal_error -> whole drain on CPU ----
     res_bad = drain_gpu_commands(
