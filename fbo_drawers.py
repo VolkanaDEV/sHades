@@ -1,44 +1,43 @@
-# fbo_drawers.py — FBO-composited drawers + root-slot quad (v4 medicine).
+# fbo_drawers.py — FBO-composited drawers (canvas-object bake dance).
 #
-# Receipt basis (2026-11-24 tay's device, logs 4-6 + shots on v3):
+# Receipt basis (2026-11-24 tay's device, logs 4-7):
 #   - runtime child order is CORRECT (right_sidebar children[0], the
 #     topmost slot; chat_screen bottom) - the paint-over is not a
-#     tree-order fault. log.log_5 line 154, log.log_6 line 142.
-#   - unique-texture batch separators in the drawers' canvas.before did
-#     NOT stop the embed from painting over the open People panel
-#     (log.log_6 139-141 armed; the v3 shots show the crossing).
-#   - restore-sheet button labels blank while their textures test
-#     healthy and forced rebinds run - rebind is falsified as a cure.
+#     tree-order fault (log 5 line 154, log 6 line 142).
+#   - unique-texture batch separators did NOT stop the crossing
+#     (log 6 139-141 armed; v3 shots show the crossing).
+#   - restore-sheet pair labels blank with healthy textures; rebind
+#     cure falsified (logs 5/6, log 4 EMPTY paint receipt).
+#   - v5 side-load: install crashed on kivy 2.3.1 ('Fbo' object has no
+#     attribute 'clearcolor', log 7 lines 106-107) so the composite
+#     never engaged; the stencil strip regressed the screens white
+#     (clip-bounds rects painted as opaque fills) and was reverted.
 #
-# Mechanism summary consistent with every receipt: the device's
-# ANGLE/Vulkan (PowerVR) compose draws later-submitted groups under
-# earlier content for some group pairs. The only client-side paint that
-# cannot lose that race is a single quad whose texture was baked ahead
-# of time, drawn in the ABSOLUTE LAST paint slot Kivy offers: the
-# app root's canvas.after group.
-#
-# install(app) does, per drawer (left_clip / right_clip):
-#   1. swap the clip's canvas to an Fbo -> the whole pane subtree bakes
-#      into one texture (bg color via fbo clearcolor, content on top,
-#      in one self-contained render);
-#   2. clear the panel's canvas.before bg rect group (the fbo texture
-#      now carries the bg color, so the window-side untextured rect
-#      that could merge with chat-side rects is GONE);
-#   3. draw a Color+Rectangle quad bound to the fbo texture in the
-#      ROOT's canvas.after - the last group of the last frame order;
-#   4. keep size/pos synced, re-bake on an interval (member list
-#      updates, avatar loads) and on resize.
-# Lazy: called at every client_diag report() until it sticks.
+# DESIGN (kivy's own export_to_png dance, applied live):
+#   The clip's whole canvas group is DETACHED from the window's render
+#   tree (parent.canvas.indexof / remove - the kivy export pattern).
+#   Once detached the pane never paints into the window framebuffer
+#   again - its draw stream is gone from the window batcher entirely.
+#   Each re-bake follows kivy's export_as_image exactly:
+#       fbo.add(clip.canvas); fbo.draw(); fbo.remove(clip.canvas)
+#   The canvas object travels as ONE group instruction, so its compiled
+#   state is valid and re-renders with CURRENT widget values; the bake
+#   is clip-local by construction (its own transform chain; the parent
+#   translation is not applied - verified on desktop: the subtree bakes
+#   bg + label glyphs + button, stable across ticks).
+#   The visible panel = ONE textured quad bound to the fbo texture,
+#   drawn in the ROOT's canvas.after (the absolute last paint slot).
+#   One quad, one texture: nothing for a batcher to merge or reorder,
+#   on any driver, GPU, or backend.
 from kivy.clock import Clock
 from kivy.graphics import Color, Fbo, Rectangle
 
-_STATE = {"installed": False, "tried": False, "fbs": {}}
+_STATE = {"fbs": {}, "tick_live": False}
 
-TARGET_IDS = ("chat_screen", "left_sidebar", "right_sidebar")
 CLIP_IDS = ("left_clip", "right_clip")
 
 
-def _walk_widgets(widget, out, cap=1200):
+def _walk_widgets(widget, out, cap=1600):
     if len(out) >= cap:
         return
     out.append(widget)
@@ -60,24 +59,29 @@ def _ids(root):
     return found
 
 
-def _sync_fbo(clip, fbo, quad, panel, tag):
+def _detach(clip, cid):
+    """Take the clip's whole canvas group out of the window render."""
+    parent_w = clip.parent
+    if parent_w is None:
+        return
     try:
-        if quad is not None and clip.parent is not None:
-            # panel coordinate: the quad lives at the clip's window pos
-            quad.pos = clip.to_window(*clip.pos)
-            quad.size = clip.size
-        if clip.parent is None:
-            return
-        size = (max(int(clip.size[0]), 1), max(int(clip.size[1]), 1))
-        if tuple(fbo.size) != size:
-            fbo.size = size
-        fbo.draw()
+        idx = parent_w.canvas.indexof(clip.canvas)
+        if idx > -1:
+            parent_w.canvas.remove(clip.canvas)
+            print("DIAG fbo-drawer %s detached from parent canvas idx=%s"
+                  % (cid, idx), flush=True)
     except Exception as e:
-        print("DIAG fbo-drawer sync %s error %s" % (tag, e), flush=True)
+        print("DIAG fbo-drawer %s detach error %s" % (cid, e), flush=True)
+
+
+def _bake(clip, fbo):
+    fbo.add(clip.canvas)
+    fbo.draw()
+    fbo.remove(clip.canvas)
 
 
 def install(app):
-    """Compose both drawer panes into Fbos drawn in root canvas.after."""
+    """Composite both drawer panes into Fbos drawn in root canvas.after."""
     root = getattr(app, "root", None)
     if root is None:
         return
@@ -85,13 +89,6 @@ def install(app):
     clips = [i for i in CLIP_IDS if i in found]
     if not clips:
         return  # main screen not built yet (onboarding); retry later
-    # the sidebar bg color for the fbo clear
-    bg = (0.09, 0.09, 0.12, 1)
-    try:
-        tc = getattr(app, "theme_colors", None) or {}
-        bg = tc.get("bg_sidebar", bg)
-    except Exception:
-        pass
     installed = 0
     for cid in clips:
         if cid in _STATE["fbs"]:
@@ -99,61 +96,99 @@ def install(app):
             continue
         clip = found[cid]
         try:
-            panel = clip.parent  # the BoxLayout drawer frame
-            fbo = Fbo(size=(max(int(clip.width), 1), max(int(clip.height), 1)),
+            _detach(clip, cid)
+            fbo = Fbo(size=(max(int(clip.width), 1),
+                            max(int(clip.height), 1)),
                       with_depthbuffer=False, with_stencilbuffer=False)
-            fbo.clearcolor = bg
-            # 1. bake the pane subtree: the clip's render context is now
-            # the fbo; its children (stencil ops + pane + content) render
-            # into the texture instead of the window
-            clip.canvas = fbo
-            # 2. kill the window-side untextured bg rect (merge surface):
-            # the bg now rides inside the fbo via clearcolor
-            try:
-                panel.canvas.before.clear()
-            except Exception:
-                pass
-            # 3. the quad in the ROOT's canvas.after: absolute last paint
-            quad = Rectangle(texture=fbo.texture)
+            # visible side: ONE quad in the ROOT's canvas.after
             with root.canvas.after:
                 Color(1, 1, 1, 1)
-                quad
-            _STATE["fbs"][cid] = {"fbo": fbo, "quad": quad,
-                                  "clip": clip, "panel": panel}
+                q = Rectangle(texture=fbo.texture)
+            st = {"fbo": fbo, "quad": q, "clip": clip}
+            _STATE["fbs"][cid] = st
             clip.bind(size=lambda _w, _v, c=cid: _resize(c),
-                      pos=lambda _w, _v, c=cid: _resize(c))
-            _resize(cid)
+                      pos=lambda _w, _v, c=cid: _pos_tick(c))
+            _sync(st, cid, bake=True)
             installed += 1
-            print("DIAG fbo-drawer %s installed size=%s bg=%s"
-                  % (cid, tuple(fbo.size), tuple(bg)), flush=True)
+            print("DIAG fbo-drawer %s installed fbo=%s quad-in-root-after"
+                  % (cid, tuple(fbo.size)), flush=True)
         except Exception as e:
-            print("DIAG fbo-drawer %s error %s" % (cid, e), flush=True)
-    if installed == len(clips):
-        _STATE["installed"] = True
-    # 4. re-bake interval (member updates, avatar texture loads)
-    if not _STATE["tried"]:
-        _STATE["tried"] = True
-        Clock.schedule_interval(_tick, 1.0)
+            print("DIAG fbo-drawer %s install error %s" % (cid, e),
+                  flush=True)
+    if not _STATE["tick_live"]:
+        _STATE["tick_live"] = True
+        # cheap 20/s pos sync; re-bakes piggyback on size changes and
+        # on the 1s content refresh
+        Clock.schedule_interval(_tick, 0.05)
+        Clock.schedule_interval(_reframe, 1.0)
 
 
 def _resize(cid):
     st = _STATE["fbs"].get(cid)
     if not st:
         return
-    _sync_fbo(st["clip"], st["fbo"], st["quad"], st["panel"], cid)
+    _tick(0.0)
+
+
+def _pos_tick(cid):
+    st = _STATE["fbs"].get(cid)
+    if not st:
+        return
+    _tick(0.0)
+
+
+def _sync(st, cid, bake=False):
+    clip = st["clip"]
+    fbo = st["fbo"]
+    quad = st["quad"]
+    try:
+        if clip.parent is None:
+            # drawer removed: park the quad off-frame
+            quad.size = (0, 0)
+            return
+        size = (max(int(clip.width), 1), max(int(clip.height), 1))
+        if tuple(fbo.size) != size:
+            fbo.size = size
+            quad.texture = fbo.texture
+            bake = True
+        quad.pos = clip.to_window(*clip.pos)
+        quad.size = clip.size
+        if bake and clip.width >= 2:
+            # a closed slide keeps width 0 -> skip baking, sync pos only
+            _bake(clip, fbo)
+    except Exception as e:
+        print("DIAG fbo-drawer %s sync error %s" % (cid, e), flush=True)
 
 
 def _tick(dt):
     if not _STATE["fbs"]:
         return
     for cid, st in list(_STATE["fbs"].items()):
-        clip = st["clip"]
         try:
+            clip = st["clip"]
+            quad = st["quad"]
             if clip.parent is None:
+                quad.size = (0, 0)
                 continue
-            # skip closed/zero-width drawers (nothing to re-bake)
-            if clip.width < 2 or clip.height < 2:
-                continue
-            _sync_fbo(clip, st["fbo"], st["quad"], st["panel"], cid)
+            # pos sync every tick (cheap); re-bake when size changed
+            size = (max(int(clip.width), 1), max(int(clip.height), 1))
+            if tuple(st["fbo"].size) != size:
+                _sync(st, cid, bake=True)
+            else:
+                quad.pos = clip.to_window(*clip.pos)
+                if clip.width >= 2:
+                    quad.size = clip.size
         except Exception as e:
             print("DIAG fbo-drawer %s tick error %s" % (cid, e), flush=True)
+
+
+def _reframe(dt):
+    """1s content refresh: member joins/avatars/spawned rows."""
+    if not _STATE["fbs"]:
+        return
+    for cid, st in list(_STATE["fbs"].items()):
+        try:
+            _sync(st, cid, bake=True)
+        except Exception as e:
+            print("DIAG fbo-drawer %s reframe error %s" % (cid, e),
+                  flush=True)

@@ -138,25 +138,18 @@ def install_batch_separators(app):
 
 
 def strip_mask_stencils(app):
-    """STENCIL FALSIFIER: remove every round-mask StencilPush/Use/UnUse/
-    Pop family from widget canvases, one complete family per widget so
-    the global stencil stream stays balanced.
+    """REVERTED - kept as a falsification receipt only, never installed.
 
-    Receipt basis (the order audit b7b283b, audit_order_receipts_1124.md):
-    tar1 added three stencil mask families - the message-embed image
-    corner mask (kv_md.kv ~212-240), the FullScreenImageOverlay mask,
-    and the avatar disc mask (the PfpImage canvas.before at the
-    kivy_client 1094-1105 split move). Stencil ops interleave
-    rasterizer state along the frame instruction stream on exactly the
-    two surfaces where the device order symptoms live (the crossing
-    embed and the People drawer's avatar rows). Every side-loaded log
-    to date ran with the masks active. If the crossing dies with the
-    ops stripped, tar1's stencil masks are the named root; the shapes
-    render square/round as the geometry itself dictates, only the
-    texture corner mask is lost - a visual sacrifice we buy for one
-    verdict. New embeds spawning later are caught at the next DIAG
-    moment (each embed-applied fires report -> this strip).
+    Verdict (tay's device, log.log_7 + the 2026-11-24 shots): stripping
+    ALL top-level Stencil* ops unbalanced the kivy StencilView clip
+    state left behind per widget: the clip BOUNDS rects that used to
+    draw into the stencil plane then painted as opaque COLOR fills
+    (white quads the size of the clip regions, covering the content
+    panes - the two 'shades' screens tay shot). The strip is refuted
+    as a cure AND proven harmful. The stencil-mask root question stays
+    open for a class-scoped, mask-shape-inclusive falsifier only.
     """
+    return
     widgets = []
     _walk_widgets(app.root, widgets)
     stripped = 0
@@ -197,7 +190,6 @@ def report(app, tag):
             return
         chains = _panel_chains(root)
         install_batch_separators(app)
-        strip_mask_stencils(app)
         try:
             import fbo_drawers
             fbo_drawers.install(app)
