@@ -152,6 +152,7 @@ NODE_REGISTRY_LOCK = threading.Lock()
 # on top. ONLINE_LINKS maps link_id -> user_hash, bound on every API request
 # (the request's remote_identity is the proof of who is behind the link).
 ONLINE_LINKS = {}                 # link_id -> user_hash
+ONLINE_LINK_SPOT = {}             # link_id -> time of last identified request
 ONLINE_LINKS_LOCK = threading.Lock()
 
 # Stream state for the JSON API. One subscription per link: subscribing to a
@@ -166,6 +167,10 @@ SUBSCRIPTIONS = {}                      # link_id -> {user_hash, channel, cursor
 # They NEVER enter SUB_BY_USER (see subscribe) — bots are not users.
 SUB_BY_USER   = {}                      # user_hash -> {channel, link_id, at}
 SUB_LOCK      = threading.Lock()
+
+# hub-side liveness refs: lets the reaper name why a client link died
+HUB_SEEN_LINKS = {}
+HUB_SEEN_LOCK = threading.Lock()
 TYPING        = {}                      # channel_id -> {user_hash: expires_at}
 TYPING_LOCK   = threading.Lock()
 
@@ -551,9 +556,50 @@ def _reap_stale_nodes():
     before = set(online_users())
     active = {l.link_id for l in list(RNS.Transport.active_links)
               if l.status == RNS.Link.ACTIVE}
+    # Presence is traffic, not status: a link the request dispatcher
+    # identified recently is live even when its RNS status snapshot
+    # reads STALE (short keepalive on fast links, traffic gaps) -- the
+    # 10 Hz relay frames keep the spot warm for voice speakers. The
+    # grace only extends links the hub knows as real link objects
+    # (HUB_SEEN_LINKS): a presence entry with no known object is a
+    # synthetic bind, and absence from active_links is that link's
+    # death -- the v0.29 contract pinned by test_streams, where the
+    # death transition must fire on the same reap, not after a grace.
     with ONLINE_LINKS_LOCK:
-        for lid in [lid for lid in ONLINE_LINKS if lid not in active]:
-            del ONLINE_LINKS[lid]
+        with HUB_SEEN_LOCK:
+            fresh = {lid for lid in list(ONLINE_LINKS)
+                     if lid in HUB_SEEN_LINKS
+                     and time.time() - ONLINE_LINK_SPOT.get(lid, 0.0)
+                     < VOICE_RNS_STALE_GRACE_S}
+        active |= fresh
+        vanished = [HUB_SEEN_LINKS.pop(lid) for lid in list(HUB_SEEN_LINKS)
+                    if lid not in active]
+        for l in list(RNS.Transport.active_links):
+            if l.link_id in active:
+                HUB_SEEN_LINKS[l.link_id] = l
+    for l in vanished:
+        try:
+            RNS.log("hub link vanished: status=%s reason=%s" % (
+                l.status, l.teardown_reason), RNS.LOG_NOTICE)
+        except Exception:
+            pass
+    with ONLINE_LINKS_LOCK:
+        pruned = [lid for lid in list(ONLINE_LINKS) if lid not in active]
+        for lid in pruned:
+            l = HUB_SEEN_LINKS.get(lid)
+            raw = None
+            in_tl = False
+            try:
+                for tl in list(RNS.Transport.active_links):
+                    if tl.link_id == lid:
+                        in_tl = True
+                        raw = getattr(tl, "status", None)
+                        break
+            except Exception as e:
+                RNS.log("presence prune diag failed: %s" % e,
+                        RNS.LOG_ERROR)
+        for lid in pruned:
+            ONLINE_LINKS.pop(lid, None)
         live_users = set(ONLINE_LINKS.values())
     with SUB_LOCK:
         for lid in [lid for lid in SUBSCRIPTIONS if lid not in active]:
@@ -568,7 +614,26 @@ def _reap_stale_nodes():
             for h in stale:
                 del NODE_REGISTRY[h]
                 RNS.log("dropped node %s (link down)" % h[:12], RNS.LOG_NOTICE)
+    # Voice rooms: a member without a live link is out of the room (the
+    # roster ride the event ring, so callers see the change on push).
+    voice_touched = []
+    with VOICE_ROOMS_LOCK:
+        for cid, members in list(VOICE_ROOMS.items()):
+            for v in [v for v in members if v not in live_users]:
+                members.pop(v, None)
+                voice_touched.append(cid)
+                RNS.log("voice reaper: %s lost in %s" % (v[:12], cid[:8]),
+                        RNS.LOG_NOTICE)
+            if cid in VOICE_ROOMS and not VOICE_ROOMS[cid]:
+                del VOICE_ROOMS[cid]
     after = set(online_users())
+    for cid in sorted(set(voice_touched)):
+        try:
+            RNS.log("voice reaper: member without live link dropped (%s)"
+                    % cid[:8], RNS.LOG_NOTICE)
+            _voice_emit_roster(cid, "left")
+        except Exception as e:
+            RNS.log("voice roster push failed: %s" % e, RNS.LOG_ERROR)
     if after != before:
         _emit_event(None, "presence", {"users": _presence_payload()},
                     guild_wide=True)
@@ -1290,6 +1355,12 @@ def wrap_api(fn):
         # to this user until the link dies (the presence keeper prunes it).
         if link_id:
             with ONLINE_LINKS_LOCK:
+                if link_id not in ONLINE_LINKS or \
+                        ONLINE_LINKS[link_id] != viewer:
+                    RNS.log("presence bind: link %s -> user %s"
+                            " via %s" % (_pretty_lid(link_id),
+                             viewer[:12], path), RNS.LOG_NOTICE)
+                ONLINE_LINK_SPOT[link_id] = time.time()
                 ONLINE_LINKS[link_id] = viewer
         try:
             if not isinstance(data, dict):
@@ -1578,6 +1649,12 @@ def wrap_json_api(fn):
         # to this user until the link dies (the presence keeper prunes it).
         if link_id:
             with ONLINE_LINKS_LOCK:
+                if link_id not in ONLINE_LINKS or \
+                        ONLINE_LINKS[link_id] != viewer:
+                    RNS.log("presence bind: link %s -> user %s"
+                            " via %s" % (_pretty_lid(link_id),
+                             viewer[:12], path), RNS.LOG_NOTICE)
+                ONLINE_LINK_SPOT[link_id] = time.time()
                 ONLINE_LINKS[link_id] = viewer
         args = _json_args(data)
         if args is None:
@@ -2065,6 +2142,276 @@ def api_v1_stream_unsubscribe(viewer, data, link_id):
             if cur and cur.get("link_id") == link_id:
                 del SUB_BY_USER[sub["user_hash"]]
     return {"ok": 1}
+
+# ---- voice rooms ------------------------------------------------------------------
+#
+# tay, 2026-11-23: the hub is the directory, never the relay. A voice room
+# is a roster on the channel: who is in, each member's voice destination
+# hash, mute flag, last refresh. Roster changes ride the event ring on the
+# room's own channel (k:"voice_state"), so room members get pushed through
+# the same path that carries chat. Audio frames link peer-to-peer between
+# member voice destinations; this process never reads or forwards them.
+
+VOICE_ROOMS = {}        # cid -> {viewer: {"dest": hex, "muted": bool, "at": ts}}
+VOICE_ROOMS_LOCK = threading.RLock()
+VOICE_ROOMS_SWEEP_S = 900.0   # no refreshes for this long -> dropped from rooms
+VOICE_RNS_STALE_GRACE_S = 12.0  # STALE link still fed traffic -> stay live
+
+
+def _voice_leave_all(viewer):
+    """Remove a viewer from every room. Returns the touched channel ids."""
+    touched = []
+    with VOICE_ROOMS_LOCK:
+        for cid, members in list(VOICE_ROOMS.items()):
+            if viewer in members:
+                members.pop(viewer, None)
+                touched.append(cid)
+                if not members:
+                    del VOICE_ROOMS[cid]
+    return touched
+
+
+def _voice_room_roster(cid):
+    with VOICE_ROOMS_LOCK:
+        members = VOICE_ROOMS.get(cid, {})
+        return [dict({"viewer": v}, **{
+            "dest": m["dest"], "muted": m["muted"], "at": m["at"]})
+            for v, m in members.items()]
+
+
+def _voice_emit_roster(cid, reason="change"):
+    RNS.log("voice roster %s: %s" % (cid[:8], reason), RNS.LOG_NOTICE)
+    _emit_event(cid, "voice_state", {
+        "channel": cid, "reason": reason,
+        "members": _voice_room_roster(cid)}, guild_wide=False)
+
+
+def _sweep_voice_rooms():
+    cutoff = now() - VOICE_ROOMS_SWEEP_S
+    touched = []
+    with VOICE_ROOMS_LOCK:
+        for cid, members in list(VOICE_ROOMS.items()):
+            for v in [v for v, m in members.items() if m["at"] < cutoff]:
+                members.pop(v, None)
+                touched.append(cid)
+            if cid in VOICE_ROOMS and not VOICE_ROOMS[cid]:
+                del VOICE_ROOMS[cid]
+    for cid in sorted(set(touched)):
+        _voice_emit_roster(cid, "sweep")
+
+
+@api_route("/api/v1/voice/join")
+@wrap_json_api
+def api_v1_voice_join(viewer, data, link_id):
+    cid = data.get("channel")
+    dest = data.get("dest") or ""
+    muted = data.get("muted") or False
+    chan = store.channel_row(db, db_lock, cid)
+    if not chan:
+        return {"ok": 0, "error": "unknown channel", "code": 404}
+    if chan["kind"] != "voice":
+        return {"ok": 0, "error": "channel is not a voice channel", "code": 400}
+    if not dest or len(dest) < 10:
+        # The roster hands out peer link targets; an empty one is useless.
+        return {"ok": 0, "error": "dest required", "code": 400}
+    if not has_perm(viewer, cid, PERMS["VIEW"]):
+        return {"ok": 0, "error": "view permission required", "code": 403}
+    _sweep_voice_rooms()
+    touched = _voice_leave_all(viewer)
+    for t in sorted(set(touched) - {cid}):
+        RNS.log("voice join %s drops old room %s" % (viewer[:8], t[:8]),
+                RNS.LOG_NOTICE)
+    with VOICE_ROOMS_LOCK:
+        VOICE_ROOMS.setdefault(cid, {})[viewer] = {
+            "dest": dest, "muted": muted, "at": now()}
+    for t in sorted(set(touched) - {cid}):
+        _voice_emit_roster(t, "left")
+    _voice_emit_roster(cid, "joined")
+    return {"ok": 1, "channel": cid, "members": _voice_room_roster(cid)}
+
+
+@api_route("/api/v1/voice/leave")
+@wrap_json_api
+def api_v1_voice_leave(viewer, data, link_id):
+    touched = _voice_leave_all(viewer)
+    for t in sorted(set(touched)):
+        _voice_emit_roster(t, "left")
+    return {"ok": 1, "left": sorted(set(touched))}
+
+
+@api_route("/api/v1/voice/rooms")
+@wrap_json_api
+def api_v1_voice_rooms(viewer, data, link_id):
+    """Rail counts: one voice channel id per room, with member rosters."""
+    _sweep_voice_rooms()
+    with VOICE_ROOMS_LOCK:
+        rooms = {cid: {"members": [m for m in [
+            dict({"viewer": v}, **mm) for v, mm in members.items()]]}
+            for cid, members in list(VOICE_ROOMS.items())}
+    return {"ok": 1, "rooms": rooms}
+
+
+def _push_voice(cid, sender_viewer, body):
+    """Relay one speaker's voice frame to the room's other subscriber
+    links. The engine's direct lane is peer-to-peer over RNS links; this
+    fallback exists for probe-failed pairs that could never establish
+    one. The frame is raw on the link (k="voice") because metadata
+    events carry references, never bodies; voice is audio bytes by
+    design and must not enter the event ring."""
+    with VOICE_ROOMS_LOCK:
+        room = VOICE_ROOMS.get(cid) or {}
+        sender_dest = (room.get(sender_viewer) or {}).get("dest")
+        targets = [v for v in room if v != sender_viewer]
+    if not sender_dest or not targets:
+        RNS.log("voice relay %s: empty (sender=%s room=%s targets=%s)"
+                % (cid[:8], sender_viewer, sorted(room), targets),
+                RNS.LOG_NOTICE)
+        return 0
+    frame = msgpack.packb({"k": "voice", "dest": sender_dest, "body": body})
+    with SUB_LOCK:
+        subs = [(lid, s["user_hash"])
+                for lid, s in SUBSCRIPTIONS.items()
+                if s["channel"] == cid and s["user_hash"] in targets]
+    sent = 0
+    seen_lids = set()
+    for lid, uhash in subs:
+        if not has_perm(uhash, cid, PERMS["VIEW"]):
+            continue
+        match = None
+        for link in list(RNS.Transport.active_links):
+            if link.link_id == lid and link.status == RNS.Link.ACTIVE:
+                match = link
+                break
+        if match is None:
+            # Same traffic grace as presence: a link the dispatcher
+            # identified moments ago is deliverable even if its RNS
+            # status snapshot reads STALE between the client's polls.
+            with ONLINE_LINKS_LOCK:
+                spot = ONLINE_LINK_SPOT.get(lid, 0.0)
+            if time.time() - spot < VOICE_RNS_STALE_GRACE_S:
+                for link in list(RNS.Transport.active_links):
+                    if link.link_id == lid:
+                        match = link
+                        break
+        if match is None:
+            if lid not in seen_lids:
+                seen_lids.add(lid)
+                RNS.log("voice relay %s: sub %s/%s has NO active link"
+                        % (cid[:8], uhash[:8], lid[:8]), RNS.LOG_NOTICE)
+            continue
+        if lid not in seen_lids:
+            seen_lids.add(lid)
+            itab = []
+            for i in RNS.Transport.interfaces:
+                itab.append("%s%s/%d" % (type(i).__name__,
+                                         "/OUT" if getattr(i, "OUT", False)
+                                         else "",
+                                         len(getattr(i, "spawned_interfaces",
+                                                     []) or [])))
+            att = getattr(match, "attached_interface", None)
+            att_is_spawned = any(
+                att is s
+                for i in RNS.Transport.interfaces
+                for s in (getattr(i, "spawned_interfaces", None) or []))
+            attin = any(att is i for i in RNS.Transport.interfaces)
+            inpt = match.link_id in RNS.Transport.path_table
+            RNS.log("voice relay %s: sub %s lid %s active -> send attin=%s"
+                    " att_is_spawned=%s att_online=%s inpath=%s"
+                    " active_links=%d itab=%s"
+                    % (cid[:8], uhash[:8], lid[:8], attin, att_is_spawned,
+                       getattr(att, "online", "n/a"), inpt,
+                       len(RNS.Transport.active_links), itab), RNS.LOG_NOTICE)
+        try:
+            iface = match.attached_interface
+            if iface is None:
+                RNS.log("voice relay %s: link %s has no attached iface"
+                        % (cid[:8], lid[:8]), RNS.LOG_ERROR)
+                continue
+            pkt = RNS.Packet(match, frame)
+            pkt.pack()
+            RNS.Transport.transmit(iface, pkt.raw)
+            sent += 1
+        except Exception as e:
+            RNS.log("voice relay to link failed: %s" % e, RNS.LOG_ERROR)
+    RNS.log("voice relay %s: room=%s subs=%d active=%d sent=%d"
+            % (cid[:8], sorted(room), len(subs),
+               len(RNS.Transport.active_links), sent), RNS.LOG_NOTICE)
+    return sent
+
+
+@api_route("/api/v1/voice/publish")
+@wrap_json_api
+def api_v1_voice_publish(viewer, data, link_id):
+    """One speaker tick of relayed voice. Body is the speaker's own
+    direct-form packet: two bytes of sequence, then a codec packet."""
+    if not rate_ok(viewer, "_voice_pub", 900, 60):
+        return {"ok": 0, "error": "rate limited", "code": 429}
+    cid = data.get("channel")
+    try:
+        body = base64.b64decode(data.get("body") or "")
+    except ValueError:
+        return {"ok": 0, "error": "bad body", "code": 400}
+    if not body or len(body) < 2:
+        return {"ok": 0, "error": "empty body", "code": 400}
+    with VOICE_ROOMS_LOCK:
+        member = (VOICE_ROOMS.get(cid) or {}).get(viewer)
+    if member is None:
+        return {"ok": 0, "error": "not in room", "code": 404}
+    n = _push_voice(cid, viewer, body)
+    RNS.log("voice relay %s: %d links (%d bytes)"
+            % (cid[:8], n, len(body)), RNS.LOG_DEBUG)
+    return {"ok": 1, "sent": n}
+
+
+def _on_node_link_established(link):
+    """Raw lane: a node link's packets are demuxed for voice-pub."""
+    try:
+        link.set_packet_callback(_on_link_voice_pub)
+    except Exception as e:
+        RNS.log("link packet callback failed: %s" % e, RNS.LOG_ERROR)
+
+
+def _pretty_lid(lid):
+    """prettyhexrep for real link ids; str ids (test lanes) pass through."""
+    if isinstance(lid, bytes):
+        return RNS.prettyhexrep(lid)
+    return str(lid)
+
+
+def _on_link_voice_pub(plaintext, packet=None):
+    """One speaker tick of relayed voice as a raw link packet. A viewer
+    is in at most one voice room (join leaves the others), so the room
+    is resolved from the viewer, not carried in the frame: no channel
+    field keeps the packet under the link MTU."""
+    try:
+        frame = msgpack.unpackb(plaintext, raw=False)
+    except Exception:
+        return
+    if not isinstance(frame, dict) or frame.get("k") != "voice-pub":
+        return
+    body = frame.get("body")
+    if not isinstance(body, (bytes, bytearray)) or len(body) < 2:
+        return
+    link = packet.link if packet is not None else None
+    viewer = ONLINE_LINKS.get(link.link_id) if link is not None else None
+    if not viewer:
+        return
+    # Raw voice traffic is traffic: feed the same presence stamp the
+    # dispatcher feeds on identified requests, so a speaker's relay
+    # stream at 10Hz keeps its link live without any api calls.
+    with ONLINE_LINKS_LOCK:
+        ONLINE_LINK_SPOT[link.link_id] = time.time()
+    with VOICE_ROOMS_LOCK:
+        room = next((cid for cid, m in VOICE_ROOMS.items() if viewer in m),
+                    None)
+    if not room:
+        return
+    if not rate_ok(viewer, "_voice_pub", 900, 60):
+        return
+    n = _push_voice(room, viewer, body)
+    RNS.log("voice pub %s from %s -> %d links (%d bytes)"
+            % (room[:8], viewer[:8], n, len(body)), RNS.LOG_DEBUG)
+
 
 # ---- typing -----------------------------------------------------------------------
 
@@ -4646,6 +4993,27 @@ def api_v1_channels_patch(viewer, data, link_id):
 # Boot (plan §9 skeleton — every call verified against the installed stack)
 # ----------------------------------------------------------------------------------
 
+def _iface_tick(debug):
+    if not debug:
+        return
+    rows = []
+    for i in RNS.Transport.interfaces:
+        spw = getattr(i, "spawned_interfaces", None) or []
+        rows.append("%s/on=%s" % (type(i).__name__,
+                                  getattr(i, "online", None)))
+        for s in spw:
+            peer = ""
+            try:
+                peer = "%s:%s" % tuple(s.socket.getpeername())
+            except Exception:
+                pass
+            rows[-1] += " [%s %s on=%s up=%s]" % (
+                getattr(s, "name", "?"), peer,
+                getattr(s, "online", None),
+                getattr(s, "up", None))
+    RNS.log("iface tick: %s" % (" | ".join(rows),), RNS.LOG_NOTICE)
+
+
 def _announce_now():
     try:
         # LXMRouter.announce(destination_hash) announces the registered delivery
@@ -4654,12 +5022,55 @@ def _announce_now():
         router.announce_propagation_node()                 # delayed-thread announce
         node_destination.announce(app_data=GUILD_NAME.encode("utf-8"))  # Node.py:announce format
         RNS.log("Announced guild (delivery, propagation, node).", RNS.LOG_NOTICE)
+        _iface_tick(os.environ.get("SHADES_VOICE_DEBUG") == "1")
     except Exception as e:
         RNS.log(f"announce error: {e}", RNS.LOG_ERROR)
 
 def announce_all():
     time.sleep(ANNOUNCE_DELAY)
     _announce_now()
+
+
+_VO_KEEPALIVE_INTERVAL = 3.0
+
+
+def _hub_keepalive_loop():
+    """Every 3s, ride each active link's interface with a KEEPALIVE-context
+    probe packet. Two jobs: the raw bytes keep the TCP lanes past
+    TCPInterface's idle watchdog (PROBE_AFTER=5, PROBES=12, INTERVAL=2,
+    which otherwise tears idle conns down at ~31s), and at the RNS layer
+    the packets are honest dead letters -- the hub is the responder side
+    of these links, so only the client's own dog feeds the link. Presence
+    gates on dispatcher bind stamps, never on this ping."""
+
+    last_ping = {}
+
+    while True:
+        time.sleep(_VO_KEEPALIVE_INTERVAL)
+        try:
+            links = list(RNS.Transport.active_links)
+        except Exception:
+            continue
+        now = time.time()
+        for link in links:
+            lid = link.link_id
+            if now - last_ping.get(lid, 0.0) < _VO_KEEPALIVE_INTERVAL:
+                continue
+            last_ping[lid] = now
+            try:
+                iface = link.attached_interface
+                if iface is None or not getattr(iface, "online", False):
+                    continue
+                # Answered by the initiator per the RNS link contract
+                # (context=KEEPALIVE, data=0xFF; the client replies 0xFE).
+                pkt = RNS.Packet(link, bytes([0xFF]),
+                                 context=RNS.Packet.KEEPALIVE)
+                pkt.pack()
+                RNS.Transport.transmit(iface, pkt.raw)
+            except Exception as e:
+                RNS.log("link ping failed on %s: %s"
+                        % (RNS.prettyhexrep(lid), e), RNS.LOG_DEBUG)
+
 
 def run(argv=None):
     global db, router, guild_delivery, node_destination, guild_identity
@@ -4735,7 +5146,16 @@ def run(argv=None):
                 f.write("  [[AutoInterface]]\n"
                         "    type = AutoInterface\n"
                         "    enabled = yes\n")
-    reticulum = RNS.Reticulum(configdir=rns_configdir)
+    _boot_loglevel = None
+    try:
+        _boot_loglevel = int(os.environ.get("SHADES_RNS_LOGLEVEL"))
+    except (TypeError, ValueError):
+        _boot_loglevel = None
+    if _boot_loglevel is None:
+        reticulum = RNS.Reticulum(configdir=rns_configdir)
+    else:
+        reticulum = RNS.Reticulum(configdir=rns_configdir,
+                                  loglevel=_boot_loglevel)
 
     ipath = os.path.join(STORAGE, "identity")
     if os.path.exists(ipath):
@@ -4766,6 +5186,10 @@ def run(argv=None):
         node_destination.register_request_handler(path, response_generator=fn,
                                                   allow=RNS.Destination.ALLOW_ALL)
 
+    # voice-pub raw lane: inbound node links get a packet callback for
+    # one-packet voice frames (k="voice-pub"); the request lane's
+    # /api/v1/voice/publish remains for clients without a link in hand
+    node_destination.set_link_established_callback(_on_node_link_established)
     # re-register attachment files from previous runs
     paths = [r["path"] for r in store.list_attachment_paths(db, db_lock)]
     for fname in paths:
@@ -4844,6 +5268,7 @@ def run(argv=None):
     _BOOT_ARGV = list(argv) if argv is not None else []
     _update_maybe_tick(force=True)
     threading.Thread(target=announce_all, daemon=True).start()
+    threading.Thread(target=_hub_keepalive_loop, daemon=True).start()
     try:
         while True:
             time.sleep(10)

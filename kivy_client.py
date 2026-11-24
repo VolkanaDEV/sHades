@@ -270,6 +270,7 @@ from app_channels import ChannelsMixin  # noqa: E402
 from app_settings import SettingsMixin  # noqa: E402
 from app_site import SiteMixin  # noqa: E402
 from app_stream import StreamMixin  # noqa: E402
+from app_voice_panel import VoicePanelMixin  # noqa: E402
 from app_menus import MenusMixin  # noqa: E402
 from app_attachments import AttachmentsMixin  # noqa: E402
 if KIVY:
@@ -2137,7 +2138,8 @@ def _fail_validation(app, text):
     app._set_status(text)
 
 
-class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, MenusMixin,
+class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
+                      VoicePanelMixin, StreamMixin, MenusMixin,
                       AttachmentsMixin, MDApp):
     title = "sHades"
 
@@ -2256,7 +2258,8 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
         self._stream_tick_event = None
         # site channels: kind per cid, the rendered page stack, the page
         # currently shown, and the active theme from the manifest
-        self._channel_kinds = {}     # cid -> chat|site|term|announce
+        self._channel_kinds = {}     # cid -> chat|site|term|voice|announce
+        self._voice_state_init()     # item 6: voice rows + join panel
         self._channel_can_post = {}  # cid -> can_post (P8)
         self._channel_pos = {}       # name -> position (task 7 ordering)
         self._channel_order = {}     # cid -> position (server-side index)
@@ -5499,6 +5502,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
             if res.get("ok"):
                 self.i_am_moderator = bool(res.get("is_moderator"))
                 self.i_am_admin = bool(res.get("is_admin"))
+                self.my_user_hash = (res.get("user_hash") or "").lower()
                 self.my_roles = res.get("roles") or []
                 # the whole whoami verdict rides the boot log: the
                 # Downloads copy then answers "why is the admin item
@@ -7640,6 +7644,11 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
                 pass
             self.lxmf_router = None
             self.lxmf_delivery = None
+        # desktop teardown carries voice state off with it
+        try:
+            VoicePanelMixin.on_stop(self)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

@@ -1275,6 +1275,69 @@ class ClickableLabel(ContextMenuMixin, ButtonBehavior, Label):
         return actions
 
 
+class VoiceRow(BoxLayout):
+    """One voice channel's roster row on the rail (item 6).
+
+    Renders "n in call" plus up to three names, and a Join/Leave
+    affordance. Press routes to the app's voice panel actions through
+    bind_action; while in-call, Mute/Unmute joins the panel's state.
+    """
+
+    channel_name = StringProperty("")
+
+    def __init__(self, **kw):
+        super().__init__(orientation="horizontal", size_hint_y=None,
+                         height=dp(22), padding=(dp(24), 0, dp(6), 0),
+                         **kw)
+        self._label = Label(font_size=sp(10),
+                            color=App.get_running_app().theme_colors
+                            ["text_muted"] if App.get_running_app()
+                            else (0.6, 0.6, 0.6, 1),
+                            halign="left", valign="middle")
+        self._label.bind(size=lambda inst, s: setattr(inst, "text_size",
+                                                      (s[0], s[1])))
+        self._cta = Label(text="join", font_size=sp(11))
+        self.add_widget(self._label)
+        self.add_widget(self._cta)
+        self._members = []
+        self._joined = False
+        self._muted = False
+        self._on_join = self._on_leave = self._on_mute = None
+        self.bind(on_touch_down=self._tap_dispatch)
+
+    def bind_action(self, on_join, on_leave, on_mute):
+        self._on_join, self._on_leave, self._on_mute = (
+            on_join, on_leave, on_mute)
+
+    def render(self, members, joined=False, muted=False):
+        self._members = members or []
+        self._joined = joined
+        self._muted = muted
+        names = ", ".join(str(m.get("viewer", ""))[:4]
+                          for m in self._members[:3])
+        count = len(self._members)
+        head = ("%d in call" % count) if count else "empty"
+        self._label.text = ("%s - %s%s" % (head, names,
+                                           ", ..." if count > 3 else "")
+                            if names else head)
+        self._cta.text = ("leave" if self._joined else
+                          "join")
+
+    def _tap_dispatch(self, inst, touch):
+        if not self.collide_point(*touch.pos):
+            return False
+        # one-tap CTA: in-call -> leave; not in-call -> join. The mute
+        # toggle lives on the in-call panel, not the rail row.
+        if self._joined:
+            if self._on_mute is not None and touch.is_double_tap:
+                self._on_mute(self.channel_name)
+            elif self._on_leave is not None:
+                self._on_leave(self.channel_name)
+        elif self._on_join is not None:
+            self._on_join(self.channel_name)
+        return True
+
+
 class ChannelButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
     channel_name = StringProperty("")
     badge = NumericProperty(0)

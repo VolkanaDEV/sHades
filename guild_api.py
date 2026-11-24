@@ -281,6 +281,32 @@ class GuildAPI:
     def stream_unsubscribe(self):
         return self._request_json("/api/v1/stream/unsubscribe", {})
 
+    # Voice rooms: the hub is the directory; the roster here, audio over
+    # direct peer links below (tay, 2026-11-23).
+    def voice_join(self, channel, dest, muted=False):
+        return self._request_json(
+            "/api/v1/voice/join",
+            {"channel": channel, "dest": dest, "muted": bool(muted)})
+
+    def voice_leave(self):
+        return self._request_json("/api/v1/voice/leave", {})
+
+    def voice_rooms(self):
+        """Roster counts per voice channel, for the rail."""
+        return self._request_json("/api/v1/voice/rooms", {})
+
+    def voice_publish(self, channel, body):
+        """One speaker tick destined for the relay fallback. body is the
+        engine's raw packet (seq + codec packet); it rides the request
+        body b64 and the hub fans it to the room's other subscriber
+        links as a k:"voice" raw push frame."""
+        import base64
+        raw = body if isinstance(body, (bytes, bytearray)) else bytes(body)
+        return self._request_json(
+            "/api/v1/voice/publish",
+            {"channel": channel,
+             "body": base64.b64encode(bytes(raw)).decode("ascii")})
+
     def typing(self, channel, active=True):
         return self._request_json("/api/v1/typing",
                                   {"channel": channel, "active": bool(active)})
