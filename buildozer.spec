@@ -5,7 +5,18 @@ title = sHades
 package.name = shades
 package.domain = io.eldeucebag
 source.dir = .
-source.include_exts = py,png,jpg,kv,atlas,ttf,otf
+source.include_exts = py,png,jpg,kv,atlas,ttf,otf,bc
+# Sanguis scripting data: interp.bc is caught by the `bc` ext above.
+# The `bch` floor binary has NO extension, so include_exts can never
+# match it; buildozer's mechanism for extensionless files is
+# source.include_patterns (glob patterns against paths relative to
+# source.dir). bch.exe is deliberately NOT listed: it is the Windows
+# binary and has no use in the APK.
+# OPEN ITEM (verify in CI, not locally -- no NDK here): confirm the APK
+# actually carries sanguis/bch, e.g. `unzip -l bin/*.apk | grep sanguis`
+# in the build-android job. If include_patterns does not pick it up,
+# the fallback is a p4a recipe / buildozer `android.add_src` step.
+source.include_patterns = sanguis/bch
 source.exclude_dirs = .git, .github, tests, __pycache__, build, dist, .buildozer
 # tay's sHades wordmark art, centered inside the circular adaptive safe zone
 # (measured 55.9% lettering span; contract lane: tests/test_launcher_icon.py)

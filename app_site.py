@@ -8,12 +8,59 @@ reachable as ``app.<name>`` and ``kc.sHadesClientApp.<name>``.
 """
 
 import base64
-from micron import (micron_media_target, micron_page_bg, micron_parse, runs_to_markup)
+from micron import (micron_media_target, micron_page_bg,
+                    micron_page_media, micron_parse,
+                    micron_parse_emitted, runs_to_markup)
+import queue
 import re
+import sanguis_script
 import threading
+import time
 import webbrowser
 from client_util import _escape
 from client_widgets import MicronRefLabel
+
+
+def _site_media_blob(guild_api, target):
+    """Fetch one site-media target's bytes (site_get for /file/sites/
+    targets, fetch_file otherwise); None on any failure. Shared by
+    the media landings in _add_site_media so every path
+    can never disagree about where bytes come from."""
+    try:
+        if target.startswith("/file/sites/"):
+            parts = target.split("/", 4)
+            if len(parts) == 5:
+                res = guild_api.site_get(parts[3], "/" + parts[4])
+                if res.get("ok"):
+                    return base64.b64decode(res.get("data_b64") or "")
+        else:
+            raw = guild_api.fetch_file(target)
+            if raw:
+                return raw
+    except Exception as e:
+        print("site media fetch failed:", repr(e))
+    return None
+
+
+# Animated script blocks: target cadence between frames (10 fps).
+# A frame that overruns the interval pushes the next tick out instead
+# of queuing a second run (see _anim_next_delay).
+ANIM_FRAME_INTERVAL = 0.1
+ANIM_FRAME_MIN_DELAY = 0.02
+# How long an animation worker thread waits idle for its next frame
+# job before exiting (see _anim_worker): well above the ~20-100 ms
+# gap between a frame landing and the next tick, so the thread --
+# and the GL backend cached on it -- survives the steady loop, but
+# a stopped loop never leaves a blocked thread behind for long.
+ANIM_WORKER_IDLE_TIMEOUT = 0.3
+
+# Safe media access by blob id (direction 4): a page script reads a
+# page asset only through the media_blob() builtin, fed by host
+# bindings the renderer fetches once per render (see
+# _fetch_media_bindings). MEDIA_MAX_BYTES caps one blob; the count
+# cap lives in micron_page_media (MICRON_PAGE_MEDIA_MAX).
+MEDIA_MAX_BYTES = 8192
+MEDIA_MAX_BLOBS = 8
 
 # Kivy (guarded so the module can be imported for linting without Kivy present)
 try:
@@ -33,6 +80,27 @@ try:
 except Exception as _e:  # pragma: no cover - Kivy missing at import time
     KIVY = False
     _KIVY_IMPORT_ERROR = _e
+
+
+def _format_script_value(value):
+    """A script result value -> display text. Integral floats print
+    without the trailing .0 (42.0 -> "42"); lists render recursively
+    as [a, b], mirroring the interpreter's val_to_str."""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return repr(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "[" + ", ".join(_format_script_value(v) for v in value) + "]"
+    if value is None:
+        return ""
+    return str(value)
 
 
 def _resolve_micron_path(base_path, target):
@@ -55,6 +123,543 @@ def _resolve_micron_path(base_path, target):
             continue
         parts.append(seg)
     return "/" + "/".join(parts)
+
+
+def _anim_next_delay(target, elapsed):
+    """Delay before the next animation tick: hold the target cadence
+    when the frame was quick; when the drain overran the interval,
+    come back almost at once (floored, never zero) so the loop keeps
+    moving at the drain's own pace instead of stalling."""
+    return max(ANIM_FRAME_MIN_DELAY, target - elapsed)
+
+
+def _pil_to_png_bytes(image):
+    """A PIL Image -> PNG bytes (worker-thread safe)."""
+    import io
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _anim_ensure_worker(app, state):
+    """Start the block's worker thread, unless one is already up.
+
+    The worker owns the frame queue (see _anim_worker); the slot
+    is cleared when the worker exits, so a tick after an
+    idle-timeout exit starts a fresh thread (and a fresh cached
+    backend) instead of enqueueing into the void.
+    """
+    if state.get("worker") is not None:
+        return
+    worker = threading.Thread(
+        target=lambda: _anim_worker(app, state), daemon=True)
+    state["worker"] = worker
+    worker.start()
+
+
+def _anim_stop(state):
+    """Mark the loop stopped and wake the worker so it exits.
+
+    The None sentinel in the frame queue is the worker's exit
+    signal (see _anim_worker); a worker that already exited
+    (idle timeout) simply never reads it. Idempotent.
+    """
+    state["stopped"] = True
+    job_queue = state.get("queue")
+    if job_queue is not None:
+        try:
+            job_queue.put(None)
+        except Exception:
+            pass
+
+
+def _anim_worker(app, state):
+    """The block's frame loop: one thread, jobs off a queue.
+
+    Each job is a frame number (None is the stop sentinel). The
+    thread blocks on the queue between frames, so the
+    thread-local cached GL backend survives from frame to frame
+    -- that reuse is the whole point (a fresh EGL context per
+    frame costs ~50 ms; the cached drain is ~5 ms). After
+    ANIM_WORKER_IDLE_TIMEOUT with no job it exits on its own
+    (and clears the worker slot, so the next tick starts a fresh
+    thread); a stopped loop also exits promptly on the sentinel
+    from _anim_stop.
+    """
+    me = state.get("worker")
+    try:
+        while True:
+            try:
+                job = state["queue"].get(
+                    timeout=ANIM_WORKER_IDLE_TIMEOUT)
+            except queue.Empty:
+                break
+            if job is None:
+                break
+            _anim_run_frame(app, state, job)
+    finally:
+        # The thread is going away: release the GL backend cached
+        # on it, here on its own thread, instead of leaking the
+        # EGL context until process exit (a thread-local slot dies
+        # with its thread, so nothing else could ever release it).
+        # A later tick starts a fresh thread with a fresh backend.
+        try:
+            from gpu_drain import release_thread_backend
+        except Exception:
+            release_thread_backend = None
+        if release_thread_backend is not None:
+            try:
+                release_thread_backend()
+            except Exception:
+                pass
+        if state.get("worker") is me:
+            state["worker"] = None
+
+
+def _fetch_media_bindings(app, media):
+    """Fetch one page's media blobs as script bindings.
+
+    `media` is micron_page_media's [(digest, target), ...] list.
+    For each entry: skip when app.guild_api is None; probe the size
+    with app.guild_api.att_get(target, length=1) and read `total`
+    (the server clamps length to >= 1, so the probe returns total
+    plus one byte); skip when the probe is not ok, total <= 0, or
+    total > MEDIA_MAX_BYTES; else a full att_get(target),
+    base64-decode data_b64, and use the returned bytes (verifying
+    the length matches total when present). Returns the list of
+    ["media_" + digest, decimals] bindings, where decimals is the
+    bytes as space-separated decimals, no trailing space -- the
+    exact format media_blob() parses. NEVER raises: every failure
+    skips that blob (the script then sees [] for it).
+
+    Module-level, not a mixin method: the test stubs bind a fixed
+    method list, so a new mixin method called from bound code is
+    missing on stubs and raises AttributeError.
+    """
+    bindings = []
+    try:
+        guild_api = getattr(app, "guild_api", None)
+        if guild_api is None:
+            return bindings
+        att_get = getattr(guild_api, "att_get", None)
+        if att_get is None:
+            return bindings
+        for digest, target in media or []:
+            try:
+                probe = att_get(target, length=1)
+                if not isinstance(probe, dict) or not probe.get("ok"):
+                    continue
+                try:
+                    total = int(probe.get("total"))
+                except (TypeError, ValueError):
+                    continue
+                if total <= 0 or total > MEDIA_MAX_BYTES:
+                    continue
+                res = att_get(target)
+                if not isinstance(res, dict) or not res.get("ok"):
+                    continue
+                try:
+                    data = base64.b64decode(res.get("data_b64") or "")
+                except Exception:
+                    continue
+                full_total = res.get("total")
+                if isinstance(full_total, int) \
+                        and not isinstance(full_total, bool) \
+                        and len(data) != full_total:
+                    continue
+                bindings.append(["media_" + digest,
+                                 " ".join(str(b) for b in data)])
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return bindings
+
+
+def _anim_run_frame(app, state, frame):
+    """Run one animation frame on the worker thread: re-run the
+    script with the `frame` binding, drain the GPU queue, and
+    land the raw RGB bytes on the main thread. Animation re-runs
+    drain the GPU queue only: audio is a frame-0-landing concern
+    (see _add_site_script's work()), so a re-run never drains
+    audio and a failing frame never restarts the melody."""
+    landed = {"raw": None, "size": None, "error": None}
+    source = state["source"]
+    bindings = app._script_bindings(state["cid"], frame=float(frame))
+    # Media is fetched once per block render and reused every frame
+    # (see _anim_maybe_start): never re-fetched per frame.
+    bindings = bindings + (state.get("media_bindings") or [])
+    try:
+        res = app._run_page_script(source, bindings)
+    except Exception as e:
+        res = {"ok": 0.0, "result": "runner failed: %s" % e,
+               "out": [], "gpu": []}
+    if not isinstance(res, dict):
+        res = {"ok": 0.0, "result": "runner failed: bad result",
+               "out": [], "gpu": []}
+    if res.get("ok"):
+        gpu = res.get("gpu") or []
+        if gpu:
+            try:
+                drained = app._drain_page_gpu(gpu)
+            except Exception as e:
+                drained = {"image": None,
+                           "notes": ["GPU output unavailable: %s" % e],
+                           "handled": [], "unhandled": []}
+            image = None
+            if isinstance(drained, dict):
+                image = drained.get("image")
+            if image is not None:
+                try:
+                    landed["raw"] = image.tobytes()
+                    landed["size"] = image.size
+                except Exception as e:
+                    landed["error"] = (
+                        "could not encode frame: %s" % e)
+            else:
+                landed["error"] = "no image drained"
+        else:
+            landed["error"] = "no gpu commands this frame"
+    else:
+        landed["error"] = str(res.get("result") or "unknown error")
+    Clock.schedule_once(
+        lambda dt: app._land_anim_frame(state, frame, landed), 0)
+
+
+def _interact_maybe_start(app, container, landed, widgets):
+    """Start tap interactivity for a landed interact block.
+
+    `container` is the dedicated box _land_site_script wrapped
+    the landed widgets in (the re-render target for event
+    landings, not the page). The state lives on the box; the tap
+    handler is bound on the result label (widgets[0]) only --
+    never on the box, so taps on child embeds/links are never
+    eaten. The stored state starts at landed["interact_state"]
+    (the first run's numeric result, or 0.0). Module-level, not
+    a mixin method: the test stubs bind a fixed method list, so
+    a new mixin method called from bound code is missing on
+    stubs and raises AttributeError (the anim/media pattern).
+    """
+    if not widgets:
+        return
+    try:
+        start_state = float(landed.get("interact_state") or 0.0)
+    except (TypeError, ValueError):
+        start_state = 0.0
+    state = {"container": container, "cid": landed.get("cid"),
+             "source": landed.get("source"),
+             "expected": landed.get("expected"),
+             "media_bindings": landed.get("media_bindings") or [],
+             "state": start_state, "busy": False, "stopped": False,
+             "taps": 0, "result_widget": widgets[0]}
+    try:
+        container._interact_state = state
+    except Exception:
+        pass
+    _interact_bind(app, state)
+
+
+def _interact_bind(app, state):
+    """Bind the tap handler on the block's current result label
+    (state["result_widget"]): a tap on the label dispatches one
+    re-run via _interact_dispatch. Called once at first landing
+    and again after every event landing, when the label is new."""
+    label = state.get("result_widget")
+    if label is None:
+        return
+    try:
+        label.bind(on_touch_down=lambda inst, touch: (
+            _interact_dispatch(app, state, touch)))
+    except Exception:
+        pass
+
+
+def _interact_alive(state):
+    """True while a tap may still re-run the block: not stopped
+    and the box is still on a page. The page check
+    (_site_current still the captured page) lives in the callers
+    (_interact_dispatch, _land_interact_run), which have the
+    app; this stays app-free so the state alone decides the
+    rest."""
+    if state.get("stopped"):
+        return False
+    box = state.get("container")
+    if box is None or box.parent is None:
+        return False
+    return True
+
+
+def _interact_dispatch(app, state, touch):
+    """Main-thread tap handler, bound on the result label's
+    on_touch_down: drop the tap unless it landed on the label
+    and the block is alive, on the current page, and idle;
+    otherwise mark busy, count the tap, and spawn a daemon
+    thread for the re-run. Returns True only when a run was
+    dispatched (the touch is consumed); False lets the touch
+    keep propagating (scroll, other handlers).
+
+    Coordinates: the touch arrives in the ScrollView's content
+    frame -- the walk applies no per-hop transform (see
+    MicronRefLabel) -- so the label's local position is the
+    touch minus the label's offset chain up to the ScrollView,
+    NOT touch minus label.x/y (label.x/y are relative to the
+    interact box only, so that subtraction is off by the
+    box/page offsets -- wildly so in y). MicronRefLabel's
+    _content_anchor computes exactly that chain; a label
+    without it falls back to its own x/y. The same anchor math
+    guards the collide check: a bare collide_point would
+    compare content-frame coords against box-relative bounds
+    and almost never collide."""
+    label = state.get("result_widget")
+    if label is None:
+        return False
+    try:
+        anchor = label._content_anchor()
+    except Exception:
+        anchor = None
+    if anchor is None:
+        try:
+            anchor = (label.x, label.y)
+        except Exception:
+            return False
+    try:
+        lx = touch.x - anchor[0]
+        ly = touch.y - anchor[1]
+        width = label.width
+        height = label.height
+    except Exception:
+        return False
+    if lx < 0 or ly < 0 or lx > width or ly > height:
+        return False
+    if not _interact_alive(state):
+        return False
+    expected = state.get("expected")
+    if expected:
+        cur = getattr(app, "_site_current", None)
+        if cur is not None and tuple(cur[:2]) != expected:
+            return False
+    if state.get("busy"):
+        return False
+    state["busy"] = True
+    state["taps"] = state.get("taps", 0) + 1
+    threading.Thread(
+        target=lambda: _interact_run(app, state, lx, ly),
+        daemon=True).start()
+    return True
+
+
+def _interact_run(app, state, x, y):
+    """One tap re-run, on a worker thread: re-run the script
+    with event="tap", the tap position, and the stored state,
+    drain the GPU queue (texture-only, like an animation frame)
+    and the audio queue (saved + auto-played on landing, like
+    the first run), update the stored state by the sticky rule,
+    and land on the main thread. Each run is a fresh
+    run_script call, so it gets a fresh 200,000-step budget and
+    a fresh 10.0 s timeout -- the same limits as the first run.
+    Media bindings are the ones fetched at first render, never
+    re-fetched per tap (see _add_site_script's work())."""
+    landed = {"expected": state.get("expected"), "gpu_notes": [],
+              "gpu_fpath": None, "interact": True,
+              "source": state.get("source"), "cid": state.get("cid"),
+              "media_bindings": state.get("media_bindings") or [],
+              "interact_state": state.get("state", 0.0)}
+    bindings = app._script_bindings(state.get("cid"))
+    bindings = bindings + [["event", "tap"], ["event_x", x],
+                           ["event_y", y],
+                           ["state", state.get("state", 0.0)]] \
+        + (state.get("media_bindings") or [])
+    try:
+        res = app._run_page_script(state.get("source"), bindings)
+    except Exception as e:
+        res = {"ok": 0.0, "result": "runner failed: %s" % e,
+               "out": [], "gpu": []}
+    if not isinstance(res, dict):
+        res = {"ok": 0.0, "result": "runner failed: bad result",
+               "out": [], "gpu": []}
+    landed["result"] = res
+    # Sticky state: a numeric result replaces the stored state;
+    # a non-numeric result (string, list, bool) leaves it
+    # unchanged, so the next tap still sees the last numeric
+    # value. A failing run never touches the state either.
+    if res.get("ok"):
+        val = res.get("result")
+        if isinstance(val, (int, float)) \
+                and not isinstance(val, bool):
+            state["state"] = float(val)
+            landed["interact_state"] = float(val)
+    gpu = res.get("gpu") or []
+    if res.get("ok") and gpu:
+        try:
+            drained = app._drain_page_gpu(gpu)
+        except Exception as e:
+            drained = {"image": None,
+                       "notes": ["GPU output unavailable: %s" % e],
+                       "handled": [], "unhandled": []}
+        if not isinstance(drained, dict):
+            drained = {"image": None, "notes": [],
+                       "handled": [], "unhandled": []}
+        notes = list(drained.get("notes") or [])
+        backend = drained.get("backend")
+        backend_names = {"opengl": "OpenGL ES", "cpu": "CPU"}
+        if (isinstance(backend, str) and backend in backend_names
+                and not any(isinstance(n, str)
+                            and n.startswith("GPU backend:")
+                            for n in notes)):
+            notes.insert(0, "GPU backend: "
+                         + backend_names[backend])
+        unhandled = drained.get("unhandled") or []
+        if unhandled:
+            notes.append("unhandled GPU commands: "
+                         + ", ".join(str(n) for n in unhandled))
+        landed["gpu_notes"] = notes
+        image = drained.get("image")
+        if image is not None:
+            # Texture-only, like an animated frame: the file
+            # save below is for the fullscreen tap only, and a
+            # file-source embed could show the loader-cached
+            # first image instead of this run's.
+            try:
+                landed["gpu_raw"] = image.tobytes()
+                landed["gpu_size"] = image.size
+            except Exception:
+                pass
+            fpath = app._save_gpu_image(image)
+            if fpath:
+                landed["gpu_fpath"] = fpath
+            else:
+                landed["gpu_notes"] = notes + [
+                    "GPU output unavailable: could not save image"]
+    audio = res.get("audio") or []
+    if res.get("ok") and audio:
+        try:
+            drained_a = app._drain_page_audio(audio)
+        except Exception as e:
+            drained_a = {"wav": None, "duration": 0.0,
+                         "count": 0, "handled": [],
+                         "unhandled": [],
+                         "notes": ["Audio output unavailable: "
+                                   "%s" % e]}
+        if not isinstance(drained_a, dict):
+            drained_a = {"wav": None, "duration": 0.0,
+                         "count": 0, "handled": [],
+                         "unhandled": [], "notes": []}
+        notes_a = list(drained_a.get("notes") or [])
+        unhandled_a = drained_a.get("unhandled") or []
+        if unhandled_a:
+            notes_a.append("unhandled audio commands: "
+                           + ", ".join(str(n)
+                                       for n in unhandled_a))
+        landed["audio_notes"] = notes_a
+        try:
+            landed["audio_duration"] = float(
+                drained_a.get("duration") or 0.0)
+        except (TypeError, ValueError):
+            landed["audio_duration"] = 0.0
+        try:
+            landed["audio_count"] = int(
+                drained_a.get("count") or 0)
+        except (TypeError, ValueError):
+            landed["audio_count"] = 0
+        wav = drained_a.get("wav")
+        landed["audio_wav"] = wav if isinstance(wav, bytes) \
+            else None
+        if landed["audio_wav"] is not None:
+            fpath_a = app._save_audio_wav(landed["audio_wav"])
+            if fpath_a:
+                landed["audio_fpath"] = fpath_a
+            else:
+                landed["audio_notes"] = notes_a + [
+                    "Audio output unavailable: could not save audio"]
+    Clock.schedule_once(
+        lambda dt: _land_interact_run(app, state, landed), 0)
+
+
+def _land_interact_run(app, state, landed):
+    """Main-thread landing for one tap re-run: rebuild the
+    block's widgets inside its box from the new run's result.
+    The box stays where the first landing put it; only its
+    children change. The new result label (the error label on
+    a failing run) is re-bound as the tap target, so the block
+    stays tappable after an error; audio auto-plays on each
+    event landing, like the first landing (a tap that plays a
+    note is the point -- the anim "frame 0 only" rule was about
+    a looping animation, not user-initiated taps)."""
+    state["busy"] = False
+    if not _interact_alive(state):
+        return
+    box = state.get("container")
+    if box is None or box.parent is None:
+        return
+    expected = state.get("expected")
+    if expected:
+        cur = getattr(app, "_site_current", None)
+        if cur is not None and tuple(cur[:2]) != expected:
+            return
+    res = landed.get("result") or {}
+    try:
+        widgets = app._script_result_widgets(res, landed)
+        box.clear_widgets()
+        for w in widgets:
+            box.add_widget(w)
+        if widgets:
+            state["result_widget"] = widgets[0]
+            _interact_bind(app, state)
+        audio_row = None
+        for w in widgets:
+            if getattr(w, "_is_script_audio_row", False):
+                audio_row = w
+                break
+        if audio_row is not None:
+            fpath = landed.get("audio_fpath")
+            if fpath:
+                play = getattr(app, "_play_audio", None)
+                started = None
+                if play is not None:
+                    try:
+                        started = play(fpath)
+                    except Exception:
+                        started = None
+                try:
+                    audio_row._audio_started = started is not None
+                except Exception:
+                    pass
+    except Exception as e:
+        print("interact land failed:", repr(e))
+
+
+def _texture_from_raw(raw, size):
+    """A Kivy texture from top-down RGB bytes -- no PNG round-trip.
+
+    ``Texture.create`` + ``blit_buffer`` with the PIL bytes lands
+    pixels identical to the CoreImage PNG path (and no flip: the
+    stored pixels are already top-down). Raises on failure; the
+    caller falls back to the PNG path.
+    """
+    from kivy.graphics.texture import Texture
+    tex = Texture.create(size=size, colorfmt="rgb")
+    tex.blit_buffer(raw, colorfmt="rgb", bufferfmt="ubyte")
+    return tex
+
+
+def _rgb_bytes_to_texture(raw, size):
+    """A Kivy texture from top-down RGB bytes.
+
+    Raw blit first; if that raises (a driver that refuses the
+    blit), fall back to the PNG round-trip (PIL -> PNG bytes ->
+    CoreImage), which is the path this replaced. Raises only when
+    both paths fail, and the caller then falls back further (the
+    file source for frame 0, a stopped loop for later frames).
+    """
+    try:
+        return _texture_from_raw(raw, size)
+    except Exception:
+        from PIL import Image as _PILImage
+        from kivy.core.image import Image as CoreImage
+        import io
+        image = _PILImage.frombytes("RGB", size, raw)
+        return CoreImage(io.BytesIO(_pil_to_png_bytes(image)),
+                         ext="png").texture
 
 
 class SiteMixin:
@@ -390,6 +995,9 @@ class SiteMixin:
         bg = micron_page_bg(blocks, self._site_theme)
         if bg and isinstance(container, SitePage):
             container.bg_color = self._hex6_to_rgba(bg)
+        # The page's media set, computed once per render: every
+        # script block on the page reads the same fetched blobs.
+        media = micron_page_media(blocks)
         for b in blocks:
             t = b["type"]
             if t == "directive":
@@ -405,6 +1013,15 @@ class SiteMixin:
                 container.add_widget(self._micron_label(
                     _escape(b["text"]), code=True))
                 continue
+            if t == "script":
+                self._add_site_script(container, cid, b.get("text") or "",
+                                      lang=b.get("lang", "sanguis"),
+                                      media_ok=media_ok,
+                                      anim=bool(b.get("anim")),
+                                      markup=bool(b.get("markup")),
+                                      interact=bool(b.get("interact")),
+                                      media_ids=media)
+                continue
             runs = b.get("runs") or []
             if len(runs) == 1 and micron_media_target(runs[0].get("link") or ""):
                 if media_ok:
@@ -415,6 +1032,735 @@ class SiteMixin:
             else:
                 container.add_widget(self._micron_label(
                     runs_to_markup(runs, _escape), center=b.get("center")))
+
+    def _script_bindings(self, cid, frame=None):
+        """Bindings injected for a page script: the micron path of the
+        page on screen (from _site_current) and gpu_present, plus the
+        channel name when it is trivially at hand (the main screen's
+        _current_channel is the channel name). The channel binding is
+        omitted when no name is available — never guessed. `frame` is
+        the animation frame (animated blocks only): frame 0 for the
+        first run, N for frame N; one-shot blocks get no `frame`
+        binding at all, so their bindings are byte-identical to
+        before."""
+        page_path = ""
+        cur = getattr(self, "_site_current", None)
+        if cur and cur[0] == cid and len(cur) > 1:
+            page_path = cur[1] or ""
+        bindings = [["page", page_path],
+                    ["gpu_present", sanguis_script.gpu_present_value()]]
+        try:
+            name = getattr(self.root.get_screen("main"),
+                           "_current_channel", None)
+        except Exception:
+            name = None
+        if isinstance(name, str) and name:
+            bindings.append(["channel", name])
+        if frame is not None:
+            bindings.append(["frame", float(frame)])
+        return bindings
+
+    def _script_page_path(self, cid):
+        """The micron path of the page on screen for this channel, or
+        "" when it is not known (direct _micron_blocks_into calls)."""
+        cur = getattr(self, "_site_current", None)
+        if cur and cur[0] == cid and len(cur) > 1:
+            return cur[1] or ""
+        return ""
+
+    def _run_page_script(self, source, bindings):
+        """Seam for page-script execution (tests replace this with a
+        fake): run one script through the Sanguis runner."""
+        return sanguis_script.run_script(source, bindings)
+
+    def _drain_page_gpu(self, queue):
+        """Seam for GPU draining (tests replace this with a fake):
+        drain the interpreter's queued GPU commands into an image +
+        notes. Imported lazily — gpu_drain may not exist on every
+        build, and the import must never break module import."""
+        from gpu_drain import drain_gpu_commands
+        return drain_gpu_commands(queue, width=160, height=120)
+
+    def _drain_page_audio(self, queue):
+        """Seam for audio draining (tests replace this with a fake):
+        drain the interpreter's queued audio commands into WAV
+        bytes + notes. Imported lazily — audio_drain may not exist
+        on every build, and the import must never break module
+        import."""
+        from audio_drain import drain_audio_commands
+        return drain_audio_commands(queue)
+
+    def _save_gpu_image(self, image):
+        """A drained PIL Image -> PNG bytes -> attachments dir; the
+        local path, or None when anything fails. Worker-thread safe
+        (same pattern as _add_site_media's _save_attachment_blob)."""
+        try:
+            save = getattr(self, "_save_attachment_blob", None)
+            if save is None:
+                return None
+            return save(_pil_to_png_bytes(image), "script-gpu.png")
+        except Exception:
+            return None
+
+    def _save_audio_wav(self, wav_bytes):
+        """Drained WAV bytes -> attachments dir as script-audio.wav;
+        the local path, or None when anything fails. Worker-thread
+        safe (same pattern as _save_gpu_image)."""
+        try:
+            save = getattr(self, "_save_attachment_blob", None)
+            if save is None:
+                return None
+            return save(wav_bytes, "script-audio.wav")
+        except Exception:
+            return None
+
+    def _add_site_script(self, container, cid, source, lang="sanguis",
+                         media_ok=True, anim=False, markup=False,
+                         interact=False, media_ids=()):
+        """A `=sanguis script block. Editor preview (media_ok=False)
+        shows the source and never executes it — the media_ok
+        precedent. A non-sanguis lang renders as code too: only the
+        fixed `=sanguis fence ever runs. Live render inserts a
+        placeholder, runs the script on a daemon thread (cf.
+        _add_site_media), and lands the result on the main thread;
+        a stale landing (navigated away, page re-rendered) is a
+        no-op. Non-script content renders immediately; script output
+        fills in on completion. `anim` (a `=sanguis anim block)
+        re-runs the script once per frame with a `frame` binding
+        (frame 0 here, then 1, 2, ... via _anim_tick) and swaps each
+        drained image into the landed embed's texture in place — the
+        page is never re-rendered. The loop only starts when the
+        first run actually lands a GPU image; a block whose script
+        draws nothing animates nothing and behaves one-shot.
+        `markup` (a `=sanguis markup block) re-parses the run's
+        printed lines as micron source on a successful landing
+        (see _markup_result_widgets): the result widget stays, the
+        printed lines become headings, paragraphs, links and media
+        instead of code lines, and any nested script block the
+        output tries to emit is neutralized to literal code, never
+        executed. `interact` (a `=sanguis interact block) re-runs
+        the script when the viewer taps its result label: the
+        first run carries event="load", event_x/event_y 0.0 and
+        state 0.0; each tap re-runs it with event="tap", the tap
+        position in the block's local coordinates, and the stored
+        numeric state (the previous run's numeric result -- a
+        non-numeric result leaves the stored state unchanged, see
+        _interact_run). The landed widgets live in a dedicated box
+        (see _land_site_script / _interact_maybe_start) that each
+        event landing rebuilds in place. A block with any two of
+        anim/markup/interact renders as code, never executed --
+        the parser never emits the combination, and the loop
+        would re-render markup every frame. `media_ids` is the
+        page's media set from
+        micron_page_media (computed once per render by
+        _micron_blocks_into): the worker fetches those blobs once
+        via _fetch_media_bindings and passes them as extra
+        bindings, so media_blob() can read them; animated blocks
+        reuse the same fetched bindings every frame, and interact
+        blocks reuse them on every tap."""
+        if not media_ok or lang != "sanguis":
+            container.add_widget(self._micron_label(
+                _escape(source), code=True))
+            return
+        if not sanguis_script.scripting_available():
+            container.add_widget(self._micron_label(
+                "[i]scripting unavailable on this platform[/i]"))
+            return
+        if anim + markup + interact >= 2:
+            # Defense in depth: the parser never emits a block
+            # with two flags (an opener carrying two suffixes is
+            # not a script block at all), so reaching here means a
+            # direct caller passed two. Fail closed as code.
+            container.add_widget(self._micron_label(
+                _escape(source), code=True))
+            return
+        placeholder = self._micron_label("[i]running script…[/i]")
+        container.add_widget(placeholder)
+        token = object()
+        try:
+            placeholder._script_token = token
+        except Exception:
+            pass
+        bindings = self._script_bindings(cid,
+                                         frame=0.0 if anim else None)
+        if interact:
+            # First run: the "load" event, no tap position yet,
+            # state 0.0 (see _interact_run for the tap bindings).
+            bindings = bindings + [["event", "load"],
+                                   ["event_x", 0.0],
+                                   ["event_y", 0.0],
+                                   ["state", 0.0]]
+        page_path = self._script_page_path(cid)
+        expected = (cid, page_path) if page_path else None
+
+        def work():
+            landed = {"expected": expected, "gpu_notes": [],
+                      "gpu_fpath": None, "anim": anim, "markup": markup,
+                      "interact": interact, "interact_state": 0.0,
+                      "source": source, "cid": cid, "media_bindings": []}
+            # Media first: fetch this page's blobs once (worker
+            # thread, like the media fetch) and pass them as extra
+            # bindings, so media_blob() can read them. Any fetch
+            # failure yields no bindings and the script still runs
+            # (a missing blob answers [] in the script).
+            try:
+                media_bindings = _fetch_media_bindings(self, media_ids)
+            except Exception:
+                media_bindings = []
+            landed["media_bindings"] = media_bindings
+            try:
+                res = self._run_page_script(source,
+                                            bindings + media_bindings)
+            except Exception as e:
+                res = {"ok": 0.0, "result": "runner failed: %s" % e,
+                       "out": [], "gpu": []}
+            if not isinstance(res, dict):
+                res = {"ok": 0.0, "result": "runner failed: bad result",
+                       "out": [], "gpu": []}
+            landed["result"] = res
+            if interact and res.get("ok"):
+                # First run's state: a numeric result becomes
+                # the stored state; a non-numeric result leaves
+                # it at 0.0 (the sticky rule, see _interact_run).
+                val = res.get("result")
+                if isinstance(val, (int, float)) \
+                        and not isinstance(val, bool):
+                    landed["interact_state"] = float(val)
+            gpu = res.get("gpu") or []
+            if res.get("ok") and gpu:
+                try:
+                    drained = self._drain_page_gpu(gpu)
+                except Exception as e:
+                    drained = {"image": None,
+                               "notes": ["GPU output unavailable: %s" % e],
+                               "handled": [], "unhandled": []}
+                if not isinstance(drained, dict):
+                    drained = {"image": None, "notes": [],
+                               "handled": [], "unhandled": []}
+                notes = list(drained.get("notes") or [])
+                backend = drained.get("backend")
+                backend_names = {"opengl": "OpenGL ES", "cpu": "CPU"}
+                # The real drainer already leads its notes with a
+                # "GPU backend: ..." line (richer on fallback: it
+                # names the reason); only add the renderer line
+                # when no such line is present, so the page never
+                # shows the backend twice.
+                if (isinstance(backend, str) and backend in backend_names
+                        and not any(isinstance(n, str)
+                                    and n.startswith("GPU backend:")
+                                    for n in notes)):
+                    notes.insert(0, "GPU backend: "
+                                 + backend_names[backend])
+                unhandled = drained.get("unhandled") or []
+                if unhandled:
+                    notes.append("unhandled GPU commands: "
+                                 + ", ".join(str(n) for n in unhandled))
+                landed["gpu_notes"] = notes
+                image = drained.get("image")
+                if image is not None:
+                    if anim or interact:
+                        # The first frame's raw bytes ride along so
+                        # the landing can build the embed texture
+                        # directly (see _script_result_widgets):
+                        # a `source` would let the AsyncImage
+                        # loader overwrite later frames with this
+                        # first one. No PNG encode here -- the
+                        # file save below still encodes one, for
+                        # the fullscreen tap. An interact block
+                        # is texture-only for the same reason: a
+                        # tap re-run must show its own image, not
+                        # the loader-cached first one.
+                        try:
+                            landed["gpu_raw"] = image.tobytes()
+                            landed["gpu_size"] = image.size
+                        except Exception:
+                            pass
+                    fpath = self._save_gpu_image(image)
+                    if fpath:
+                        landed["gpu_fpath"] = fpath
+                    else:
+                        landed["gpu_notes"] = notes + [
+                            "GPU output unavailable: "
+                            "could not save image"]
+            # Audio drains ONLY here, on the frame-0 landing path:
+            # _anim_tick re-runs the script and drains the GPU
+            # queue per frame but never touches the audio queue, so
+            # a melody plays once when the block lands and a later
+            # (or failing) animation frame never restarts it. A
+            # failing script produces no audio at all, and an empty
+            # queue drains nothing (no note line, no control, no
+            # file). res.get("audio") (never res["audio"]) so a
+            # runner that predates the audio field still works.
+            audio = res.get("audio") or []
+            if res.get("ok") and audio:
+                try:
+                    drained_a = self._drain_page_audio(audio)
+                except Exception as e:
+                    drained_a = {"wav": None, "duration": 0.0,
+                                 "count": 0, "handled": [],
+                                 "unhandled": [],
+                                 "notes": ["Audio output unavailable: "
+                                           "%s" % e]}
+                if not isinstance(drained_a, dict):
+                    drained_a = {"wav": None, "duration": 0.0,
+                                 "count": 0, "handled": [],
+                                 "unhandled": [], "notes": []}
+                notes_a = list(drained_a.get("notes") or [])
+                unhandled_a = drained_a.get("unhandled") or []
+                if unhandled_a:
+                    notes_a.append("unhandled audio commands: "
+                                   + ", ".join(str(n)
+                                               for n in unhandled_a))
+                landed["audio_notes"] = notes_a
+                try:
+                    landed["audio_duration"] = float(
+                        drained_a.get("duration") or 0.0)
+                except (TypeError, ValueError):
+                    landed["audio_duration"] = 0.0
+                try:
+                    landed["audio_count"] = int(
+                        drained_a.get("count") or 0)
+                except (TypeError, ValueError):
+                    landed["audio_count"] = 0
+                wav = drained_a.get("wav")
+                landed["audio_wav"] = wav if isinstance(wav, bytes) \
+                    else None
+                if landed["audio_wav"] is not None:
+                    fpath_a = self._save_audio_wav(landed["audio_wav"])
+                    if fpath_a:
+                        landed["audio_fpath"] = fpath_a
+                    else:
+                        landed["audio_notes"] = notes_a + [
+                            "Audio output unavailable: "
+                            "could not save audio"]
+            Clock.schedule_once(
+                lambda dt: self._land_site_script(
+                    container, placeholder, token, landed), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _land_site_script(self, container, placeholder, token, landed):
+        """Replace a script placeholder with the run's result, on the
+        main thread. No-ops when the page is stale: the viewer
+        navigated away (_site_current moved on from the (cid, path)
+        captured at render), the page re-rendered (the placeholder
+        left its container), or another block's landing already
+        claimed this placeholder (per-block token)."""
+        try:
+            seen = getattr(placeholder, "_script_token", token)
+            if seen is not token:
+                return
+            if placeholder.parent is not container:
+                return
+            expected = landed.get("expected")
+            if expected:
+                cur = getattr(self, "_site_current", None)
+                if cur is not None and tuple(cur[:2]) != expected:
+                    return
+            try:
+                idx = container.children.index(placeholder)
+            except ValueError:
+                return
+            container.remove_widget(placeholder)
+            res = landed.get("result") or {}
+            widgets = self._script_result_widgets(res, landed)
+            # Interact blocks land inside a dedicated box at the
+            # placeholder's index: one re-render target the event
+            # landings rebuild in place (_land_interact_run).
+            # The box sizes to its content like the page itself
+            # (size_hint_y None + minimum_height binding).
+            box = None
+            if landed.get("interact"):
+                box = BoxLayout(orientation="vertical",
+                                size_hint_y=None, spacing=dp(4))
+                box.bind(minimum_height=lambda w, h: setattr(
+                    w, "height", h))
+                for w in widgets:
+                    box.add_widget(w)
+                container.add_widget(box, index=idx)
+            else:
+                # children is newest-first; inserting each widget at the
+                # placeholder's index, in visual (top-to-bottom) order,
+                # puts the group back exactly where the placeholder was.
+                for w in widgets:
+                    container.add_widget(w, index=idx)
+            # Auto-play landed script audio. This landing runs on
+            # the main thread (it arrives via Clock.schedule_once
+            # from the worker), so _play_audio is never called from
+            # the worker thread. _play_audio returns None headless
+            # or with no audio device; the page keeps the note line
+            # and the stop button either way, and the row only
+            # counts as started when playback actually began.
+            audio_row = None
+            for w in widgets:
+                if getattr(w, "_is_script_audio_row", False):
+                    audio_row = w
+                    break
+            if audio_row is not None:
+                fpath = landed.get("audio_fpath")
+                if fpath:
+                    play = getattr(self, "_play_audio", None)
+                    started = None
+                    if play is not None:
+                        try:
+                            started = play(fpath)
+                        except Exception:
+                            started = None
+                    try:
+                        audio_row._audio_started = started is not None
+                    except Exception:
+                        pass
+            if landed.get("anim"):
+                self._anim_maybe_start(container, landed, widgets)
+            if landed.get("interact"):
+                _interact_maybe_start(self, box, landed, widgets)
+        except Exception as e:
+            print("site script land failed:", repr(e))
+
+    def _anim_maybe_start(self, container, landed, widgets):
+        """Start the frame loop for an animated block whose first run
+        landed a GPU image. No image -> no loop: the block stays
+        one-shot. The loop state lives on the embed widget, so the
+        live probe and tests can read frames landed and timing;
+        the first tick is scheduled at the target interval."""
+        emb_cls = globals().get("MessageEmbed")
+        if emb_cls is None:
+            return
+        emb = None
+        for w in widgets:
+            if isinstance(w, emb_cls):
+                emb = w
+                break
+        if emb is None:
+            return
+        state = {"container": container, "cid": landed.get("cid"),
+                 "source": landed.get("source"),
+                 "expected": landed.get("expected"),
+                 "media_bindings": landed.get("media_bindings") or [],
+                 "embed": emb, "frame": 0, "busy": False,
+                 "stopped": False, "landed_frames": 0,
+                 "target": ANIM_FRAME_INTERVAL,
+                 "first_land": time.time(), "last_land": None,
+                 "tick_started": None}
+        try:
+            emb._anim_state = state
+        except Exception:
+            pass
+        self._anim_start(state)
+
+    def _anim_start(self, state):
+        """Arm the loop: create the frame queue and schedule the
+        first tick at the target interval.
+
+        The worker thread itself starts on the first tick (see
+        _anim_tick -> _anim_ensure_worker), not here: a loop
+        whose viewer navigates away before the first tick must
+        never spawn a thread at all, and one daemon thread per
+        animated block then lives as long as frames keep coming,
+        so the GL backend cached on it (thread-local, see
+        gpu_drain.acquire_backend) is reused every frame instead
+        of rebuilt.
+        """
+        state["queue"] = queue.Queue()
+        state["worker"] = None
+        Clock.schedule_once(lambda dt: self._anim_tick(state),
+                            state["target"])
+
+    def _anim_alive(self, state):
+        """True while the loop may keep running: the embed is still
+        in the container it landed in and the viewer is still on
+        the page the block was rendered for. Either check failing
+        means the page was left or re-rendered, so the loop stops."""
+        if state.get("stopped"):
+            return False
+        embed = state.get("embed")
+        if embed is None or embed.parent is not state.get("container"):
+            return False
+        expected = state.get("expected")
+        if expected:
+            cur = getattr(self, "_site_current", None)
+            if cur is not None and tuple(cur[:2]) != expected:
+                return False
+        return True
+
+    def _anim_tick(self, state):
+        """One Clock tick: queue the next frame on the block's
+        worker thread, unless the previous frame is still running
+        — then skip this tick and try again at the target interval.
+        Runs never overlap and never queue up; a slow drain just
+        makes the animation run slower. The worker (started once
+        by _anim_start) re-runs the script with the `frame`
+        binding and lands on the main thread; a tick after the
+        worker exited idle starts a fresh one first, and a busy
+        tick does the same check so an orphaned job can never
+        strand the loop with busy set and no worker to run it."""
+        if not self._anim_alive(state):
+            _anim_stop(state)
+            return
+        if state["busy"]:
+            _anim_ensure_worker(self, state)
+            Clock.schedule_once(lambda dt: self._anim_tick(state),
+                                state["target"])
+            return
+        frame = state["frame"] + 1
+        state["frame"] = frame
+        state["busy"] = True
+        state["tick_started"] = time.time()
+        _anim_ensure_worker(self, state)
+        state["queue"].put(frame)
+
+    def _land_anim_frame(self, state, frame, landed):
+        """Main-thread landing for one animation frame: swap the new
+        image into the embed's texture in place. The page is not
+        re-rendered; the result/out widgets keep frame 0's text.
+        The embed has no `source` (texture-only, so the AsyncImage
+        loader never runs and can never overwrite a later frame
+        with the first one — a late `on_load` clobbers any texture
+        set before it completes); the frame-0 file path lives in
+        `_anim_source` for the fullscreen tap. A frame that fails
+        (runner error, no GPU image) stops the loop and leaves a
+        visible note under the last good frame."""
+        state["busy"] = False
+        if not self._anim_alive(state):
+            _anim_stop(state)
+            return
+        raw = landed.get("raw")
+        if raw is None:
+            _anim_stop(state)
+            err = landed.get("error")
+            if err:
+                try:
+                    label = self._micron_label(
+                        "[i]animation stopped: %s[/i]"
+                        % _escape(str(err)))
+                    container = state["container"]
+                    idx = container.children.index(state["embed"])
+                    container.add_widget(label, index=idx)
+                except Exception:
+                    pass
+            return
+        try:
+            tex = _rgb_bytes_to_texture(raw, landed.get("size"))
+            state["embed"].texture = tex
+        except Exception:
+            _anim_stop(state)
+            return
+        now = time.time()
+        state["landed_frames"] += 1
+        state["last_land"] = now
+        elapsed = now - (state.get("tick_started") or now)
+        delay = _anim_next_delay(state["target"], elapsed)
+        Clock.schedule_once(lambda dt: self._anim_tick(state), delay)
+
+    def _script_result_widgets(self, res, landed):
+        """Widgets replacing a script placeholder after a run: the
+        result on success, the error string on failure, the script's
+        printed lines either way, then the drained GPU image (when
+        there is one) and drain notes. Never blank, never a crash:
+        a bad script lands as an error block, not an empty page. An
+        animated block's image lands texture-only (no `source`), so
+        the AsyncImage loader can never overwrite later frames with
+        the first one; the file path is kept in `_anim_source` for
+        the fullscreen tap. An interact block's image lands
+        texture-only for the same reason (a tap re-run must show
+        its own image), and an interact landing appends a hint
+        line advertising the result as tappable."""
+        widgets = []
+        if res.get("ok"):
+            widgets.append(self._micron_label(
+                "[b]" + _escape(_format_script_value(res.get("result")))
+                + "[/b]"))
+        else:
+            err = res.get("result")
+            widgets.append(self._micron_label(
+                "[b]script error:[/b] "
+                + _escape(str(err) if err is not None
+                          else "unknown error")))
+        if landed.get("markup") and res.get("ok"):
+            # A markup block's printed lines are micron source, not
+            # literal text: re-parse and render them in place of
+            # the code lines (see _markup_result_widgets). The
+            # result widget above stays, and the GPU/audio widgets
+            # below are unaffected. A failing script keeps the code
+            # lines (the error block + lines printed before the
+            # error), so a half-printed emit is never rendered as
+            # markup.
+            widgets.extend(self._markup_result_widgets(res, landed))
+        else:
+            for line in res.get("out") or []:
+                widgets.append(self._micron_label(
+                    _escape(str(line)), code=True))
+        fpath = landed.get("gpu_fpath")
+        if fpath:
+            emb_cls = globals().get("MessageEmbed")
+            if emb_cls is not None:
+                try:
+                    emb = emb_cls()
+                    raw = (landed.get("gpu_raw")
+                           if (landed.get("anim")
+                               or landed.get("interact")) else None)
+                    textured = False
+                    if raw is not None:
+                        try:
+                            emb.texture = _rgb_bytes_to_texture(
+                                raw, landed.get("gpu_size"))
+                            textured = True
+                        except Exception:
+                            textured = False
+                    if textured:
+                        try:
+                            emb._anim_source = fpath
+                        except Exception:
+                            pass
+                    else:
+                        emb.source = fpath
+                    widgets.append(emb)
+                except Exception as e:
+                    widgets.append(self._micron_label(
+                        "[i]GPU output unavailable: %s[/i]"
+                        % _escape(str(e))))
+            else:
+                widgets.append(self._micron_label(
+                    "[i]GPU output unavailable: no image widget[/i]"))
+        for note in landed.get("gpu_notes") or []:
+            widgets.append(self._micron_label(
+                "[i]" + _escape(str(note)) + "[/i]"))
+        # Script audio: only when the frame-0 run drained the audio
+        # queue ("audio_count" in landed). The summary line plus
+        # any drainer notes land like the GPU notes; the stop row
+        # only appears when a WAV file was actually saved (nothing
+        # to stop otherwise). There is deliberately no play button:
+        # playback starts automatically on landing (see
+        # _land_site_script) and stop is the only control.
+        if "audio_count" in landed:
+            try:
+                count = int(landed.get("audio_count") or 0)
+            except (TypeError, ValueError):
+                count = 0
+            try:
+                duration = float(landed.get("audio_duration") or 0.0)
+            except (TypeError, ValueError):
+                duration = 0.0
+            widgets.append(self._micron_label(
+                "[i]audio: %d notes, %.1f s[/i]" % (count, duration)))
+            for note in landed.get("audio_notes") or []:
+                widgets.append(self._micron_label(
+                    "[i]" + _escape(str(note)) + "[/i]"))
+            if landed.get("audio_fpath"):
+                widgets.append(self._script_audio_row())
+        if landed.get("interact"):
+            # The block advertises itself as tappable; the hint
+            # is rebuilt on every event landing along with the
+            # rest of the widgets (see _land_interact_run).
+            widgets.append(self._micron_label(
+                "[i]tap the result to interact[/i]"))
+        return widgets
+
+    def _markup_result_widgets(self, res, landed):
+        """Widgets for a markup block's successful run: the printed
+        lines joined and re-parsed as micron source, rendered into
+        a throwaway container and harvested in visual order. Script
+        blocks in the emitted source are neutralized by
+        micron_parse_emitted (shown as literal code, never
+        executed), so an emitted script can never re-enter the
+        renderer. The throwaway is a plain BoxLayout, not a
+        SitePage, so an emitted `#!bg=` directive cannot restyle
+        the page; links, media and headings otherwise follow the
+        same rules as authored markup. Any failure falls back to
+        the plain code lines, so a bad emit never blanks the
+        landing; empty output renders nothing extra."""
+        lines = res.get("out") or []
+        text = "\n".join(str(line) for line in lines)
+        if not text.strip():
+            return []
+        try:
+            blocks = micron_parse_emitted(text)
+            temp = BoxLayout(orientation="vertical")
+            self._micron_blocks_into(temp, blocks, landed.get("cid"),
+                                     media_ok=True)
+            harvested = list(reversed(temp.children))
+            # Kivy's add_widget refuses a widget that already has a
+            # parent, so detach the harvest from the throwaway
+            # before the landing inserts it into the page.
+            temp.clear_widgets()
+            return harvested
+        except Exception:
+            return [self._micron_label(_escape(text), code=True)]
+
+    def _script_audio_row(self):
+        """The stop control row for landed script audio: a status
+        label plus a stop button in the _AudioAttachRow style. The
+        button stops the currently playing script audio with the
+        AudioRow stop idiom (app._audio_media: stop() + release()
+        if present, then _audio_media None) and resets the row's
+        own labels to their stopped state. When the row leaves its
+        parent (page re-rendered / navigated away) playback stops
+        too, if this row started it — script audio never keeps
+        playing on a page the viewer left. No play button: playback
+        is automatic on landing."""
+        row = BoxLayout(orientation="horizontal", size_hint_y=None,
+                        height=dp(40), spacing=dp(6))
+        row._is_script_audio_row = True
+        row._audio_started = False
+        label = self._micron_label("audio playing")
+        row._audio_label = label
+        row.add_widget(label)
+        try:
+            from client_widgets import _fancy_button
+            btn = _fancy_button("secondary", "stop", font_size=sp(11),
+                                size_hint_x=None, width=dp(48))
+        except Exception:
+            from kivy.uix.button import Button
+            btn = Button(text="stop", size_hint_x=None, width=dp(48))
+        row._stop_button = btn
+
+        def _stop_audio(pressed=None):
+            mp = getattr(self, "_audio_media", None)
+            if mp is not None:
+                try:
+                    mp.stop()
+                    rel = getattr(mp, "release", None)
+                    if rel is not None:
+                        rel()
+                except Exception:
+                    pass
+                try:
+                    self._audio_media = None
+                except Exception:
+                    pass
+            try:
+                row._audio_started = False
+            except Exception:
+                pass
+            try:
+                row._audio_label.text = "audio stopped"
+            except Exception:
+                pass
+            target = pressed if pressed is not None \
+                else getattr(row, "_stop_button", None)
+            if target is not None:
+                try:
+                    fancy = getattr(target, "_fancy_label", None)
+                    if fancy is not None:
+                        fancy.text = "stopped"
+                    elif hasattr(target, "text"):
+                        target.text = "stopped"
+                except Exception:
+                    pass
+
+        row._stop_script_audio = _stop_audio
+        btn.bind(on_release=_stop_audio)
+        row.add_widget(btn)
+
+        def _on_row_parent(inst, parent):
+            # The row left its container: the page was re-rendered
+            # or navigated away. Stop playback if this row started
+            # it; a row that never started anything is a no-op.
+            if parent is None and getattr(inst, "_audio_started",
+                                          False):
+                _stop_audio(getattr(inst, "_stop_button", None))
+
+        row.bind(parent=_on_row_parent)
+        return row
 
     def _open_site_editor(self):
         """Enter the micron editor for the page currently on screen."""
@@ -542,7 +1888,8 @@ class SiteMixin:
 
     def _add_site_media(self, container, cid, run):
         """A media-only line: images render inline (MessageEmbed, bytes
-        fetched over the link), audio/video as a tappable download row."""
+        fetched over the link), every other extension stays a tappable
+        [ref]audio:[/ref] link label, exactly as before."""
         target = (run.get("link") or "").split("`")[0].strip()
         name = target.rsplit("/", 1)[-1] or "media"
         ext = micron_media_target(target)
@@ -555,20 +1902,7 @@ class SiteMixin:
         container.add_widget(emb)
 
         def work():
-            blob = None
-            try:
-                if target.startswith("/file/sites/"):
-                    parts = target.split("/", 4)
-                    if len(parts) == 5:
-                        res = self.guild_api.site_get(parts[3], "/" + parts[4])
-                        if res.get("ok"):
-                            blob = base64.b64decode(res.get("data_b64") or "")
-                else:
-                    raw = self.guild_api.fetch_file(target)
-                    if raw:
-                        blob = raw
-            except Exception as e:
-                print("site media fetch failed:", repr(e))
+            blob = _site_media_blob(self.guild_api, target)
             if not blob:
                 return
             fpath = self._save_attachment_blob(blob, name)
@@ -766,7 +2100,13 @@ if KIVY:
             if self.is_expanded:
                 app.dismiss_fullscreen_image(self)
             else:
-                app.show_fullscreen_image(self.source, embed=self)
+                # Animated embeds carry no `source` (texture-only, so
+                # the loader cannot clobber later frames); the
+                # frame-0 file path lives in _anim_source instead.
+                source = self.source or getattr(self, "_anim_source", "")
+                if not source:
+                    return True
+                app.show_fullscreen_image(source, embed=self)
                 self.is_expanded = True
             return True
 
