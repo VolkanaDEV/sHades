@@ -48,7 +48,7 @@ set_env.RH_DEBUG = 1
 # SDL2-based (sdl2/sdl2_image/sdl2_ttf/sdl2_mixer + libmtdev recipes, which
 # p4a ships by default), and touch input on arm64-v8a needs minapi >= 26 +
 # ndk_api 26, exactly as pinned below. api 33 = modern Play/permission model.
-requirements = python3,kivy,kivymd==2.0.0,pillow==12.2.0,qrcode==8.2,materialyoucolor,materialshapes==0.3,asynckivy==0.6.4,asyncgui==0.6.3,typing-extensions==4.15.0,charset-normalizer==3.4.4,rns==1.1.3,cryptography,pyserial,lxmf==0.9.4,wasmtime==50.0.1,libbz2,liblzma,kivy_garden.zbarcam,pyzbar==0.1.8,xcamera==2019.928,libzbar,libiconv,pyjnius
+requirements = python3,kivy,kivymd==2.0.0,pillow==12.2.0,qrcode==8.2,materialyoucolor,materialshapes==0.3,asynckivy==0.6.4,asyncgui==0.6.3,typing-extensions==4.15.0,charset-normalizer==3.4.4,rns==1.1.3,cryptography,pyserial,lxmf==0.9.4,wasmtime==50.0.1,libbz2,liblzma,kivy_garden.zbarcam,pyzbar==0.1.8,xcamera==2019.928,libzbar,libiconv,opus,pyjnius
 # libbz2 + liblzma: p4a's python3 recipe marks _bz2/_lzma as OPTIONAL
 # opt_depends (pythonforandroid/recipes/python3/__init__.py: opt_depends
 # + the `if library_name in self.ctx.recipe_build_order` check) -- the
@@ -60,15 +60,16 @@ requirements = python3,kivy,kivymd==2.0.0,pillow==12.2.0,qrcode==8.2,materialyou
 # android target with the right flags.
 # VOICE: pyjnius (recipe exists) is the AudioRecord/AudioTrack boundary;
 # RECORD_AUDIO + MODIFY_AUDIO_SETTINGS ride android.permissions. The
-# spec once named `opus` here expecting a p4a opus recipe: there is none
-# at the pinned p4a revision 9562d1b (receipt: its recipe tree has no
-# opus/libopus entry and no recipe mentions opus), so the name fell into
-# p4a's pip group and pip died on "No matching distribution found for
-# opus" (run 45381551657, job 138404504953). libopus.so bring-up is its
-# own task behind one of: a custom p4a recipe, or a prebuilt arm64
-# libopus.so staged like sanguis/bch-android. Until one lands,
-# voice_codec stays off-device by design ("libopus could not be
-# located; voice stays off, everything else runs", voice_codec.py).
+# `opus` name is backed by THIS repo's injected recipe: the pinned p4a
+# revision 9562d1b has no opus recipe of any name (probe receipt in
+# android-ndk/p4a-recipes/opus/__init__.py), so CI copies
+# android-ndk/p4a-recipes/opus into the p4a clone at the pin and the
+# name `opus` resolves to it (opus 1.5.2 from xiph, sha256
+# 65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1). It
+# compiles libopus.so for arm64-v8a and the built_libraries copy packs
+# it as lib/arm64-v8a/libopus.so - the exact nativeLibraryDir name the
+# voice_codec probe appends. A fail-closed gate (build.yml "Verify APK
+# carries libopus.so") refuses any APK without it.
 orientation = portrait
 fullscreen = 0
 android.permissions = INTERNET,ACCESS_NETWORK_STATE,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,CAMERA,RECORD_AUDIO,MODIFY_AUDIO_SETTINGS
