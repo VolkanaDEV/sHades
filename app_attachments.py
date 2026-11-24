@@ -328,6 +328,11 @@ class AttachmentsMixin:
                     print(f"[TRACE] _fetch_attachment.apply: adding embed for {name}", flush=True)
                     dlog(f"_fetch_attachment.apply: adding embed for {name}")
                     self._add_attachment_embed(row, name, blob)
+                    try:
+                        import client_diag
+                        client_diag.report(self, "embed-applied " + (name[:20] or ""))
+                    except Exception:
+                        pass
                 except Exception as e:
                     print("attachment render error:", e)
 

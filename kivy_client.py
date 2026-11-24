@@ -2531,6 +2531,13 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         if BOOT_DEBUG:
             _boot_mark("on_start")
         self._apply_system_gesture_exclusions()
+        # Draw-order + texture instrument (device receipts; tay's order
+        # verdict) with the keyboard-resize texture-rebuild medicine.
+        try:
+            import client_diag
+            client_diag.bind_resize(self)
+        except Exception as e:
+            print("client_diag bind failed:", e, flush=True)
         # 0.36.14: the frame meter (main.py, UI-thread listener) feeds
         # this tick; it pads the chat container so the composer group
         # rides above the keyboard.
