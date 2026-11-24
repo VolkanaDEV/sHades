@@ -40,7 +40,9 @@ from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.screenmanager import Screen
 from kivy.uix.scrollview import ScrollView
-from kivy.uix.textinput import TextInput
+# Blircle kit: tay 2026-11-23 -- text inputs are blircles; the
+# local name TextInput keeps every call site untouched.
+from client_widgets import BlircleTextInput as TextInput
 import ui_fx
 
 # mirrors the server PERMS dict (sHades: view..admin)

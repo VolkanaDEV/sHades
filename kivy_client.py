@@ -97,9 +97,10 @@ try:
     from kivy.uix.filechooser import FileChooserListView
     from kivy.uix.popup import Popup
     from kivy.uix.button import Button
-    from kivy.uix.textinput import TextInput
     from kivy.uix.widget import Widget
-    from kivy.graphics import Color, Ellipse, Line, Rectangle
+    from kivy.graphics import (Color, Ellipse, Line, Rectangle,
+                               StencilPop, StencilPush, StencilUnUse,
+                               StencilUse)
     from kivy.metrics import dp, sp
     KIVY = True
 except Exception as _e:  # pragma: no cover - Kivy missing at import time
@@ -259,7 +260,12 @@ from client_widgets import (  # noqa: E402, F401
     _AudioAttachRow, ImageCache, ContextMenuMixin, ContextMenuOverlay,
     MeshPulse, MeshConstellation, SkeletonRow, FancyMDButton,
     ClickableLabel, ChannelButton, _app_data_dir, cache_dir,
+    blircle, BlircleTextInput,
 )  # noqa: E402, F401
+# Blircle kit: tay 2026-11-23 -- every input box is a blircle; the local
+# name TextInput keeps all call sites untouched (defined after the
+# client_widgets import so the class exists).
+TextInput = BlircleTextInput
 from app_channels import ChannelsMixin  # noqa: E402
 from app_settings import SettingsMixin  # noqa: E402
 from app_site import SiteMixin  # noqa: E402
@@ -499,6 +505,13 @@ if KIVY:
         def __init__(self, **kw):
             super().__init__(**kw)
             with self.canvas.before:
+                # tay 2026-11-23: images are blircles -- the avatars are
+                # discs, so a loaded avatar texture is masked to the same
+                # circle that the letter fallback already draws. The
+                # fallback itself stays inside the mask (pushed first).
+                StencilPush()
+                self._fb_mask = Ellipse(pos=self.pos, size=self.size)
+                StencilUse()
                 self._fb_color = Color(
                     rgba=list(DEFAULT_THEME_COLORS["sidebar_ctrl"]))
                 self._fb_disc = Ellipse(pos=self.pos, size=self.size)
@@ -508,6 +521,8 @@ if KIVY:
                 self._fb_letter_color = Color(rgba=(1, 1, 1, 1))
                 self._fb_letter_rect = Rectangle(texture=None,
                                                  pos=self.pos, size=(0, 0))
+                StencilUnUse()
+                StencilPop()
             self.bind(texture=self._sync_fallback,
                       size=self._sync_fallback, pos=self._sync_fallback,
                       fallback_letter=self._sync_fallback)
@@ -540,6 +555,8 @@ if KIVY:
         def _sync_fallback(self, *args):
             self._fb_disc.pos = self.pos
             self._fb_disc.size = self.size
+            self._fb_mask.pos = self.pos
+            self._fb_mask.size = self.size
             if self.texture is not None:
                 self.color = (1, 1, 1, 1)
                 self._fb_color.a = 0
@@ -2907,12 +2924,15 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         status.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
         box.add_widget(status)
         actions = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
-        save = Button(text="Save kit", background_normal="",
-                      background_color=self.theme_colors["primary"],
-                      color=self.theme_colors["btn_text"])
-        later = Button(text="Skip for now" if onboarding_name is not None else "Close",
-                       background_normal="", background_color=self.theme_colors["sidebar_ctrl"],
-                       color=self.theme_colors["text"])
+        save = blircle(Button(
+            text="Save kit", background_normal="",
+            background_color=[1, 1, 1, 0],
+            color=self.theme_colors["btn_text"]),
+            bg_token="primary", bg_fallback="#FFD54F")
+        later = blircle(Button(
+            text="Skip for now" if onboarding_name is not None else "Close",
+            background_normal="", background_color=[1, 1, 1, 0],
+            color=self.theme_colors["text"]), bg_token="sidebar_ctrl")
         actions.add_widget(save)
         actions.add_widget(later)
         box.add_widget(actions)
@@ -3166,12 +3186,16 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                 chooser.path = os.path.expanduser("~")
             box.add_widget(chooser)
         actions = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
-        restore_btn = Button(text="Choose kit" if self._android_platform() else "Restore selected",
-                             background_normal="", background_color=self.theme_colors["primary"],
-                             color=self.theme_colors["btn_text"])
-        cancel = Button(text="Cancel", background_normal="",
-                        background_color=self.theme_colors["sidebar_ctrl"],
-                        color=self.theme_colors["text"])
+        restore_btn = blircle(Button(
+            text="Choose kit" if self._android_platform()
+            else "Restore selected",
+            background_normal="", background_color=[1, 1, 1, 0],
+            color=self.theme_colors["btn_text"]),
+            bg_token="primary", bg_fallback="#FFD54F")
+        cancel = blircle(Button(
+            text="Cancel", background_normal="",
+            background_color=[1, 1, 1, 0],
+            color=self.theme_colors["text"]), bg_token="sidebar_ctrl")
         actions.add_widget(restore_btn)
         actions.add_widget(cancel)
         box.add_widget(actions)

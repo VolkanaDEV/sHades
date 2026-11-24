@@ -59,6 +59,7 @@ try:
     from kivy.uix.floatlayout import FloatLayout
     from kivy.uix.label import Label
     from kivy.uix.slider import Slider
+    from kivy.uix.textinput import TextInput
     from kivy.uix.widget import Widget
     from kivy.utils import get_color_from_hex
     from kivymd.uix.behaviors.hover_behavior import HoverBehavior
@@ -77,6 +78,7 @@ except Exception as _e:  # pragma: no cover - Kivy missing at import time
     App = _make_kivy_stub("App", _e)
     MDButton = _make_kivy_stub("MDButton", _e)
     HoverBehavior = _make_kivy_stub("HoverBehavior", _e)
+    TextInput = _make_kivy_stub("TextInput", _e)
     ui_fx = None
 
     def _stub_property(*args, **kwargs):
@@ -1455,3 +1457,128 @@ class ChannelButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
         child_at_row = len(buttons) - 1 - target
         grid.remove_widget(self)
         grid.add_widget(self, index=child_at_row)
+
+
+# --- blircle kit ------------------------------------------------------------
+# tay, 2026-11-23: all UI boxes are blircles (round-cornered boxes); some
+# buttons already ride Kivy's rounded atlas texture, so the loose edges are
+# the widgets whose fill was drawn square by hand: text inputs with cleared
+# atlas backgrounds, self-styled buttons with background_normal="", and the
+# square-pixel images inside rounded frames. The kit paints the app's rounded
+# fill UNDER a widget's own drawing (canvas.before) and re-tints live on
+# theme swaps, the same way SitePage keeps its bg painted. Guarded: a missing
+# app, a half-built theme or a stub widget never raises.
+
+_BLIRCLE_INPUT_BG_DEFAULT = "#232833"
+_BLIRCLE_CONTROL_BG_DEFAULT = "#2A3440"
+
+
+def _theme_token(token, fallback):
+    """theme_colors[token] as [r, g, b, a], else the fallback hex.
+
+    Never raises and never returns None: mirrors FancyMDButton._theme_rgba
+    (theme first, DESIGN.md hex second, opaque white last).
+    """
+    try:
+        app = App.get_running_app()
+        colors = getattr(app, "theme_colors", None)
+        if app is not None and colors:
+            value = colors.get(token)
+            if value is not None:
+                return [float(c) for c in list(value)]
+    except Exception:
+        pass
+    try:
+        return list(get_color_from_hex(fallback))
+    except Exception:
+        return [1, 1, 1, 1]
+
+
+class _BlircleSkin(object):
+    """Rounded fill drawn on a widget's canvas.before, theme-bound.
+
+    Instruction refs update on pos/size and on every theme_colors swap,
+    like SitePage._update_bg and PfpImage._sync_fallback. Radius is fixed
+    at construction: blircles are a shape, not a motion.
+    """
+
+    def __init__(self, widget, radius_dp=8, bg_token="input_bg",
+                 bg_fallback=_BLIRCLE_INPUT_BG_DEFAULT):
+        self.widget = widget
+        self.radius = [dp(radius_dp)] * 4
+        self.bg_token = bg_token
+        self.bg_fallback = bg_fallback
+        canvas = getattr(widget, "canvas", None)
+        if not KIVY or canvas is None:
+            self._rect = None
+            return
+        try:
+            app = App.get_running_app()
+            if app is not None:
+                try:
+                    app.bind(theme_colors=self._retint)
+                except Exception:
+                    pass
+            with canvas:
+                self._fill = Color(
+                    rgba=_theme_token(self.bg_token, self.bg_fallback))
+                self._rect = RoundedRectangle(pos=widget.pos,
+                                              size=widget.size,
+                                              radius=self.radius)
+            widget.bind(pos=self._repaint, size=self._repaint)
+        except Exception:
+            self._rect = None
+
+    def _repaint(self, widget, *_a):
+        if self._rect is None:
+            return
+        try:
+            self._rect.pos = widget.pos
+            self._rect.size = widget.size
+        except Exception:
+            pass
+
+    def _retint(self, *_a):
+        if self._rect is None:
+            return
+        try:
+            self._fill.rgba = _theme_token(self.bg_token, self.bg_fallback)
+        except Exception:
+            pass
+
+
+def blircle(widget, radius_dp=8, bg_token="sidebar_ctrl",
+            bg_fallback=_BLIRCLE_CONTROL_BG_DEFAULT):
+    """Attach the app's rounded fill to an existing widget.
+
+    For buttons whose caller already cleared the atlas texture
+    (background_normal=""), the square fill becomes the blircle. A
+    caller that keeps the atlas texture needs no blircle: that texture
+    is already rounded.
+    """
+    widget._blircle_skin = _BlircleSkin(widget, radius_dp=radius_dp,
+                                        bg_token=bg_token,
+                                        bg_fallback=bg_fallback)
+    return widget
+
+
+class BlircleTextInput(TextInput):
+    """TextInput with the app's blircle fill.
+
+    Drop-in for TextInput(...): call sites keep their kwargs. The atlas
+    texture carries a ~2px radius (not a blircle) and the self-styled
+    inputs paint their input_bg square, so the atlas is cleared and the
+    background tint is made transparent; _BlircleSkin paints the rounded
+    input_bg under the text and cursor. On the stub path (tests, no
+    Kivy) the skin construction no-ops and the class behaves like the
+    stub any other imported widget would.
+    """
+
+    def __init__(self, **kw):
+        kw.setdefault("background_normal", "")
+        kw.setdefault("background_active", "")
+        kw.setdefault("background_color", [1, 1, 1, 0])
+        super().__init__(**kw)
+        self._blircle_skin = _BlircleSkin(self, radius_dp=8,
+                                          bg_token="input_bg",
+                                          bg_fallback=_BLIRCLE_INPUT_BG_DEFAULT)

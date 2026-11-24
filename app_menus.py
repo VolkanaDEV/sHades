@@ -13,6 +13,9 @@ from ui_scale import scaled
 import threading
 import time
 from client_util import md_to_kivy
+# Blircle kit: tay 2026-11-23 -- text inputs are blircles; the
+# local name TextInput keeps every call site untouched.
+from client_widgets import BlircleTextInput as TextInput
 
 # Kivy (guarded so the module can be imported for linting without Kivy present)
 try:
@@ -24,7 +27,6 @@ try:
     from kivy.uix.label import Label
     from kivy.uix.popup import Popup
     from kivy.uix.scrollview import ScrollView
-    from kivy.uix.textinput import TextInput
     from kivy.metrics import dp
     from kivy.metrics import sp
     import ui_fx
@@ -636,7 +638,6 @@ class MenusMixin:
         """Popup to add a new server (guild)."""
         from kivy.uix.popup import Popup
         from kivy.uix.boxlayout import BoxLayout
-        from kivy.uix.textinput import TextInput
         from kivy.uix.label import Label
         from kivy.uix.button import Button
         from kivy.metrics import dp, sp

@@ -15,14 +15,40 @@ Supported subset (everything else renders literally):
   `[label`target`vars]    link (vars ignored; target drives navigation)
   `{:/page/x`8`vars}      auto-refresh partial -> rendered as a plain link
   `= ... =                literal block (monospace, unformatted)
+  `=sanguis ... `=        script block (Sanguis source, run on render;
+                          unterminated -> code block, never executed)
+  `=sanguis markup ... `= script block whose printed lines are
+                          re-parsed as micron markup on a successful
+                          run (nested script blocks neutralized, never
+                          executed); `=sanguis anim markup is not a
+                          script block at all, and renders literally
+  `=sanguis interact ... `= script block that re-runs when the viewer
+                          taps its result: the first run carries
+                          event="load", event_x/event_y/state 0.0, and
+                          each tap re-runs it with event="tap", the tap
+                          position in the block's local coordinates,
+                          and the stored numeric state (the previous
+                          run's numeric result, or 0.0). Any opener
+                          carrying two suffixes (anim+markup,
+                          anim+interact, markup+interact, either order)
+                          is not a script block at all.
 Media link targets under /file/... with a media extension render as inline
-embeds in Kivy and stay ordinary links in NomadNet.
+embeds in Kivy and stay ordinary links in NomadNet. A script block may
+also read a page asset by blob id (see micron_page_media): the host
+fetches each /file/attachments/<digest>.<ext> media link on the page
+once per render and injects it as a `media_<digest>` binding the
+script's media_blob() builtin parses.
 """
 import re
 
 MICRON_MEDIA_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp",
                      ".mp3", ".ogg", ".wav", ".flac", ".mp4", ".webm")
 _MICRON_HEX3 = re.compile(r"^[0-9a-fA-F]{3}$")
+# A page asset a script may read by blob id: at most this many
+# /file/attachments/<32-hex digest>.<ext> media links per page
+# (see micron_page_media); the host fetches each once per render.
+MICRON_PAGE_MEDIA_MAX = 8
+_MICRON_ATTACHMENT_FNAME = re.compile(r"^([0-9a-f]{32})\.[a-z0-9]{1,8}$")
 
 
 def micron_hex3(h):
@@ -152,21 +178,71 @@ def micron_parse(text):
       {"type": "sep"}
       {"type": "para", "runs": [...], "center": bool}
       {"type": "code", "text": "..."}
+      {"type": "script", "lang": "sanguis", "text": "..."}
+      {"type": "script", "lang": "sanguis", "text": "...", "anim": True}
+      {"type": "script", "lang": "sanguis", "text": "...", "markup": True}
+      {"type": "script", "lang": "sanguis", "text": "...", "interact": True}
+    A script block opens on a line that is exactly "`=sanguis" and
+    closes on the next line that is exactly "`=". An opener of
+    exactly "`=sanguis anim" marks the block animated: the renderer
+    re-runs it once per frame with a `frame` binding and swaps the
+    drained image in place (see app_site.py). An opener of exactly
+    "`=sanguis markup" marks the block markup-emitting: on a
+    successful run the renderer re-parses the printed lines as
+    micron source (see micron_parse_emitted) instead of showing
+    them as code. An opener of exactly "`=sanguis interact" marks
+    the block interactive: tapping its result re-runs it with
+    event="tap" and the stored state (see app_site.py). An opener
+    carrying two suffixes ("`=sanguis anim markup", "`=sanguis
+    markup anim", "`=sanguis anim interact", "`=sanguis interact
+    anim", "`=sanguis markup interact", "`=sanguis interact
+    markup") is not a script block at all -- it renders as a
+    literal paragraph, like any unknown suffix. An unterminated
+    script block (EOF before the closer) is emitted as a "code"
+    block instead: fail-closed, so partial source is never executed.
     """
     blocks = []
     literal = None
+    literal_type = "code"
+    literal_anim = False
+    literal_markup = False
+    literal_interact = False
     for raw in (text or "").split("\n"):
         if not raw and literal is None:
             continue    # blank line: spacing comes from the layout, not a block
         if literal is not None:
             if raw.strip() == "`=":
-                blocks.append({"type": "code", "text": "\n".join(literal)})
+                if literal_type == "script":
+                    block = {"type": "script", "lang": "sanguis",
+                             "text": "\n".join(literal)}
+                    if literal_anim:
+                        block["anim"] = True
+                    if literal_markup:
+                        block["markup"] = True
+                    if literal_interact:
+                        block["interact"] = True
+                    blocks.append(block)
+                else:
+                    blocks.append({"type": "code", "text": "\n".join(literal)})
                 literal = None
+                literal_anim = False
+                literal_markup = False
+                literal_interact = False
             else:
                 literal.append(raw)
             continue
+        if raw.strip() in ("`=sanguis", "`=sanguis anim",
+                           "`=sanguis markup", "`=sanguis interact"):
+            literal = []
+            literal_type = "script"
+            stripped = raw.strip()
+            literal_anim = stripped.endswith(" anim")
+            literal_markup = stripped.endswith(" markup")
+            literal_interact = stripped.endswith(" interact")
+            continue
         if raw.strip() == "`=":
             literal = []
+            literal_type = "code"
             continue
         if raw.startswith("#!"):
             key, _, value = raw[2:].partition("=")
@@ -189,8 +265,77 @@ def micron_parse(text):
             continue
         blocks.append({"type": "para", "runs": _micron_runs(raw), "center": False})
     if literal is not None:
+        # Unterminated literal: always a code block. A script block
+        # without its closer is partial source and must never execute.
         blocks.append({"type": "code", "text": "\n".join(literal)})
     return blocks
+
+
+def micron_parse_emitted(text):
+    """Parse micron source printed by a page script, with script
+    blocks neutralized: any block the parser would execute is
+    turned into a code block showing the fenced source verbatim
+    (opener with its anim/markup/interact suffix, body, closer), so emitted
+    markup can never run a nested script -- no `=sanguis, anim,
+    markup, or interact block inside emitted output. Headings, paragraphs,
+    links, media, separators and directives pass through exactly
+    as authored markup does. The parser is total, so this never
+    raises; callers still treat a failure as fatal and fall back
+    to plain code."""
+    blocks = micron_parse(text)
+    out = []
+    for b in blocks:
+        if b.get("type") != "script":
+            out.append(b)
+            continue
+        opener = "`=sanguis"
+        if b.get("anim"):
+            opener += " anim"
+        if b.get("markup"):
+            opener += " markup"
+        if b.get("interact"):
+            opener += " interact"
+        out.append({"type": "code",
+                    "text": opener + "\n" + b.get("text", "") + "\n`="})
+    return out
+
+
+def micron_page_media(blocks):
+    """(digest, target) pairs for the page assets a script may read.
+
+    Scans every block's runs, in page order, for a link where
+    micron_media_target(link) is not None AND the target starts
+    with /file/attachments/ AND the filename matches
+    ^([0-9a-f]{32})\\.[a-z0-9]{1,8}$ (the digest is the 32-hex
+    prefix -- the attachment digest algorithm, sha256 hexdigest
+    [:32]). Deduped by digest (first occurrence wins), at most
+    MICRON_PAGE_MEDIA_MAX entries.
+
+    /file/sites/... targets are path-addressed site files, not
+    blobs: they are excluded by design -- a script reads them
+    only through the page's own media embeds, never by blob id.
+    """
+    seen = set()
+    out = []
+    for b in blocks or []:
+        for run in b.get("runs") or []:
+            if len(out) >= MICRON_PAGE_MEDIA_MAX:
+                return out
+            link = (run.get("link") or "").split("`")[0].strip()
+            if not link.startswith("/file/attachments/"):
+                continue
+            if micron_media_target(link) is None:
+                continue
+            m = _MICRON_ATTACHMENT_FNAME.match(
+                link.rsplit("/", 1)[-1])
+            if m is None:
+                continue
+            digest = m.group(1)
+            if digest in seen:
+                continue
+            seen.add(digest)
+            out.append((digest, link))
+    return out
 
 
 def micron_page_bg(blocks, theme=None):
