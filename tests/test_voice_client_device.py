@@ -93,6 +93,23 @@ def mic_probe():
     check("mic capture probe", ok,
           "frames=%d rms=%.1f dBFS (live mic: expect loud)"
           % (len(frames), rms))
+    # codec-rate parity: every frame the mic hands is codec-shaped and
+    # encodes without raising (the 16k-default defect this catches)
+    if frames:
+        codec = voice_codec.VoiceCodec()
+        sizes_ok = all(len(f) == voice_codec.FRAME_BYTES for f in frames)
+        check("mic frame geometry (codec rate)",
+              sizes_ok and len(frames[0]) == voice_codec.FRAME_BYTES,
+              "frame0=%dB want=%d" % (len(frames[0]),
+                                      voice_codec.FRAME_BYTES))
+        try:
+            codec.encode(frames[-1])
+            check("mic frame encodes at codec rate", True)
+        except Exception as e:
+            check("mic frame encodes at codec rate", False, repr(e))
+    else:
+        check("mic frame geometry (codec rate)", False,
+              "no mic frames to check")
 
 
 def sink_loopback():
@@ -102,7 +119,9 @@ def sink_loopback():
     except Exception as e:
         check("speaker device open", False, repr(e))
         return
-    check("speaker device open", True, "default output, 16kHz mono s16")
+    khz = voice_codec.SAMPLE_RATE // 1000
+    check("speaker device open", True,
+          "default output, %dkHz mono s16" % khz)
 
     hub = HubFace()
     transport = FakeTransport()

@@ -16,11 +16,18 @@ import collections
 import threading
 import time
 
+import voice_codec
 import pyaudio
 
 # must equal app_voice.AUDIO_RATE / PACKET_FRAMES pacing; 20ms frames
 FRAME_MS = 20
-FRAMES_PER_CHUNK = 320          # 16kHz * 0.02s (bytes: *2, s16 mono)
+# Frame geometry rides voice_codec, not the mic rate: the engine's
+# source contract is one codec-rate frame per poll (960 samples at
+# 48 kHz, 1920 bytes). The first cut used 16 kHz mic defaults and a
+# 640-byte frame, which every codec.encode call would have rejected;
+# the device gate's sine loopback never caught it because its source
+# generates 48 kHz frames itself.
+FRAMES_PER_CHUNK = 960          # 48 kHz * 0.02 s (bytes: *2, s16 mono)
 FRAME_BYTES = FRAMES_PER_CHUNK * 2
 
 
@@ -31,7 +38,8 @@ class VoiceDeviceError(Exception):
 class MicSource:
     """One 20ms frame (640B) per poll(); captures continuously."""
 
-    def __init__(self, device=None, rate=16000, channels=1):
+    def __init__(self, device=None, rate=voice_codec.SAMPLE_RATE,
+                 channels=voice_codec.CHANNELS):
         self.pa = pyaudio.PyAudio()
         spec = _pick(self.pa, want_output=False, device=device)
         self._ring = collections.deque()   # 20ms frames as bytes
@@ -75,7 +83,8 @@ class SpeakerSink:
     """Queues decoded PCM; one drain thread writes the device stream.
     __call__(pcm) is the engine sink callback."""
 
-    def __init__(self, device=None, rate=16000, channels=1):
+    def __init__(self, device=None, rate=voice_codec.SAMPLE_RATE,
+                 channels=voice_codec.CHANNELS):
         self.pa = pyaudio.PyAudio()
         spec = _pick(self.pa, want_output=True, device=device)
         self._stream = self.pa.open(

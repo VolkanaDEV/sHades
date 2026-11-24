@@ -149,9 +149,16 @@ class VoicePanelMixin:
             engine.set_dest(my_dest)
             engine.set_link_factory(lane.dial_factory(engine))
             mic = speaker = None
+            # item 7: AudioRecord/AudioTrack on the platform; the
+            # contracts are identical, so the engine never changes
             try:
-                mic = client_voice.MicSource()
-                speaker = client_voice.SpeakerSink()
+                if is_android():
+                    import client_voice_android as dev
+                    mic = dev.AndroidMic()
+                    speaker = dev.AndroidSpeaker()
+                else:
+                    mic = client_voice.MicSource()
+                    speaker = client_voice.SpeakerSink()
             except client_voice.VoiceDeviceError as e:
                 print("voice devices unavailable (listen-only): %r" % e)
             client_voice.bind(engine, mic=mic, speaker=speaker)
@@ -221,5 +228,9 @@ except Exception:            # pragma: no cover - lint without kivy
     Clock = None
 try:
     import RNS
+    from RNS.vendor.platformutils import is_android
 except Exception:            # pragma: no cover
     RNS = None
+
+    def is_android():            # no RNS here: assume not Android
+        return False

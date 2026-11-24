@@ -30,6 +30,30 @@ class VoiceCodecUnavailable(Exception):
     """libopus could not be located; voice stays off, everything else runs."""
 
 
+ANDROID_ENV = ("ANDROID_ARGUMENT" in os.environ
+               or os.environ.get("KIVY_BUILD_ANDROID") == "1")
+
+
+def _android_native_lib_dir():
+    """This app's nativeLibraryDir, or None off the platform.
+
+    Android has no ldconfig: ctypes.util.find_library cannot see the
+    .so files p4a shipped inside the APK's lib dir. PythonActivity
+    (org.kivy.android) carries the running context, whose
+    applicationInfo.nativeLibraryDir is the directory the process's
+    LD_LIBRARY_PATH already searches at boot.
+    """
+    if not ANDROID_ENV:
+        return None
+    try:
+        from jnius import autoclass
+        pyact = autoclass("org.kivy.android.PythonActivity")
+        info = pyact.mActivity.getApplicationInfo()
+        return getattr(info, "nativeLibraryDir", None)
+    except Exception:
+        return None
+
+
 def _opus_lib_path():
     """Find libopus on this platform.
 
@@ -54,6 +78,11 @@ def _opus_lib_path():
         candidates.append(os.path.join(exe_dir, "share", "sdl2", "bin"))
     names = ["libopus-0.dll", "libopus.so.0", "libopus.0.dylib",
              "libopus-0.so", "libopus.dll"]
+    app_dir = _android_native_lib_dir()
+    if app_dir:
+        candidates.append(app_dir)
+        if "libopus.so" not in names:
+            names = names + ["libopus.so"]
     for d in candidates:
         for n in names:
             p = os.path.join(d, n)
