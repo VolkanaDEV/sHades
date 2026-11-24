@@ -181,6 +181,40 @@ def strip_mask_stencils(app):
               % (stripped, len(widgets)), flush=True)
 
 
+def _overlay_receipt(app, tag, parts):
+    """Receipts for tay's two observations, no inference:
+    (a) live ModalView/Popup instances (popups not being destroyed?);
+    (b) AsyncImage census with load state (images arriving late into
+    an already-composed frame are the crossing's trigger side)."""
+    try:
+        from kivy.uix.modalview import ModalView
+        from kivy.uix.image import AsyncImage
+        live = []
+        for w in list(Window.children):
+            if isinstance(w, ModalView):
+                live.append("%s@win%d dismissable=%s"
+                            % (type(w).__name__,
+                               len(Window.children),
+                               getattr(w, "auto_dismiss", "?")))
+        for w in [_w for _w in _walk_modal(app.root)]:
+            if isinstance(w, ModalView):
+                live.append("%s@root parent=%s"
+                            % (type(w).__name__, w.parent is not None))
+        parts.append("popups:%d %s" % (len(live), live[:6]))
+        imgs = []
+        _walk_widgets(app.root, imgs, cap=1600)
+        loaded = [i for i in imgs if getattr(i, "texture", None) is not None]
+        parts.append("images:%d loaded:%d" % (len(imgs), len(loaded)))
+    except Exception as e:
+        parts.append("overlayerr:%s" % e)
+
+
+def _walk_modal(widget, cap=1600):
+    out = []
+    _walk_widgets(widget, out, cap)
+    return out
+
+
 def report(app, tag):
     """One receipt line: panel paint chains + non-empty blank census."""
     try:
@@ -208,6 +242,7 @@ def report(app, tag):
         for k in TARGET_IDS:
             if k in chains:
                 parts.append("%s=%s" % (k, chains[k]))
+        _overlay_receipt(app, tag, parts)
         print("DIAG %s %s" % (tag, " | ".join(parts)), flush=True)
     except Exception as e:
         print("DIAG %s error:%s" % (tag, e), flush=True)
