@@ -39,7 +39,7 @@ import client_util
 # ---------------------------------------------------------------------------
 # P11 version bridge: the running build knows its own version.
 # ---------------------------------------------------------------------------
-APP_VERSION = "0.36.24"
+APP_VERSION = "0.36.25"
 
 # buildozer.spec, kivy_client.APP_VERSION and sHades.SERVER_VERSION must all
 # match (tests/test_update_meta.py keeps them in lockstep). On-device the
@@ -2740,7 +2740,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
                              and 0 < len(s["hub_address"]) <= 256]
             metadata_ok = self._save_servers() and metadata_ok
             self._active_server_idx = 0 if self._servers else -1
-        # tay's transfer contract (0.36.24): the restored device resumes
+        # tay's transfer contract (0.36.24, re-applied at 0.36.25): the restored device resumes
         # exactly like the device the kit came from. The kit's
         # last-active guild becomes the saved session, so the next boot
         # reconnects instead of re-staging, and the portable profile
@@ -2787,13 +2787,27 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
             pass
 
     def _enter_restored_account(self):
-        """tay's transfer contract (0.36.24): a restored kit whose server
+        """tay's transfer contract (0.36.24, re-applied at 0.36.25): a restored kit whose server
         row is complete transfers the account ALIVE - dial the kit's
         last-active guild exactly as the device it came from. Returns
-        True when the attempt started."""
+        True when an attempt started.
+
+        P11h (device receipt, 0.36.24: the import parked on connect with
+        the hub field empty and 'Identity recovered. Connect to a saved
+        guild.'): a restored kit with NO dialable server row returned
+        False here and left the member on the connect screen - hub
+        blank, Connect disabled - while the restart path auto-dialed
+        the default hub through the portable-profile fallthrough
+        (_connect_default_hub's 'user' fallback). Post-import now
+        behaves exactly like post-restart: dial the default hub through
+        connect_to_guild (its Clock law keeps RNS.Reticulum on the main
+        thread even when the SAF result callback is not); the restored
+        identity rides _init_identity_and_lxmf unchanged."""
         first = self._servers[0] if self._servers else None
         if not (first and first.get("hub_address")):
-            return False
+            username = (self.username or "").strip() or "user"
+            self.connect_to_guild(DEFAULT_HUB_ADDRESS, username)
+            return True
         port = first.get("port")
         if not (isinstance(port, int) and port > 0):
             return False
@@ -5479,6 +5493,12 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
         # Allow attachment-only messages (no text) when a file is pending.
         if not text and not getattr(self, "_pending_attachment", None):
             return
+        # fold-14 P11g: capture the reply BEFORE reply_wire consumes the
+        # card, and keep the RAW text: the restore hands back what the
+        # member typed, and the re-staged card re-applies the prefix on
+        # the retry (no double prefix ever lands on the wire).
+        old_reply = self._pending_reply
+        raw_text = text
         if self._pending_reply:
             text = reply_wire(*self._pending_reply, text)
             self.cancel_reply()
@@ -5488,7 +5508,38 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
         # worker's flight must not mutate what this one posts.
         att = getattr(self, "_pending_attachment", None)
 
+        def _send_failed(reason):
+            """No send failure costs the member their words (P11g):
+
+            a dead link raised out of the old worker with no except while
+            the composer had already cleared - text lost, no status, on
+            every failure leg. Now: the raw pre-reply_wire text returns
+            to the composer, the consumed reply card re-stages, the
+            attachment stays pending, and the status line says so. The
+            field write rides the Clock (worker-thread law)."""
+            def restore(dt=None):
+                try:
+                    inp.text = raw_text
+                except Exception:
+                    pass
+                if old_reply:
+                    self._pending_reply = old_reply
+                    self.reply_draft = "Replying to @%s · %s" % (
+                        old_reply[0], " ".join(old_reply[1].split())[:80])
+                self._set_status(
+                    "send failed: %s (text restored)" % str(reason)[:80])
+            Clock.schedule_once(restore, 0)
+
         def work():
+            try:
+                _work_inner()
+            except Exception as exc:
+                # the last-ditch net: a raise here is a dead link or an
+                # unexpected error - lose nothing, restore via the Clock
+                self._up_active = False
+                _send_failed(str(exc)[:120])
+
+        def _work_inner():
             atts_req = None
             atts_render = None
             if att:
@@ -5516,11 +5567,9 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
                 finally:
                     self._up_active = False
                 if not up.get("ok"):
-                    Clock.schedule_once(
-                        lambda dt: self._set_status(
-                            "attach upload failed (%s): %s"
-                            % (up.get("phase", "init"),
-                               up.get("error", "unknown"))[:80]), 0)
+                    _send_failed("attach upload (%s): %s"
+                                 % (up.get("phase", "init"),
+                                    up.get("error", "unknown")[:80]))
                     return
                 atts_req = [{"blob_id": up.get("blob_id"),
                              "name": name, "mime": mime}]
@@ -5545,8 +5594,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
                 self._pending_attachment = None
             else:
                 err = res.get("error", "unknown")
-                Clock.schedule_once(
-                    lambda dt: self._set_status("send failed: %s" % err), 0)
+                _send_failed(err)
         threading.Thread(target=work, daemon=True).start()
 
     def _on_key_down(self, window, key, scancode, codepoint, modifier):
