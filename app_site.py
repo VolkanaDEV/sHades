@@ -24,7 +24,6 @@ try:
     from kivy.uix.behaviors import ButtonBehavior
     from kivy.clock import Clock
     from kivy.graphics import Color
-    from kivy.uix.label import Label
     from kivy.properties import ListProperty
     from kivy.graphics import Rectangle
     from kivy.uix.widget import Widget
