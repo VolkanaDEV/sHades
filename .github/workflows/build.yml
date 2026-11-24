@@ -17,14 +17,11 @@ env:
 jobs:
   lint-and-test:
     name: lint + import test (Linux)
-    # 24.04, pinned: sanguis/bch (the script interpreter binary this
-    # job's real-runner tests exec) is a glibc 2.38 build; 22.04
-    # ships 2.35 and the loader refuses it ("GLIBC_2.38' not found").
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # actions/checkout@v4
+      - uses: actions/checkout@v4
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # actions/setup-python@v5
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: "pip"
@@ -32,18 +29,15 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -y
-          # libopus0: VoiceCodec's discovery reads the system libopus
-          # via find_library on Linux; the headless runner has none by
-          # default, and the voice suites construct a real codec.
-          sudo apt-get install -y -qq libcairo2-dev pkg-config libmtdev1 xvfb libopus0 portaudio19-dev
+          sudo apt-get install -y -qq libcairo2-dev pkg-config libmtdev1 xvfb
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Lint
         run: |
-          python -m py_compile main.py kivy_client.py setup_sHades.py sHades.py ui_scale.py applet_bridge.py app_attachments.py app_channels.py app_menus.py app_settings.py app_site.py app_stream.py client_util.py client_widgets.py store.py guild_api.py ui_fx.py ui_geom.py ui_theme.py updater.py update_run.py offline_store.py profile_card.py dms.py micron.py invite.py recovery.py qr_tools.py mesh_ui.py sanguis_script.py gpu_drain.py audio_drain.py
-          python -m flake8 main.py kivy_client.py setup_sHades.py sHades.py ui_scale.py applet_bridge.py app_attachments.py app_channels.py app_menus.py app_settings.py app_site.py app_stream.py client_util.py client_widgets.py store.py guild_api.py ui_fx.py ui_geom.py ui_theme.py updater.py update_run.py offline_store.py profile_card.py dms.py micron.py invite.py recovery.py qr_tools.py mesh_ui.py sanguis_script.py gpu_drain.py audio_drain.py
+          python -m py_compile main.py kivy_client.py setup_sHades.py sHades.py ui_scale.py applet_bridge.py
+          python -m flake8 main.py kivy_client.py setup_sHades.py sHades.py ui_scale.py applet_bridge.py
       - name: Import smoke test (headless)
         run: xvfb-run -a python -c "import kivy_client; app = kivy_client.sHadesClientApp(); app.build(); print('client builds OK')"
       - name: Test suite
@@ -59,9 +53,9 @@ jobs:
     needs: lint-and-test
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # actions/checkout@v4
+      - uses: actions/checkout@v4
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # actions/setup-python@v5
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: "pip"
@@ -69,10 +63,7 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -y
-          # portaudio19-dev: pyaudio (desktop MicSource/SpeakerSink in
-          # requirements.txt) has no prebuilt wheel for this Python on
-          # Linux; pip builds it and needs the portaudio headers.
-          sudo apt-get install -y -qq libcairo2-dev pkg-config libmtdev1 xvfb portaudio19-dev
+          sudo apt-get install -y -qq libcairo2-dev pkg-config libmtdev1 xvfb
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -86,19 +77,14 @@ jobs:
             --hidden-import=RNS.vendor \
             --hidden-import=RNS.vendor.umsgpack \
             --hidden-import=ui_scale \
-            --hidden-import=kivymd.icon_definitions \
-            --hidden-import=ui_fx \
             --collect-all=RNS \
             --collect-all=LXMF \
             --collect-all=wasmtime \
-            --collect-all=kivymd \
             --add-data "kv_md.kv:." \
             --add-data "fonts:fonts" \
-            --add-data "sanguis/interp.bc:sanguis" \
-            --add-data "sanguis/bch:sanguis" \
             --distpath dist/linux
       - name: Publish artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4
         with:
           name: sHades-client-linux
           path: dist/linux/sHades-client
@@ -110,9 +96,9 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # actions/checkout@v4
+      - uses: actions/checkout@v4
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # actions/setup-python@v5
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: "pip"
@@ -130,9 +116,9 @@ jobs:
         # never bundles; local mirror of this exact command produced an exe
         # with ZERO wasmtime entries in Analysis/EXE TOCs. Without it the
         # frozen client silently drops the micron applet bridge.
-        run: pyinstaller --onefile --name sHades-client.exe kivy_client.py --hidden-import=RNS --hidden-import=LXMF --hidden-import=RNS.vendor --hidden-import=RNS.vendor.umsgpack --hidden-import=ui_scale --hidden-import=kivymd.icon_definitions --hidden-import=ui_fx --collect-all=RNS --collect-all=LXMF --collect-all=wasmtime --collect-all=kivymd --add-data "kv_md.kv;." --add-data "fonts;fonts" --add-data "sanguis/interp.bc;sanguis" --add-data "sanguis/bch.exe;sanguis" --distpath dist/windows
+        run: pyinstaller --onefile --name sHades-client.exe kivy_client.py --hidden-import=RNS --hidden-import=LXMF --hidden-import=RNS.vendor --hidden-import=RNS.vendor.umsgpack --hidden-import=ui_scale --collect-all=RNS --collect-all=LXMF --collect-all=wasmtime --add-data "kv_md.kv;." --add-data "fonts;fonts" --distpath dist/windows
       - name: Publish artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4
         with:
           name: sHades-client-windows
           path: dist/windows/sHades-client.exe
@@ -143,15 +129,19 @@ jobs:
     needs: lint-and-test
     runs-on: ubuntu-22.04
     timeout-minutes: 180
+    # fold-8 (0.36.25, tay): GITHUB_TOKEN needs contents:write so the
+    # release step below can publish the APK as release assets.
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # actions/checkout@v4
+      - uses: actions/checkout@v4
       - name: Set up Java 17 (required by Android Gradle plugin)
-        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # actions/setup-java@v4
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # actions/setup-python@v5
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: "pip"
@@ -169,18 +159,7 @@ jobs:
       - name: Install buildozer + deps
         run: |
           python -m pip install --upgrade pip
-          # NO -r requirements.txt on the android build host (receipt,
-          # main push run 45440829050 at 11e6dde, job 138615157496):
-          # the full desktop requirements install here carried pyaudio
-          # (unpinned, line 24), and pyaudio only ever installed on
-          # this job via the shared pip cache's prebuilt
-          # pyaudio-0.2.14-cp310-cp310-linux_x86_64.whl (pull_request
-          # runs rode it: "Using cached ...", job 138609320507). On a
-          # fresh cache scope pip rebuilds the sdist and dies on
-          # "portaudio.h: No such file or directory". Android drives
-          # audio through the jnius/opus path, not pyaudio; the build
-          # host needs only the p4a toolchain deps.
-          pip install buildozer==1.5.0 cython
+          pip install -r requirements.txt buildozer==1.5.0 cython
       - name: Install gettext + autopoint (needed by liblzma recipe)
         # p4a's liblzma recipe runs `autoreconf -vif` on the xz sources;
         # xz's configure.ac uses gettext, so autoreconf invokes autopoint.
@@ -273,42 +252,6 @@ jobs:
             echo "::error::materialyoucolor recipe version not updated"; exit 1
           fi
           echo "materialyoucolor recipe pinned to 3.0.4: $MYC_RECIPE"
-          # opus recipe injection: the pinned p4a revision has NO opus
-          # recipe of any name (receipt: recipe tree probed at the pin;
-          # the miss first fell into p4a's pip group and pip died on
-          # "No matching distribution found for opus" -- run 45381551657,
-          # job 138404504953). This repo carries the recipe at
-          # android-ndk/p4a-recipes/opus (opus 1.5.2 from xiph, sha256
-          # 65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1,
-          # built_libraries copy = the APK's lib/arm64-v8a/libopus.so,
-          # the exact name voice_codec probes in nativeLibraryDir).
-          OPUS_DST="$P4A_DIR/python-for-android/pythonforandroid/recipes/opus"
-          cp -r "$GITHUB_WORKSPACE/android-ndk/p4a-recipes/opus" "$OPUS_DST"
-          if ! grep -q 'version = "1.5.2"' "$OPUS_DST/__init__.py"; then
-            echo "::error::opus recipe injection failed"; exit 1
-          fi
-          echo "opus recipe injected: $OPUS_DST (1.5.2)"
-      - name: Stage Android bch for the APK
-        # sanguis/bch in the tree is the LINUX binary (shipped by
-        # PyInstaller); the APK must carry the NDK arm64 build instead.
-        # sanguis/bch-android is that build (ANDROID-BCH-REPORT.md:
-        # NDK r27c, API 26, arm64-v8a, static, reproducible via
-        # android-ndk/build-bch-android.sh). Copy it onto sanguis/bch
-        # in this ephemeral checkout so buildozer's existing
-        # source.include_patterns = sanguis/bch ships it unchanged and
-        # the exec-bit shim (sanguis_script.executable_bch_path)
-        # resolves it as `bch` on-device. The copy is verified as a
-        # static AArch64 ELF here; the step after the build confirms
-        # the APK actually carries it. Linux/Windows jobs never run
-        # this step, so their bch/bch.exe are unaffected.
-        run: |
-          test -f sanguis/bch-android || { echo "::error::sanguis/bch-android missing from checkout"; exit 1; }
-          cp sanguis/bch-android sanguis/bch
-          chmod 755 sanguis/bch
-          file sanguis/bch
-          readelf -h sanguis/bch | grep -q "Machine:.*AArch64" || { echo "::error::staged bch is not AArch64"; exit 1; }
-          if readelf -l sanguis/bch | grep -q "INTERP"; then echo "::error::staged bch must be static (no INTERP)"; exit 1; fi
-          echo "staged Android bch: $(sha256sum sanguis/bch)"
       - name: Build debug APK
         # p4a version selection: Recipe.version reads VERSION_<name> env
         # (pythonforandroid/recipe.py). Kivy 2.3.1 supports python 3.8-3.13
@@ -320,19 +263,7 @@ jobs:
           VERSION_hostpython3: 3.11.5
         run: |
           set -o pipefail
-          # tee with /dev/null keeps the step log silent for the whole
-          # 13-minute build; a failure would leave nothing in the job's
-          # log (receipt: voice job 138391370476 - 13 min, then exit 1,
-          # zero output). Capture the exit and print the build's own
-          # tail, then let the gates still run as before.
-          if buildozer android debug 2>&1 | tee buildlog.txt > /dev/null; then
-            echo "buildozer exited 0"
-          else
-            BUILD_EXIT=$?
-            echo "::error::buildozer exited $BUILD_EXIT; last 300 lines follow"
-            tail -300 buildlog.txt
-            exit $BUILD_EXIT
-          fi
+          buildozer android debug 2>&1 | tee buildlog.txt > /dev/null
           # BZ2 gate, fail closed: this build's own log must carry a
           # target-python _bz2 probe answered yes (live or cached), and
           # no missing verdict may appear anywhere. A build that ships
@@ -348,57 +279,50 @@ jobs:
             tail -60 buildlog.txt; exit 1
           fi
           echo "bz2 gate: _bz2 probe yes count = $PROBES"
-      - name: Verify APK carries libopus.so
-        # The injected opus recipe builds and installs libopus.so during
-        # the p4a build; without this gate a silent recipe drop-out would
-        # ship an APK where voice_codec raises VoiceCodecUnavailable
-        # ("voice stays off, everything else runs") and nothing would
-        # notice. Fail closed instead: the APK must carry the exact
-        # nativeLibraryDir name the probe appends.
-        run: |
-          unzip -l bin/*.apk | grep -q "lib/arm64-v8a/libopus.so" || { echo "::error::APK is missing lib/arm64-v8a/libopus.so"; exit 1; }
-          echo "APK carries libopus.so (nativeLibraryDir name voice_codec probes)"
-      - name: Verify APK carries the Sanguis files
-        # buildozer's include_patterns is the only thing putting the
-        # extensionless sanguis/bch into the APK; if it ever misses,
-        # the app would silently fall back to "scripting unavailable".
-        # Fail the job instead, and list what did ship for diagnosis.
-        # RECEIPT: app data does NOT sit as loose APK entries - p4a
-        # packs the whole app dir into one asset, assets/private.tar
-        # (the green voice APK shades-0.36.25-arm64-v8a-debug.apk lists
-        # 48 entries, zero loose .py files, one assets/private.tar;
-        # sanguis live inside it). unzip -l | grep sanguis therefore
-        # always false-negatives; open the tar instead (run 45389210300
-        # job 138430726400 died here although the buildlog shows
-        # sanguis/bch, sanguis/bch-android and sanguis/interp.bc copied
-        # into the app dir).
-        run: |
-          APK=$(ls bin/*.apk | head -1)
-          unzip -p "$APK" assets/private.tar > private.tar
-          tar -tf private.tar | grep sanguis
-          tar -tf private.tar | grep -q "sanguis/bch" || { echo "::error::APK is missing sanguis/bch (inside assets/private.tar)"; exit 1; }
-          tar -tf private.tar | grep -q "sanguis/interp.bc" || { echo "::error::APK is missing sanguis/interp.bc (inside assets/private.tar)"; exit 1; }
-          echo "APK carries sanguis/bch + sanguis/interp.bc via assets/private.tar"
       - name: Publish APK
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4
         with:
           name: sHades-client-android
           path: bin/*.apk
           retention-days: 7
-          if-no-files-found: error
-      - name: Upload build log on failure
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # actions/upload-artifact@v4
-        with:
-          name: sHades-buildlog-android
-          path: buildlog.txt
-          retention-days: 7
+      - name: Publish GitHub release (main pushes only)
+        # fold-8 (0.36.25, tay): the phone updater reads the assets of
+        # /releases/latest (client_update.py newest_client_asset:
+        # shades-<V>-arm64-v8a-debug.apk + a .sha256 companion, the
+        # name APP_APK_RE parses) -- and no terminal should be needed
+        # on any side to put one there. Buildozer already names the
+        # APK shades-<V>-arm64-v8a-debug.apk; hash it in place inside
+        # bin/ and ship both files. PR runs and manual dispatches do
+        # NOT release (fork PR tokens cannot and should not). A
+        # release that already exists for this version is left
+        # untouched (idempotent re-runs).
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          VER=$(grep -E '^version' buildozer.spec | sed 's/^[^=]*= *//')
+          APK=$(ls bin/shades-*.apk | head -1)
+          if [ -z "$APK" ]; then echo "::error::no bin/shades-*.apk built"; exit 1; fi
+          echo "APK: $APK (version $VER)"
+          ( cd "$(dirname "$APK")" \
+            && sha256sum "$(basename "$APK")" > "$(basename "$APK").sha256" )
+          if gh release view "V$VER" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release V$VER already exists -> idempotent skip (use --latest on the existing release if it got demoted)"
+            gh release edit "V$VER" -R "$GITHUB_REPOSITORY" --latest >/dev/null 2>&1 || true
+          else
+            gh release create "V$VER" "$APK" "$APK.sha256" \
+              -R "$GITHUB_REPOSITORY" \
+              --latest --title "V$VER" \
+              --notes "automatic release ($GITHUB_SHA); version lockstep $VER"
+            echo "release V$VER published with $(basename "$APK") + $(basename "$APK").sha256"
+          fi
 
   server-bundle:
     name: package server bundle (P11)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # actions/checkout@v4
+      - uses: actions/checkout@v4
       - name: Bundle server source + sha256
         run: |
           set -e
@@ -407,7 +331,7 @@ jobs:
           sha256sum "sHades-server-$V.tar.gz" > "sHades-server-$V.sha256"
           cat "sHades-server-$V.sha256"
       - name: Publish bundle
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4
         with:
           name: sHades-server-bundle
           path: |

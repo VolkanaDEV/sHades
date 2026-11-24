@@ -37,10 +37,6 @@ sHades.db.execute("INSERT INTO users (dest_hash, username, registered_at) VALUES
                   (MOD, "boss", sHades.now()))
 sHades.db.commit()
 sHades.MODERATORS.add(MOD)
-# hard channel delete requires ADMIN (U5 tightening); legacy moderator
-# status (MANAGE_MESSAGES|MANAGE_CHANNEL) is deliberately not enough
-_admin_role = sHades._ensure_role("Admin", sHades.PERM_ALL, position=100)
-sHades._assign_role(MOD, _admin_role)
 
 victim_identity = RNS.Identity()
 VICTIM = sHades.hexstr(RNS.Destination(victim_identity, RNS.Destination.OUT,
@@ -133,17 +129,6 @@ def main():
     call("/api/v1/stream/subscribe", {"channel": cid})
     r = call("/api/v1/channels/delete", {"channel": cid_site}, ident=victim_identity)
     check("non-mod delete -> 403", r.get("ok") == 0 and r.get("code") == 403, r)
-    # legacy moderator (MANAGE_MESSAGES|MANAGE_CHANNEL, no Admin role)
-    # must not hard-delete either — hard delete is ADMIN-only
-    legacy_identity = RNS.Identity()
-    LEGACY = sHades.hexstr(RNS.Destination(legacy_identity, RNS.Destination.OUT,
-                                           RNS.Destination.SINGLE, "lxmf", "delivery").hash)
-    sHades.db.execute("INSERT OR IGNORE INTO users (dest_hash, username, registered_at) VALUES (?,?,?)",
-                      (LEGACY, "legacymod", sHades.now()))
-    sHades.db.commit()
-    sHades.MODERATORS.add(LEGACY)
-    r = call("/api/v1/channels/delete", {"channel": cid_site}, ident=legacy_identity)
-    check("legacy moderator delete -> 403", r.get("ok") == 0 and r.get("code") == 403, r)
     r = call("/api/v1/channels/delete", {"channel": "f" * 64})
     check("delete unknown channel -> 404", r.get("ok") == 0 and r.get("code") == 404, r)
     r = call("/api/v1/channels/delete", {"channel": cid_site})

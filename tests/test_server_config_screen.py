@@ -15,12 +15,11 @@ Pins down:
   - Roles tab: create posts the checked bitmask; assign posts role+user;
   - Invites tab: create posts label/max_uses/expires_in/channel.
 """
-import os, sys, time, json, functools
+import os, sys, time, json
 
 os.environ.setdefault("KIVY_GL_BACKEND", "mock")
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import kivy_client as kivy_client  # noqa: E402  (the standard upload path)
 
 PASS, FAIL = [], []
 
@@ -53,6 +52,11 @@ class FakeApi:
     def admin_audit(self, limit=100):
         return self._rec(("admin_audit", limit),
                          {"ok": 1, "entries": [{"action": "x", "target": "", "detail": ""}]})
+
+    def update_status(self, timeout=10):
+        return self._rec(("update_status",),
+                         {"ok": 1, "verdict": "current", "channel": "off",
+                          "interval": "360", "peer": "", "shapin": ""})
 
     def channels_list(self):
         return self._rec(("channels_list",), {"ok": 1, "channels": [
@@ -109,10 +113,6 @@ class FakeClient:
         self.PERM_MANAGE_ROLES = 16
         self.PERM_ADMIN = 32
         self.status = []
-        # the standard upload path; bind the real method so the screen's
-        # icon/banner flows run production retry wiring against the fake
-        self.blob_put_healed = functools.partial(
-            kivy_client.sHadesClientApp.blob_put_healed, self)
 
     def _set_status(self, txt):
         self.status.append(txt)
@@ -343,6 +343,82 @@ def main():
     _P.__init__ = real_popup_init
     check("desktop chooser popup preserved for non-android app",
           popups == ["choose an icon"], popups)
+
+    # ---------- P10c: the android pick leg reaches the upload ---------------
+    # (0.36.25 device receipt: the SAF pick returned with the purpose
+    # carried, then _route_purpose_file called _apply_icon_file on the
+    # TAB, which does not have it: AttributeError, swallowed by
+    # _on_file_selected's except: icon/banner stayed white, nothing was
+    # ever uploaded. The pick must land on the SCREEN.)
+    from kivy.uix.screenmanager import ScreenManager as _SM
+    _sm = _SM()
+    _sm.add_widget(scr)
+    probe.root = _sm
+    import kivy_client as _kc
+
+    class _PickShim(object):
+        # the real client methods, bound onto a status-carrying stub
+        _on_file_selected = _kc.sHadesClientApp._on_file_selected
+        _route_purpose_file = _kc.sHadesClientApp._route_purpose_file
+        _picker_purpose = None
+        status = None
+
+        def _set_status(self, txt):
+            self.status.append(txt)
+
+    shim = _PickShim()
+    shim.status = client.status
+    client.guild_api.calls = []
+    shim._picker_purpose = "icon"
+    shim._on_file_selected([png], None)
+    pump(1.0)
+    check("android icon pick uploads and configures guild_icon",
+          ("admin_config", "guild_icon", "d" * 32) in client.guild_api.calls,
+          client.guild_api.calls[-3:])
+    check("android icon pick never reports a routing failure",
+          not any("pick routing failed" in s for s in client.status))
+    client.guild_api.calls = []
+    shim._picker_purpose = "banner"
+    shim._on_file_selected([png], None)
+    pump(1.0)
+    check("android banner pick uploads and configures banner",
+          ("admin_config", "banner", "d" * 32) in client.guild_api.calls,
+          client.guild_api.calls[-3:])
+
+    # ---------- P11 chain 5 tail: the software channel rides the phone ------
+    check("general tab carries the update channel + peer entries",
+          "update_channel" in gen.entries
+          and "update_channel_peer" in gen.entries
+          and "update_channel_shapin" in gen.entries
+          and "update_trusted_hub" in gen.entries, list(gen.entries)[:3])
+    check("general tab renders the updater status line",
+          gen.upd_state.text
+          == "updater: current ch=off every 360m peer=- pin=peer-only",
+          gen.upd_state.text)
+    gen.entries["update_channel"].text = "github"
+    gen.do_save_key("update_channel")
+    pump(1.0)
+    check("saving the channel posts admin_config(update_channel, github)",
+          ("admin_config", "update_channel", "github")
+          in client.guild_api.calls, client.guild_api.calls[-2:])
+    gen.entries["update_channel_peer"].text = "ab" * 32
+    gen.do_save_key("update_channel_peer")
+    pump(1.0)
+    check("saving the peer pin posts admin_config(update_channel_peer)",
+          ("admin_config", "update_channel_peer", "ab" * 32)
+          in client.guild_api.calls, client.guild_api.calls[-2:])
+    gen.entries["update_channel_shapin"].text = "cd" * 32
+    gen.do_save_key("update_channel_shapin")
+    pump(1.0)
+    check("saving the artifact pin posts admin_config(update_channel_shapin)",
+          ("admin_config", "update_channel_shapin", "cd" * 32)
+          in client.guild_api.calls, client.guild_api.calls[-2:])
+    gen.entries["update_trusted_hub"].text = "ef" * 32
+    gen.do_save_key("update_trusted_hub")
+    pump(1.0)
+    check("saving the trusted hub posts admin_config(update_trusted_hub)",
+          ("admin_config", "update_trusted_hub", "ef" * 32)
+          in client.guild_api.calls, client.guild_api.calls[-2:])
 
     # ---------- P10b: prettier receipts --------------------------------------
     check("banner preview widget exists on General",

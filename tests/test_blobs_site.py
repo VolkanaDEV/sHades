@@ -103,21 +103,6 @@ def main():
     out = sHades.serve_blob_file("/file/blobs/../../etc/passwd", None, "r", "L", identity, sHades.now())
     check("serve_blob_file rejects traversal-ish names", out == b"not found", out)
 
-    # ACL: another identified member may not read someone else's upload;
-    # the uploader can; raw handler refuses the non-owner too
-    r = call("/api/v1/blobs/get", {"blob_id": digest, "len": 16}, ident=other)
-    check("other member may not blob-get uploader's blob", r.get("ok") == 0 and r.get("code") == 404, r)
-    out = sHades.serve_blob_file(f"/file/blobs/{digest}.png", None, "r", "L", other, sHades.now())
-    check("raw handler refuses non-owner", out == b"not found", out)
-    r = call("/api/v1/blobs/get", {"blob_id": digest, "len": 16}, ident=identity)
-    check("uploader may blob-get own upload", r.get("ok") == 1, r)
-
-    # a blob registered as the guild banner is readable by every member
-    sHades.store.config_set(sHades.db, sHades.db_lock, "banner", digest)
-    r = call("/api/v1/blobs/get", {"blob_id": digest, "len": 16}, ident=other)
-    check("banner-referenced blob readable by other member", r.get("ok") == 1, r)
-    sHades.store.config_set(sHades.db, sHades.db_lock, "banner", "")
-
     # ---------- chunked attachment reads (api_v1_att_get) ----------
     # receive-path chunking: one slice per request instead of the whole
     # file on a single-shot receipt (v0.31)

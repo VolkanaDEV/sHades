@@ -23,11 +23,9 @@ import shutil
 import argparse
 import sqlite3
 import hashlib
-import hmac
 import secrets
 import threading
 import updater
-import store
 from collections import defaultdict, deque
 
 import RNS
@@ -55,8 +53,7 @@ ATTACHMENT_EXT    = {"png", "jpg", "jpeg", "gif", "webp", "mp3", "ogg", "wav",
                      "flac", "mp4", "webm", "pdf", "txt"}
 
 # Channel kinds: chat, a NomadNet micron "site", or a terminal stream.
-# Defined in store.py; imported here so existing references keep working.
-CHANNEL_KINDS = store.CHANNEL_KINDS
+CHANNEL_KINDS     = ("chat", "site", "term", "announce")
 
 # Permission bitmask (U5). Guild-wide bits (MANAGE_*/ADMIN) live on roles;
 # channel-scoped bits (VIEW/POST) live in channel_overwrites keyed by role
@@ -65,30 +62,6 @@ CHANNEL_KINDS = store.CHANNEL_KINDS
 PERMS = {"VIEW": 1, "POST": 2, "MANAGE_MESSAGES": 4, "MANAGE_CHANNEL": 8,
          "MANAGE_ROLES": 16, "ADMIN": 32, "SITE_EDIT": 64}
 PERM_ALL = 127
-
-# Bot permission bitmask (Group 1). Bits 1-32 and 512 gate which event
-# kinds a bot receives on the stream; bits 64-512 gate what a bot may do
-# via the bot data path. All OTHER event kinds the server emits —
-# term_data, channels_changed, channel_deleted, posts_purged — are NEVER
-# delivered to bots, by design (Group 2 enforces this in _bot_event_allowed,
-# applied in both _push_stream and _stream_collect); there is no bit that
-# opts into them.
-#   1 MSG          — receive message events (kind "msg")
-#   2 EDIT         — receive edit events (kind "edit")
-#   4 DELETE       — receive delete events (kind "delete")
-#   8 REACTION     — receive reaction events (kind "reaction")
-#  16 PRESENCE     — receive presence events (kind "presence")
-#  32 TYPING       — receive typing events (kind "typing")
-#  64 POST         — bot may post messages
-# 128 REACT        — bot may react to messages
-# 256 READ_CHANNELS — bot may read channel list/info
-# 512 SITE         — receive site_patch events (kind "site_patch") and
-#                    read micron pages (bots/site_get, bots/site_manifest)
-BOT_PERMS = {"MSG": 1, "EDIT": 2, "DELETE": 4, "REACTION": 8, "PRESENCE": 16,
-             "TYPING": 32, "POST": 64, "REACT": 128, "READ_CHANNELS": 256,
-             "SITE": 512}
-BOT_PERM_ALL = 1023
-BOT_NAME_MAX = 64
 DEFAULT_CHANNEL_PERMS = PERMS["VIEW"] | PERMS["POST"]
 _GUILD_MANAGE_BITS = (PERMS["MANAGE_MESSAGES"] | PERMS["MANAGE_CHANNEL"] |
                       PERMS["MANAGE_ROLES"] | PERMS["ADMIN"])
@@ -152,7 +125,6 @@ NODE_REGISTRY_LOCK = threading.Lock()
 # on top. ONLINE_LINKS maps link_id -> user_hash, bound on every API request
 # (the request's remote_identity is the proof of who is behind the link).
 ONLINE_LINKS = {}                 # link_id -> user_hash
-ONLINE_LINK_SPOT = {}             # link_id -> time of last identified request
 ONLINE_LINKS_LOCK = threading.Lock()
 
 # Stream state for the JSON API. One subscription per link: subscribing to a
@@ -162,15 +134,8 @@ EVENT_COND    = threading.Condition()   # guards EVENT_LOG and wakes stream poll
 EVENT_LOG     = {}                      # channel_id -> deque[(seq, event)], maxlen EVENT_LOG_MAX
 EVENT_SEQ     = 0                       # single global sequence; cursors are per-channel views of it
 SUBSCRIPTIONS = {}                      # link_id -> {user_hash, channel, cursor, at}
-# Bot subs additionally carry bot_id + bot_perms + ticket_seq (the head seq
-# of the last push ticket sent; the push watermark — see _push_stream).
-# They NEVER enter SUB_BY_USER (see subscribe) — bots are not users.
 SUB_BY_USER   = {}                      # user_hash -> {channel, link_id, at}
 SUB_LOCK      = threading.Lock()
-
-# hub-side liveness refs: lets the reaper name why a client link died
-HUB_SEEN_LINKS = {}
-HUB_SEEN_LOCK = threading.Lock()
 TYPING        = {}                      # channel_id -> {user_hash: expires_at}
 TYPING_LOCK   = threading.Lock()
 
@@ -184,33 +149,129 @@ SERVER_VERSION = "0.36.25"
 # Database
 # ----------------------------------------------------------------------------------
 
-# Schema lives in store.py; this alias keeps sHades.SCHEMA working for
-# callers (including the unit tests, which execute it directly).
-SCHEMA = store.SCHEMA
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS guilds (
+    id TEXT PRIMARY KEY, name TEXT, node_hash TEXT, delivery_hash TEXT, prop_hash TEXT);
+CREATE TABLE IF NOT EXISTS channels (
+    id TEXT PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE, created REAL,
+    kind TEXT NOT NULL DEFAULT 'chat', manifest TEXT NOT NULL DEFAULT '{}',
+    topic TEXT, position INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS channel_state (
+    channel_id TEXT PRIMARY KEY, seq INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS members (
+    channel_id TEXT, member_hash TEXT, last_post REAL,
+    PRIMARY KEY (channel_id, member_hash));
+CREATE TABLE IF NOT EXISTS users (
+    dest_hash TEXT PRIMARY KEY, username TEXT UNIQUE COLLATE NOCASE,
+    profile_node TEXT, avatar_path TEXT, registered_at REAL);
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, msg_id TEXT UNIQUE,
+    channel_id TEXT, ts REAL, author_hash TEXT, content TEXT,
+    edited_at REAL, deleted_at REAL);
+CREATE TABLE IF NOT EXISTS message_edits (
+    msg_id TEXT NOT NULL, edited_at REAL NOT NULL, prior_content TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_message_edits ON message_edits(msg_id, edited_at);
+CREATE TABLE IF NOT EXISTS attachments (
+    msg_id TEXT, idx INTEGER, name TEXT, mime TEXT, size INTEGER, path TEXT,
+    PRIMARY KEY (msg_id, idx));
+CREATE TABLE IF NOT EXISTS blobs (
+    id TEXT PRIMARY KEY, name TEXT, mime TEXT, size INTEGER, path TEXT,
+    ts REAL, by TEXT);
+CREATE TABLE IF NOT EXISTS banned (
+    dest_hash TEXT PRIMARY KEY, reason TEXT, at REAL);
+CREATE TABLE IF NOT EXISTS muted (
+    dest_hash TEXT PRIMARY KEY, reason TEXT, at REAL, by TEXT);
+CREATE TABLE IF NOT EXISTS receipts (
+    channel_id TEXT, user_hash TEXT, last_id INTEGER NOT NULL DEFAULT 0, ts REAL,
+    PRIMARY KEY (channel_id, user_hash));
+CREATE TABLE IF NOT EXISTS reactions (
+    msg_id TEXT, user_hash TEXT, emoji TEXT, ts REAL,
+    PRIMARY KEY (msg_id, user_hash, emoji));
+CREATE TABLE IF NOT EXISTS roles (
+    role_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE COLLATE NOCASE, color TEXT, position INTEGER DEFAULT 0,
+    perms INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS user_roles (
+    user_hash TEXT, role_id INTEGER,
+    PRIMARY KEY (user_hash, role_id));
+CREATE TABLE IF NOT EXISTS channel_overwrites (
+    channel_id TEXT, role_id INTEGER, perms INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (channel_id, role_id));
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL, actor TEXT, action TEXT, target TEXT, detail TEXT);
+CREATE TABLE IF NOT EXISTS server_config (
+    key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS invites (
+    code TEXT PRIMARY KEY, label TEXT, created_at REAL, expires_at REAL,
+    max_uses INTEGER NOT NULL DEFAULT 0, uses INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT, channel_id TEXT);
+CREATE TABLE IF NOT EXISTS guild_joins (
+    user_hash TEXT PRIMARY KEY, joined_at REAL, code TEXT);
+CREATE INDEX IF NOT EXISTS idx_reactions_msg ON reactions(msg_id);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
+CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, id);
+"""
 
-# Storage lives in store.py (schema, connection, channel/sequence helpers).
-# These aliases and wrappers bind the guild's module-global `db` at call
-# time, so the rest of the server — and the unit tests, which assign
-# sHades.db directly — keep calling the same names with the same signatures.
-_migrate_schema = store.migrate_schema
-open_db = store.open_db
+def _migrate_schema(conn):
+    """Additive migrations for databases written by earlier versions.
 
+    CREATE TABLE IF NOT EXISTS never alters an existing table, so a column added
+    to SCHEMA after a guild has already booted has to be added explicitly."""
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(channels)").fetchall()}
+    for col, decl in (("kind", "TEXT NOT NULL DEFAULT 'chat'"), ("manifest", "TEXT"),
+                      ("topic", "TEXT"), ("position", "INTEGER NOT NULL DEFAULT 0")):
+        if col not in have:
+            conn.execute("ALTER TABLE channels ADD COLUMN %s %s" % (col, decl))
+    have_inv = {r["name"] for r in conn.execute("PRAGMA table_info(invites)").fetchall()}
+    if "channel_id" not in have_inv:
+        conn.execute("ALTER TABLE invites ADD COLUMN channel_id TEXT")
+
+def open_db(path):
+    conn = sqlite3.connect(path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.executescript(SCHEMA)
+    _migrate_schema(conn)
+    conn.commit()
+    return conn
 
 def ensure_channel(name, kind="chat"):
-    """Create a channel + its revision counter if needed. Returns channel id."""
-    return store.ensure_channel(db, db_lock, GUILD_ID, name, kind, emit=_emit_event)
+    """Create a channel + its revision counter if needed. Returns channel id.
 
+    A channel's id is a hash of its name, so it is case-sensitive, while the
+    channels.name unique index is COLLATE NOCASE. The name lookup below is
+    therefore NOCASE: '#General' resolves to the existing 'general' channel
+    instead of computing a different id that the unique index then refuses.
+    """
+    with db_lock:
+        row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
+                         (name,)).fetchone()
+        if row:
+            return row["id"]
+        cid = hexstr(RNS.Identity.full_hash(f"{GUILD_ID}:{name}".encode()))
+        db.execute("INSERT OR IGNORE INTO channels (id, name, created, kind) "
+                   "VALUES (?, ?, ?, ?)",
+                   (cid, name, time.time(), kind if kind in CHANNEL_KINDS else "chat"))
+        db.execute("INSERT OR IGNORE INTO channel_state (channel_id, seq) VALUES (?, 0)", (cid,))
+        db.commit()
+        # v0.28: a NEW channel must reach stream subscribers (the 3s state
+        # poller that used to notice renames/creates is being deleted);
+        # name changes ride the same event.
+        _emit_event(cid, "channels_changed", {"channel": name}, guild_wide=True)
+    return cid
 
 def channel_name(cid):
-    return store.channel_name(db, cid)
-
+    row = db.execute("SELECT name FROM channels WHERE id=?", (cid,)).fetchone()
+    return row["name"] if row else "unknown"
 
 def bump_seq(cid):
-    return store.bump_seq(db, cid)
-
+    db.execute("UPDATE channel_state SET seq = seq + 1 WHERE channel_id=?", (cid,))
 
 def get_seq(cid):
-    return store.get_seq(db, cid)
+    row = db.execute("SELECT seq FROM channel_state WHERE channel_id=?", (cid,)).fetchone()
+    return row["seq"] if row else 0
 
 # ----------------------------------------------------------------------------------
 # Small helpers
@@ -297,13 +358,17 @@ def render_content(content):
     return "\n".join(out)
 
 def get_username(author_hash):
-    return store.get_username(db, db_lock, author_hash)
+    with db_lock:
+        row = db.execute("SELECT username FROM users WHERE dest_hash=?", (author_hash,)).fetchone()
+    return row["username"] if row else "user-" + author_hash[:6]
 
 def username_fragment(author_hash):
     """§5 rendering rule: linked username when the user registered a profile node,
     otherwise a BOLD plain name. (A micron link cannot be nested inside a bold
     formatting run — the parser would break — so links render unbolded.)"""
-    row = store.user_row(db, db_lock, author_hash)
+    with db_lock:
+        row = db.execute("SELECT username, profile_node FROM users WHERE dest_hash=?",
+                         (author_hash,)).fetchone()
     name = (row["username"] if row else None) or ("user-" + author_hash[:6])
     if row and row["profile_node"] and re.match(r"^[0-9a-f]{32}$", row["profile_node"]):
         # bare 32-hex target = that node's home page (Browser.py parse_url)
@@ -339,23 +404,6 @@ def check_token(user, scope, token):
             return True
     return False
 
-def _resolve_bot(bot_id, api_key):
-    """Data-path bot auth (Group 2). Returns the bot row, or None unless
-    the row exists, revoked_at is NULL, and the presented key hashes to
-    the stored key_hash (timing-safe compare). Callers map None -> 403
-    and never distinguish unknown / revoked / wrong-key: the response
-    must not leak whether a bot_id exists. A bot authenticates AS its
-    owner's node for channel VIEW checks (owner_hash is the actor)."""
-    if not isinstance(bot_id, str) or not isinstance(api_key, str):
-        return None
-    row = store.bot_get(db, db_lock, bot_id)
-    if row is None or row["revoked_at"] is not None:
-        return None
-    digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
-    if not hmac.compare_digest(row["key_hash"], digest):
-        return None
-    return row
-
 # ----------------------------------------------------------------------------------
 # Rate limiting + moderation
 # ----------------------------------------------------------------------------------
@@ -375,26 +423,38 @@ def rate_ok(sender, channel_id, max_posts=None, window_s=None):
         return True
 
 def is_banned(sender):
-    return store.is_banned(db, db_lock, sender)
+    with db_lock:
+        return db.execute("SELECT 1 FROM banned WHERE dest_hash=?", (sender,)).fetchone() is not None
 
 def can_delete(viewer, row):
     """Author or guild moderator (plan §7)."""
     return viewer is not None and (row["author_hash"] == viewer or is_moderator(viewer))
 
 def ban_user(user, reason="", by=None):
-    store.ban_user(db, db_lock, user, reason, by)
+    with db_lock:
+        db.execute("INSERT OR REPLACE INTO banned (dest_hash, reason, at) VALUES (?, ?, ?)",
+                   (user, (reason or "")[:200], now()))
+        db.commit()
 
 def unban_user(user):
-    store.unban_user(db, db_lock, user)
+    with db_lock:
+        db.execute("DELETE FROM banned WHERE dest_hash=?", (user,))
+        db.commit()
 
 def is_muted(sender):
-    return store.is_muted(db, db_lock, sender)
+    with db_lock:
+        return db.execute("SELECT 1 FROM muted WHERE dest_hash=?", (sender,)).fetchone() is not None
 
 def mute_user(user, reason="", by=None):
-    store.mute_user(db, db_lock, user, reason, by)
+    with db_lock:
+        db.execute("INSERT OR REPLACE INTO muted (dest_hash, reason, at, by) VALUES (?, ?, ?, ?)",
+                   (user, (reason or "")[:200], now(), by))
+        db.commit()
 
 def unmute_user(user):
-    store.unmute_user(db, db_lock, user)
+    with db_lock:
+        db.execute("DELETE FROM muted WHERE dest_hash=?", (user,))
+        db.commit()
 
 def load_moderators(path):
     """moderators.txt: one canonical (lxmf.delivery) user hash per line, '#' comments.
@@ -439,12 +499,29 @@ def has_role_perm(user, bits):
     if user in MODERATORS and bits & (PERMS["MANAGE_MESSAGES"] |
                                       PERMS["MANAGE_CHANNEL"]):
         return True
-    return store.user_has_role_perm(db, db_lock, user, bits)
+    with db_lock:
+        row = db.execute(
+            "SELECT 1 FROM user_roles ur JOIN roles r ON r.role_id = ur.role_id "
+            "WHERE ur.user_hash = ? AND (r.perms & ?) != 0 LIMIT 1",
+            (user, bits)).fetchone()
+    return row is not None
 
 def _effective_perms(user_hash, channel_id, base):
     """The union: base + each of the user's roles' perms + each role's
     per-channel overwrite. The admin short-circuit lives in has_perm."""
-    return store.effective_perms(db, db_lock, user_hash, channel_id, base)
+    if user_hash is None:
+        return 0
+    with db_lock:
+        rows = db.execute(
+            "SELECT co.perms AS operms, r.perms AS rperms "
+            "FROM user_roles ur JOIN roles r ON r.role_id = ur.role_id "
+            "LEFT JOIN channel_overwrites co ON co.role_id = ur.role_id "
+            "AND co.channel_id=? WHERE ur.user_hash=?",
+            (channel_id, user_hash)).fetchall()
+    perms = base
+    for r in rows:
+        perms |= (r["operms"] or 0) | (r["rperms"] or 0)
+    return perms
 
 def _announce_post_ok(user_hash, channel_id):
     """kind=='announce' POST gate (P8): moderators/admins always; everyone
@@ -455,9 +532,12 @@ def _announce_post_ok(user_hash, channel_id):
         return True
     if user_hash is None:
         return False
-    base = store.channel_base_perms(db, db_lock, channel_id)
+    with db_lock:
+        base_row = db.execute("SELECT perms FROM channel_overwrites "
+                              "WHERE channel_id=? AND role_id=0",
+                              (channel_id,)).fetchone()
     perms = _effective_perms(user_hash, channel_id,
-                             base if base is not None else 0)
+                             base_row["perms"] if base_row else 0)
     return (perms & PERMS["POST"]) != 0
 
 def has_perm(user, channel_id, bit):
@@ -469,10 +549,16 @@ def has_perm(user, channel_id, bit):
         return False
     if bit & _GUILD_MANAGE_BITS:
         return has_role_perm(user, bit)
-    base = store.channel_base_perms(db, db_lock, channel_id)
-    is_admin = store.user_has_role_perm(db, db_lock, user, PERMS["ADMIN"])
+    with db_lock:
+        base = db.execute("SELECT perms FROM channel_overwrites "
+                          "WHERE channel_id=? AND role_id=0",
+                          (channel_id,)).fetchone()
+        is_admin = db.execute(
+            "SELECT 1 FROM user_roles ur JOIN roles r ON r.role_id = ur.role_id "
+            "WHERE ur.user_hash=? AND (r.perms & ?) != 0 LIMIT 1",
+            (user, PERMS["ADMIN"])).fetchone()
     perms = _effective_perms(user, channel_id,
-                             base if base is not None else DEFAULT_CHANNEL_PERMS)
+                             base["perms"] if base else DEFAULT_CHANNEL_PERMS)
     if is_admin:
         return True
     return (perms & bit) != 0
@@ -484,8 +570,11 @@ def page_can_view(user, channel_id):
     makes the anonymous lane a separate question. (tay fork tier-1)"""
     if user is not None:
         return has_perm(user, channel_id, PERMS["VIEW"])
-    base = store.channel_base_perms(db, db_lock, channel_id)
-    perms = base if base is not None else DEFAULT_CHANNEL_PERMS
+    with db_lock:
+        row = db.execute("SELECT perms FROM channel_overwrites "
+                         "WHERE channel_id=? AND role_id=0",
+                         (channel_id,)).fetchone()
+    perms = row["perms"] if row else DEFAULT_CHANNEL_PERMS
     return bool(perms & PERMS["VIEW"])
 
 def attachment_visible(viewer, fname):
@@ -493,15 +582,30 @@ def attachment_visible(viewer, fname):
     message. Serving a hash-keyed file with no message linkage would let
     anyone with a node link pull every stored blob by name (or after its
     message was deleted). (tay fork tier-1)"""
-    rows = store.attachment_channels(db, db_lock, fname)
+    with db_lock:
+        rows = db.execute(
+            "SELECT DISTINCT m.channel_id FROM attachments a "
+            "JOIN messages m ON m.msg_id=a.msg_id "
+            "WHERE a.path=? AND m.deleted_at IS NULL", (fname,)).fetchall()
     return any(page_can_view(viewer, row["channel_id"]) for row in rows)
 
 def _ensure_role(name, perms, position=0, color=None):
     """Create a role if missing (boot seeding / role editor). Returns id."""
-    return store.ensure_role(db, db_lock, name, perms, position, color)
+    with db_lock:
+        row = db.execute("SELECT role_id FROM roles WHERE name=? COLLATE NOCASE",
+                         (name,)).fetchone()
+        if row:
+            return row["role_id"]
+        cur = db.execute("INSERT INTO roles (name, color, position, perms) "
+                         "VALUES (?, ?, ?, ?)", (name, color, position, perms))
+        db.commit()
+        return cur.lastrowid
 
 def _assign_role(user_hash, role_id):
-    store.assign_role(db, db_lock, user_hash, role_id)
+    with db_lock:
+        db.execute("INSERT OR IGNORE INTO user_roles (user_hash, role_id) "
+                   "VALUES (?, ?)", (user_hash, role_id))
+        db.commit()
 
 FOUNDER_ROLE_NAME = "Founder"
 
@@ -517,11 +621,13 @@ def _maybe_founder(viewer):
     can ever reach it, and existing deployments with members are never
     touched.
     """
-    if store.count_users(db, db_lock) != 1:
-        return
-    rid = _ensure_role(FOUNDER_ROLE_NAME, PERM_ALL, position=200, color="FB8")
-    _assign_role(viewer, rid)
-    _audit(viewer, "role.founder", None, "first member granted Founder")
+    with db_lock:
+        n = db.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+        if n != 1:
+            return
+        rid = _ensure_role(FOUNDER_ROLE_NAME, PERM_ALL, position=200, color="FB8")
+        _assign_role(viewer, rid)
+        _audit(viewer, "role.founder", None, "first member granted Founder")
 
 def load_role_seeds(storage):
     """Boot-time role seeding (U5): admin.txt hashes get the Admin role
@@ -556,50 +662,9 @@ def _reap_stale_nodes():
     before = set(online_users())
     active = {l.link_id for l in list(RNS.Transport.active_links)
               if l.status == RNS.Link.ACTIVE}
-    # Presence is traffic, not status: a link the request dispatcher
-    # identified recently is live even when its RNS status snapshot
-    # reads STALE (short keepalive on fast links, traffic gaps) -- the
-    # 10 Hz relay frames keep the spot warm for voice speakers. The
-    # grace only extends links the hub knows as real link objects
-    # (HUB_SEEN_LINKS): a presence entry with no known object is a
-    # synthetic bind, and absence from active_links is that link's
-    # death -- the v0.29 contract pinned by test_streams, where the
-    # death transition must fire on the same reap, not after a grace.
     with ONLINE_LINKS_LOCK:
-        with HUB_SEEN_LOCK:
-            fresh = {lid for lid in list(ONLINE_LINKS)
-                     if lid in HUB_SEEN_LINKS
-                     and time.time() - ONLINE_LINK_SPOT.get(lid, 0.0)
-                     < VOICE_RNS_STALE_GRACE_S}
-        active |= fresh
-        vanished = [HUB_SEEN_LINKS.pop(lid) for lid in list(HUB_SEEN_LINKS)
-                    if lid not in active]
-        for l in list(RNS.Transport.active_links):
-            if l.link_id in active:
-                HUB_SEEN_LINKS[l.link_id] = l
-    for l in vanished:
-        try:
-            RNS.log("hub link vanished: status=%s reason=%s" % (
-                l.status, l.teardown_reason), RNS.LOG_NOTICE)
-        except Exception:
-            pass
-    with ONLINE_LINKS_LOCK:
-        pruned = [lid for lid in list(ONLINE_LINKS) if lid not in active]
-        for lid in pruned:
-            l = HUB_SEEN_LINKS.get(lid)
-            raw = None
-            in_tl = False
-            try:
-                for tl in list(RNS.Transport.active_links):
-                    if tl.link_id == lid:
-                        in_tl = True
-                        raw = getattr(tl, "status", None)
-                        break
-            except Exception as e:
-                RNS.log("presence prune diag failed: %s" % e,
-                        RNS.LOG_ERROR)
-        for lid in pruned:
-            ONLINE_LINKS.pop(lid, None)
+        for lid in [lid for lid in ONLINE_LINKS if lid not in active]:
+            del ONLINE_LINKS[lid]
         live_users = set(ONLINE_LINKS.values())
     with SUB_LOCK:
         for lid in [lid for lid in SUBSCRIPTIONS if lid not in active]:
@@ -614,26 +679,7 @@ def _reap_stale_nodes():
             for h in stale:
                 del NODE_REGISTRY[h]
                 RNS.log("dropped node %s (link down)" % h[:12], RNS.LOG_NOTICE)
-    # Voice rooms: a member without a live link is out of the room (the
-    # roster ride the event ring, so callers see the change on push).
-    voice_touched = []
-    with VOICE_ROOMS_LOCK:
-        for cid, members in list(VOICE_ROOMS.items()):
-            for v in [v for v in members if v not in live_users]:
-                members.pop(v, None)
-                voice_touched.append(cid)
-                RNS.log("voice reaper: %s lost in %s" % (v[:12], cid[:8]),
-                        RNS.LOG_NOTICE)
-            if cid in VOICE_ROOMS and not VOICE_ROOMS[cid]:
-                del VOICE_ROOMS[cid]
     after = set(online_users())
-    for cid in sorted(set(voice_touched)):
-        try:
-            RNS.log("voice reaper: member without live link dropped (%s)"
-                    % cid[:8], RNS.LOG_NOTICE)
-            _voice_emit_roster(cid, "left")
-        except Exception as e:
-            RNS.log("voice roster push failed: %s" % e, RNS.LOG_ERROR)
     if after != before:
         _emit_event(None, "presence", {"users": _presence_payload()},
                     guild_wide=True)
@@ -787,7 +833,9 @@ def ingest(channel_id, author_hash, content, ts=None, attachments=None):
         return None
     if is_muted(author_hash):
         return None  # muted: post silently dropped
-    _kind_row = store.channel_row(db, db_lock, channel_id)
+    with db_lock:
+        _kind_row = db.execute("SELECT kind FROM channels WHERE id=?",
+                               (channel_id,)).fetchone()
     _chn_kind = _kind_row["kind"] if _kind_row else "chat"
     if _chn_kind == "announce":
         # P8: announcements only -- explicit grants (or mods); the open
@@ -822,28 +870,38 @@ def ingest(channel_id, author_hash, content, ts=None, attachments=None):
     msg_id = hexstr(RNS.Identity.full_hash(
         f"{channel_id}|{author_hash}|{ts}|{content}".encode()))
     att_meta = []
-    if store.message_exists(db, db_lock, msg_id):
-        dlog(f"ingest: duplicate msg_id {msg_id[:12]}")
-        return None  # duplicate
-    att_rows = []
-    for idx, att in enumerate((attachments or [])[:MAX_ATTACHMENTS]):
-        try:
-            name, mime, blob = att
-        except Exception:
-            dlog(f"ingest: malformed attachment at idx {idx}, skipping")
-            continue
-        fname = store_attachment(str(name)[:128], str(mime)[:64],
-                                 blob, by=author_hash)
-        if fname:
-            dlog(f"ingest: stored attachment idx={idx} name={name} fname={fname}")
-            att_rows.append((idx, str(name)[:128], str(mime)[:64], len(blob), fname))
-            att_meta.append({"name": str(name)[:128], "mime": str(mime)[:64],
-                             "size": len(blob), "path": "/file/attachments/" + fname})
-        else:
-            dlog(f"ingest: store_attachment returned None for idx={idx} name={name}")
-    if not store.ingest_insert(db, db_lock, msg_id, channel_id, ts, author_hash,
-                               content, att_rows):
-        return None  # duplicate raced in
+    with db_lock:
+        if db.execute("SELECT 1 FROM messages WHERE msg_id=?", (msg_id,)).fetchone():
+            dlog(f"ingest: duplicate msg_id {msg_id[:12]}")
+            return None  # duplicate
+        # zero-login: auto-register placeholder username on first post
+        db.execute("INSERT OR IGNORE INTO users (dest_hash, username, registered_at) "
+                   "VALUES (?, ?, ?)", (author_hash, "user-" + author_hash[:6], now()))
+        db.execute(
+            "INSERT INTO messages (msg_id, channel_id, ts, author_hash, content) "
+            "VALUES (?, ?, ?, ?, ?)", (msg_id, channel_id, ts, author_hash, content))
+        for idx, att in enumerate((attachments or [])[:MAX_ATTACHMENTS]):
+            try:
+                name, mime, blob = att
+            except Exception:
+                dlog(f"ingest: malformed attachment at idx {idx}, skipping")
+                continue
+            fname = store_attachment(str(name)[:128], str(mime)[:64],
+                                     blob, by=author_hash)
+            if fname:
+                dlog(f"ingest: stored attachment idx={idx} name={name} fname={fname}")
+                db.execute("INSERT OR REPLACE INTO attachments "
+                           "(msg_id, idx, name, mime, size, path) VALUES (?, ?, ?, ?, ?, ?)",
+                           (msg_id, idx, str(name)[:128], str(mime)[:64], len(blob), fname))
+                att_meta.append({"name": str(name)[:128], "mime": str(mime)[:64],
+                                 "size": len(blob), "path": "/file/attachments/" + fname})
+            else:
+                dlog(f"ingest: store_attachment returned None for idx={idx} name={name}")
+        db.execute("INSERT INTO members (channel_id, member_hash, last_post) VALUES (?, ?, ?) "
+                   "ON CONFLICT(channel_id, member_hash) DO UPDATE SET last_post=excluded.last_post",
+                   (channel_id, author_hash, ts))
+        bump_seq(channel_id)
+        db.commit()
     RNS.log(f"ingest #{channel_name(channel_id)} msg {msg_id[:12]} from {author_hash[:12]}",
             RNS.LOG_DEBUG)
     # Stream event: subscribers of this channel get the full message row.
@@ -932,8 +990,11 @@ PAGE_IDENTITY_REQUIRED = (page_header() + "> Identification needed for this acti
     "c(message the guild address with a #channel first token).")
 
 def msg_row_json(row):
-    atts = store.message_attachments(db, db_lock, row["msg_id"])
-    rx = store.message_reactions(db, db_lock, row["msg_id"])
+    with db_lock:
+        atts = db.execute("SELECT idx, name, mime, size, path FROM attachments "
+                          "WHERE msg_id=? ORDER BY idx", (row["msg_id"],)).fetchall()
+        rx = db.execute("SELECT emoji, user_hash FROM reactions "
+                        "WHERE msg_id=? ORDER BY ts", (row["msg_id"],)).fetchall()
     summary = {}
     for r in rx:
         e = summary.setdefault(r["emoji"],
@@ -959,7 +1020,8 @@ def page_index(path, data, request_id, link_id, remote_identity, requested_at):
     out.append("`F8a8Reticulum-native chat`f  `[Settings`:/page/sHades/settings.mu]\n")
     out.append("-\n")
     out.append("> Channels\n")
-    chans = store.list_channel_names(db, db_lock)
+    with db_lock:
+        chans = db.execute("SELECT id, name FROM channels ORDER BY name ASC").fetchall()
     viewer = viewer_of(remote_identity)
     # anonymous / insufficient-VIEW lanes never even see the channel names
     chans = [c for c in chans if page_can_view(viewer, c["id"])]
@@ -973,7 +1035,8 @@ def page_index(path, data, request_id, link_id, remote_identity, requested_at):
 @route("/page/sHades/channel.mu")
 def page_channel(path, data, request_id, link_id, remote_identity, requested_at):
     cid = get_data(data, "channel")
-    chan = store.channel_row(db, db_lock, cid)
+    with db_lock:
+        chan = db.execute("SELECT id, name FROM channels WHERE id=?", (cid,)).fetchone()
     if not chan:
         return (page_header() + "> Unknown channel\n"
                 "cPick one from `[Channels`:/page/index.mu]\n").encode("utf-8")
@@ -998,16 +1061,21 @@ def page_messages(path, data, request_id, link_id, remote_identity, requested_at
     cid = get_data(data, "channel")
     before = get_data(data, "before")
     viewer = viewer_of(remote_identity)
-    chan = store.channel_row(db, db_lock, cid)
-    if not chan:
-        return b"cUnknown channel."
-    if before and str(before).isdigit():
-        rows = store.channel_messages(db, db_lock, cid, int(before), PAGE_SIZE)
-    else:
-        rows = store.channel_messages(db, db_lock, cid, None, PAGE_SIZE)
-    oldest = rows[-1]["id"] if rows else None
-    total_before = (store.count_messages_before(db, db_lock, cid, oldest)
-                    if oldest else 0)
+    with db_lock:
+        chan = db.execute("SELECT id, name FROM channels WHERE id=?", (cid,)).fetchone()
+        if not chan:
+            return b"cUnknown channel."
+        if before and str(before).isdigit():
+            rows = db.execute(
+                "SELECT * FROM messages WHERE channel_id=? AND id<? "
+                "ORDER BY id DESC LIMIT ?", (cid, int(before), PAGE_SIZE)).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT * FROM messages WHERE channel_id=? "
+                "ORDER BY id DESC LIMIT ?", (cid, PAGE_SIZE)).fetchall()
+        oldest = rows[-1]["id"] if rows else None
+        total_before = (db.execute("SELECT COUNT(*) AS n FROM messages WHERE channel_id=? AND id<?",
+                                   (cid, oldest)).fetchone()["n"] if oldest else 0)
     if not page_can_view(viewer, cid):
         return (page_header() + "> Channel unavailable\n").encode("utf-8")
     rows = list(reversed(rows))  # newest last, Discord order
@@ -1022,7 +1090,9 @@ def page_messages(path, data, request_id, link_id, remote_identity, requested_at
             out.append("`F555<message deleted>`f\n")
         else:
             out.append(render_content(r["content"]) + "\n")
-            atts = store.message_attachments(db, db_lock, r["msg_id"])
+            with db_lock:
+                atts = db.execute("SELECT name, path FROM attachments WHERE msg_id=? ORDER BY idx",
+                                  (r["msg_id"],)).fetchall()
             for a in atts:
                 out.append("`F8a8[attachment]`f `[Download " + esc_micron_text(a["name"]) +
                            "`/file/attachments/" + a["path"] + "]\n")
@@ -1053,7 +1123,8 @@ def page_update(path, data, request_id, link_id, remote_identity, requested_at):
     cid = get_data(data, "channel")
     body = get_data(data, "msg") or ""
     token = get_data(data, "token") or ""
-    chan = store.channel_row(db, db_lock, cid)
+    with db_lock:
+        chan = db.execute("SELECT id FROM channels WHERE id=?", (cid,)).fetchone()
     if not chan or not isinstance(body, str) or not body.strip():
         return (page_header() + "> Nothing to send\ncEmpty message.\n").encode("utf-8")
     if not check_token(viewer, f"post:{cid}", token):
@@ -1072,7 +1143,8 @@ def page_edit(path, data, request_id, link_id, remote_identity, requested_at):
     if viewer is None:
         return PAGE_IDENTITY_REQUIRED.encode("utf-8")
     msg_id = get_data(data, "msg") or ""
-    row = store.message_by_msg_id(db, db_lock, msg_id)
+    with db_lock:
+        row = db.execute("SELECT * FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
     if not row or row["deleted_at"] or row["author_hash"] != viewer:
         return (page_header() + "> Not allowed\ncYou can only edit your own messages.\n"
                 ).encode("utf-8")
@@ -1095,16 +1167,22 @@ def page_save_edit(path, data, request_id, link_id, remote_identity, requested_a
     msg_id = get_data(data, "msg") or ""
     token = get_data(data, "token") or ""
     content = get_data(data, "content") or ""
-    row = store.message_by_msg_id(db, db_lock, msg_id)
+    with db_lock:
+        row = db.execute("SELECT * FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
     if not row or row["author_hash"] != viewer:
         return (page_header() + "> Not allowed\n").encode("utf-8")
     if not check_token(viewer, f"edit:{msg_id}", token):
         return (page_header() + "> Expired form\ncReload and retry.\n").encode("utf-8")
     if not isinstance(content, str) or not content.strip():
         return (page_header() + "> Empty edit\ncUse delete instead.\n").encode("utf-8")
-    store.save_message_edit(db, db_lock, msg_id,
-                            content.strip()[:MAX_CONTENT_LEN], row["content"],
-                            now(), row["channel_id"])
+    with db_lock:
+        edited_at = now()
+        db.execute("INSERT INTO message_edits (msg_id, edited_at, prior_content) "
+                   "VALUES (?, ?, ?)", (msg_id, edited_at, row["content"]))
+        db.execute("UPDATE messages SET content=?, edited_at=? WHERE msg_id=?",
+                   (content.strip()[:MAX_CONTENT_LEN], edited_at, msg_id))
+        bump_seq(row["channel_id"])
+        db.commit()
     return page_messages(path, {"var_channel": row["channel_id"]},
                          request_id, link_id, remote_identity, requested_at)
 
@@ -1114,7 +1192,8 @@ def page_delete(path, data, request_id, link_id, remote_identity, requested_at):
     if viewer is None:
         return PAGE_IDENTITY_REQUIRED.encode("utf-8")
     msg_id = get_data(data, "msg") or ""
-    row = store.message_by_msg_id(db, db_lock, msg_id)
+    with db_lock:
+        row = db.execute("SELECT * FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
     if not row or row["deleted_at"] or not can_delete(viewer, row):
         return (page_header() + "> Not allowed\n"
                 "cOnly the author or a guild moderator can delete this.\n").encode("utf-8")
@@ -1134,24 +1213,32 @@ def page_do_delete(path, data, request_id, link_id, remote_identity, requested_a
         return PAGE_IDENTITY_REQUIRED.encode("utf-8")
     msg_id = get_data(data, "msg") or ""
     token = get_data(data, "token") or ""
-    row = store.message_by_msg_id(db, db_lock, msg_id)
+    with db_lock:
+        row = db.execute("SELECT * FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
     if not row or not page_can_view(viewer, row["channel_id"]):
         return (page_header() + "> Not allowed\n").encode("utf-8")
     if not can_delete(viewer, row):
         return (page_header() + "> Not allowed\n").encode("utf-8")
     if not check_token(viewer, f"del:{msg_id}", token):
         return (page_header() + "> Expired form\ncReload and retry.\n").encode("utf-8")
-    store.soft_delete_message(db, db_lock, msg_id, now(), row["channel_id"])
+    with db_lock:
+        db.execute("UPDATE messages SET deleted_at=? WHERE msg_id=?", (now(), msg_id))
+        bump_seq(row["channel_id"])
+        db.commit()
     return page_messages(path, {"var_channel": row["channel_id"]},
                          request_id, link_id, remote_identity, requested_at)
 
 @route("/page/sHades/members.mu")
 def page_members(path, data, request_id, link_id, remote_identity, requested_at):
     cid = get_data(data, "channel")
-    chan = store.channel_row(db, db_lock, cid)
-    if not chan:
-        return b"cUnknown channel."
-    rows = store.channel_members(db, db_lock, cid)
+    with db_lock:
+        chan = db.execute("SELECT id, name FROM channels WHERE id=?", (cid,)).fetchone()
+        if not chan:
+            return b"cUnknown channel."
+        rows = db.execute(
+            "SELECT m.member_hash, m.last_post, u.username FROM members m "
+            "LEFT JOIN users u ON u.dest_hash = m.member_hash "
+            "WHERE m.channel_id=? ORDER BY m.last_post DESC LIMIT 100", (cid,)).fetchall()
     viewer = viewer_of(remote_identity)
     if not page_can_view(viewer, cid):
         return (page_header() + "> Channel unavailable\n").encode("utf-8")
@@ -1207,7 +1294,10 @@ def page_mod(path, data, request_id, link_id, remote_identity, requested_at):
         return (page_header() + "> Not a moderator\ncAsk a guild operator to add your\n"
                 "chash to moderators.txt on the guild host.\n").encode("utf-8").replace(
                     b"chash", b"hash")
-    rows = store.list_banned(db, db_lock)
+    with db_lock:
+        rows = db.execute(
+            "SELECT b.dest_hash, b.reason, b.at, u.username FROM banned b "
+            "LEFT JOIN users u ON u.dest_hash = b.dest_hash ORDER BY b.at DESC").fetchall()
     out = [page_header()]
     out.append("> Moderation\n-\n")
     out.append("You are a guild moderator.\n\n")
@@ -1294,7 +1384,9 @@ def page_settings(path, data, request_id, link_id, remote_identity, requested_at
     viewer = viewer_of(remote_identity)
     if viewer is None:
         return PAGE_IDENTITY_REQUIRED.encode("utf-8")
-    row = store.user_row(db, db_lock, viewer)
+    with db_lock:
+        row = db.execute("SELECT username, profile_node FROM users WHERE dest_hash=?",
+                         (viewer,)).fetchone()
     username = (row["username"] if row and row["username"] else "")
     profile_node = (row["profile_node"] if row and row["profile_node"] else "")
     token = issue_token(viewer, f"settings:{viewer}")
@@ -1325,9 +1417,18 @@ def page_save_settings(path, data, request_id, link_id, remote_identity, request
         return (page_header() + "> Invalid profile node hash\nc32 hex characters.\n"
                 ).encode("utf-8")
     profile_node = profile_node.lower() if profile_node else None
-    if store.register_user(db, db_lock, viewer, username, profile_node, now(),
-                           FOUNDER_ROLE_NAME, PERM_ALL):
-        return (page_header() + "> Username taken\ncPick another one.\n").encode("utf-8")
+    with db_lock:
+        clash = db.execute("SELECT dest_hash FROM users WHERE username=? COLLATE NOCASE "
+                           "AND dest_hash<>?", (username, viewer)).fetchone()
+        if clash:
+            return (page_header() + "> Username taken\ncPick another one.\n").encode("utf-8")
+        db.execute("INSERT INTO users (dest_hash, username, profile_node, registered_at) "
+                   "VALUES (?, ?, ?, ?) "
+                   "ON CONFLICT(dest_hash) DO UPDATE SET username=excluded.username, "
+                   "profile_node=excluded.profile_node",
+                   (viewer, username, profile_node, now()))
+        db.commit()
+        _maybe_founder(viewer)
     out = [page_header()]
     out.append("> Saved\n-\n")
     out.append("Username: `!" + esc_micron_text(username) + "!`\n")
@@ -1355,12 +1456,6 @@ def wrap_api(fn):
         # to this user until the link dies (the presence keeper prunes it).
         if link_id:
             with ONLINE_LINKS_LOCK:
-                if link_id not in ONLINE_LINKS or \
-                        ONLINE_LINKS[link_id] != viewer:
-                    RNS.log("presence bind: link %s -> user %s"
-                            " via %s" % (_pretty_lid(link_id),
-                             viewer[:12], path), RNS.LOG_NOTICE)
-                ONLINE_LINK_SPOT[link_id] = time.time()
                 ONLINE_LINKS[link_id] = viewer
         try:
             if not isinstance(data, dict):
@@ -1375,10 +1470,12 @@ def wrap_api(fn):
 @wrap_api
 def api_state(viewer, data):
     cid = data.get("channel")
-    if not store.channel_exists(db, db_lock, cid):
-        return api_error("unknown channel", 404)
-    seq = get_seq(cid)
-    row = store.latest_message_stamp(db, db_lock, cid)
+    with db_lock:
+        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
+            return api_error("unknown channel", 404)
+        seq = get_seq(cid)
+        row = db.execute("SELECT msg_id, max(coalesce(edited_at,0), coalesce(deleted_at,0)) AS mt "
+                         "FROM messages WHERE channel_id=? ORDER BY id DESC LIMIT 1", (cid,)).fetchone()
     return msgpack.packb({"ok": 1, "seq": seq,
                           "last": row["msg_id"] if row else None,
                           "last_ts": row["mt"] if row else 0.0})
@@ -1389,12 +1486,56 @@ def api_messages(viewer, data):
     cid = data.get("channel")
     if not has_perm(viewer, cid, PERMS["VIEW"]):
         return api_error("view permission required", 403)
-    res = store.fetch_messages(db, db_lock, cid, data.get("since_id"),
-                               data.get("since_ts"), data.get("before"),
-                               data.get("limit", PAGE_SIZE))
-    if res is None:
-        return api_error("unknown channel", 404)
-    seq, new_rows, upd_rows = res
+    with db_lock:
+        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
+            return api_error("unknown channel", 404)
+        seq = get_seq(cid)
+        since_id = data.get("since_id")
+        since_ts = data.get("since_ts")
+        before   = data.get("before")
+        limit = min(int(data.get("limit", PAGE_SIZE)), 200)
+        if before:
+            brow = db.execute("SELECT id FROM messages WHERE msg_id=?", (before,)).fetchone()
+            new_rows = db.execute(
+                "SELECT * FROM messages WHERE channel_id=? AND id<? ORDER BY id DESC LIMIT ?",
+                (cid, brow["id"] if brow else 0, limit)).fetchall()
+            new_rows = list(reversed(new_rows))
+        elif isinstance(since_id, int):
+            new_rows = db.execute(
+                "SELECT * FROM messages WHERE channel_id=? AND id>? ORDER BY id ASC LIMIT ?",
+                (cid, since_id, limit)).fetchall()
+        elif isinstance(since_id, str) and since_id:
+            # since_id is a msg_id hash string, not the integer PK. Resolve it
+            # first so delta polling returns rows after the last seen message.
+            bound = db.execute(
+                "SELECT id FROM messages WHERE msg_id=? AND channel_id=?",
+                (since_id, cid)).fetchone()
+            if bound:
+                new_rows = db.execute(
+                    "SELECT * FROM messages WHERE channel_id=? AND id>? ORDER BY id ASC LIMIT ?",
+                    (cid, bound["id"], limit)).fetchall()
+            else:
+                new_rows = []
+        else:
+            new_rows = db.execute(
+                "SELECT * FROM messages WHERE channel_id=? ORDER BY id DESC LIMIT ?",
+                (cid, limit)).fetchall()
+            new_rows = list(reversed(new_rows))
+        upd_rows = []
+        if isinstance(since_ts, (int, float)) and since_ts > 0:
+            id_bound = since_id if isinstance(since_id, int) else None
+            if id_bound is not None:
+                upd_rows = db.execute(
+                    "SELECT * FROM messages WHERE channel_id=? AND id<=? AND "
+                    "(coalesce(edited_at,0) > ? OR coalesce(deleted_at,0) > ?) "
+                    "ORDER BY id ASC LIMIT ?",
+                    (cid, id_bound, since_ts, since_ts, limit)).fetchall()
+            else:
+                upd_rows = db.execute(
+                    "SELECT * FROM messages WHERE channel_id=? AND "
+                    "(coalesce(edited_at,0) > ? OR coalesce(deleted_at,0) > ?) "
+                    "ORDER BY id ASC LIMIT ?",
+                    (cid, since_ts, since_ts, limit)).fetchall()
     return msgpack.packb({
         "ok": 1, "seq": seq,
         "messages": [msg_row_json(r) for r in new_rows],
@@ -1413,8 +1554,9 @@ def api_post(viewer, data):
     if not isinstance(atts, list):
         atts = []
     dlog(f"api_post: viewer={viewer[:12]} channel={cid} content_len={len(content or '')} attachments={len(atts)}")
-    if not store.channel_exists(db, db_lock, cid):
-        return api_error("unknown channel", 404)
+    with db_lock:
+        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
+            return api_error("unknown channel", 404)
     if not isinstance(content, str):
         return api_error("empty content", 400)
     # A message may be attachment-only (no text); require at least one.
@@ -1428,8 +1570,11 @@ def api_post(viewer, data):
         return api_error("rejected", 400)
     dlog(f"api_post: ingest ok msg_id={msg_id[:12]}")
     # Return stored attachment metadata so the client knows it's server-stored.
-    _atts = store.message_attachments(db, db_lock, msg_id)
-    att_row = _atts[0] if _atts else None
+    with db_lock:
+        att_row = db.execute(
+            "SELECT name, mime, size, path FROM attachments WHERE msg_id=? ORDER BY idx LIMIT 1",
+            (msg_id,),
+        ).fetchone()
     resp = {"ok": 1, "msg_id": msg_id}
     if att_row:
         dlog(f"api_post: attachment metadata name={att_row['name']} path={att_row['path']}")
@@ -1443,16 +1588,35 @@ def api_post(viewer, data):
 
 def _mutate_msg(viewer, data, action):
     msg_id = data.get("msg")
-    err, channel_id, seq, event = store.mutate_message(
-        db, db_lock, msg_id, viewer, action, data.get("content"),
-        MAX_CONTENT_LEN, now())
-    if err == "unknown message":
-        return api_error("unknown message", 404)
-    if err == "not your message":
-        return api_error("not your message", 403)
-    if err == "empty content":
-        return api_error("empty content", 400)
-    _emit_event(channel_id, action, event)
+    with db_lock:
+        row = db.execute("SELECT * FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
+        if not row:
+            return api_error("unknown message", 404)
+        if row["author_hash"] != viewer:
+            return api_error("not your message", 403)
+        if action == "edit":
+            content = data.get("content")
+            if not isinstance(content, str) or not content.strip():
+                return api_error("empty content", 400)
+            new_content = content.strip()[:MAX_CONTENT_LEN]
+            edited_at = now()
+            db.execute("INSERT INTO message_edits (msg_id, edited_at, prior_content) "
+                       "VALUES (?, ?, ?)", (msg_id, edited_at, row["content"]))
+            db.execute("UPDATE messages SET content=?, edited_at=? WHERE msg_id=?",
+                       (new_content, edited_at, msg_id))
+            event = {"msg_id": msg_id, "content": new_content,
+                     "edited_at": edited_at, "deleted_at": None}
+        else:
+            deleted_at = now()
+            db.execute("UPDATE messages SET deleted_at=? WHERE msg_id=?", (deleted_at, msg_id))
+            db.execute("DELETE FROM reactions WHERE msg_id=?", (msg_id,))
+            db.execute("DELETE FROM message_edits WHERE msg_id=?", (msg_id,))
+            event = {"msg_id": msg_id, "content": "", "edited_at": None,
+                     "deleted_at": deleted_at}
+        bump_seq(row["channel_id"])
+        db.commit()
+        seq = get_seq(row["channel_id"])
+    _emit_event(row["channel_id"], action, event)
     return msgpack.packb({"ok": 1, "seq": seq})
 
 @api_route("/api/edit")
@@ -1479,10 +1643,18 @@ def api_register(viewer, data):
         return api_error("invalid username", 400)
     if profile_node and not re.match(r"^[0-9a-fA-F]{32}$", profile_node):
         return api_error("invalid profile node hash", 400)
-    if store.register_user(db, db_lock, viewer, username,
-                           profile_node.lower() or None, now(),
-                           FOUNDER_ROLE_NAME, PERM_ALL):
-        return api_error("username taken", 409)
+    with db_lock:
+        clash = db.execute("SELECT dest_hash FROM users WHERE username=? COLLATE NOCASE "
+                           "AND dest_hash<>?", (username, viewer)).fetchone()
+        if clash:
+            return api_error("username taken", 409)
+        db.execute("INSERT INTO users (dest_hash, username, profile_node, registered_at) "
+                   "VALUES (?, ?, ?, ?) "
+                   "ON CONFLICT(dest_hash) DO UPDATE SET username=excluded.username, "
+                   "profile_node=excluded.profile_node",
+                   (viewer, username, profile_node.lower() or None, now()))
+        db.commit()
+        _maybe_founder(viewer)
     return msgpack.packb({"ok": 1})
 
 @api_route("/api/register_node")
@@ -1585,14 +1757,17 @@ def api_avatar(viewer, data):
     fname = viewer + ".img"
     with open(os.path.join(adir, fname), "wb") as f:
         f.write(blob)
-    store.set_avatar_path(db, db_lock, viewer, fname)
+    with db_lock:
+        db.execute("UPDATE users SET avatar_path=? WHERE dest_hash=?", (fname, viewer))
+        db.commit()
     return msgpack.packb({"ok": 1})
 
 @api_route("/api/avatar_get")
 @wrap_api
 def api_avatar_get(viewer, data):
     uh = data.get("user") or viewer
-    row = store.user_avatar_path(db, db_lock, uh)
+    with db_lock:
+        row = db.execute("SELECT avatar_path FROM users WHERE dest_hash=?", (uh,)).fetchone()
     if not row or not row["avatar_path"]:
         return msgpack.packb({"ok": 1, "avatar": None})
     fpath = os.path.join(STORAGE, "avatars", row["avatar_path"])
@@ -1649,12 +1824,6 @@ def wrap_json_api(fn):
         # to this user until the link dies (the presence keeper prunes it).
         if link_id:
             with ONLINE_LINKS_LOCK:
-                if link_id not in ONLINE_LINKS or \
-                        ONLINE_LINKS[link_id] != viewer:
-                    RNS.log("presence bind: link %s -> user %s"
-                            " via %s" % (_pretty_lid(link_id),
-                             viewer[:12], path), RNS.LOG_NOTICE)
-                ONLINE_LINK_SPOT[link_id] = time.time()
                 ONLINE_LINKS[link_id] = viewer
         args = _json_args(data)
         if args is None:
@@ -1668,36 +1837,6 @@ def wrap_json_api(fn):
     return handler
 
 # ---- stream internals -------------------------------------------------------------
-
-# Event kind -> BOT_PERMS receive bit. Every other kind the server emits —
-# term_data, channels_changed, channel_deleted, posts_purged — is NEVER
-# delivered to bots (no bit opts into them), and unknown kinds are denied
-# by default. Applied in BOTH delivery paths: _push_stream (the ticket
-# wake-up) and _stream_collect (poll / gap recovery), so a bot can never
-# receive a disallowed event through the other path.
-_BOT_EVENT_BITS = {"msg": BOT_PERMS["MSG"], "edit": BOT_PERMS["EDIT"],
-                   "delete": BOT_PERMS["DELETE"],
-                   "reaction": BOT_PERMS["REACTION"],
-                   "presence": BOT_PERMS["PRESENCE"],
-                   "typing": BOT_PERMS["TYPING"],
-                   "site_patch": BOT_PERMS["SITE"]}
-
-
-def _bot_event_allowed(perms, kind):
-    """May a bot holding `perms` receive an event of `kind`?"""
-    bit = _BOT_EVENT_BITS.get(kind)
-    return bit is not None and (perms & bit) != 0
-
-
-def _typing_snapshot_for(cid, bot_perms):
-    """Typing snapshot for one subscriber: a bot sees it only with the
-    TYPING bit (bot_perms None = human, always). The snapshot rides the
-    push ticket and the subscribe/poll responses, so it is gated the
-    same way as the typing events themselves."""
-    if bot_perms is not None and not (bot_perms & BOT_PERMS["TYPING"]):
-        return []
-    return _typing_snapshot(cid)
-
 
 def _emit_event(channel_id, kind, data, guild_wide=False):
     """Append an event to the rings that should carry it. A single global
@@ -1741,45 +1880,15 @@ def _push_stream(cid):
     receives it. The poll endpoint stays for one-shot gap recovery.
     """
     with SUB_LOCK:
-        subs = [(lid, s["cursor"], s.get("user_hash"), s.get("bot_id"),
-                 s.get("bot_perms"), s.get("ticket_seq", s["cursor"]))
-                for lid, s in SUBSCRIPTIONS.items() if s["channel"] == cid]
-    for lid, cursor, user_hash, bot_id, bot_perms, ticket_seq in subs:
-        if bot_perms is not None:
-            # Bot subscription: re-check the row on every push (a PK
-            # lookup; bot subs are few) so a revoke stops the flow on
-            # the next event instead of waiting for a poll or TTL reap.
-            row = store.bot_get(db, db_lock, bot_id)
-            if row is None or row["revoked_at"] is not None:
-                _drop_subscription(lid)
-                continue
+        subs = [(lid, s["cursor"], s.get("user_hash")) for lid, s in SUBSCRIPTIONS.items()
+                if s["channel"] == cid]
+    for lid, cursor, user_hash in subs:
         if not has_perm(user_hash, cid, PERMS["VIEW"]):
             # a revoked or never-granted VIEW must not keep a live push
-            # flowing down the link (tay fork tier-1); for a bot sub
-            # user_hash is the OWNER, so this is the owner's VIEW
+            # flowing down the link (tay fork tier-1)
             _drop_subscription(lid)
             continue
-        events, head, reset = _stream_collect(cid, cursor, perms=bot_perms)
-        if bot_perms is not None and not reset \
-                and not any(ev["seq"] > ticket_seq for ev in events):
-            # Bandwidth point: never wake a bot unless there is an event
-            # it may receive that it has not already been ticketed for.
-            # The push path never advances the poll cursor (the ticket
-            # only prompts a delta-fetch), so without the ticket_seq
-            # watermark a stale allowed event still sitting after the
-            # cursor would re-wake the bot for every later event —
-            # including disallowed ones. The sub stays alive, the
-            # watermark advances to head, and the poll cursor is
-            # untouched, so nothing is ever lost to the poll path. A
-            # reset IS still sent: it carries no event content, only
-            # "your cursor is stale, resync" — without it the bot's
-            # cursor could never advance past a rotated ring.
-            with SUB_LOCK:
-                s = SUBSCRIPTIONS.get(lid)
-                if s and s["channel"] == cid:
-                    s["at"] = now()
-                    s["ticket_seq"] = head
-            continue
+        events, head, reset = _stream_collect(cid, cursor)
         # v0.31 ticket protocol: the push frame carries REFERENCES, never
         # bodies. The frame rides a raw RNS.Packet with the 500-byte link
         # MTU; a single serialized message row (say 400 chars of content,
@@ -1793,7 +1902,7 @@ def _push_stream(cid):
         # snapshot capped at eight identities always packs under MTU.
         frame = {"k": "stream", "channel": cid, "seq": head,
                  "reset": reset, "ticket": True,
-                 "typing": _typing_snapshot_for(cid, bot_perms)[:8]}
+                 "typing": _typing_snapshot(cid)[:8]}
         out_cursor = cursor
         packed = msgpack.packb(frame, raw=False)
         sent = False
@@ -1811,8 +1920,6 @@ def _push_stream(cid):
             if s and s["channel"] == cid:
                 if sent:
                     s["cursor"] = out_cursor   # mirror the poll's advance
-                    if bot_perms is not None:
-                        s["ticket_seq"] = head
                 s["at"] = now()                # push keeps the sub alive
 
 def _emit_presence_if_changed(before):
@@ -1840,15 +1947,9 @@ def _drop_subscription(link_id):
                 del SUB_BY_USER[sub["user_hash"]]
     return sub
 
-def _stream_collect(cid, cursor, perms=None):
+def _stream_collect(cid, cursor):
     """(events after cursor, head seq, gap?) for one channel's ring.
-    A gap means the ring rotated past the client's cursor: it must resync.
-    perms is a bot's BOT_PERMS bitmask (None = human, unfiltered): when
-    given, only events the bot may receive are returned — the poll / gap
-    recovery path enforces the same filter as the push path, so a bot can
-    never get a disallowed event through either one. The cursor still
-    advances only to the last returned event; disallowed events are
-    skipped over when the next allowed one arrives (or on resync)."""
+    A gap means the ring rotated past the client's cursor: it must resync."""
     with EVENT_COND:
         head = EVENT_SEQ
         ring = EVENT_LOG.get(cid)
@@ -1857,11 +1958,7 @@ def _stream_collect(cid, cursor, perms=None):
         oldest = ring[0][0]
         if cursor < oldest - 1:
             return [], head, True
-        events = [ev for seq, ev in ring if seq > cursor]
-        if perms is not None:
-            events = [ev for ev in events
-                      if _bot_event_allowed(perms, ev["kind"])]
-        return events, head, False
+        return [ev for seq, ev in ring if seq > cursor], head, False
 
 def _typing_snapshot(cid):
     cutoff = now()
@@ -1874,32 +1971,24 @@ def _active_channels_by_user():
         return {uh: s["channel"] for uh, s in SUB_BY_USER.items()
                 if now() - s["at"] <= SUB_TTL_S}
 
-def _presence_payload(viewer=None):
-    """online_users() enriched with the channel each user is streaming.
-
-    active_channel is only disclosed to a viewer who holds VIEW on that
-    channel; a broadcast (guild-wide) payload carries no channel at all."""
+def _presence_payload():
+    """online_users() enriched with the channel each user is streaming."""
     active = _active_channels_by_user()
-    out = []
-    for u in sorted(online_users().values(),
-                    key=lambda x: x["username"].lower()):
-        d = dict(u)
-        ch = active.get(u["user_hash"])
-        # stable shape: the key is always present; the value is the
-        # channel only when the viewer may see it, else None
-        d["active_channel"] = (
-            ch if (viewer is not None and ch and has_perm(viewer, ch, PERMS["VIEW"]))
-            else None)
-        out.append(d)
-    return out
+    return [dict(u, active_channel=active.get(u["user_hash"]))
+            for u in sorted(online_users().values(),
+                            key=lambda x: x["username"].lower())]
 
 # ---- channels ---------------------------------------------------------------------
 
-def _channels_list_for(viewer):
-    """Channel list for one user: VIEW-filtered, with can_post + unread.
-    Shared by the human /api/v1/channels/list and the bot
-    /api/v1/bots/channels (which passes the bot's owner as viewer)."""
-    chans = store.list_channels(db, db_lock)
+@api_route("/api/v1/channels/list")
+@wrap_json_api
+def api_v1_channels_list(viewer, data, link_id):
+    with db_lock:
+        rows = db.execute("SELECT id, name, kind, created, topic, position FROM channels "
+                          "ORDER BY position ASC, name ASC").fetchall()
+        chans = [{"id": r["id"], "name": r["name"], "kind": r["kind"],
+                  "created": r["created"], "topic": r["topic"],
+                  "position": r["position"], "seq": get_seq(r["id"])} for r in rows]
     # VIEW permission: channels the viewer cannot read are absent entirely
     chans = [c for c in chans if has_perm(viewer, c["id"], PERMS["VIEW"])]
     for c in chans:
@@ -1911,34 +2000,7 @@ def _channels_list_for(viewer):
             c["can_post"] = bool(has_perm(viewer, c["id"], PERMS["POST"]))
         last_id = _receipt_last_id(c["id"], viewer)
         c["unread"] = _unread_count(c["id"], last_id)
-    return chans
-
-
-def _channel_info(cid, viewer=None):
-    """Channel metadata response (or an error dict). Shared by the human
-    /api/v1/channels/info and the bot /api/v1/bots/channel_info. Gated on
-    VIEW: channel metadata (name/topic/manifest) is not for members who
-    cannot see the channel, and non-VIEW members must not be able to
-    probe its existence."""
-    if viewer is not None and not has_perm(viewer, cid, PERMS["VIEW"]):
-        return {"ok": 0, "error": "unknown channel", "code": 404}
-    r = store.channel_row(db, db_lock, cid)
-    if not r:
-        return {"ok": 0, "error": "unknown channel", "code": 404}
-    seq = get_seq(cid)
-    try:
-        manifest = json.loads(r["manifest"] or "{}")
-    except Exception:
-        manifest = {}
-    return {"ok": 1, "channel": {"id": r["id"], "name": r["name"], "kind": r["kind"],
-                                 "manifest": manifest, "created": r["created"],
-                                 "topic": r["topic"], "seq": seq}}
-
-
-@api_route("/api/v1/channels/list")
-@wrap_json_api
-def api_v1_channels_list(viewer, data, link_id):
-    return {"ok": 1, "channels": _channels_list_for(viewer)}
+    return {"ok": 1, "channels": chans}
 
 @api_route("/api/v1/channels/reorder")
 @wrap_json_api
@@ -1953,9 +2015,14 @@ def api_v1_channels_reorder(viewer, data, link_id):
             or not all(isinstance(c, str) for c in order) \
             or len(set(order)) != len(order):
         return {"ok": 0, "error": "order must be a unique cid list", "code": 400}
-    if not store.reorder_channels(db, db_lock, order):
-        return {"ok": 0, "error": "order must cover every channel exactly once",
-                "code": 400}
+    with db_lock:
+        known = {r["id"] for r in db.execute("SELECT id FROM channels").fetchall()}
+        if set(order) != known:
+            return {"ok": 0, "error": "order must cover every channel exactly once",
+                    "code": 400}
+        for idx, cid in enumerate(order, start=1):
+            db.execute("UPDATE channels SET position=? WHERE id=?", (idx, cid))
+        db.commit()
     # every subscriber sees the new order through their own channel's stream
     _audit(viewer, "channel.reorder", None, "channels=%d" % len(order))
     _emit_event(None, "channels_changed", {"order": order}, guild_wide=True)
@@ -1968,8 +2035,6 @@ def _create_channel_txn(viewer, name, kind, manifest=None):
     kind = (kind or "chat").strip().lower()
     if not re.match(r"^[a-zA-Z0-9_\-]{1,32}$", name):
         return None, "invalid channel name"
-    if not rate_ok(viewer, "_chancreate", 10, 3600):
-        return None, "rate limited: too many channels created"
     if kind not in CHANNEL_KINDS:
         return None, "kind must be one of: " + ", ".join(CHANNEL_KINDS)
     if kind in ("site", "term") and not is_moderator(viewer):
@@ -1978,10 +2043,18 @@ def _create_channel_txn(viewer, name, kind, manifest=None):
         return None, "manifest must be an object"
     manifest_json = json.dumps(manifest)[:4096] if manifest else "{}"
     cid = hexstr(RNS.Identity.full_hash(f"{GUILD_ID}:{name}".encode()))
-    cid, err = store.create_channel(db, db_lock, cid, name, kind,
-                                    manifest_json, now())
-    if err:
-        return None, err
+    with db_lock:
+        if db.execute("SELECT 1 FROM channels WHERE id=? OR (name=? COLLATE NOCASE)",
+                      (cid, name)).fetchone():
+            return None, "channel exists"
+        # explicit ordering: new channels sink to the end of the drag list
+        nxt = (db.execute("SELECT COALESCE(MAX(position), 0) + 1 AS nxt "
+                          "FROM channels").fetchone()["nxt"])
+        db.execute("INSERT INTO channels (id, name, created, kind, manifest, position) "
+                   "VALUES (?, ?, ?, ?, ?, ?)",
+                   (cid, name, now(), kind, manifest_json, nxt))
+        db.execute("INSERT OR IGNORE INTO channel_state (channel_id, seq) VALUES (?, 0)", (cid,))
+        db.commit()
     if kind == "site":
         # outside db_lock: the seed is a file write + handler registration
         _seed_default_site(cid)
@@ -1995,9 +2068,7 @@ def api_v1_channels_create(viewer, data, link_id):
                                    data.get("manifest"))
     if err:
         return {"ok": 0, "error": err,
-                "code": 403 if "moderator" in err
-                else (429 if "rate limited" in err
-                      else (409 if "exists" in err else 400))}
+                "code": 403 if "moderator" in err else (409 if "exists" in err else 400)}
     kind = (data.get("kind") or "chat").strip().lower()
     manifest = data.get("manifest")
     return {"ok": 1, "channel": {"id": cid, "name": (data.get("name") or "").strip(),
@@ -2007,7 +2078,20 @@ def api_v1_channels_create(viewer, data, link_id):
 @api_route("/api/v1/channels/info")
 @wrap_json_api
 def api_v1_channels_info(viewer, data, link_id):
-    return _channel_info(data.get("channel"), viewer)
+    cid = data.get("channel")
+    with db_lock:
+        r = db.execute("SELECT id, name, kind, manifest, created, topic FROM channels "
+                       "WHERE id=?", (cid,)).fetchone()
+        if not r:
+            return {"ok": 0, "error": "unknown channel", "code": 404}
+        seq = get_seq(cid)
+        try:
+            manifest = json.loads(r["manifest"] or "{}")
+        except Exception:
+            manifest = {}
+    return {"ok": 1, "channel": {"id": r["id"], "name": r["name"], "kind": r["kind"],
+                                 "manifest": manifest, "created": r["created"],
+                                 "topic": r["topic"], "seq": seq}}
 
 # ---- stream -----------------------------------------------------------------------
 
@@ -2015,23 +2099,11 @@ def api_v1_channels_info(viewer, data, link_id):
 @wrap_json_api
 def api_v1_stream_subscribe(viewer, data, link_id):
     cid = data.get("channel")
-    chan = store.channel_row(db, db_lock, cid)
+    with db_lock:
+        chan = db.execute("SELECT id, kind FROM channels WHERE id=?", (cid,)).fetchone()
     if not chan:
         return {"ok": 0, "error": "unknown channel", "code": 404}
-    bot = None
-    if "bot_id" in data or "api_key" in data:
-        # Bot subscription: credentials travel in the request data — the
-        # bot's link identity is its own RNS identity, not the owner's,
-        # so viewer_of would give the bot's own delivery hash. Bad,
-        # revoked or unknown credentials -> 403, never 404: the response
-        # must not leak whether a bot_id exists.
-        bot = _resolve_bot(data.get("bot_id"), data.get("api_key"))
-        if bot is None:
-            return {"ok": 0, "error": "invalid bot credentials", "code": 403}
-        # The bot streams AS its owner: the owner must hold VIEW.
-        if not has_perm(bot["owner_hash"], cid, PERMS["VIEW"]):
-            return {"ok": 0, "error": "view permission required", "code": 403}
-    elif not has_perm(viewer, cid, PERMS["VIEW"]):
+    if not has_perm(viewer, cid, PERMS["VIEW"]):
         return {"ok": 0, "error": "view permission required", "code": 403}
     _purge_subs()
     with EVENT_COND:
@@ -2041,36 +2113,16 @@ def api_v1_stream_subscribe(viewer, data, link_id):
     # One subscription per link: this replaces whatever the link streamed before,
     # which is what makes "only the active channel flows" a server-side rule.
     with SUB_LOCK:
-        if bot is not None:
-            # Bot subs are keyed by the OWNER's hash (that is what the
-            # VIEW checks read), but they NEVER enter SUB_BY_USER: that
-            # index is the presence machinery's per-user view — a bot
-            # subscribing as its owner would clobber the owner's own
-            # subscription and surface the bot's channel as the owner's
-            # active_channel. Bots are not users; _presence_payload must
-            # never list them. _drop_subscription / unsubscribe only
-            # clear SUB_BY_USER when the link_id matches, so a stale
-            # human entry pointing at this link is cleaned up, never a
-            # live one on another link.
-            SUBSCRIPTIONS[link_id] = {"user_hash": bot["owner_hash"],
-                                      "channel": cid, "cursor": cursor,
-                                      "at": now(), "bot_id": bot["bot_id"],
-                                      "bot_perms": bot["perms"],
-                                      "ticket_seq": cursor}
-        else:
-            old = SUBSCRIPTIONS.get(link_id)
-            if old and old["user_hash"] == viewer:
-                cur = SUB_BY_USER.get(viewer)
-                if cur and cur.get("link_id") == link_id:
-                    del SUB_BY_USER[viewer]
-            SUBSCRIPTIONS[link_id] = {"user_hash": viewer, "channel": cid,
-                                      "cursor": cursor, "at": now()}
-            SUB_BY_USER[viewer] = {"channel": cid, "link_id": link_id, "at": now()}
-    if bot is not None:
-        store.bot_touch_last_seen(db, db_lock, bot["bot_id"], now())
+        old = SUBSCRIPTIONS.get(link_id)
+        if old and old["user_hash"] == viewer:
+            cur = SUB_BY_USER.get(viewer)
+            if cur and cur.get("link_id") == link_id:
+                del SUB_BY_USER[viewer]
+        SUBSCRIPTIONS[link_id] = {"user_hash": viewer, "channel": cid,
+                                  "cursor": cursor, "at": now()}
+        SUB_BY_USER[viewer] = {"channel": cid, "link_id": link_id, "at": now()}
     return {"ok": 1, "channel": cid, "kind": chan["kind"],
-            "seq": head, "cursor": cursor,
-            "typing": _typing_snapshot_for(cid, bot["perms"] if bot else None)}
+            "seq": head, "cursor": cursor, "typing": _typing_snapshot(cid)}
 
 @api_route("/api/v1/stream/poll")
 @wrap_json_api
@@ -2081,30 +2133,13 @@ def api_v1_stream_poll(viewer, data, link_id):
     except (TypeError, ValueError):
         wait_s = STREAM_WAIT_S
     deadline = now() + wait_s
-    touched_bot = None    # bot_id whose last_seen this request already touched
     while True:
         with SUB_LOCK:
             sub = SUBSCRIPTIONS.get(link_id)
         if not sub:
             return {"ok": 0, "error": "not subscribed", "code": 409}
         cid = sub["channel"]
-        bot_perms = sub.get("bot_perms")
-        if bot_perms is not None:
-            # Bot subscription: the link identity is the bot's own, not
-            # the owner's, so the viewer check below cannot apply —
-            # authenticate as the owner instead, and re-check the row
-            # on every pass (a PK lookup) so a revoke mid-long-poll
-            # drops the sub with a 403 instead of draining events.
-            row = store.bot_get(db, db_lock, sub["bot_id"])
-            if row is None or row["revoked_at"] is not None \
-                    or not has_perm(sub["user_hash"], cid, PERMS["VIEW"]):
-                _drop_subscription(link_id)
-                return {"ok": 0, "error": "invalid bot credentials",
-                        "code": 403}
-            if touched_bot is None:
-                store.bot_touch_last_seen(db, db_lock, sub["bot_id"], now())
-                touched_bot = sub["bot_id"]
-        elif sub["user_hash"] != viewer or not has_perm(viewer, cid, PERMS["VIEW"]):
+        if sub["user_hash"] != viewer or not has_perm(viewer, cid, PERMS["VIEW"]):
             # identity swap on this link, or a permission revoke: the sub
             # must not outlive the VIEW grant (tay fork tier-1)
             _drop_subscription(link_id)
@@ -2113,7 +2148,7 @@ def api_v1_stream_poll(viewer, data, link_id):
         pc = data.get("cursor")
         if isinstance(pc, (int, float)) and pc >= 0:
             cursor = int(pc)          # client override (reconnect/resync)
-        events, head, reset = _stream_collect(cid, cursor, perms=bot_perms)
+        events, head, reset = _stream_collect(cid, cursor)
         if events or reset or now() >= deadline:
             out_cursor = events[-1]["seq"] if events else (head if reset else cursor)
             with SUB_LOCK:
@@ -2126,7 +2161,7 @@ def api_v1_stream_poll(viewer, data, link_id):
                 return {"ok": 1, "channel": cid, "events": [], "cursor": head,
                         "seq": head, "reset": True}
             return {"ok": 1, "channel": cid, "events": events, "cursor": out_cursor,
-                    "reset": False, "typing": _typing_snapshot_for(cid, bot_perms)}
+                    "reset": False, "typing": _typing_snapshot(cid)}
         # Long-poll: sleep on the event condition in short slices so a
         # resubscribe from this link is honoured promptly.
         with EVENT_COND:
@@ -2143,289 +2178,16 @@ def api_v1_stream_unsubscribe(viewer, data, link_id):
                 del SUB_BY_USER[sub["user_hash"]]
     return {"ok": 1}
 
-# ---- voice rooms ------------------------------------------------------------------
-#
-# tay, 2026-11-23: the hub is the directory, never the relay. A voice room
-# is a roster on the channel: who is in, each member's voice destination
-# hash, mute flag, last refresh. Roster changes ride the event ring on the
-# room's own channel (k:"voice_state"), so room members get pushed through
-# the same path that carries chat. Audio frames link peer-to-peer between
-# member voice destinations; this process never reads or forwards them.
-
-VOICE_ROOMS = {}        # cid -> {viewer: {"dest": hex, "muted": bool, "at": ts}}
-VOICE_ROOMS_LOCK = threading.RLock()
-VOICE_ROOMS_SWEEP_S = 900.0   # no refreshes for this long -> dropped from rooms
-VOICE_RNS_STALE_GRACE_S = 12.0  # STALE link still fed traffic -> stay live
-
-
-def _voice_leave_all(viewer):
-    """Remove a viewer from every room. Returns the touched channel ids."""
-    touched = []
-    with VOICE_ROOMS_LOCK:
-        for cid, members in list(VOICE_ROOMS.items()):
-            if viewer in members:
-                members.pop(viewer, None)
-                touched.append(cid)
-                if not members:
-                    del VOICE_ROOMS[cid]
-    return touched
-
-
-def _voice_room_roster(cid):
-    with VOICE_ROOMS_LOCK:
-        members = VOICE_ROOMS.get(cid, {})
-        return [dict({"viewer": v}, **{
-            "dest": m["dest"], "muted": m["muted"], "at": m["at"]})
-            for v, m in members.items()]
-
-
-def _voice_emit_roster(cid, reason="change"):
-    RNS.log("voice roster %s: %s" % (cid[:8], reason), RNS.LOG_NOTICE)
-    _emit_event(cid, "voice_state", {
-        "channel": cid, "reason": reason,
-        "members": _voice_room_roster(cid)}, guild_wide=False)
-
-
-def _sweep_voice_rooms():
-    cutoff = now() - VOICE_ROOMS_SWEEP_S
-    touched = []
-    with VOICE_ROOMS_LOCK:
-        for cid, members in list(VOICE_ROOMS.items()):
-            for v in [v for v, m in members.items() if m["at"] < cutoff]:
-                members.pop(v, None)
-                touched.append(cid)
-            if cid in VOICE_ROOMS and not VOICE_ROOMS[cid]:
-                del VOICE_ROOMS[cid]
-    for cid in sorted(set(touched)):
-        _voice_emit_roster(cid, "sweep")
-
-
-@api_route("/api/v1/voice/join")
-@wrap_json_api
-def api_v1_voice_join(viewer, data, link_id):
-    cid = data.get("channel")
-    dest = data.get("dest") or ""
-    muted = data.get("muted") or False
-    chan = store.channel_row(db, db_lock, cid)
-    if not chan:
-        return {"ok": 0, "error": "unknown channel", "code": 404}
-    if chan["kind"] != "voice":
-        return {"ok": 0, "error": "channel is not a voice channel", "code": 400}
-    if not dest or len(dest) < 10:
-        # The roster hands out peer link targets; an empty one is useless.
-        return {"ok": 0, "error": "dest required", "code": 400}
-    if not has_perm(viewer, cid, PERMS["VIEW"]):
-        return {"ok": 0, "error": "view permission required", "code": 403}
-    _sweep_voice_rooms()
-    touched = _voice_leave_all(viewer)
-    for t in sorted(set(touched) - {cid}):
-        RNS.log("voice join %s drops old room %s" % (viewer[:8], t[:8]),
-                RNS.LOG_NOTICE)
-    with VOICE_ROOMS_LOCK:
-        VOICE_ROOMS.setdefault(cid, {})[viewer] = {
-            "dest": dest, "muted": muted, "at": now()}
-    for t in sorted(set(touched) - {cid}):
-        _voice_emit_roster(t, "left")
-    _voice_emit_roster(cid, "joined")
-    return {"ok": 1, "channel": cid, "members": _voice_room_roster(cid)}
-
-
-@api_route("/api/v1/voice/leave")
-@wrap_json_api
-def api_v1_voice_leave(viewer, data, link_id):
-    touched = _voice_leave_all(viewer)
-    for t in sorted(set(touched)):
-        _voice_emit_roster(t, "left")
-    return {"ok": 1, "left": sorted(set(touched))}
-
-
-@api_route("/api/v1/voice/rooms")
-@wrap_json_api
-def api_v1_voice_rooms(viewer, data, link_id):
-    """Rail counts: one voice channel id per room, with member rosters."""
-    _sweep_voice_rooms()
-    with VOICE_ROOMS_LOCK:
-        rooms = {cid: {"members": [m for m in [
-            dict({"viewer": v}, **mm) for v, mm in members.items()]]}
-            for cid, members in list(VOICE_ROOMS.items())}
-    return {"ok": 1, "rooms": rooms}
-
-
-def _push_voice(cid, sender_viewer, body):
-    """Relay one speaker's voice frame to the room's other subscriber
-    links. The engine's direct lane is peer-to-peer over RNS links; this
-    fallback exists for probe-failed pairs that could never establish
-    one. The frame is raw on the link (k="voice") because metadata
-    events carry references, never bodies; voice is audio bytes by
-    design and must not enter the event ring."""
-    with VOICE_ROOMS_LOCK:
-        room = VOICE_ROOMS.get(cid) or {}
-        sender_dest = (room.get(sender_viewer) or {}).get("dest")
-        targets = [v for v in room if v != sender_viewer]
-    if not sender_dest or not targets:
-        RNS.log("voice relay %s: empty (sender=%s room=%s targets=%s)"
-                % (cid[:8], sender_viewer, sorted(room), targets),
-                RNS.LOG_NOTICE)
-        return 0
-    frame = msgpack.packb({"k": "voice", "dest": sender_dest, "body": body})
-    with SUB_LOCK:
-        subs = [(lid, s["user_hash"])
-                for lid, s in SUBSCRIPTIONS.items()
-                if s["channel"] == cid and s["user_hash"] in targets]
-    sent = 0
-    seen_lids = set()
-    for lid, uhash in subs:
-        if not has_perm(uhash, cid, PERMS["VIEW"]):
-            continue
-        match = None
-        for link in list(RNS.Transport.active_links):
-            if link.link_id == lid and link.status == RNS.Link.ACTIVE:
-                match = link
-                break
-        if match is None:
-            # Same traffic grace as presence: a link the dispatcher
-            # identified moments ago is deliverable even if its RNS
-            # status snapshot reads STALE between the client's polls.
-            with ONLINE_LINKS_LOCK:
-                spot = ONLINE_LINK_SPOT.get(lid, 0.0)
-            if time.time() - spot < VOICE_RNS_STALE_GRACE_S:
-                for link in list(RNS.Transport.active_links):
-                    if link.link_id == lid:
-                        match = link
-                        break
-        if match is None:
-            if lid not in seen_lids:
-                seen_lids.add(lid)
-                RNS.log("voice relay %s: sub %s/%s has NO active link"
-                        % (cid[:8], uhash[:8], lid[:8]), RNS.LOG_NOTICE)
-            continue
-        if lid not in seen_lids:
-            seen_lids.add(lid)
-            itab = []
-            for i in RNS.Transport.interfaces:
-                itab.append("%s%s/%d" % (type(i).__name__,
-                                         "/OUT" if getattr(i, "OUT", False)
-                                         else "",
-                                         len(getattr(i, "spawned_interfaces",
-                                                     []) or [])))
-            att = getattr(match, "attached_interface", None)
-            att_is_spawned = any(
-                att is s
-                for i in RNS.Transport.interfaces
-                for s in (getattr(i, "spawned_interfaces", None) or []))
-            attin = any(att is i for i in RNS.Transport.interfaces)
-            inpt = match.link_id in RNS.Transport.path_table
-            RNS.log("voice relay %s: sub %s lid %s active -> send attin=%s"
-                    " att_is_spawned=%s att_online=%s inpath=%s"
-                    " active_links=%d itab=%s"
-                    % (cid[:8], uhash[:8], lid[:8], attin, att_is_spawned,
-                       getattr(att, "online", "n/a"), inpt,
-                       len(RNS.Transport.active_links), itab), RNS.LOG_NOTICE)
-        try:
-            iface = match.attached_interface
-            if iface is None:
-                RNS.log("voice relay %s: link %s has no attached iface"
-                        % (cid[:8], lid[:8]), RNS.LOG_ERROR)
-                continue
-            pkt = RNS.Packet(match, frame)
-            pkt.pack()
-            RNS.Transport.transmit(iface, pkt.raw)
-            sent += 1
-        except Exception as e:
-            RNS.log("voice relay to link failed: %s" % e, RNS.LOG_ERROR)
-    RNS.log("voice relay %s: room=%s subs=%d active=%d sent=%d"
-            % (cid[:8], sorted(room), len(subs),
-               len(RNS.Transport.active_links), sent), RNS.LOG_NOTICE)
-    return sent
-
-
-@api_route("/api/v1/voice/publish")
-@wrap_json_api
-def api_v1_voice_publish(viewer, data, link_id):
-    """One speaker tick of relayed voice. Body is the speaker's own
-    direct-form packet: two bytes of sequence, then a codec packet."""
-    if not rate_ok(viewer, "_voice_pub", 900, 60):
-        return {"ok": 0, "error": "rate limited", "code": 429}
-    cid = data.get("channel")
-    try:
-        body = base64.b64decode(data.get("body") or "")
-    except ValueError:
-        return {"ok": 0, "error": "bad body", "code": 400}
-    if not body or len(body) < 2:
-        return {"ok": 0, "error": "empty body", "code": 400}
-    with VOICE_ROOMS_LOCK:
-        member = (VOICE_ROOMS.get(cid) or {}).get(viewer)
-    if member is None:
-        return {"ok": 0, "error": "not in room", "code": 404}
-    n = _push_voice(cid, viewer, body)
-    RNS.log("voice relay %s: %d links (%d bytes)"
-            % (cid[:8], n, len(body)), RNS.LOG_DEBUG)
-    return {"ok": 1, "sent": n}
-
-
-def _on_node_link_established(link):
-    """Raw lane: a node link's packets are demuxed for voice-pub."""
-    try:
-        link.set_packet_callback(_on_link_voice_pub)
-    except Exception as e:
-        RNS.log("link packet callback failed: %s" % e, RNS.LOG_ERROR)
-
-
-def _pretty_lid(lid):
-    """prettyhexrep for real link ids; str ids (test lanes) pass through."""
-    if isinstance(lid, bytes):
-        return RNS.prettyhexrep(lid)
-    return str(lid)
-
-
-def _on_link_voice_pub(plaintext, packet=None):
-    """One speaker tick of relayed voice as a raw link packet. A viewer
-    is in at most one voice room (join leaves the others), so the room
-    is resolved from the viewer, not carried in the frame: no channel
-    field keeps the packet under the link MTU."""
-    try:
-        frame = msgpack.unpackb(plaintext, raw=False)
-    except Exception:
-        return
-    if not isinstance(frame, dict) or frame.get("k") != "voice-pub":
-        return
-    body = frame.get("body")
-    if not isinstance(body, (bytes, bytearray)) or len(body) < 2:
-        return
-    link = packet.link if packet is not None else None
-    viewer = ONLINE_LINKS.get(link.link_id) if link is not None else None
-    if not viewer:
-        return
-    # Raw voice traffic is traffic: feed the same presence stamp the
-    # dispatcher feeds on identified requests, so a speaker's relay
-    # stream at 10Hz keeps its link live without any api calls.
-    with ONLINE_LINKS_LOCK:
-        ONLINE_LINK_SPOT[link.link_id] = time.time()
-    with VOICE_ROOMS_LOCK:
-        room = next((cid for cid, m in VOICE_ROOMS.items() if viewer in m),
-                    None)
-    if not room:
-        return
-    if not rate_ok(viewer, "_voice_pub", 900, 60):
-        return
-    n = _push_voice(room, viewer, body)
-    RNS.log("voice pub %s from %s -> %d links (%d bytes)"
-            % (room[:8], viewer[:8], n, len(body)), RNS.LOG_DEBUG)
-
-
 # ---- typing -----------------------------------------------------------------------
 
 @api_route("/api/v1/typing")
 @wrap_json_api
 def api_v1_typing(viewer, data, link_id):
-    if not rate_ok(viewer, "_typing", 30, 60):
-        return {"ok": 0, "error": "rate limited", "code": 429}
     cid = data.get("channel")
     active = bool(data.get("active"))
-    if not store.channel_exists(db, db_lock, cid):
-        return {"ok": 0, "error": "unknown channel", "code": 404}
-    if not has_perm(viewer, cid, PERMS["VIEW"]):
-        return {"ok": 0, "error": "view permission required", "code": 403}
+    with db_lock:
+        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
+            return {"ok": 0, "error": "unknown channel", "code": 404}
     with TYPING_LOCK:
         bucket = TYPING.setdefault(cid, {})
         was_active = bucket.get(viewer, 0) >= now()
@@ -2447,35 +2209,7 @@ def api_v1_typing(viewer, data, link_id):
 def api_v1_presence(viewer, data, link_id):
     """Link-derived active users (v0.29) plus the channel each user is
     currently streaming."""
-    return {"ok": 1, "mode": "link", "users": _presence_payload(viewer), "now": now()}
-
-# ---- blob access control (tay: ACLs, not just identified links) ----------
-# A digest is a 256-bit capability, but capability was the only gate. The
-# rule: the uploader may read their own blob; guild-icon and banner blobs
-# (server_config) are readable by every identified member; guild admins
-# may read anything; everyone else gets the same "not found" silence as
-# an unknown blob. Chat attachments never ride this path (ingest copies
-# bytes into attachments/), so tightening blob reads cannot break posts.
-
-def blob_visible(viewer, digest):
-    """True if `viewer` may read blob `digest`."""
-    if not viewer or not re.match(r"^[0-9a-f]{32}$", digest or ""):
-        return False
-    try:
-        if store.user_has_role_perm(db, db_lock, viewer, PERMS["ADMIN"]):
-            return True
-    except Exception:
-        pass
-    owner = store.blob_owner(db, db_lock, digest)
-    if owner and owner == viewer:
-        return True
-    try:
-        for key in ("guild_icon", "banner"):
-            if (_cfg_get(key, "") or "").strip().lower() == digest:
-                return True
-    except Exception:
-        pass
-    return False
+    return {"ok": 1, "mode": "link", "users": _presence_payload(), "now": now()}
 
 # ---- blobs (phase 3): content-addressed image/media get+put ------------------------
 
@@ -2507,7 +2241,9 @@ def _blob_fname(digest):
     # registry, so the disk scan misses -- but the blobs metadata row
     # persists in both modes, and its path is exactly the fname the
     # serve paths (RAM-first, then disk) use.
-    row = store.blob_path(db, db_lock, digest)
+    with db_lock:
+        row = db.execute("SELECT path FROM blobs WHERE id=?",
+                         (digest,)).fetchone()
     if row and row["path"]:
         return row["path"]
     return None
@@ -2625,8 +2361,6 @@ def api_v1_blobs_get(viewer, data, link_id):
     """Chunked blob read: {blob_id, offset?, len?} ->
     {data_b64, total, offset, eof}. len is capped at BLOB_CHUNK_MAX."""
     digest = (data.get("blob_id") or "").strip().lower()
-    if not blob_visible(viewer, digest):
-        return {"ok": 0, "error": "unknown blob_id", "code": 404}
     fname = _blob_fname(digest)
     if not fname:
         return {"ok": 0, "error": "unknown blob_id", "code": 404}
@@ -2678,15 +2412,8 @@ def api_v1_att_get(viewer, data, link_id):
 
 def serve_blob_file(path, data, request_id, link_id, remote_identity, requested_at):
     """Raw /file/blobs/<fname> handler (one per stored blob, attachments
-    pattern). Path is the registration key; validate before touching disk.
-    Like attachments there is no message linkage to gate on, so the gate
-    is blob_visible(): uploader, guild admin, or a blob referenced by the
-    guild icon/banner config. Everyone else gets the same "not found"
-    silence as an unknown blob. (Digests are 256-bit capabilities, but
-    capability alone no longer grants a read.)"""
+    pattern). Path is the registration key; validate before touching disk."""
     fname = path.rsplit("/", 1)[-1]
-    if not blob_visible(viewer_of(remote_identity), fname.split(".")[0]):
-        return b"not found"
     if not re.match(r"^[0-9a-f]{32}\.[a-z0-9]{1,8}$", fname):
         return b"not found"
     entry = _att_ram_get(fname.split(".")[0])
@@ -2736,9 +2463,14 @@ def _blob_commit(blob, name, mime, by=None):
         node_destination.register_request_handler(
             "/file/blobs/" + fname, serve_blob_file,
             allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
-    store.record_blob(db, db_lock, digest, name or fname,
-                      EXT_MIME.get(ext, mime or "application/octet-stream"),
-                      len(blob), fname, by)
+    with db_lock:
+        db.execute(
+            "INSERT OR IGNORE INTO blobs (id, name, mime, size, path, ts, by) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (digest, name or fname,
+             EXT_MIME.get(ext, mime or "application/octet-stream"),
+             len(blob), fname, now(), by))
+        db.commit()
     return {"ok": 1, "blob_id": digest, "size": len(blob),
             "mime": EXT_MIME.get(ext, mime or "application/octet-stream"),
             "name": name or fname, "path": "/file/blobs/" + fname}
@@ -2965,8 +2697,9 @@ def api_v1_post(viewer, data, link_id):
     Same ingest path as the msgpack /api/post (rate limit, moderation, ledger)."""
     cid = data.get("channel")
     content = data.get("content")
-    if not store.channel_exists(db, db_lock, cid):
-        return {"ok": 0, "error": "unknown channel", "code": 404}
+    with db_lock:
+        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
+            return {"ok": 0, "error": "unknown channel", "code": 404}
     if not isinstance(content, str):
         return {"ok": 0, "error": "empty content", "code": 400}
     triples, err = _resolve_v1_attachments(data.get("attachments"))
@@ -2979,7 +2712,9 @@ def api_v1_post(viewer, data, link_id):
     msg_id = ingest(cid, viewer, content, attachments=triples)
     if msg_id is None:
         return {"ok": 0, "error": "rejected", "code": 400}
-    atts = store.message_attachments(db, db_lock, msg_id)
+    with db_lock:
+        atts = db.execute("SELECT name, mime, size, path FROM attachments "
+                          "WHERE msg_id=? ORDER BY idx", (msg_id,)).fetchall()
     return {"ok": 1, "msg_id": msg_id,
             "attachments": [{"name": a["name"], "mime": a["mime"], "size": a["size"],
                              "path": "/file/attachments/" + a["path"]} for a in atts]}
@@ -3056,7 +2791,8 @@ def _seed_default_site(cid):
     RNS.log(f"site channel seeded: {cid}/index.mu", RNS.LOG_INFO)
 
 def _site_channel(cid):
-    r = store.channel_row(db, db_lock, cid)
+    with db_lock:
+        r = db.execute("SELECT id, kind FROM channels WHERE id=?", (cid,)).fetchone()
     return r if (r and r["kind"] == "site") else None
 
 @api_route("/api/v1/site/put")
@@ -3104,10 +2840,10 @@ def api_v1_site_put(viewer, data, link_id):
     return {"ok": 1, "channel": cid, "path": "/" + rel, "size": len(blob),
             "mime": mime, "file_path": reg_path}
 
-def _site_read_for(viewer, data):
-    """Chunked site resource read shared by human /api/v1/site/get and
-    bot /api/v1/bots/site_get (the bot passes its owner as viewer, so
-    VIEW and can_edit are the owner's)."""
+@api_route("/api/v1/site/get")
+@wrap_json_api
+def api_v1_site_get(viewer, data, link_id):
+    """Chunked site resource read: {channel, path, offset?, len?}."""
     cid = data.get("channel")
     if not _site_channel(cid):
         return {"ok": 0, "error": "unknown or non-site channel", "code": 404}
@@ -3136,36 +2872,20 @@ def _site_read_for(viewer, data):
             "can_edit": bool(can_edit),
             "data_b64": base64.b64encode(chunk).decode("ascii")}
 
-
-@api_route("/api/v1/site/get")
+@api_route("/api/v1/site/manifest")
 @wrap_json_api
-def api_v1_site_get(viewer, data, link_id):
-    """Chunked site resource read: {channel, path, offset?, len?}."""
-    return _site_read_for(viewer, data)
-
-def _site_manifest_for(viewer, data, require_view=False):
-    """Site-manifest read shared by human /api/v1/site/manifest and bot
-    /api/v1/bots/site_manifest. The human endpoint is ungated (manifests
-    are public metadata); the bot one passes require_view=True so a bot
-    still needs its owner's VIEW on the channel."""
+def api_v1_site_manifest(viewer, data, link_id):
+    """Get a site channel's manifest: {channel} -> {manifest}."""
     cid = data.get("channel")
-    r = store.channel_row(db, db_lock, cid)
+    with db_lock:
+        r = db.execute("SELECT kind, manifest FROM channels WHERE id=?", (cid,)).fetchone()
     if not r or r["kind"] != "site":
         return {"ok": 0, "error": "unknown or non-site channel", "code": 404}
-    if require_view and not has_perm(viewer, cid, PERMS["VIEW"]):
-        return {"ok": 0, "error": "view permission required", "code": 403}
     try:
         manifest = json.loads(r["manifest"] or "{}")
     except Exception:
         manifest = {}
     return {"ok": 1, "channel": cid, "manifest": manifest}
-
-
-@api_route("/api/v1/site/manifest")
-@wrap_json_api
-def api_v1_site_manifest(viewer, data, link_id):
-    """Get a site channel's manifest: {channel} -> {manifest}."""
-    return _site_manifest_for(viewer, data)
 
 @api_route("/api/v1/site/manifest_put")
 @wrap_json_api
@@ -3181,7 +2901,10 @@ def api_v1_site_manifest_put(viewer, data, link_id):
     manifest = data.get("manifest")
     if not isinstance(manifest, dict):
         return {"ok": 0, "error": "manifest must be an object", "code": 400}
-    store.set_channel_manifest(db, db_lock, cid, json.dumps(manifest)[:4096])
+    with db_lock:
+        db.execute("UPDATE channels SET manifest=? WHERE id=?",
+                   (json.dumps(manifest)[:4096], cid))
+        db.commit()
     _emit_event(cid, "site_patch", {"manifest": manifest})
     return {"ok": 1, "channel": cid, "manifest": manifest}
 
@@ -3245,7 +2968,9 @@ def _resolve_user(token):
     token = (token or "").strip()
     if re.match(r"^[0-9a-f]{32}$", token):
         return token
-    row = store.user_by_username(db, db_lock, token)
+    with db_lock:
+        row = db.execute("SELECT dest_hash FROM users WHERE username=? COLLATE NOCASE",
+                         (token,)).fetchone()
     return row["dest_hash"] if row else None
 
 def _dispatch_command(viewer, line):
@@ -3270,7 +2995,7 @@ def _dispatch_command(viewer, line):
             "  presence            the active user list",
             "  uptime              guild uptime",
             "  create <name> [kind]   new channel (site/term: moderator)",
-            "  delete <channel>    delete a channel (admin)",
+            "  delete <channel>    delete a channel (moderator)",
             "  rename <channel> <name>   rename (moderator)",
             "  topic <channel> <text>    set the channel topic (moderator)",
             "  ban <user> / unban <user>        moderator",
@@ -3287,12 +3012,11 @@ def _dispatch_command(viewer, line):
             out = "\r\n".join(
                 "  %s  node %s  in %s" % (
                     u["username"], u["node_hash"][:12],
-                    (channel_name(active.get(u["user_hash"], ""))
-                     if active.get(u["user_hash"]) and has_perm(viewer, active[u["user_hash"]], PERMS["VIEW"])
-                     else "-"))
+                    channel_name(active.get(u["user_hash"], "")) or "-")
                 for u in sorted(users.values(), key=lambda x: x["username"].lower()))
     elif cmd == "channels":
-        rows = store.list_channel_name_kind(db, db_lock)
+        with db_lock:
+            rows = db.execute("SELECT name, kind FROM channels ORDER BY name").fetchall()
         out = "\r\n".join("  #%s (%s)" % (r["name"], r["kind"]) for r in rows) or "  (none)"
     elif cmd == "msg":
         chan, _, text = arg.partition(" ")
@@ -3301,7 +3025,9 @@ def _dispatch_command(viewer, line):
         if not chan or not text:
             out = "usage: msg <channel> <text>"
         else:
-            row = store.channel_id_by_name(db, db_lock, chan)
+            with db_lock:
+                row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
+                                 (chan,)).fetchone()
             if not row:
                 out = "unknown channel: #%s" % chan
             elif not rate_ok(viewer, row["id"]):
@@ -3311,7 +3037,9 @@ def _dispatch_command(viewer, line):
                 out = "posted to #%s" % chan if mid else "rejected"
     elif cmd == "info":
         chan = arg.lstrip("#").strip()
-        row = store.channel_by_name(db, db_lock, chan)
+        with db_lock:
+            row = db.execute("SELECT id, kind, created, topic FROM channels "
+                             "WHERE name=? COLLATE NOCASE", (chan,)).fetchone()
         if not row:
             out = "unknown channel: #%s" % chan
         else:
@@ -3319,7 +3047,7 @@ def _dispatch_command(viewer, line):
                                            ("  topic: " + row["topic"])
                                            if row["topic"] else "")
     elif cmd == "presence":
-        users = _presence_payload(viewer)
+        users = _presence_payload()
         out = "\r\n".join(
             "  %s%s" % (u["username"],
                        "  in " + channel_name(u["active_channel"])
@@ -3335,7 +3063,9 @@ def _dispatch_command(viewer, line):
         out = ("created #%s" % name.strip()) if cid else err
     elif cmd == "delete":
         chan = arg.lstrip("#").strip()
-        row = store.channel_id_by_name(db, db_lock, chan)
+        with db_lock:
+            row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
+                             (chan,)).fetchone()
         if not row:
             out = "unknown channel: #%s" % chan
         else:
@@ -3348,28 +3078,39 @@ def _dispatch_command(viewer, line):
                 not re.match(r"^[a-zA-Z0-9_\-]{1,32}$", new):
             out = "usage: rename <channel> <newname>"
         else:
-            row = store.channel_id_by_name(db, db_lock, chan.lstrip("#").strip())
+            with db_lock:
+                row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
+                                 (chan.lstrip("#").strip(),)).fetchone()
             if not row:
                 out = "unknown channel: #%s" % chan
             elif not has_perm(viewer, row["id"], PERMS["MANAGE_CHANNEL"]):
                 out = "manage channel permission required"
-            elif store.channel_name_taken(db, db_lock, new, row["id"]):
+            elif db.execute("SELECT 1 FROM channels WHERE name=? COLLATE NOCASE "
+                            "AND id<>?", (new, row["id"])).fetchone():
                 out = "name already taken"
             else:
-                store.rename_channel(db, db_lock, new, row["id"])
+                with db_lock:
+                    db.execute("UPDATE channels SET name=? WHERE id=?",
+                               (new, row["id"]))
+                    db.commit()
                 _emit_event(row["id"], "channels_changed",
                             {"channel": new}, guild_wide=True)
                 out = "renamed #%s -> #%s" % (chan, new)
     elif cmd == "topic":
         chan, _, text = arg.partition(" ")
         text = text.strip()[:200]
-        row = store.channel_id_by_name(db, db_lock, chan.lstrip("#").strip())
+        with db_lock:
+            row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
+                             (chan.lstrip("#").strip(),)).fetchone()
         if not row:
             out = "unknown channel: #%s" % chan
         elif not has_perm(viewer, row["id"], PERMS["MANAGE_CHANNEL"]):
             out = "manage channel permission required"
         else:
-            store.set_channel_topic(db, db_lock, row["id"], text or None)
+            with db_lock:
+                db.execute("UPDATE channels SET topic=? WHERE id=?",
+                           (text or None, row["id"]))
+                db.commit()
             _emit_event(row["id"], "channels_changed",
                         {"channel": chan.lstrip("#").strip()},
                         guild_wide=True)
@@ -3423,7 +3164,8 @@ def api_v1_term_open(viewer, data, link_id):
     """Open a console session on a term channel. {channel, rows?, cols?} ->
     {session}. The banner + prompt arrive as term_data stream events."""
     cid = data.get("channel")
-    row = store.channel_row(db, db_lock, cid)
+    with db_lock:
+        row = db.execute("SELECT id, kind FROM channels WHERE id=?", (cid,)).fetchone()
     if not row or row["kind"] != "term":
         return {"ok": 0, "error": "unknown or non-term channel", "code": 404}
     if not has_perm(viewer, cid, PERMS["VIEW"]):
@@ -3533,10 +3275,16 @@ def _emoji_ok(emoji):
     return len(emoji.encode("utf-8")) <= 32 and bool(_EMOJI_CORE_RE.match(emoji))
 
 def _receipt_last_id(cid, viewer):
-    return store.receipt_last_id(db, db_lock, cid, viewer)
+    with db_lock:
+        row = db.execute("SELECT last_id FROM receipts WHERE channel_id=? AND user_hash=?",
+                         (cid, viewer)).fetchone()
+    return row["last_id"] if row else 0
 
 def _unread_count(cid, last_id):
-    return store.unread_count(db, db_lock, cid, last_id)
+    with db_lock:
+        row = db.execute("SELECT COUNT(*) AS n FROM messages WHERE channel_id=? AND id>?",
+                         (cid, last_id)).fetchone()
+    return row["n"]
 
 @api_route("/api/v1/receipts")
 @wrap_json_api
@@ -3544,47 +3292,27 @@ def api_v1_receipts(viewer, data, link_id):
     """Read watermarks. With msg_id: mark read up to that message (it must
     belong to the channel). Without: report {last_read_id, unread}."""
     cid = data.get("channel")
-    if not store.channel_exists(db, db_lock, cid):
-        return {"ok": 0, "error": "unknown channel", "code": 404}
+    with db_lock:
+        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
+            return {"ok": 0, "error": "unknown channel", "code": 404}
     if not has_perm(viewer, cid, PERMS["VIEW"]):
         return {"ok": 0, "error": "view permission required", "code": 403}
     msg_id = data.get("msg_id")
     if msg_id:
-        if store.mark_read(db, db_lock, msg_id, cid, viewer, now()) is None:
-            return {"ok": 0, "error": "unknown message in channel", "code": 404}
+        with db_lock:
+            row = db.execute("SELECT id FROM messages WHERE msg_id=? AND channel_id=?",
+                             (msg_id, cid)).fetchone()
+            if not row:
+                return {"ok": 0, "error": "unknown message in channel", "code": 404}
+            db.execute("INSERT INTO receipts (channel_id, user_hash, last_id, ts) "
+                       "VALUES (?, ?, ?, ?) "
+                       "ON CONFLICT(channel_id, user_hash) DO UPDATE SET "
+                       "last_id=MAX(receipts.last_id, excluded.last_id), ts=excluded.ts",
+                       (cid, viewer, row["id"], now()))
+            db.commit()
     last_id = _receipt_last_id(cid, viewer)
     return {"ok": 1, "channel": cid, "last_read_id": last_id,
             "unread": _unread_count(cid, last_id)}
-
-def _react_as(actor, msg_id, emoji):
-    """Shared react path: the human /api/v1/react and the bot
-    /api/v1/bots/react both toggle through here, passing the actor
-    (human viewer, or a bot's owner). Validates, toggles the reaction
-    as `actor` via the store, and emits kind "reaction". Returns a
-    response dict."""
-    if is_banned(actor):
-        return {"ok": 0, "error": "banned", "code": 403}
-    if is_muted(actor):
-        return {"ok": 0, "error": "muted", "code": 403}
-    emoji = (emoji or "").strip().lower() if isinstance(emoji, str) else ""
-    if not _emoji_ok(emoji):
-        return {"ok": 0, "error": "emoji must be an emoji or a shortcode (a-z0-9_+-)",
-                "code": 400}
-    row = store.message_by_msg_id(db, db_lock, msg_id)
-    if not row:
-        return {"ok": 0, "error": "unknown message", "code": 404}
-    if not has_perm(actor, row["channel_id"], PERMS["VIEW"]):
-        return {"ok": 0, "error": "view permission required", "code": 403}
-    err, active, counts = store.toggle_reaction(db, db_lock, msg_id, actor, emoji,
-                                                MAX_EMOJI_PER_MSG, now())
-    if err:
-        return {"ok": 0, "error": err, "code": 400}
-    _emit_event(row["channel_id"], "reaction", {
-        "msg_id": msg_id, "emoji": emoji, "user_hash": actor,
-        "username": get_username(actor), "active": active, "counts": counts,
-    })
-    return {"ok": 1, "active": active, "counts": counts}
-
 
 @api_route("/api/v1/react")
 @wrap_json_api
@@ -3592,7 +3320,42 @@ def api_v1_react(viewer, data, link_id):
     """Toggle a reaction (one emoji per user per message). Emoji are unicode
     emoji characters (BMP symbols, supplementary plane, ZWJ composites) or
     legacy ASCII shortcodes ('+1', 'laugh', ...) for older rows."""
-    return _react_as(viewer, data.get("msg"), data.get("emoji"))
+    msg_id = data.get("msg")
+    emoji = (data.get("emoji") or "").strip().lower()
+    if not _emoji_ok(emoji):
+        return {"ok": 0, "error": "emoji must be an emoji or a shortcode (a-z0-9_+-)",
+                "code": 400}
+    with db_lock:
+        row = db.execute("SELECT channel_id, deleted_at FROM messages WHERE msg_id=?",
+                         (msg_id,)).fetchone()
+        if not row:
+            return {"ok": 0, "error": "unknown message", "code": 404}
+    if not has_perm(viewer, row["channel_id"], PERMS["VIEW"]):
+        return {"ok": 0, "error": "view permission required", "code": 403}
+    with db_lock:
+        existing = db.execute("SELECT 1 FROM reactions WHERE msg_id=? AND user_hash=? "
+                              "AND emoji=?", (msg_id, viewer, emoji)).fetchone()
+        if existing:
+            db.execute("DELETE FROM reactions WHERE msg_id=? AND user_hash=? AND emoji=?",
+                       (msg_id, viewer, emoji))
+            active = False
+        else:
+            distinct = db.execute("SELECT COUNT(DISTINCT emoji) AS n FROM reactions "
+                                  "WHERE msg_id=?", (msg_id,)).fetchone()["n"]
+            if distinct >= MAX_EMOJI_PER_MSG:
+                return {"ok": 0, "error": "too many reactions on this message", "code": 400}
+            db.execute("INSERT INTO reactions (msg_id, user_hash, emoji, ts) "
+                       "VALUES (?, ?, ?, ?)", (msg_id, viewer, emoji, now()))
+            active = True
+        counts = {r["emoji"]: r["n"] for r in db.execute(
+            "SELECT emoji, COUNT(*) AS n FROM reactions WHERE msg_id=? "
+            "GROUP BY emoji", (msg_id,)).fetchall()}
+        db.commit()
+    _emit_event(row["channel_id"], "reaction", {
+        "msg_id": msg_id, "emoji": emoji, "user_hash": viewer,
+        "username": get_username(viewer), "active": active, "counts": counts,
+    })
+    return {"ok": 1, "active": active, "counts": counts}
 
 @api_route("/api/v1/search")
 @wrap_json_api
@@ -3611,8 +3374,9 @@ def api_v1_search(viewer, data, link_id):
     args = ["%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"]
     cid = data.get("channel")
     if cid:
-        if not store.channel_exists(db, db_lock, cid):
-            return {"ok": 0, "error": "unknown channel", "code": 404}
+        with db_lock:
+            if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
+                return {"ok": 0, "error": "unknown channel", "code": 404}
         if not has_perm(viewer, cid, PERMS["VIEW"]):
             return {"ok": 0, "error": "view permission required", "code": 403}
         sql += "AND channel_id=? "
@@ -3622,7 +3386,9 @@ def api_v1_search(viewer, data, link_id):
         # matches afterwards can return an empty page when hidden-channel
         # posts are newer than a visible match — and the trim also leaks
         # the mere existence of results it discarded.
-        channel_ids = [r["id"] for r in store.list_channel_ids(db, db_lock)]
+        with db_lock:
+            channel_ids = [r["id"] for r in
+                           db.execute("SELECT id FROM channels").fetchall()]
         visible = [ch for ch in channel_ids
                    if has_perm(viewer, ch, PERMS["VIEW"])]
         if not visible:
@@ -3631,7 +3397,8 @@ def api_v1_search(viewer, data, link_id):
         args.extend(visible)
     sql += "ORDER BY id DESC LIMIT ?"
     args.append(limit)
-    rows = store.search_messages(db, db_lock, sql, args)
+    with db_lock:
+        rows = db.execute(sql, args).fetchall()
     return {"ok": 1, "query": q, "results": [msg_row_json(r) for r in rows]}
 
 # ---- whoami + moderation + channel deletion (U3: context-menu backend) -------------
@@ -3642,7 +3409,11 @@ def api_v1_whoami(viewer, data, link_id):
     """The requester's own identity as the guild sees it. The client uses
     this to show/hide moderator affordances (menus are a convenience —
     every action is still enforced server-side)."""
-    rows = store.user_roles(db, db_lock, viewer)
+    with db_lock:
+        rows = db.execute(
+            "SELECT r.role_id, r.name, r.perms, r.color FROM user_roles ur "
+            "JOIN roles r ON r.role_id = ur.role_id WHERE ur.user_hash=? "
+            "ORDER BY r.position DESC", (viewer,)).fetchall()
     roles = [{"role_id": r["role_id"], "name": r["name"], "perms": r["perms"],
               "color": r["color"]} for r in rows]
     is_admin = any(r["perms"] & PERMS["ADMIN"] for r in roles)
@@ -3700,16 +3471,33 @@ def _audit(actor, action, target=None, detail=None):
     """Append one row to the audit log (U8). Every privileged mutation
     (ban/mute/delete/channel/role/config) lands here. Never raises — an
     audit failure must not break the action that was being audited."""
-    store.audit(db, db_lock, actor, action, target, detail)
+    try:
+        with db_lock:
+            db.execute("INSERT INTO audit_log (ts, actor, action, target, detail) "
+                       "VALUES (?, ?, ?, ?, ?)",
+                       (now(), actor or "-", str(action)[:64],
+                        (target or "")[:128], (detail or "")[:400]))
+            db.commit()
+    except Exception as e:
+        RNS.log("audit write failed: %s" % e, RNS.LOG_ERROR)
 
 def _cfg_get(key, default=None):
-    return store.config_get(db, db_lock, key, default)
+    with db_lock:
+        row = db.execute("SELECT value FROM server_config WHERE key=?",
+                         (key,)).fetchone()
+    return row["value"] if row else default
 
 def _cfg_set(key, value):
-    store.config_set(db, db_lock, key, value)
+    with db_lock:
+        db.execute("INSERT INTO server_config (key, value) VALUES (?, ?) "
+                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                   (key, str(value)))
+        db.commit()
 
 def _cfg_all():
-    return store.config_all(db, db_lock)
+    with db_lock:
+        rows = db.execute("SELECT key, value FROM server_config").fetchall()
+    return {r["key"]: r["value"] for r in rows}
 
 # Server settings the admin panel may change (U8). Everything else in
 # server_config is server-internal.
@@ -3736,10 +3524,6 @@ SERVER_CONFIG_KEYS = {
                                   # initiating update source. Any other hub
                                   # may be compromised; a non-trusted pull
                                   # needs the artifact pin to run at all.
-    "update_manifest_policy": "off",  # off | log | enforce (trust model s1)
-    "update_release_channel": "general",  # nightly | canary | general
-    "update_manifest_key": "",   # ed25519 PUBLIC key (PEM/base64/hex);
-                                 # empty = use compiled-in release key
 }
 
 # ---------------------------------------------------------------------- P11 updater
@@ -3818,8 +3602,8 @@ def _update_maybe_tick(force=False):
 
 
 @api_route("/api/v1/update_status")
-@wrap_json_api
-def api_v1_update_status(viewer, data, link_id):
+def api_v1_update_status(viewer, data, request_id, link_id,
+                         remote_identity, requested_at):
     """P11: the updater's last verdict, admin-only read (the panel
     consumes this in chain 5)."""
     denied = _require_admin(viewer)
@@ -3831,9 +3615,6 @@ def api_v1_update_status(viewer, data, link_id):
     out["peer"] = _cfg_get("update_channel_peer", "")
     out["shapin"] = _cfg_get("update_channel_shapin", "")
     out["trusted"] = _cfg_get("update_trusted_hub", "")
-    out["manifest_policy"] = _cfg_get("update_manifest_policy", "off")
-    out["release_channel"] = _cfg_get("update_release_channel", "general")
-    out["manifest_key"] = bool(_cfg_get("update_manifest_key", ""))
     return out
 
 
@@ -3968,12 +3749,7 @@ def _rns_pull():
         resp = getattr(receipt, "response", None)
         if resp is None:
             raise TimeoutError(path)
-        # RNS hands us the handler's return object already unpacked:
-        # the raw /api/v1/update/* handlers return dicts, which arrive
-        # here as dicts — not as bytes to unpack. Accept both.
-        if isinstance(resp, (bytes, bytearray)):
-            return msgpack.unpackb(resp, raw=False)
-        return resp
+        return msgpack.unpackb(resp, raw=False)
 
     try:
         info = _req("/api/v1/update/serve_info")
@@ -4048,7 +3824,6 @@ def _rns_pull():
         updater._note("no-bundle", "peer fetch failed: %s" % e)
         return None
 
-
 def _require_admin(viewer):
     """Admin gate for the panel endpoints (U8). ADMIN role only — the
     legacy moderator set is NOT enough here."""
@@ -4080,6 +3855,32 @@ def api_v1_admin_config(viewer, data, link_id):
     if key == "registration" and value not in ("open", "code"):
         return {"ok": 0, "error": "registration must be 'open' or 'code'",
                 "code": 400}
+    if key == "update_channel_peer" and value:
+        # P11d: the pin is an RNS node destination hash: 32 bytes = 64 hex
+        digest = value.strip().lower()
+        if not re.match(r"^[0-9a-f]{64}$", digest):
+            return {"ok": 0,
+                    "error": "update_channel_peer must be a 64-hex node "
+                             "destination hash", "code": 400}
+        value = digest
+    if key == "update_channel_shapin" and value:
+        # P11e: the artifact pin is a sha256 hex digest: 64 hex. Empty
+        # is allowed (and means the pull trusts the peer's own sha -
+        # integrity only, provenance rides the identity pin).
+        digest = value.strip().lower()
+        if not re.match(r"^[0-9a-f]{64}$", digest):
+            return {"ok": 0,
+                    "error": "update_channel_shapin must be a 64-hex "
+                             "sha256 digest", "code": 400}
+        value = digest
+    if key == "update_trusted_hub" and value:
+        # P11f: the trusted hub is an RNS node destination hash
+        digest = value.strip().lower()
+        if not re.match(r"^[0-9a-f]{64}$", digest):
+            return {"ok": 0,
+                    "error": "update_trusted_hub must be a 64-hex node "
+                             "destination hash", "code": 400}
+        value = digest
     if key == "guild_icon" and value:
         # the icon rides the standard blob store: the value must resolve to
         # a committed blob (uploaded via blobs/put or the chunked flow)
@@ -4087,6 +3888,33 @@ def api_v1_admin_config(viewer, data, link_id):
         if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
                 or not _blob_fname(digest):
             return {"ok": 0, "error": "guild_icon must be a stored blob_id",
+                    "code": 400}
+        value = digest
+    if key == "banner" and value:
+        # P5: same shape as guild_icon -- the asset rides the standard
+        # blob store; the config only references it
+        digest = value.strip().lower()
+        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
+                or not _blob_fname(digest):
+            return {"ok": 0, "error": "banner must be a stored blob_id",
+                    "code": 400}
+        value = digest
+    if key == "banner" and value:
+        # P5: same shape as guild_icon -- the asset rides the standard
+        # blob store; the config only references it
+        digest = value.strip().lower()
+        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
+                or not _blob_fname(digest):
+            return {"ok": 0, "error": "banner must be a stored blob_id",
+                    "code": 400}
+        value = digest
+    if key == "banner" and value:
+        # P5: same shape as guild_icon -- the asset rides the standard
+        # blob store; the config only references it
+        digest = value.strip().lower()
+        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
+                or not _blob_fname(digest):
+            return {"ok": 0, "error": "banner must be a stored blob_id",
                     "code": 400}
         value = digest
     if key == "banner" and value:
@@ -4109,48 +3937,8 @@ def api_v1_admin_config(viewer, data, link_id):
     if key == "attachments" and value not in ("saved", "ephemeral"):
         return {"ok": 0, "error": "attachments must be 'saved' or "
                 "'ephemeral'", "code": 400}
-    if key == "update_channel" and value not in ("off", "github", "rns"):
-        return {"ok": 0, "error": "update_channel must be one of "
-                "'off', 'github', 'rns'", "code": 400}
-    if key == "update_check_minutes":
-        try:
-            mins = int(value)
-        except ValueError:
-            return {"ok": 0, "error": "update_check_minutes must be an integer",
-                    "code": 400}
-        if mins < 0 or mins > 10080:
-            return {"ok": 0, "error": "update_check_minutes must be 0-10080",
-                    "code": 400}
-        value = str(mins)
-    if key in ("update_channel_peer", "update_channel_shapin",
-               "update_trusted_hub"):
-        if value and not re.match(r"^[0-9a-f]{64}$", value):
-            return {"ok": 0, "error": key + " must be a 64-hex digest or empty",
-                    "code": 400}
-        value = value.lower()
-    if key == "update_manifest_policy" and value not in ("off", "log",
-                                                         "enforce"):
-        return {"ok": 0, "error": "update_manifest_policy must be one of "
-                "'off', 'log', 'enforce'", "code": 400}
-    if key == "update_release_channel" and not re.match(
-            r"^[a-z0-9][a-z0-9._-]{0,31}$", value):
-        return {"ok": 0, "error": "update_release_channel must be 1-32 "
-                "chars of [a-z0-9._-]", "code": 400}
-    if key == "update_manifest_key" and value:
-        try:
-            import release_manifest
-            release_manifest.load_public_key(value)
-        except Exception:
-            return {"ok": 0, "error": "update_manifest_key is not a valid "
-                    "ed25519 public key (PEM, base64 or hex)",
-                    "code": 400}
     old = _cfg_get(key, SERVER_CONFIG_KEYS[key])
     _cfg_set(key, value)
-    if key == "update_manifest_key":
-        _audit(viewer, "config.set", key,
-               "%s -> %s" % ("<set>" if old else "<empty>",
-                             "<set>" if value else "<empty>"))
-        return {"ok": 1, "config": {key: "<redacted>"}}
     _audit(viewer, "config.set", key, "%s -> %s" % (old, value))
     return {"ok": 1, "config": {key: value}}
 
@@ -4166,7 +3954,10 @@ def api_v1_admin_audit(viewer, data, link_id):
     except (TypeError, ValueError):
         limit = 100
     limit = max(1, min(limit, 500))
-    rows = store.list_audit(db, db_lock, limit)
+    with db_lock:
+        rows = db.execute("SELECT ts, actor, action, target, detail FROM "
+                          "audit_log ORDER BY id DESC LIMIT ?",
+                          (limit,)).fetchall()
     return {"ok": 1, "entries": [
         {"ts": r["ts"], "actor": r["actor"], "action": r["action"],
          "target": r["target"], "detail": r["detail"]} for r in rows]}
@@ -4232,7 +4023,15 @@ def _has_joined(user_hash):
     """True if this user is already in the guild for gate purposes: either
     they joined with a code, or they already registered a username (so
     turning the gate on never locks existing members out)."""
-    return store.has_joined(db, db_lock, user_hash)
+    if not user_hash:
+        return False
+    with db_lock:
+        if db.execute("SELECT 1 FROM guild_joins WHERE user_hash=?",
+                      (user_hash,)).fetchone():
+            return True
+        row = db.execute("SELECT username FROM users WHERE dest_hash=?",
+                         (user_hash,)).fetchone()
+    return bool(row and row["username"])
 
 def _new_invite_code():
     """Short unambiguous code (Crockford-ish base32, no I/O/0/1)."""
@@ -4260,22 +4059,36 @@ def api_v1_join(viewer, data, link_id):
         # open guild: joining is implicit, but still record it so the state
         # is consistent if the policy is tightened later. A channel-targeted
         # code still resolves its landing channel in an open guild.
-        channel_id = store.record_join_open(db, db_lock, viewer, code, now())
+        channel_id = None
+        with db_lock:
+            db.execute("INSERT OR IGNORE INTO guild_joins (user_hash, joined_at, "
+                       "code) VALUES (?, ?, ?)", (viewer, now(), code))
+            db.commit()
+            row = db.execute("SELECT channel_id FROM invites WHERE code=?",
+                             (code,)).fetchone()
+            channel_id = (row["channel_id"] or None) if row else None
         return {"ok": 1, "required": False, "joined": True, "policy": policy,
                 "channel_id": channel_id}
     if not re.match(r"^[A-Z0-9]{6,16}$", code):
         return {"ok": 0, "error": "invalid code", "code": 400}
-    err = store.redeem_invite(db, db_lock, viewer, code, now())
-    if err == "invalid code":
-        return {"ok": 0, "error": "invalid code", "code": 403}
-    if err == "code expired":
-        return {"ok": 0, "error": "code expired", "code": 403}
-    if err == "code exhausted":
-        return {"ok": 0, "error": "code exhausted", "code": 403}
+    with db_lock:
+        row = db.execute("SELECT * FROM invites WHERE code=?", (code,)).fetchone()
+        if not row:
+            return {"ok": 0, "error": "invalid code", "code": 403}
+        if row["expires_at"] and now() > row["expires_at"]:
+            return {"ok": 0, "error": "code expired", "code": 403}
+        if row["max_uses"] and row["uses"] >= row["max_uses"]:
+            return {"ok": 0, "error": "code exhausted", "code": 403}
+        db.execute("UPDATE invites SET uses = uses + 1 WHERE code=?", (code,))
+        db.execute("INSERT OR IGNORE INTO guild_joins (user_hash, joined_at, "
+                   "code) VALUES (?, ?, ?)", (viewer, now(), code))
+        db.commit()
     _audit(viewer, "join", None, "code=%s" % code)
-    channel_id = store.invite_channel(db, db_lock, code)
+    with db_lock:
+        row = db.execute("SELECT channel_id FROM invites WHERE code=?",
+                         (code,)).fetchone()
     return {"ok": 1, "required": True, "joined": True, "policy": policy,
-            "channel_id": channel_id}
+            "channel_id": (row["channel_id"] or None) if row else None}
 
 @api_route("/api/v1/invites")
 @wrap_json_api
@@ -4288,7 +4101,9 @@ def api_v1_invites(viewer, data, link_id):
         return denied
     op = (data.get("op") or "list").lower()
     if op == "list":
-        rows = store.list_invites(db, db_lock)
+        with db_lock:
+            rows = db.execute("SELECT * FROM invites ORDER BY created_at DESC"
+                              ).fetchall()
         return {"ok": 1, "invites": [
             {"code": r["code"], "label": r["label"], "created_at": r["created_at"],
              "expires_at": r["expires_at"], "max_uses": r["max_uses"],
@@ -4309,14 +4124,21 @@ def api_v1_invites(viewer, data, link_id):
         # optional channel target: the joiner is told which channel to open
         channel = data.get("channel")
         if channel:
-            if not store.channel_exists(db, db_lock, channel):
-                return {"ok": 0, "error": "unknown channel", "code": 400}
+            with db_lock:
+                if not db.execute("SELECT 1 FROM channels WHERE id=?",
+                                  (channel,)).fetchone():
+                    return {"ok": 0, "error": "unknown channel", "code": 400}
         code = _new_invite_code()
-        if store.invite_exists(db, db_lock, code):
-            code = _new_invite_code()
-        expires_at = (now() + expires_in) if expires_in else 0
-        store.create_invite(db, db_lock, code, label, now(), expires_at,
-                            max_uses, viewer, channel or None)
+        with db_lock:
+            if db.execute("SELECT 1 FROM invites WHERE code=?", (code,)).fetchone():
+                code = _new_invite_code()
+            expires_at = (now() + expires_in) if expires_in else 0
+            db.execute("INSERT INTO invites (code, label, created_at, "
+                       "expires_at, max_uses, uses, created_by, channel_id) "
+                       "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+                       (code, label, now(), expires_at, max_uses, viewer,
+                        channel or None))
+            db.commit()
         _audit(viewer, "invite.create", code, label)
         return {"ok": 1, "code": code, "label": label, "max_uses": max_uses,
                 "expires_at": expires_at, "channel_id": channel or None}
@@ -4324,7 +4146,10 @@ def api_v1_invites(viewer, data, link_id):
         code = (data.get("code") or "").strip().upper()
         if not re.match(r"^[A-Z0-9]{6,16}$", code):
             return {"ok": 0, "error": "invalid code", "code": 400}
-        if not store.revoke_invite(db, db_lock, code):
+        with db_lock:
+            cur = db.execute("DELETE FROM invites WHERE code=?", (code,))
+            db.commit()
+        if not cur.rowcount:
             return {"ok": 0, "error": "unknown code", "code": 404}
         _audit(viewer, "invite.revoke", code)
         return {"ok": 1, "code": code}
@@ -4332,14 +4157,26 @@ def api_v1_invites(viewer, data, link_id):
 
 def _delete_channel_txn(cid, viewer):
     """Shared channel deletion (API + slash command). Returns
-    (error_or_None, name_or_None). Hard delete destroys messages,
-    attachments and site resources irreversibly, so it takes ADMIN,
-    not merely MANAGE_CHANNEL."""
-    if not has_role_perm(viewer, PERMS["ADMIN"]):
-        return "admin permission required", None
-    err, name = store.delete_channel_data(db, db_lock, cid)
-    if err:
-        return err, None
+    (error_or_None, name_or_None)."""
+    if not has_perm(viewer, cid, PERMS["MANAGE_CHANNEL"]):
+        return "manage channel permission required", None
+    with db_lock:
+        row = db.execute("SELECT id, name FROM channels WHERE id=?", (cid,)).fetchone()
+        if not row:
+            return "unknown channel", None
+        n = db.execute("SELECT COUNT(*) AS n FROM channels").fetchone()["n"]
+        if n <= 1:
+            return "cannot delete the last channel", None
+        name = row["name"]
+        msg_ids = "SELECT msg_id FROM messages WHERE channel_id=?"
+        db.execute("DELETE FROM attachments WHERE msg_id IN (%s)" % msg_ids, (cid,))
+        db.execute("DELETE FROM reactions WHERE msg_id IN (%s)" % msg_ids, (cid,))
+        db.execute("DELETE FROM messages WHERE channel_id=?", (cid,))
+        db.execute("DELETE FROM receipts WHERE channel_id=?", (cid,))
+        db.execute("DELETE FROM members WHERE channel_id=?", (cid,))
+        db.execute("DELETE FROM channel_state WHERE channel_id=?", (cid,))
+        db.execute("DELETE FROM channels WHERE id=?", (cid,))
+        db.commit()
     with TERM_SESSIONS_LOCK:
         for sid in [s for s, t in TERM_SESSIONS.items() if t["channel"] == cid]:
             TERM_SESSIONS.pop(sid, None)
@@ -4392,22 +4229,10 @@ def _require_manage_roles(viewer):
         return {"ok": 0, "error": "manage roles permission required", "code": 403}
     return None
 
-def _actor_guild_perms(viewer):
-    """The viewer's own guild-wide permission union (roles + legacy
-    moderator set). Used to keep role management from escalating past
-    what the actor holds."""
-    perms = store.user_perm_union(db, db_lock, viewer)
-    if viewer in MODERATORS:
-        perms |= PERMS["MANAGE_MESSAGES"] | PERMS["MANAGE_CHANNEL"]
-    return perms
-
-def _may_grant(viewer, perms):
-    """True iff every bit in `perms` is held by the viewer. No one mints
-    or hands out authority they do not themselves hold."""
-    return (perms & ~_actor_guild_perms(viewer)) == 0
-
 def _role_row(r):
-    members = store.role_members(db, db_lock, r["role_id"])
+    with db_lock:
+        members = db.execute("SELECT user_hash FROM user_roles WHERE role_id=? "
+                             "ORDER BY user_hash LIMIT 64", (r["role_id"],)).fetchall()
     return {"role_id": r["role_id"], "name": r["name"], "color": r["color"],
             "position": r["position"], "perms": r["perms"],
             "members": [m["user_hash"] for m in members]}
@@ -4415,7 +4240,8 @@ def _role_row(r):
 @api_route("/api/v1/roles/list")
 @wrap_json_api
 def api_v1_roles_list(viewer, data, link_id):
-    rows = store.list_roles(db, db_lock)
+    with db_lock:
+        rows = db.execute("SELECT * FROM roles ORDER BY position DESC, name").fetchall()
     return {"ok": 1, "roles": [_role_row(r) for r in rows]}
 
 @api_route("/api/v1/roles/create")
@@ -4430,9 +4256,6 @@ def api_v1_roles_create(viewer, data, link_id):
     perms = data.get("perms", 0)
     if not isinstance(perms, int) or perms < 0 or perms > PERM_ALL:
         return {"ok": 0, "error": "perms must be a bitmask 0-63", "code": 400}
-    if not _may_grant(viewer, perms):
-        return {"ok": 0, "error": "cannot grant permissions you do not hold",
-                "code": 403}
     color = (data.get("color") or "").strip().upper()
     if color and not re.match(r"^[0-9A-F]{3}$", color):
         return {"ok": 0, "error": "color must be 3-hex", "code": 400}
@@ -4441,9 +4264,14 @@ def api_v1_roles_create(viewer, data, link_id):
         position = max(0, min(int(position), 1000))
     except (TypeError, ValueError):
         position = 0
-    role_id = store.create_role(db, db_lock, name, color or None, position, perms)
-    if role_id is None:
-        return {"ok": 0, "error": "role exists", "code": 409}
+    with db_lock:
+        if db.execute("SELECT 1 FROM roles WHERE name=? COLLATE NOCASE",
+                      (name,)).fetchone():
+            return {"ok": 0, "error": "role exists", "code": 409}
+        cur = db.execute("INSERT INTO roles (name, color, position, perms) "
+                         "VALUES (?, ?, ?, ?)", (name, color or None, position, perms))
+        db.commit()
+        role_id = cur.lastrowid
     return {"ok": 1, "role": {"role_id": role_id, "name": name, "perms": perms,
                               "color": color or None, "position": position}}
 
@@ -4452,12 +4280,16 @@ def api_v1_roles_create(viewer, data, link_id):
 def api_v1_message_edits(viewer, data, link_id):
     """Prior versions are visible only to viewers of this channel."""
     msg_id = data.get("msg")
-    row = store.message_by_msg_id(db, db_lock, msg_id)
-    if row is None or row["deleted_at"]:
-        return {"ok": 0, "error": "message unavailable", "code": 404}
-    if not has_perm(viewer, row["channel_id"], PERMS["VIEW"]):
-        return {"ok": 0, "error": "view permission required", "code": 403}
-    edits = store.message_edits(db, db_lock, msg_id)
+    with db_lock:
+        row = db.execute("SELECT channel_id, deleted_at FROM messages WHERE msg_id=?",
+                         (msg_id,)).fetchone()
+        if row is None or row["deleted_at"]:
+            return {"ok": 0, "error": "message unavailable", "code": 404}
+        if not has_perm(viewer, row["channel_id"], PERMS["VIEW"]):
+            return {"ok": 0, "error": "view permission required", "code": 403}
+        edits = db.execute("SELECT edited_at, prior_content FROM message_edits "
+                           "WHERE msg_id=? ORDER BY edited_at DESC LIMIT 50",
+                           (msg_id,)).fetchall()
     return {"ok": 1, "edits": [dict(r) for r in edits]}
 
 
@@ -4470,12 +4302,16 @@ def api_v1_account_export(viewer, data, link_id):
         limit = max(1, min(100, int(data.get("limit", 100))))
     except (TypeError, ValueError):
         return {"ok": 0, "error": "invalid cursor", "code": 400}
-    rows = store.list_own_messages(db, db_lock, viewer, after, limit)
-    messages = []
-    for row in rows:
-        msg = msg_row_json(row)
-        msg["edits"] = [dict(e) for e in store.message_edits_asc(db, db_lock, row["msg_id"])]
-        messages.append(msg)
+    with db_lock:
+        rows = db.execute("SELECT * FROM messages WHERE author_hash=? AND id>? "
+                          "ORDER BY id LIMIT ?", (viewer, after, limit)).fetchall()
+        messages = []
+        for row in rows:
+            msg = msg_row_json(row)
+            msg["edits"] = [dict(e) for e in db.execute(
+                "SELECT edited_at, prior_content FROM message_edits WHERE msg_id=? "
+                "ORDER BY edited_at ASC", (row["msg_id"],)).fetchall()]
+            messages.append(msg)
     return {"ok": 1, "messages": messages,
             "next_after": rows[-1]["id"] if len(rows) == limit else None,
             "scope": "own guild posts and attachment metadata; no attachment bytes"}
@@ -4487,9 +4323,46 @@ def api_v1_account_delete_posts(viewer, data, link_id):
     """Erase this identity's ledger text and references; retain tombstones."""
     if data.get("confirm") != "DELETE MY POSTS":
         return {"ok": 0, "error": "confirmation required", "code": 400}
-    deleted_at = now()
-    all_ids, channels, orphaned, orphaned_blobs = store.delete_own_posts(
-        db, db_lock, viewer, deleted_at)
+    with db_lock:
+        rows = db.execute("SELECT msg_id, channel_id FROM messages WHERE "
+                          "author_hash=? AND deleted_at IS NULL", (viewer,)).fetchall()
+        all_ids = [r["msg_id"] for r in db.execute(
+            "SELECT msg_id FROM messages WHERE author_hash=?", (viewer,)).fetchall()]
+        paths = set()
+        for msg_id in all_ids:
+            paths.update(r["path"] for r in db.execute(
+                "SELECT path FROM attachments WHERE msg_id=?", (msg_id,)).fetchall())
+            db.execute("DELETE FROM attachments WHERE msg_id=?", (msg_id,))
+            db.execute("DELETE FROM reactions WHERE msg_id=?", (msg_id,))
+            db.execute("DELETE FROM message_edits WHERE msg_id=?", (msg_id,))
+        deleted_at = now()
+        db.execute("UPDATE messages SET content='', deleted_at=coalesce(deleted_at, ?) "
+                   "WHERE author_hash=?", (deleted_at, viewer))
+        channels = {r["channel_id"] for r in rows}
+        for cid in channels:
+            bump_seq(cid)
+        db.commit()
+        orphaned = [path for path in paths if not db.execute(
+            "SELECT 1 FROM attachments WHERE path=? LIMIT 1", (path,)).fetchone()]
+        orphaned_blobs = []
+        for path in orphaned:
+            if not re.fullmatch(r"[0-9a-f]{32}\.[a-z0-9]{1,8}", path):
+                continue
+            digest = path.split(".", 1)[0]
+            record = db.execute("SELECT path FROM blobs WHERE id=? AND by=?",
+                                (digest, viewer)).fetchone()
+            if record and not db.execute(
+                    "SELECT 1 FROM attachments WHERE path LIKE ? LIMIT 1",
+                    (digest + ".%",)).fetchone():
+                orphaned_blobs.append(record["path"])
+                db.execute("DELETE FROM blobs WHERE id=?", (digest,))
+        db.commit()
+        # Clear the live WAL and compact historical page versions where possible.
+        try:
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            db.execute("VACUUM")
+        except sqlite3.Error as exc:
+            RNS.log("post compaction deferred: %s" % exc, RNS.LOG_WARNING)
     for path in orphaned:
         if re.fullmatch(r"[0-9a-f]{32}\.[a-z0-9]{1,8}", path):
             for directory, name in (("attachments", path),
@@ -4518,7 +4391,15 @@ def api_v1_account_leave(viewer, data, link_id):
     """Release registration and roles without silently deleting messages."""
     if data.get("confirm") != "LEAVE GUILD":
         return {"ok": 0, "error": "confirmation required", "code": 400}
-    avatar_path = store.leave_guild(db, db_lock, viewer)
+    with db_lock:
+        avatar = db.execute("SELECT avatar_path FROM users WHERE dest_hash=?",
+                            (viewer,)).fetchone()
+        db.execute("DELETE FROM guild_joins WHERE user_hash=?", (viewer,))
+        db.execute("DELETE FROM user_roles WHERE user_hash=?", (viewer,))
+        db.execute("DELETE FROM receipts WHERE user_hash=?", (viewer,))
+        db.execute("DELETE FROM members WHERE member_hash=?", (viewer,))
+        db.execute("DELETE FROM users WHERE dest_hash=?", (viewer,))
+        db.commit()
     with NODE_REGISTRY_LOCK:
         for node, record in list(NODE_REGISTRY.items()):
             if record.get("user_hash") == viewer:
@@ -4529,7 +4410,7 @@ def api_v1_account_leave(viewer, data, link_id):
     if viewer in ADMIN_USERS:
         ADMIN_USERS.discard(viewer)
         _write_hash_file(os.path.join(STORAGE, "admin.txt"), sorted(ADMIN_USERS))
-    if avatar_path == viewer + ".img":
+    if avatar and avatar["avatar_path"] == viewer + ".img":
         try:
             os.unlink(os.path.join(STORAGE, "avatars", viewer + ".img"))
         except OSError:
@@ -4543,24 +4424,31 @@ def api_v1_account_leave(viewer, data, link_id):
 @wrap_json_api
 def api_v1_catchup(viewer, data, link_id):
     """Small per-channel summary after the member's own read watermark."""
-    channels = store.list_channel_names(db, db_lock)
-    result = []
-    for channel in channels:
-        cid = channel["id"]
-        if not has_perm(viewer, cid, PERMS["VIEW"]):
-            continue
-        receipt = store.receipt_row(db, db_lock, cid, viewer)
-        if receipt is None:
-            continue
-        last_id = receipt["last_id"]
-        count = store.catchup_count(db, db_lock, cid, last_id, viewer)
-        if not count:
-            continue
-        samples = store.catchup_samples(db, db_lock, cid, last_id, viewer)
-        result.append({"channel": cid, "name": channel["name"], "count": count,
-                       "recent": [{"username": get_username(r["author_hash"]),
-                                   "content": r["content"][:100], "ts": r["ts"]}
-                                  for r in reversed(samples)]})
+    with db_lock:
+        channels = db.execute("SELECT id, name FROM channels ORDER BY name").fetchall()
+        result = []
+        for channel in channels:
+            cid = channel["id"]
+            if not has_perm(viewer, cid, PERMS["VIEW"]):
+                continue
+            receipt = db.execute("SELECT last_id FROM receipts WHERE channel_id=? "
+                                 "AND user_hash=?", (cid, viewer)).fetchone()
+            if receipt is None:
+                continue
+            last_id = receipt["last_id"]
+            count = db.execute("SELECT count(*) FROM messages WHERE channel_id=? "
+                               "AND id>? AND author_hash!=? AND deleted_at IS NULL",
+                               (cid, last_id, viewer)).fetchone()[0]
+            if not count:
+                continue
+            samples = db.execute("SELECT author_hash, content, ts FROM messages "
+                                 "WHERE channel_id=? AND id>? AND author_hash!=? "
+                                 "AND deleted_at IS NULL ORDER BY id DESC LIMIT 3",
+                                 (cid, last_id, viewer)).fetchall()
+            result.append({"channel": cid, "name": channel["name"], "count": count,
+                           "recent": [{"username": get_username(r["author_hash"]),
+                                       "content": r["content"][:100], "ts": r["ts"]}
+                                      for r in reversed(samples)]})
     return {"ok": 1, "channels": result[:100]}
 
 
@@ -4577,7 +4465,11 @@ def api_v1_moderation_public(viewer, data, link_id):
     actions = ("mod.muted", "mod.unmuted", "mod.banned", "mod.unbanned",
                "mods.add", "mods.remove", "admins.add", "admins.remove",
                "channel.delete", "role.assign", "role.unassign")
-    rows = store.public_moderation_log(db, db_lock, actions, limit)
+    with db_lock:
+        rows = db.execute(
+            "SELECT ts, actor, action, target FROM audit_log WHERE action IN "
+            "(%s) ORDER BY id DESC LIMIT ?" % ",".join("?" for _ in actions),
+            (*actions, limit)).fetchall()
     return {"ok": 1, "entries": [
         {"ts": r["ts"], "actor": r["actor"], "action": r["action"],
          "target": r["target"]} for r in rows]}
@@ -4590,17 +4482,16 @@ def api_v1_roles_delete(viewer, data, link_id):
     if denied:
         return denied
     role_id = data.get("role_id")
-    role_perms = store.role_perms(db, db_lock, role_id)
-    if role_perms is None:
-        return {"ok": 0, "error": "unknown role", "code": 404}
-    if not _may_grant(viewer, role_perms):
-        return {"ok": 0, "error": "cannot delete a role holding permissions you do not hold",
-                "code": 403}
-    name = store.delete_role(db, db_lock, role_id)
-    if name is None:
-        return {"ok": 0, "error": "unknown role", "code": 404}
+    with db_lock:
+        row = db.execute("SELECT name FROM roles WHERE role_id=?", (role_id,)).fetchone()
+        if not row:
+            return {"ok": 0, "error": "unknown role", "code": 404}
+        db.execute("DELETE FROM user_roles WHERE role_id=?", (role_id,))
+        db.execute("DELETE FROM channel_overwrites WHERE role_id=?", (role_id,))
+        db.execute("DELETE FROM roles WHERE role_id=?", (role_id,))
+        db.commit()
     _audit(viewer, "role.delete", None, "role_id=%s" % role_id)
-    return {"ok": 1, "role_id": role_id, "name": name}
+    return {"ok": 1, "role_id": role_id, "name": row["name"]}
 
 @api_route("/api/v1/roles/assign")
 @wrap_json_api
@@ -4612,14 +4503,12 @@ def api_v1_roles_assign(viewer, data, link_id):
     target = _resolve_user(data.get("user"))
     if not target:
         return {"ok": 0, "error": "unknown user", "code": 404}
-    role_perms = store.role_perms(db, db_lock, role_id)
-    if role_perms is None:
-        return {"ok": 0, "error": "unknown role", "code": 404}
-    if not _may_grant(viewer, role_perms):
-        return {"ok": 0, "error": "cannot assign a role holding permissions you do not hold",
-                "code": 403}
-    if not store.assign_role_checked(db, db_lock, target, role_id):
-        return {"ok": 0, "error": "unknown role", "code": 404}
+    with db_lock:
+        if not db.execute("SELECT 1 FROM roles WHERE role_id=?", (role_id,)).fetchone():
+            return {"ok": 0, "error": "unknown role", "code": 404}
+        db.execute("INSERT OR IGNORE INTO user_roles (user_hash, role_id) VALUES (?, ?)",
+                   (target, role_id))
+        db.commit()
     _audit(viewer, "role.assign", target, "role_id=%s" % role_id)
     return {"ok": 1, "role_id": role_id, "user": target}
 
@@ -4633,325 +4522,12 @@ def api_v1_roles_unassign(viewer, data, link_id):
     target = _resolve_user(data.get("user"))
     if not target:
         return {"ok": 0, "error": "unknown user", "code": 404}
-    store.unassign_role(db, db_lock, target, role_id)
+    with db_lock:
+        db.execute("DELETE FROM user_roles WHERE user_hash=? AND role_id=?",
+                   (target, role_id))
+        db.commit()
     _audit(viewer, "role.unassign", target, "role_id=%s" % role_id)
     return {"ok": 1, "role_id": role_id, "user": target}
-
-# ----------------------------------------------------------------------------------
-# Bots (Group 1: registry + management; Group 2: data path). Management
-# endpoints are user-authenticated by link identity; the caller IS the
-# owner (viewer). Owners only ever see/manage their own bots. Key format:
-# bot_id = secrets.token_hex(16) (32 hex chars);
-# api key = "sk-" + secrets.token_hex(32) (64 hex chars of entropy).
-# Only sha256(key) is stored; the key is shown ONCE at creation and is never
-# retrievable afterwards (rotation = revoke + create anew).
-#
-# Data path (Group 2): the bot endpoints below authenticate with bot_id +
-# api_key in the request data (NOT the link identity — a bot's link is its
-# own RNS identity, so viewer_of would give the bot's own delivery hash,
-# not the owner's). A bot acts AS its owner: channel VIEW/POST are the
-# owner's, posts carry the owner as author_hash, and every successful bot
-# post / react writes an audit row (actor = owner hash, target = bot_id,
-# detail = msg_id) so the bot is on the record without changing
-# attribution. Every successful bot request also touches last_seen.
-# ----------------------------------------------------------------------------------
-
-def _bot_row(row):
-    """Public bot shape — never includes key_hash or the raw key."""
-    return {"bot_id": row["bot_id"], "name": row["name"],
-            "owner_hash": row["owner_hash"], "perms": row["perms"],
-            "created_at": row["created_at"], "revoked_at": row["revoked_at"],
-            "last_seen": row["last_seen"]}
-
-
-def _bot_gateway():
-    """Gateway info for a newly created bot: the guild's node/delivery
-    hashes (saved to the guilds row at boot) plus the stream/data endpoints.
-    Hashes are None until the guild has booted and saved its row."""
-    row = store.get_guild(db, db_lock, GUILD_ID)
-    return {"node_hash": row["node_hash"] if row else None,
-            "delivery_hash": row["delivery_hash"] if row else None,
-            "endpoints": {"subscribe": "/api/v1/stream/subscribe",
-                          "poll": "/api/v1/stream/poll",
-                          "post": "/api/v1/bots/post",
-                          "react": "/api/v1/bots/react",
-                          "channels": "/api/v1/bots/channels",
-                          "channel_info": "/api/v1/bots/channel_info",
-                          "site_get": "/api/v1/bots/site_get",
-                          "site_manifest": "/api/v1/bots/site_manifest"}}
-
-
-def _bot_valid_name(data):
-    """Validated bot name (stripped, 1..BOT_NAME_MAX chars), or None."""
-    name = data.get("name")
-    if not isinstance(name, str):
-        return None
-    name = name.strip()
-    return name if 1 <= len(name) <= BOT_NAME_MAX else None
-
-
-def _bot_valid_perms(data):
-    """Validated perms bitmask (int, no unknown bits outside BOT_PERM_ALL),
-    or None. Bools are rejected — True is an int in Python, not a bitmask."""
-    perms = data.get("perms")
-    if isinstance(perms, bool) or not isinstance(perms, int):
-        return None
-    return perms if 0 <= perms <= BOT_PERM_ALL else None
-
-
-def _bot_for_owner(viewer, data):
-    """Load a bot the caller owns. Returns (row, error-dict-or-None):
-    missing bot_id -> 400, unknown bot_id -> 404, another owner's -> 403."""
-    bot_id = data.get("bot_id")
-    if not bot_id or not isinstance(bot_id, str):
-        return None, {"ok": 0, "error": "bot_id required", "code": 400}
-    row = store.bot_get(db, db_lock, bot_id)
-    if row is None:
-        return None, {"ok": 0, "error": "unknown bot", "code": 404}
-    if row["owner_hash"] != viewer:
-        return None, {"ok": 0, "error": "not your bot", "code": 403}
-    return row, None
-
-
-def _bot_for_data(data, bit, what):
-    """Load a bot by its data-path credentials for an action needing
-    BOT_PERMS `bit`. Returns (row, error-dict-or-None): bad, revoked or
-    unknown credentials -> 403 (never 404, so the response cannot leak
-    whether a bot_id exists); missing bit -> 403."""
-    bot = _resolve_bot(data.get("bot_id"), data.get("api_key"))
-    if bot is None:
-        return None, {"ok": 0, "error": "invalid bot credentials", "code": 403}
-    if not (bot["perms"] & bit):
-        return None, {"ok": 0, "error": "bot may not %s" % what, "code": 403}
-    return bot, None
-
-
-@api_route("/api/v1/bots/create")
-@wrap_json_api
-def api_v1_bots_create(viewer, data, link_id):
-    name = _bot_valid_name(data)
-    if name is None:
-        return {"ok": 0, "error": "name required (1-%d chars)" % BOT_NAME_MAX,
-                "code": 400}
-    if "perms" not in data:
-        return {"ok": 0, "error": "perms required", "code": 400}
-    perms = _bot_valid_perms(data)
-    if perms is None:
-        return {"ok": 0, "error": "perms must be a bitmask 0-%d" % BOT_PERM_ALL,
-                "code": 400}
-    bot_id = secrets.token_hex(16)
-    api_key = "sk-" + secrets.token_hex(32)
-    key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
-    row = store.bot_create(db, db_lock, bot_id, viewer, name, key_hash,
-                           perms, now())
-    _audit(viewer, "bot_create", bot_id, name)
-    return {"ok": 1, "bot": _bot_row(row), "api_key": api_key,
-            "gateway": _bot_gateway()}
-
-
-@api_route("/api/v1/bots/list")
-@wrap_json_api
-def api_v1_bots_list(viewer, data, link_id):
-    rows = store.bot_list_by_owner(db, db_lock, viewer)
-    return {"ok": 1, "bots": [_bot_row(r) for r in rows]}
-
-
-@api_route("/api/v1/bots/info")
-@wrap_json_api
-def api_v1_bots_info(viewer, data, link_id):
-    row, err = _bot_for_owner(viewer, data)
-    if err:
-        return err
-    return {"ok": 1, "bot": _bot_row(row)}
-
-
-@api_route("/api/v1/bots/update")
-@wrap_json_api
-def api_v1_bots_update(viewer, data, link_id):
-    row, err = _bot_for_owner(viewer, data)
-    if err:
-        return err
-    name = None
-    perms = None
-    if "name" in data:
-        name = _bot_valid_name(data)
-        if name is None:
-            return {"ok": 0, "error": "name must be 1-%d chars" % BOT_NAME_MAX,
-                    "code": 400}
-    if "perms" in data:
-        perms = _bot_valid_perms(data)
-        if perms is None:
-            return {"ok": 0,
-                    "error": "perms must be a bitmask 0-%d" % BOT_PERM_ALL,
-                    "code": 400}
-    if name is None and perms is None:
-        return {"ok": 0, "error": "nothing to update", "code": 400}
-    changes = []
-    if name is not None and name != row["name"]:
-        changes.append("name: %s -> %s" % (row["name"], name))
-    if perms is not None and perms != row["perms"]:
-        changes.append("perms: %d -> %d" % (row["perms"], perms))
-    row = store.bot_update(db, db_lock, row["bot_id"], name=name, perms=perms)
-    if changes:
-        _audit(viewer, "bot_update", row["bot_id"], "; ".join(changes))
-    return {"ok": 1, "bot": _bot_row(row)}
-
-
-@api_route("/api/v1/bots/revoke")
-@wrap_json_api
-def api_v1_bots_revoke(viewer, data, link_id):
-    row, err = _bot_for_owner(viewer, data)
-    if err:
-        return err
-    already = row["revoked_at"] is not None
-    row = store.bot_revoke(db, db_lock, row["bot_id"], now())
-    if not already:
-        _audit(viewer, "bot_revoke", row["bot_id"], row["name"])
-    return {"ok": 1, "bot": _bot_row(row)}
-
-
-def _bot_attachments(data):
-    """Decode a bot post's attachments — [{name, mime, data}] with data
-    base64 — into the (name, mime, bytes) triples ingest takes. Returns
-    (atts, error-dict-or-None). Absent attachments is fine (plain post)."""
-    raw = data.get("attachments")
-    if raw is None:
-        return [], None
-    if not isinstance(raw, list) or len(raw) > MAX_ATTACHMENTS:
-        return None, {"ok": 0, "error": "attachments must be a list of at most %d"
-                      % MAX_ATTACHMENTS, "code": 400}
-    atts = []
-    for att in raw:
-        if not isinstance(att, dict):
-            return None, {"ok": 0, "error": "attachment must be an object",
-                          "code": 400}
-        blob = _b64_decode(att.get("data"))
-        if blob is None or len(blob) > MAX_ATTACHMENT_SZ:
-            return None, {"ok": 0,
-                          "error": "attachment data must be base64 under %d bytes"
-                          % MAX_ATTACHMENT_SZ, "code": 400}
-        atts.append((str(att.get("name") or "file")[:128],
-                     str(att.get("mime") or "application/octet-stream")[:64],
-                     blob))
-    return atts, None
-
-
-@api_route("/api/v1/bots/post")
-@wrap_json_api
-def api_v1_bots_post(viewer, data, link_id):
-    """Bot post. Auth is bot_id + api_key in the data (the link identity
-    is the bot's own, not the owner's). Requires the POST bit; the OWNER
-    must hold VIEW + POST on the channel. The post is ingested as the
-    owner (author_hash = owner_hash) so attribution converges with human
-    posts; the bot_id lands in the audit trail instead. The rate limit
-    is keyed by the bot ("bot:" + bot_id), independent of the owner's,
-    so a chatty bot cannot silence its owner (or vice versa)."""
-    bot, err = _bot_for_data(data, BOT_PERMS["POST"], "post")
-    if err:
-        return err
-    cid = data.get("channel")
-    if not store.channel_exists(db, db_lock, cid):
-        return {"ok": 0, "error": "unknown channel", "code": 404}
-    content = data.get("content")
-    atts, err = _bot_attachments(data)
-    if err:
-        return err
-    if not isinstance(content, str) or (not content.strip() and not atts):
-        return {"ok": 0, "error": "empty content", "code": 400}
-    owner = bot["owner_hash"]
-    if not has_perm(owner, cid, PERMS["VIEW"]) \
-            or not has_perm(owner, cid, PERMS["POST"]):
-        return {"ok": 0, "error": "owner lacks view/post permission",
-                "code": 403}
-    if not rate_ok("bot:" + bot["bot_id"], cid):
-        return {"ok": 0, "error": "rate limited", "code": 429}
-    msg_id = ingest(cid, owner, content, attachments=atts[:MAX_ATTACHMENTS])
-    if msg_id is None:
-        return {"ok": 0, "error": "rejected", "code": 400}
-    _audit(owner, "bot_post", bot["bot_id"], msg_id)
-    store.bot_touch_last_seen(db, db_lock, bot["bot_id"], now())
-    return {"ok": 1, "msg_id": msg_id}
-
-
-@api_route("/api/v1/bots/react")
-@wrap_json_api
-def api_v1_bots_react(viewer, data, link_id):
-    """Bot react. Same auth as /api/v1/bots/post; requires the REACT bit.
-    Toggles through the shared _react_as path with the owner as actor,
-    so the reaction is stored and emitted exactly as the owner's own
-    (the owner's VIEW on the message's channel is enforced there)."""
-    bot, err = _bot_for_data(data, BOT_PERMS["REACT"], "react")
-    if err:
-        return err
-    msg_id = data.get("msg")
-    resp = _react_as(bot["owner_hash"], msg_id, data.get("emoji"))
-    if resp.get("ok") != 1:
-        return resp
-    _audit(bot["owner_hash"], "bot_react", bot["bot_id"], msg_id)
-    store.bot_touch_last_seen(db, db_lock, bot["bot_id"], now())
-    return resp
-
-
-@api_route("/api/v1/bots/channels")
-@wrap_json_api
-def api_v1_bots_channels(viewer, data, link_id):
-    """Bot channel list. A bot-only endpoint, not the shared human list:
-    the shared handler's viewer is the link identity, which for a bot is
-    its own hash rather than the owner's, so the bot path authenticates
-    in the data and passes the owner into the same _channels_list_for
-    query the human endpoint uses. Requires the READ_CHANNELS bit; the
-    list is exactly the owner's VIEWable channels, with can_post +
-    unread as the owner."""
-    bot, err = _bot_for_data(data, BOT_PERMS["READ_CHANNELS"],
-                             "read channels")
-    if err:
-        return err
-    store.bot_touch_last_seen(db, db_lock, bot["bot_id"], now())
-    return {"ok": 1, "channels": _channels_list_for(bot["owner_hash"])}
-
-
-@api_route("/api/v1/bots/channel_info")
-@wrap_json_api
-def api_v1_bots_channel_info(viewer, data, link_id):
-    """Bot channel info. Same READ_CHANNELS gate; the metadata shape is
-    the human /api/v1/channels/info one via the shared _channel_info
-    helper (VIEW-gated the same way — a bot whose owner cannot see the
-    channel gets the same 404 a human would)."""
-    bot, err = _bot_for_data(data, BOT_PERMS["READ_CHANNELS"],
-                             "read channels")
-    if err:
-        return err
-    store.bot_touch_last_seen(db, db_lock, bot["bot_id"], now())
-    return _channel_info(data.get("channel"), bot["owner_hash"])
-
-
-@api_route("/api/v1/bots/site_get")
-@wrap_json_api
-def api_v1_bots_site_get(viewer, data, link_id):
-    """Bot micron-page read — the hook's other half: a site_patch event
-    tells the bot a page changed, this fetches the new content. Requires
-    the SITE bit; the OWNER must hold VIEW on the site channel. Same
-    chunked read as human /api/v1/site/get, owner as viewer. Reads touch
-    last_seen like the other bot read endpoints; no audit entry (reads
-    are not attributed actions). No bot site_put exists by design:
-    publishing pages stays moderator / SITE_EDIT, human-only."""
-    bot, err = _bot_for_data(data, BOT_PERMS["SITE"], "read micron pages")
-    if err:
-        return err
-    store.bot_touch_last_seen(db, db_lock, bot["bot_id"], now())
-    return _site_read_for(bot["owner_hash"], data)
-
-
-@api_route("/api/v1/bots/site_manifest")
-@wrap_json_api
-def api_v1_bots_site_manifest(viewer, data, link_id):
-    """Bot site-manifest read. Same SITE-bit + owner-VIEW gate as
-    bots/site_get; the human endpoint is ungated, the bot one is not."""
-    bot, err = _bot_for_data(data, BOT_PERMS["SITE"], "read micron pages")
-    if err:
-        return err
-    store.bot_touch_last_seen(db, db_lock, bot["bot_id"], now())
-    return _site_manifest_for(bot["owner_hash"], data, require_view=True)
 
 @api_route("/api/v1/channels/patch")
 @wrap_json_api
@@ -4961,13 +4537,17 @@ def api_v1_channels_patch(viewer, data, link_id):
     must also carry MANAGE_CHANNEL; overwrites are {role_id: perms} with
     perms null deleting the row (falling back to the default)."""
     cid = data.get("channel")
-    if not store.channel_exists(db, db_lock, cid):
-        return {"ok": 0, "error": "unknown channel", "code": 404}
+    with db_lock:
+        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
+            return {"ok": 0, "error": "unknown channel", "code": 404}
     if not has_perm(viewer, cid, PERMS["MANAGE_CHANNEL"]):
         return {"ok": 0, "error": "manage channel permission required", "code": 403}
     topic = data.get("topic")
     if topic is not None:
-        store.set_channel_topic(db, db_lock, cid, str(topic).strip()[:200] or None)
+        with db_lock:
+            db.execute("UPDATE channels SET topic=? WHERE id=?",
+                       (str(topic).strip()[:200] or None, cid))
+            db.commit()
         _emit_event(cid, "channels_changed", {"channel": channel_name(cid)},
                     guild_wide=True)
     overwrites = data.get("overwrites")
@@ -4979,40 +4559,25 @@ def api_v1_channels_patch(viewer, data, link_id):
                 rid = int(rid)
             except (TypeError, ValueError):
                 return {"ok": 0, "error": "role_id must be an integer", "code": 400}
-            if perms is None:
-                store.delete_channel_overwrite(db, db_lock, cid, rid)
-            else:
-                if not isinstance(perms, int) or perms < 0 or perms > PERM_ALL:
-                    return {"ok": 0, "error": "perms must be a bitmask 0-127",
-                            "code": 400}
-                store.set_channel_overwrite(db, db_lock, cid, rid, perms)
-        store.commit(db, db_lock)
+            with db_lock:
+                if perms is None:
+                    db.execute("DELETE FROM channel_overwrites "
+                               "WHERE channel_id=? AND role_id=?", (cid, rid))
+                else:
+                    if not isinstance(perms, int) or perms < 0 or perms > PERM_ALL:
+                        return {"ok": 0, "error": "perms must be a bitmask 0-127",
+                                "code": 400}
+                    db.execute("INSERT INTO channel_overwrites "
+                               "(channel_id, role_id, perms) VALUES (?, ?, ?) "
+                               "ON CONFLICT(channel_id, role_id) "
+                               "DO UPDATE SET perms=excluded.perms", (cid, rid, perms))
+        with db_lock:
+            db.commit()
     return {"ok": 1, "channel": cid}
 
 # ----------------------------------------------------------------------------------
 # Boot (plan §9 skeleton — every call verified against the installed stack)
 # ----------------------------------------------------------------------------------
-
-def _iface_tick(debug):
-    if not debug:
-        return
-    rows = []
-    for i in RNS.Transport.interfaces:
-        spw = getattr(i, "spawned_interfaces", None) or []
-        rows.append("%s/on=%s" % (type(i).__name__,
-                                  getattr(i, "online", None)))
-        for s in spw:
-            peer = ""
-            try:
-                peer = "%s:%s" % tuple(s.socket.getpeername())
-            except Exception:
-                pass
-            rows[-1] += " [%s %s on=%s up=%s]" % (
-                getattr(s, "name", "?"), peer,
-                getattr(s, "online", None),
-                getattr(s, "up", None))
-    RNS.log("iface tick: %s" % (" | ".join(rows),), RNS.LOG_NOTICE)
-
 
 def _announce_now():
     try:
@@ -5022,55 +4587,12 @@ def _announce_now():
         router.announce_propagation_node()                 # delayed-thread announce
         node_destination.announce(app_data=GUILD_NAME.encode("utf-8"))  # Node.py:announce format
         RNS.log("Announced guild (delivery, propagation, node).", RNS.LOG_NOTICE)
-        _iface_tick(os.environ.get("SHADES_VOICE_DEBUG") == "1")
     except Exception as e:
         RNS.log(f"announce error: {e}", RNS.LOG_ERROR)
 
 def announce_all():
     time.sleep(ANNOUNCE_DELAY)
     _announce_now()
-
-
-_VO_KEEPALIVE_INTERVAL = 3.0
-
-
-def _hub_keepalive_loop():
-    """Every 3s, ride each active link's interface with a KEEPALIVE-context
-    probe packet. Two jobs: the raw bytes keep the TCP lanes past
-    TCPInterface's idle watchdog (PROBE_AFTER=5, PROBES=12, INTERVAL=2,
-    which otherwise tears idle conns down at ~31s), and at the RNS layer
-    the packets are honest dead letters -- the hub is the responder side
-    of these links, so only the client's own dog feeds the link. Presence
-    gates on dispatcher bind stamps, never on this ping."""
-
-    last_ping = {}
-
-    while True:
-        time.sleep(_VO_KEEPALIVE_INTERVAL)
-        try:
-            links = list(RNS.Transport.active_links)
-        except Exception:
-            continue
-        now = time.time()
-        for link in links:
-            lid = link.link_id
-            if now - last_ping.get(lid, 0.0) < _VO_KEEPALIVE_INTERVAL:
-                continue
-            last_ping[lid] = now
-            try:
-                iface = link.attached_interface
-                if iface is None or not getattr(iface, "online", False):
-                    continue
-                # Answered by the initiator per the RNS link contract
-                # (context=KEEPALIVE, data=0xFF; the client replies 0xFE).
-                pkt = RNS.Packet(link, bytes([0xFF]),
-                                 context=RNS.Packet.KEEPALIVE)
-                pkt.pack()
-                RNS.Transport.transmit(iface, pkt.raw)
-            except Exception as e:
-                RNS.log("link ping failed on %s: %s"
-                        % (RNS.prettyhexrep(lid), e), RNS.LOG_DEBUG)
-
 
 def run(argv=None):
     global db, router, guild_delivery, node_destination, guild_identity
@@ -5146,16 +4668,7 @@ def run(argv=None):
                 f.write("  [[AutoInterface]]\n"
                         "    type = AutoInterface\n"
                         "    enabled = yes\n")
-    _boot_loglevel = None
-    try:
-        _boot_loglevel = int(os.environ.get("SHADES_RNS_LOGLEVEL"))
-    except (TypeError, ValueError):
-        _boot_loglevel = None
-    if _boot_loglevel is None:
-        reticulum = RNS.Reticulum(configdir=rns_configdir)
-    else:
-        reticulum = RNS.Reticulum(configdir=rns_configdir,
-                                  loglevel=_boot_loglevel)
+    reticulum = RNS.Reticulum(configdir=rns_configdir)
 
     ipath = os.path.join(STORAGE, "identity")
     if os.path.exists(ipath):
@@ -5163,10 +4676,6 @@ def run(argv=None):
     else:
         guild_identity = RNS.Identity()
         guild_identity.to_file(ipath)
-        try:
-            os.chmod(ipath, 0o600)
-        except OSError:
-            pass
 
     # LXMF router: ingest + propagation (mesh reachability)
     router = LXMF.LXMRouter(identity=guild_identity, storagepath=STORAGE)
@@ -5186,12 +4695,10 @@ def run(argv=None):
         node_destination.register_request_handler(path, response_generator=fn,
                                                   allow=RNS.Destination.ALLOW_ALL)
 
-    # voice-pub raw lane: inbound node links get a packet callback for
-    # one-packet voice frames (k="voice-pub"); the request lane's
-    # /api/v1/voice/publish remains for clients without a link in hand
-    node_destination.set_link_established_callback(_on_node_link_established)
     # re-register attachment files from previous runs
-    paths = [r["path"] for r in store.list_attachment_paths(db, db_lock)]
+    with db_lock:
+        paths = [r["path"] for r in
+                 db.execute("SELECT DISTINCT path FROM attachments").fetchall()]
     for fname in paths:
         node_destination.register_request_handler(
             "/file/attachments/" + fname, serve_attachment_file,
@@ -5244,7 +4751,11 @@ def run(argv=None):
     node_hash     = hexstr(node_destination.hash)
     delivery_hash = hexstr(guild_delivery.hash)
     prop_hash     = hexstr(router.propagation_destination.hash)
-    store.save_guild(db, db_lock, GUILD_ID, GUILD_NAME, node_hash, delivery_hash, prop_hash)
+    with db_lock:
+        db.execute("INSERT OR REPLACE INTO guilds (id, name, node_hash, delivery_hash, prop_hash) "
+                   "VALUES (?, ?, ?, ?, ?)",
+                   (GUILD_ID, GUILD_NAME, node_hash, delivery_hash, prop_hash))
+        db.commit()
 
     info = {"name": GUILD_NAME, "node_hash": node_hash,
             "delivery_hash": delivery_hash, "prop_hash": prop_hash,
@@ -5268,7 +4779,6 @@ def run(argv=None):
     _BOOT_ARGV = list(argv) if argv is not None else []
     _update_maybe_tick(force=True)
     threading.Thread(target=announce_all, daemon=True).start()
-    threading.Thread(target=_hub_keepalive_loop, daemon=True).start()
     try:
         while True:
             time.sleep(10)
@@ -5277,7 +4787,7 @@ def run(argv=None):
         RNS.log("Shutting down.", RNS.LOG_NOTICE)
 
 if __name__ == "__main__":
-    # tay's boot (0.36.25 fold-4): the flags live in sys.argv, not in
+    # tay's boot (0.36.24 fold-4): the flags live in sys.argv, not in
     # the argv parameter - list(None) crashed AFTER the banner on
     # every boot (bare or flagged) since P11 chain 2, and a guard
     # alone would restart a flagged hub flagless. The entry feeds the

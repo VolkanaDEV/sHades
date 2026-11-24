@@ -32,7 +32,7 @@ def main():
     # --- wire format survives a client hop ---------------------------------
     wire = mesh_ui.reply_wire("tay", "hi there", "answer here")
     check("reply_wire renders the visible prefix",
-          wire.startswith("> @tay · hi there\n\n"), wire[:40])
+          wire.startswith("↳ @tay · hi there\n\n"), wire[:40])
     author, excerpt, body = mesh_ui.split_reply(wire)
     check("split_reply reverses the wire prefix",
           (author, excerpt, body) == ("tay", "hi there", "answer here"),
@@ -71,7 +71,7 @@ def main():
           "height: 0 if root.grouped else dp(18)" in kv, None)
     check("kv: reply card block present",
           "dp(44) if root.reply_author else 0" in kv
-          and "'> @' + root.reply_author" in kv, None)
+          and "'↳ @' + root.reply_author" in kv, None)
     check("kv: composer reply bar present",
           "height: dp(32) if app.reply_draft else 0" in kv
           and "app.cancel_reply()" in kv, None)
