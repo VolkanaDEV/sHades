@@ -20,6 +20,8 @@ calls, so no real time has to elapse.
 - popup_entrance: opacity starts at 0, passes through a partial
   opacity mid-fade, lands at 1; REDUCED_MOTION opens at opacity 1
   at once; a failed open() still raises (and restores opacity 1)
+- the Android fade skip (POPUP_FADE_SKIP) opens at opacity 1 with
+  no animation, pinning the tay 2026-11-24 recovery-sheet fix
 
 Real MainScreen / Popup widgets under Xvfb; the screen is bare
 (no KV ids), so swipe-band fakes stand in for the sidebars.
@@ -277,6 +279,25 @@ def main():
             pop2.dismiss()
     finally:
         ui_fx.set_reduced_motion(False)
+
+    # --- popup entrance with the Android fade skip ---------------------
+    # the skip opens at opacity 1 exactly like reduced motion (tay
+    # 2026-11-24: the phone GLES path hid sheet button labels through
+    # the fade; the skip path replaces the fade there).
+    ui_fx.POPUP_FADE_SKIP = True
+    try:
+        pop3 = Popup(title="probe3", content=Label(text="hi"),
+                     size_hint=(0.5, 0.5))
+        try:
+            ui_fx.popup_entrance(pop3)
+            check("fade-skip popup opens at opacity 1 at once",
+                  pop3.opacity == 1, repr(pop3.opacity))
+            check("fade-skip popup starts no animation",
+                  _anim_for(pop3, "opacity") is None)
+        finally:
+            pop3.dismiss()
+    finally:
+        ui_fx.POPUP_FADE_SKIP = False
 
     # --- a failed open() still raises (and restores opacity 1) --------
     def _boom():
