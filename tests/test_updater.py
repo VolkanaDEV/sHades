@@ -223,9 +223,9 @@ with _DB():
     sHades._cfg_set("update_channel", "rns")
     r = updater.check_and_apply(TAR_DIR, "0.36.20", cfg,
                                 api_base="http://127.0.0.1:1")
-    check("toggle rns: skipped, no fetch hook wired (P11d carrier)",
+    check("toggle rns: skipped, channel not wired",
           bool(r.get("skipped"))
-          and r.get("reason") == "no-rns-fetch", str(r))
+          and r.get("reason") == "channel-not-wired", str(r))
     check("toggle rns: still no fetch", Hits == [], "hits=%s" % Hits)
 
 # --- happy path: fetch, gate, stage, swap (exec restart off in-lane)

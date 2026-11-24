@@ -4,6 +4,8 @@
 #:import MDApp kivymd.app.MDApp
 #:import scaled ui_scale.scaled
 #:import AuroraBackground ui_fx.AuroraBackground
+#:import FancyMDButton client_widgets.FancyMDButton
+#:import MDLinearProgressIndicator kivymd.uix.progressindicator.MDLinearProgressIndicator
 
 # Button heights are written literally as dp(N) so they read at their
 # nominal size. They used to be scaled by 2/3, which drew a 40dp button
@@ -63,6 +65,7 @@
         size: dp(32), 0 if root.grouped else dp(32)
         opacity: 0 if root.grouped else 1
         source: root.avatar_source or ""
+        fallback_letter: root.username[:1]
         allow_stretch: False
         keep_ratio: True
 
@@ -115,7 +118,7 @@
                     size: self.size
                     radius: [dp(10), dp(10), dp(10), dp(10)]
             Label:
-                text: '↳ @' + root.reply_author
+                text: '> @' + root.reply_author
                 color: app.theme_colors['accent']
                 bold: True
                 font_size: sp(11)
@@ -232,20 +235,18 @@
             keep_ratio: True
             size_hint: 1, 1
             pos_hint: {'center_x': 0.5, 'center_y': 0.5}
-        MDButton:
-            style: 'filled'
+        FancyMDButton:
+            variant: 'primary'
             size_hint_y: None
             height: scaled(dp(40))
             size_hint_x: None
             width: dp(150)
             pos_hint: {'center_x': 0.5}
-            theme_bg_color: 'Custom'
-            md_bg_color: app.theme_colors['primary']
             on_press: root.download_image()
             MDButtonText:
                 text: 'Download'
-        MDButton:
-            style: 'outlined'
+        FancyMDButton:
+            variant: 'outlined'
             size_hint_y: None
             height: scaled(dp(40))
             size_hint_x: None
@@ -266,6 +267,7 @@
         size_hint: None, None
         size: dp(26), dp(26)
         source: root.avatar_source or ""
+        fallback_letter: root.username[:1]
         allow_stretch: False
         keep_ratio: True
     ClickableLabel:
@@ -276,6 +278,10 @@
         halign: 'left'
         valign: 'middle'
         text_size: self.width, None
+        # Task 2: a long name wrapped to 2-3 lines and painted outside
+        # its 36px row. Single-line with ellipsis, like the message
+        # author label.
+        shorten: True
         size_hint_x: 1
         on_press: app.open_profile(root.author_hash, root.username)
     Widget:
@@ -288,211 +294,215 @@
         color: root.presence_color
 
 <ProfileScreen>:
-    BoxLayout:
-        orientation: 'vertical'
-        padding: dp(20)
-        spacing: dp(15)
+    ScrollView:
+        do_scroll_x: False
+        bar_width: dp(6)
         canvas.before:
             Color:
                 rgba: app.theme_colors['bg_main']
             Rectangle:
                 pos: self.pos
                 size: self.size
-        Label:
-            text: 'Profile'
-            font_size: sp(32)
-            bold: True
-            color: app.theme_colors['text']
-            size_hint_y: None
-            height: dp(50)
         BoxLayout:
-            orientation: 'horizontal'
+            orientation: 'vertical'
             size_hint_y: None
-            height: dp(200)
-            spacing: dp(10)
-            Widget:
-                size_hint_x: 1
-            PfpImage:
-                id: profile_pfp
+            height: self.minimum_height
+            padding: dp(20)
+            spacing: dp(15)
+            Label:
+                text: 'Profile'
+                font_size: sp(32)
+                bold: True
+                color: app.theme_colors['text']
+                size_hint_y: None
+                height: dp(50)
+            BoxLayout:
+                orientation: 'horizontal'
+                size_hint_y: None
+                height: dp(200)
+                spacing: dp(10)
+                Widget:
+                    size_hint_x: 1
+                PfpImage:
+                    id: profile_pfp
+                    size_hint: None, None
+                    size: dp(150), dp(150)
+                    source: root.target_avatar or ''
+                    fallback_letter: root.target_username[:1]
+                    allow_stretch: False
+                    keep_ratio: True
+                    canvas.after:
+                        Color:
+                            rgba: 0, 0, 0, 0.5
+                        Ellipse:
+                            pos: self.center_x - dp(75), self.center_y - dp(75)
+                            size: dp(150), dp(150)
+                        Color:
+                            rgba: app.theme_colors['text']
+                        Line:
+                            circle: self.center_x, self.center_y, 75
+                            width: 2
+                Widget:
+                    size_hint_x: 1
+            Label:
+                text: root.target_username
+                font_size: sp(20)
+                bold: True
+                color: app.theme_colors['text']
+                size_hint_y: None
+                height: dp(30)
+                halign: 'center'
+                text_size: self.width, None
+            MDTextField:
+                id: profile_username_input
+                text: root.target_username
+                mode: 'filled'
+                size_hint_y: None
+                height: dp(56)
+                fill_color_normal: app.theme_colors['input_bg']
+                fill_color_focus: app.theme_colors['input_bg_focus']
+                text_color_normal: app.theme_colors['text']
+                text_color_focus: app.theme_colors['text']
+                cursor_color: app.theme_colors['text']
+                MDTextFieldHintText:
+                    text: 'Username'
+                    text_color_normal: app.theme_colors['text']
+                    text_color_focus: app.theme_colors['text']
+            Label:
+                id: profile_status
+                text: ''
+                font_size: sp(11)
+                color: app.theme_colors['text_muted']
+                size_hint_y: None
+                height: dp(18)
+            Label:
+                text: 'Node hash: ' + root.target_hash
+                font_size: sp(11)
+                color: app.theme_colors['text_muted']
+                size_hint_y: None
+                height: dp(20)
+                halign: 'center'
+                text_size: self.width, None
+                shorten: True
+            # The lxmf.delivery hash -- previously this line rendered
+            # target_username, so the profile showed the name twice and the
+            # label claimed to be a hash that it was not.
+            Label:
+                text: 'Delivery: ' + root.target_delivery
+                font_size: sp(11)
+                color: app.theme_colors['text_muted']
+                size_hint_y: None
+                height: dp(20)
+                halign: 'center'
+                text_size: self.width, None
+                shorten: True
+            Label:
+                id: profile_card_alias
+                text: ''
+                font_size: sp(14)
+                bold: True
+                color: app.theme_colors['text']
+                size_hint_y: None
+                height: dp(24)
+                halign: 'center'
+                text_size: self.width, None
+            # ---- contact card QR (v0.34, tay: collectible profile card) ----
+            # the QR carries the public keyset only; tap copy below to hand
+            # the payload to someone as text (v1 import path)
+            Image:
+                id: profile_card_qr
                 size_hint: None, None
-                size: dp(150), dp(150)
-                source: root.target_avatar or ''
-                allow_stretch: False
-                keep_ratio: True
+                size: dp(180), dp(180)
+                source: ''
+                # Task 2: an Image with no source draws a white rect;
+                # hide the whole QR block (image + border) until a card
+                # is actually rendered for this profile.
+                opacity: 1 if self.source else 0
+                allow_stretch: True
+                pos_hint: {'center_x': 0.5}
                 canvas.after:
-                    Color:
-                        rgba: 0, 0, 0, 0.5
-                    Ellipse:
-                        pos: self.center_x - dp(75), self.center_y - dp(75)
-                        size: dp(150), dp(150)
                     Color:
                         rgba: app.theme_colors['text']
                     Line:
-                        circle: self.center_x, self.center_y, 75
-                        width: 2
-            Widget:
-                size_hint_x: 1
-        Label:
-            text: root.target_username
-            font_size: sp(20)
-            bold: True
-            color: app.theme_colors['text']
-            size_hint_y: None
-            height: dp(30)
-            halign: 'center'
-            text_size: self.width, None
-        MDTextField:
-            id: profile_username_input
-            text: root.target_username
-            mode: 'filled'
-            size_hint_y: None
-            height: dp(56)
-            fill_color_normal: app.theme_colors['input_bg']
-            fill_color_focus: app.theme_colors['input_bg_focus']
-            text_color_normal: app.theme_colors['text']
-            text_color_focus: app.theme_colors['text']
-            cursor_color: app.theme_colors['text']
-            MDTextFieldHintText:
-                text: 'Username'
-                text_color_normal: app.theme_colors['text']
-                text_color_focus: app.theme_colors['text']
-        Label:
-            id: profile_status
-            text: ''
-            font_size: sp(11)
-            color: app.theme_colors['text_muted']
-            size_hint_y: None
-            height: dp(18)
-        Label:
-            text: 'Node hash: ' + root.target_hash
-            font_size: sp(11)
-            color: app.theme_colors['text_muted']
-            size_hint_y: None
-            height: dp(20)
-            halign: 'center'
-            text_size: self.width, None
-            shorten: True
-        # The lxmf.delivery hash -- previously this line rendered
-        # target_username, so the profile showed the name twice and the
-        # label claimed to be a hash that it was not.
-        Label:
-            text: 'Delivery: ' + root.target_delivery
-            font_size: sp(11)
-            color: app.theme_colors['text_muted']
-            size_hint_y: None
-            height: dp(20)
-            halign: 'center'
-            text_size: self.width, None
-            shorten: True
-        Label:
-            id: profile_card_alias
-            text: ''
-            font_size: sp(14)
-            bold: True
-            color: app.theme_colors['text']
-            size_hint_y: None
-            height: dp(24)
-            halign: 'center'
-            text_size: self.width, None
-        # ---- contact card QR (v0.34, tay: collectible profile card) ----
-        # the QR carries the public keyset only; tap copy below to hand
-        # the payload to someone as text (v1 import path)
-        Image:
-            id: profile_card_qr
-            size_hint: None, None
-            size: dp(180), dp(180)
-            source: ''
-            allow_stretch: True
-            pos_hint: {'center_x': 0.5}
-            canvas.after:
-                Color:
-                    rgba: app.theme_colors['text']
-                Line:
-                    rounded_rectangle: self.x - dp(6), self.y - dp(6), self.width + dp(12), self.height + dp(12), dp(10)
-                    width: 1.5
-        MDButton:
-            style: 'outlined'
-            size_hint_x: None
-            width: dp(230)
-            pos_hint: {'center_x': 0.5}
-            on_press: app.share_contact_card()
-            MDButtonText:
-                text: 'Copy card payload'
-                text_color: app.theme_colors['text']
-        MDButton:
-            style: 'outlined'
-            size_hint_x: None
-            width: dp(230)
-            pos_hint: {'center_x': 0.5}
-            on_press: app.import_contact_card()
-            MDButtonText:
-                text: 'Import card from clipboard'
-                text_color: app.theme_colors['text']
-        MDButton:
-            style: 'outlined'
-            size_hint_x: None
-            width: dp(230)
-            pos_hint: {'center_x': 0.5}
-            on_press: app.open_recovery_sheet()
-            MDButtonText:
-                text: 'Save recovery kit'
-                text_color: app.theme_colors['text']
-        MDButton:
-            style: 'outlined'
-            size_hint_x: None
-            width: dp(230)
-            pos_hint: {'center_x': 0.5}
-            on_press: app.open_command_palette()
-            MDButtonText:
-                text: 'Slash commands'
-                text_color: app.theme_colors['text']
-        BoxLayout:
-            size_hint_y: None
-            height: dp(50)
-            spacing: dp(10)
-            MDButton:
-                style: 'filled'
+                        rounded_rectangle: self.x - dp(6), self.y - dp(6), self.width + dp(12), self.height + dp(12), dp(10)
+                        width: 1.5
+            FancyMDButton:
+                variant: 'outlined'
                 size_hint_x: None
-                width: dp(140)
-                theme_bg_color: 'Custom'
-                md_bg_color: app.theme_colors['primary']
-                on_press: app.open_file_chooser(avatar=True)
+                width: dp(230)
+                pos_hint: {'center_x': 0.5}
+                on_press: app.share_contact_card()
                 MDButtonText:
-                    text: 'Change Avatar'
-                    text_color: app.theme_colors['btn_text']
-            MDButton:
-                style: 'filled'
-                size_hint_x: None
-                width: dp(140)
-                theme_bg_color: 'Custom'
-                md_bg_color: app.theme_colors['primary']
-                on_press: app.save_profile()
-                MDButtonText:
-                    text: 'Save Username'
-                    text_color: app.theme_colors['btn_text']
-            MDButton:
-                style: 'outlined'
-                size_hint_x: None
-                width: dp(100)
-                on_press: app.root.current = 'main'
-                MDButtonText:
-                    text: 'Back'
+                    text: 'Copy card payload'
                     text_color: app.theme_colors['text']
-        MDButton:
-            id: profile_delete
-            # P1 (plan_admin v1.1, tay 2026-11-19): purge this
-            # guild account from the server; two-stage type-to-
-            # confirm carries the literals the server validates.
-            style: 'filled'
-            size_hint_x: None
-            width: dp(230)
-            pos_hint: {'center_x': 0.5}
-            theme_bg_color: 'Custom'
-            md_bg_color: 0.76, 0.22, 0.22, 1
-            on_press: app.open_confirm_delete_account()
-            MDButtonText:
-                text: 'Delete account'
-                text_color: 1, 1, 1, 1
+            FancyMDButton:
+                variant: 'outlined'
+                size_hint_x: None
+                width: dp(230)
+                pos_hint: {'center_x': 0.5}
+                on_press: app.import_contact_card()
+                MDButtonText:
+                    text: 'Import card from clipboard'
+                    text_color: app.theme_colors['text']
+            FancyMDButton:
+                variant: 'outlined'
+                size_hint_x: None
+                width: dp(230)
+                pos_hint: {'center_x': 0.5}
+                on_press: app.open_recovery_sheet()
+                MDButtonText:
+                    text: 'Save recovery kit'
+                    text_color: app.theme_colors['text']
+            FancyMDButton:
+                variant: 'outlined'
+                size_hint_x: None
+                width: dp(230)
+                pos_hint: {'center_x': 0.5}
+                on_press: app.open_command_palette()
+                MDButtonText:
+                    text: 'Slash commands'
+                    text_color: app.theme_colors['text']
+            BoxLayout:
+                size_hint_y: None
+                height: dp(50)
+                spacing: dp(10)
+                FancyMDButton:
+                    variant: 'primary'
+                    size_hint_x: None
+                    width: dp(140)
+                    on_press: app.open_file_chooser(avatar=True)
+                    MDButtonText:
+                        text: 'Change Avatar'
+                        text_color: app.theme_colors['btn_text']
+                FancyMDButton:
+                    variant: 'primary'
+                    size_hint_x: None
+                    width: dp(140)
+                    on_press: app.save_profile()
+                    MDButtonText:
+                        text: 'Save Username'
+                        text_color: app.theme_colors['btn_text']
+                FancyMDButton:
+                    variant: 'outlined'
+                    size_hint_x: None
+                    width: dp(100)
+                    on_press: app.root.current = 'main'
+                    MDButtonText:
+                        text: 'Back'
+                        text_color: app.theme_colors['text']
+            FancyMDButton:
+                id: profile_delete
+                # P1 (plan_admin v1.1, tay 2026-11-19): purge this
+                # guild account from the server; two-stage type-to-
+                # confirm carries the literals the server validates.
+                variant: 'danger'
+                size_hint_x: None
+                width: dp(230)
+                pos_hint: {'center_x': 0.5}
+                on_press: app.open_confirm_delete_account()
+                MDButtonText:
+                    text: 'Delete account'
+                    text_color: 1, 1, 1, 1
 
 <MainScreen>:
     BoxLayout:
@@ -565,6 +575,60 @@
             GearIcon:
                 on_press: app.open_profile(app.my_hash or '', app.username or '')
                 color: app.theme_colors['text']
+        BoxLayout:
+            # sitenav (g): persistent site nav chrome -- lives outside
+            # the page content so Back/Forward and the breadcrumb are
+            # reachable without scrolling to the top of the page. Shown
+            # only while a site page is on screen; hidden it collapses
+            # to 0px. The in-page < Back link keeps working as well.
+            id: site_nav_bar
+            orientation: 'horizontal'
+            size_hint_y: None
+            height: dp(40) if app.site_nav_visible else 0
+            opacity: 1 if app.site_nav_visible else 0
+            disabled: not app.site_nav_visible
+            padding: [dp(8), 0]
+            spacing: dp(6)
+            canvas.before:
+                Color:
+                    rgba: app.theme_colors['topbar']
+                Rectangle:
+                    pos: self.pos
+                    size: self.size
+                Color:
+                    rgba: app.theme_colors['border_subtle']
+                Rectangle:
+                    pos: self.x, self.y
+                    size: self.width, dp(1)
+            MDButton:
+                id: site_nav_back
+                style: 'text'
+                size_hint_x: None
+                width: dp(64)
+                disabled: not app.site_nav_can_back
+                on_press: app.site_go_back()
+                MDButtonText:
+                    text: '< Back'
+                    text_color: app.theme_colors['primary'] if app.site_nav_can_back else app.theme_colors['text_dim']
+            MDButton:
+                id: site_nav_forward
+                style: 'text'
+                size_hint_x: None
+                width: dp(80)
+                disabled: not app.site_nav_can_forward
+                on_press: app.site_go_forward()
+                MDButtonText:
+                    text: 'Forward >'
+                    text_color: app.theme_colors['primary'] if app.site_nav_can_forward else app.theme_colors['text_dim']
+            Label:
+                id: site_nav_path
+                text: app.site_nav_path
+                color: app.theme_colors['text_dim']
+                font_size: sp(13)
+                halign: 'left'
+                valign: 'middle'
+                text_size: self.width, None
+                shorten: True
         FloatLayout:
             id: chat_body
             size_hint_y: 1
@@ -599,6 +663,15 @@
                         spacing: dp(2)
                         padding: [dp(8), dp(8)]
                 BoxLayout:
+                    id: reply_bar
+                    # 32px: pinned by tests/test_reply_cards.py
+                    # ("height: dp(32) if app.reply_draft else 0").
+                    # Known 4px overhang: the cancel MDButton is 40px
+                    # tall (minimum touch target) and sticks 4px out
+                    # of this 32px bar top and bottom. The bar height
+                    # is a pinned contract, so the overflow test
+                    # explicitly tolerates this one pair instead of
+                    # growing the bar (see test_uix_layout_overflow).
                     size_hint_y: None
                     height: dp(32) if app.reply_draft else 0
                     opacity: 1 if app.reply_draft else 0
@@ -616,13 +689,45 @@
                         width: dp(38)
                         on_press: app.cancel_reply()
                         MDButtonText:
-                            text: '×'
+                            # G6 (UIX P1-1): ASCII 'x', not the
+                            # multiplication sign -- button labels must
+                            # stay ASCII (Roboto has no symbol glyphs;
+                            # the glyph test pins this).
+                            text: 'x'
+                BoxLayout:
+                    # polish (g): composer upload-progress strip --
+                    # a thin bar directly above the composer, visible
+                    # only while an upload is in flight. Progress is
+                    # state, not motion: the fill jumps to
+                    # app.upload_pct (never start() -- the indicator's
+                    # own determinate animation would drive the value
+                    # itself). Fill = theme primary on a panel_darker
+                    # track; both re-tint live with the theme.
+                    id: upload_progress_bar
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: dp(4) if app.upload_active else 0
+                    opacity: 1 if app.upload_active else 0
+                    disabled: not app.upload_active
+                    MDLinearProgressIndicator:
+                        id: upload_progress_fill
+                        type: 'determinate'
+                        value: app.upload_pct
+                        indicator_color: app.theme_colors['primary']
+                        track_color: app.theme_colors['panel_darker']
+                        size_hint_y: None
+                        height: dp(4)
                 BoxLayout:
                     # 56px (task 9): the bar contains the pfp (dp(42)) and
                     # the field. At 48px a dp(42) pfp plus padding
                     # overflowed upward into the message list.
+                    # G1 (fixes.md #10): the bar grows with the field --
+                    # max(dp(56), field + vertical padding) -- so a
+                    # multi-line field expands visibly and the message
+                    # list above shrinks instead of the field overflowing.
+                    id: composer_bar
                     size_hint_y: None
-                    height: dp(56)
+                    height: max(dp(56), msg_input.height + dp(12))
                     padding: [dp(4), dp(6)]
                     spacing: dp(4)
                     canvas.before:
@@ -637,12 +742,15 @@
                         background_down: ''
                         background_color: [0, 0, 0, 0]
                         size_hint_x: None
-                        width: dp(46)
+                        # G6 (UIX P2-1): 48px wide like every other touch
+                        # target; was dp(46), 2px under the 48px minimum.
+                        width: dp(48)
                         # v0.36.9 (tay): tap opens the profile editor
                         on_press: app.open_profile(app.my_hash or '', app.username or '')
                         PfpImage:
                             id: composer_pfp
                             source: app.composer_pfp_path or ''
+                            fallback_letter: (app.username or '')[:1]
                             size: dp(42), dp(42)
                             center: self.parent.center if self.parent else (0, 0)
                             allow_stretch: True
@@ -681,12 +789,20 @@
                         multiline: True
                         size_hint_x: 1
                         size_hint_y: None
-                        # max_height caps the field at one line inside the
-                        # bar; adjust_height() otherwise balloons it to
-                        # dp(56) and it overflows the bar.
-                        height: dp(40)
+                        # G1 (fixes.md #10): the field grows with its text
+                        # up to ~4+ lines instead of capping at one line.
+                        # max(dp(40), minimum_height): bare minimum_height
+                        # is 37.5px for one line, which would shrink the
+                        # single-line field below the 40px the layout test
+                        # pins. max_height caps it at dp(160); the composer
+                        # bar grows with it (see composer_bar above).
+                        height: max(dp(40), self.minimum_height)
                         min_height: dp(40)
-                        max_height: dp(40)
+                        max_height: dp(160)
+                        # G5 (UIX P2-4): border tokens (see hub_address).
+                        theme_line_color: 'Custom'
+                        line_color_normal: app.theme_colors['border_subtle']
+                        line_color_focus: app.theme_colors['border']
                         radius: [0, dp(6), dp(6), 0]
                         fill_color_normal: app.theme_colors['input_bg']
                         fill_color_focus: app.theme_colors['input_bg_focus']
@@ -703,15 +819,13 @@
                             text: 'announcements only' if app.composer_readonly else 'Message...'
                             text_color_normal: app.theme_colors['text']
                             text_color_focus: app.theme_colors['text']
-                    MDButton:
-                        style: 'filled'
+                    FancyMDButton:
+                        variant: 'primary'
                         size_hint_x: None
                         width: dp(56)
                         size_hint_y: None
                         height: scaled(dp(40))
                         disabled: app.composer_readonly
-                        theme_bg_color: 'Custom'
-                        md_bg_color: app.theme_colors['primary']
                         on_press: app.send_message()
                         MDButtonText:
                             text: app.composer_send_label
@@ -724,7 +838,10 @@
             BoxLayout:
                 id: left_sidebar
                 size_hint: None, 1
-                width: min(dp(284), root.width * 0.8) if root.left_open else 0
+                # Polish group 3: the width is MainScreen.left_width,
+                # animated 0 <-> open width by _slide_drawer (the
+                # boolean only gates touches and mutual exclusion).
+                width: root.left_width
                 orientation: 'horizontal'
                 pos_hint: {'x': 0}
                 canvas.before:
@@ -750,11 +867,7 @@
                         BoxLayout:
                             id: server_sidebar
                             size_hint_x: None
-                            # 0.36.25 (tay): the rail kept its 64dp box when the
-                            # drawer closed and, disabled+collide, ate every
-                            # tap in the left 64dp of the message area - the
-                            # site page's [ Edit page ] line lives there
-                            width: dp(64) if root.left_open else 0
+                            width: dp(64)
                             orientation: 'vertical'
                             canvas.before:
                                 Color:
@@ -772,13 +885,11 @@
                                     spacing: dp(4)
                                     padding: [dp(4), dp(8)]
                             # Add server button at bottom
-                            MDButton:
+                            FancyMDButton:
                                 id: add_server_btn
-                                style: 'filled'
+                                variant: 'primary'
                                 size_hint_y: None
                                 height: scaled(dp(40))
-                                theme_bg_color: 'Custom'
-                                md_bg_color: app.theme_colors['primary']
                                 on_press: app._open_add_server_popup()
                                 MDButtonText:
                                     text: '+'
@@ -797,7 +908,7 @@
                                     source: app.banner_channel_path or ''
                                     size_hint: (None, None)
                                     height: dp(96)
-                                    width: min(dp(200), banner_strip.width)
+                                    width: dp(200)
                                     allow_stretch: False
                                     keep_ratio: True
                                     pos_hint: {'center_x': 0.5, 'center_y': 0.5}
@@ -810,6 +921,16 @@
                                     color: app.theme_colors['sidebar_ctrl']
                                     pos_hint: {'center_x': 0.5, 'center_y': 0.5}
                                     opacity: 0 if app.banner_channel_path else 1
+                            # Task 2: the strip text lives on the Button
+                            # itself, not in a child Label. A child Label
+                            # is never positioned by any layout (its
+                            # parent is a Button, not a layout), so it kept
+                            # its default pos (0, 0) and its text painted
+                            # at the window's bottom-left corner -- a
+                            # phantom "Update available: " with no version
+                            # whenever the drawer opened. The Button's own
+                            # text renders inside its bounds; it is ''
+                            # while the strip is hidden so nothing paints.
                             Button:
                                 id: motd_strip
                                 size_hint_y: None
@@ -818,28 +939,33 @@
                                 background_color: (0, 0, 0, 0)
                                 disabled: not app.server_motd
                                 on_press: app._open_motd_popup()
-                                Label:
-                                    text: (app.server_motd or '')[:64]
-                                    font_size: sp(11)
-                                    color: app.theme_colors['text_dim']
-                                    text_size: self.width, None
-                                    halign: 'left'
-                                    valign: 'middle'
+                                text: (app.server_motd or '')[:64] if app.server_motd else ''
+                                font_size: sp(11)
+                                color: app.theme_colors['text_dim']
+                                halign: 'left'
+                                valign: 'middle'
+                                text_size: self.width, None
+                                shorten: True
                             Button:
                                 id: update_strip
                                 size_hint_y: None
                                 height: scaled(dp(22)) if app.client_update_version else 0
                                 background_normal: ''
-                                background_color: (0.55, 0.13, 0.13, 0.85)
+                                # Task 2: maroon only while an update is
+                                # offered. The Button's BorderImage borders
+                                # spill outside a 0-height box, so a
+                                # constant maroon painted two phantom bars
+                                # across the channel column with no update.
+                                background_color: (0.55, 0.13, 0.13, 0.85) if app.client_update_version else (0, 0, 0, 0)
                                 disabled: not app.client_update_version
                                 on_press: app._open_update_prompt()
-                                Label:
-                                    text: ('Update available: ' + (app.client_update_version or ''))[:64]
-                                    font_size: sp(11)
-                                    color: app.theme_colors['text']
-                                    text_size: self.width, None
-                                    halign: 'left'
-                                    valign: 'middle'
+                                text: ('Update available: ' + (app.client_update_version or ''))[:64] if app.client_update_version else ''
+                                font_size: sp(11)
+                                color: app.theme_colors['text']
+                                halign: 'left'
+                                valign: 'middle'
+                                text_size: self.width, None
+                                shorten: True
                             BoxLayout:
                                 size_hint_y: None
                                 height: dp(52)
@@ -879,7 +1005,8 @@
             BoxLayout:
                 id: right_sidebar
                 size_hint: None, 1
-                width: min(dp(200), root.width * 0.72) if root.right_open else 0
+                # Polish group 3: see left_sidebar (MainScreen.right_width).
+                width: root.right_width
                 orientation: 'vertical'
                 pos_hint: {'right': 1}
                 canvas.before:
@@ -942,114 +1069,129 @@
                     pos: self.pos
                     size: self.size
                     radius: [dp(24), dp(24), dp(24), dp(24)]
-            Image:
-                source: app.banner_config_path or ''
-                size_hint_y: None
-                height: dp(122)
-                allow_stretch: False
-                keep_ratio: True
-            Label:
-                text: '0%d  /  03' % (root.stage + 1)
-                color: app.theme_colors['accent']
-                font_size: sp(12)
-                size_hint_y: None
-                height: dp(24)
-            Label:
-                text: root.titles[root.stage]
-                font_name: 'MeshDisplay'
-                color: app.theme_colors['text']
-                bold: True
-                font_size: sp(28)
-                size_hint_y: None
-                height: dp(48)
-            Label:
-                text: root.descriptions[root.stage]
-                color: app.theme_colors['text_muted']
-                font_size: sp(15)
-                text_size: self.width, None
-                halign: 'center'
-                valign: 'middle'
+            ScrollView:
+                do_scroll_x: False
+                bar_width: dp(6)
                 size_hint_y: 1
-            BoxLayout:
-                spacing: dp(10)
-                size_hint_y: None
-                height: dp(52) if root.stage == 2 else 0
-                opacity: 1 if root.stage == 2 else 0
-                PfpImage:
-                    size_hint_x: None
-                    width: dp(44)
-                    source: app.avatar_preview or ""
-                    allow_stretch: False
-                    keep_ratio: True
-                MDButton:
-                    style: 'outlined'
-                    size_hint_x: None
-                    width: dp(160)
-                    height: dp(40)
-                    on_press: app.open_file_chooser(avatar=True)
-                    MDButtonText:
-                        text: 'Choose photo'
-                        text_color: app.theme_colors['text']
-            MDTextField:
-                id: welcome_name
-                text: app.onboarding_name
-                mode: 'filled'
-                multiline: False
-                size_hint_y: None
-                height: dp(44) if root.stage == 2 else 0
-                opacity: 1 if root.stage == 2 else 0
-                fill_color_normal: app.theme_colors['input_bg']
-                text_color_normal: app.theme_colors['text']
-                MDTextFieldHintText:
-                    text: 'Your name on the mesh'
-            MDTextField:
-                id: onb_hub
-                mode: 'filled'
-                multiline: False
-                size_hint_y: None
-                height: dp(44) if root.stage == 2 else 0
-                opacity: 1 if root.stage == 2 else 0
-                fill_color_normal: app.theme_colors['input_bg']
-                text_color_normal: app.theme_colors['text']
-                MDTextFieldHintText:
-                    text: 'Hub address (ip:port), empty = community hub'
-            MDTextField:
-                id: onb_node
-                mode: 'filled'
-                multiline: False
-                size_hint_y: None
-                height: dp(44) if root.stage == 2 else 0
-                opacity: 1 if root.stage == 2 else 0
-                fill_color_normal: app.theme_colors['input_bg']
-                text_color_normal: app.theme_colors['text']
-                MDTextFieldHintText:
-                    text: 'Guild node hash (optional)'
-            BoxLayout:
-                spacing: dp(10)
-                size_hint_y: None
-                height: dp(44) if root.stage == 2 else 0
-                opacity: 1 if root.stage == 2 else 0
-                MDTextField:
-                    id: onb_delivery
-                    mode: 'filled'
-                    multiline: False
-                    fill_color_normal: app.theme_colors['input_bg']
-                    text_color_normal: app.theme_colors['text']
-                    MDTextFieldHintText:
-                        text: 'Delivery hash (optional)'
-            MDButton:
-                style: 'filled'
+                BoxLayout:
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: self.minimum_height
+                    spacing: dp(16)
+                    Image:
+                        source: app.banner_config_path or ''
+                        size_hint_y: None
+                        height: dp(122) if app.banner_config_path else 0
+                        opacity: 1 if app.banner_config_path else 0
+                        allow_stretch: False
+                        keep_ratio: True
+                    Label:
+                        text: '0%d  /  03' % (root.stage + 1)
+                        color: app.theme_colors['accent']
+                        font_size: sp(12)
+                        size_hint_y: None
+                        height: dp(24)
+                    Label:
+                        text: root.titles[root.stage]
+                        font_name: 'MeshDisplay'
+                        color: app.theme_colors['text']
+                        bold: True
+                        font_size: sp(28)
+                        size_hint_y: None
+                        height: dp(48)
+                    Label:
+                        text: root.descriptions[root.stage]
+                        color: app.theme_colors['text_muted']
+                        font_size: sp(15)
+                        text_size: self.width, None
+                        halign: 'center'
+                        valign: 'middle'
+                        size_hint_y: None
+                        height: self.texture_size[1]
+                    BoxLayout:
+                        spacing: dp(10)
+                        size_hint_y: None
+                        height: dp(52) if root.stage == 2 else 0
+                        opacity: 1 if root.stage == 2 else 0
+                        PfpImage:
+                            size_hint_x: None
+                            width: dp(44)
+                            source: app.avatar_preview or ""
+                            fallback_letter: (app.onboarding_name or '')[:1]
+                            allow_stretch: False
+                            keep_ratio: True
+                        FancyMDButton:
+                            variant: 'outlined'
+                            size_hint_x: None
+                            width: dp(160)
+                            height: dp(40)
+                            on_press: app.open_file_chooser(avatar=True)
+                            MDButtonText:
+                                text: 'Choose photo'
+                                text_color: app.theme_colors['text']
+                    MDTextField:
+                        id: welcome_name
+                        text: app.onboarding_name
+                        mode: 'filled'
+                        multiline: False
+                        size_hint_y: None
+                        height: dp(44) if root.stage == 2 else 0
+                        opacity: 1 if root.stage == 2 else 0
+                        fill_color_normal: app.theme_colors['input_bg']
+                        text_color_normal: app.theme_colors['text']
+                        MDTextFieldHintText:
+                            text: 'Your name on the mesh'
+                    MDTextField:
+                        id: onb_hub
+                        mode: 'filled'
+                        multiline: False
+                        size_hint_y: None
+                        height: dp(44) if root.stage == 2 else 0
+                        opacity: 1 if root.stage == 2 else 0
+                        fill_color_normal: app.theme_colors['input_bg']
+                        text_color_normal: app.theme_colors['text']
+                        MDTextFieldHintText:
+                            text: 'Hub address (ip:port), empty = community hub'
+                    MDTextField:
+                        id: onb_node
+                        mode: 'filled'
+                        multiline: False
+                        size_hint_y: None
+                        height: dp(44) if root.stage == 2 else 0
+                        opacity: 1 if root.stage == 2 else 0
+                        fill_color_normal: app.theme_colors['input_bg']
+                        text_color_normal: app.theme_colors['text']
+                        MDTextFieldHintText:
+                            text: 'Guild node hash (optional)'
+                    BoxLayout:
+                        spacing: dp(10)
+                        size_hint_y: None
+                        height: dp(44) if root.stage == 2 else 0
+                        opacity: 1 if root.stage == 2 else 0
+                        MDTextField:
+                            id: onb_delivery
+                            # G6: explicit 44px like its siblings -- without it
+                            # the filled field floors itself at dp(56) and sticks
+                            # 12px out of its 44px row.
+                            size_hint_y: None
+                            height: dp(44)
+                            mode: 'filled'
+                            multiline: False
+                            fill_color_normal: app.theme_colors['input_bg']
+                            text_color_normal: app.theme_colors['text']
+                            MDTextFieldHintText:
+                                text: 'Delivery hash (optional)'
+            FancyMDButton:
+                variant: 'primary'
                 size_hint_y: None
                 height: dp(46)
-                theme_bg_color: 'Custom'
-                md_bg_color: app.theme_colors['primary']
                 on_press: root.advance()
                 MDButtonText:
                     disabled: root.stage == 2 and not welcome_name.text.strip()
                     text: 'Protect identity' if root.stage == 2 else 'Continue'
                     text_color: app.theme_colors['btn_text']
-            MDButton:
-                style: 'outlined'
+            FancyMDButton:
+                variant: 'outlined'
                 size_hint_y: None
                 height: dp(44) if root.stage == 0 else 0
                 opacity: 1 if root.stage == 0 else 0
@@ -1086,7 +1228,8 @@
                     id: banner_config
                     source: app.banner_config_path or ''
                     size_hint_y: None
-                    height: dp(96)
+                    height: dp(96) if app.banner_config_path else 0
+                    opacity: 1 if app.banner_config_path else 0
                     size_hint_x: None
                     width: dp(240)
                     pos_hint: {'center_x': 0.5}
@@ -1129,6 +1272,14 @@
                             multiline: False
                             size_hint_y: None
                             height: dp(44)
+                            # G5 (UIX P2-4): border tokens -- the filled
+                            # field otherwise has no visible boundary.
+                            # theme_line_color must be 'Custom' or the
+                            # line colors below are ignored (KivyMD 2.0
+                            # defaults them to the theme's Primary).
+                            theme_line_color: 'Custom'
+                            line_color_normal: app.theme_colors['border_subtle']
+                            line_color_focus: app.theme_colors['border']
                             fill_color_normal: app.theme_colors['input_bg']
                             fill_color_focus: app.theme_colors['input_bg_focus']
                             text_color_normal: app.theme_colors['text']
@@ -1144,6 +1295,10 @@
                             multiline: False
                             size_hint_y: None
                             height: dp(44)
+                            # G5 (UIX P2-4): border tokens (see hub_address).
+                            theme_line_color: 'Custom'
+                            line_color_normal: app.theme_colors['border_subtle']
+                            line_color_focus: app.theme_colors['border']
                             fill_color_normal: app.theme_colors['input_bg']
                             fill_color_focus: app.theme_colors['input_bg_focus']
                             text_color_normal: app.theme_colors['text']
@@ -1157,28 +1312,24 @@
                         # the hub's announce covers them -- so they are behind
                         # a disclosure instead of four more always-visible
                         # fields with four helper labels underneath.
-                        MDButton:
+                        FancyMDButton:
                             id: advanced_toggle
-                            style: 'outlined'
+                            variant: 'outlined'
                             size_hint_x: None
                             width: self.parent.width
                             size_hint_y: None
                             height: scaled(dp(40))
-                            theme_bg_color: 'Custom'
-                            md_bg_color: app.theme_colors['sidebar_ctrl']
                             on_press: root.toggle_advanced()
                             MDButtonText:
                                 id: advanced_label
                                 text: 'Advanced: guild hashes'
-                        MDButton:
-                            style: 'filled'
+                        FancyMDButton:
+                            variant: 'primary'
                             size_hint_x: None
                             width: self.parent.width
                             size_hint_y: None
                             height: scaled(dp(40))
-                            theme_bg_color: 'Custom'
-                            md_bg_color: app.theme_colors['primary']
-                            disabled: app.connect_username_required and not username.text.strip()
+                            disabled: app.connect_username_required and not username.text
                             on_press: app.connect_to_guild(hub_address.text, username.text, node_hash.text, delivery_hash.text)
                             MDButtonText:
                                 text: 'Connect'
@@ -1211,6 +1362,10 @@
                             multiline: False
                             size_hint_y: None
                             height: dp(44)
+                            # G5 (UIX P2-4): border tokens (see hub_address).
+                            theme_line_color: 'Custom'
+                            line_color_normal: app.theme_colors['border_subtle']
+                            line_color_focus: app.theme_colors['border']
                             fill_color_normal: app.theme_colors['input_bg']
                             fill_color_focus: app.theme_colors['input_bg_focus']
                             text_color_normal: app.theme_colors['text']
@@ -1223,6 +1378,10 @@
                             multiline: False
                             size_hint_y: None
                             height: dp(44)
+                            # G5 (UIX P2-4): border tokens (see hub_address).
+                            theme_line_color: 'Custom'
+                            line_color_normal: app.theme_colors['border_subtle']
+                            line_color_focus: app.theme_colors['border']
                             fill_color_normal: app.theme_colors['input_bg']
                             fill_color_focus: app.theme_colors['input_bg_focus']
                             text_color_normal: app.theme_colors['text']
@@ -1297,28 +1456,28 @@
                     size_hint_y: None
                     height: dp(96)
                     spacing: dp(6)
-                    MDButton:
-                        style: 'outlined'
+                    FancyMDButton:
+                        variant: 'outlined'
                         on_press: root.choose_preset('Midnight')
                         MDButtonText:
                             text: 'Midnight'
-                    MDButton:
-                        style: 'outlined'
+                    FancyMDButton:
+                        variant: 'outlined'
                         on_press: root.choose_preset('Ember')
                         MDButtonText:
                             text: 'Ember'
-                    MDButton:
-                        style: 'outlined'
+                    FancyMDButton:
+                        variant: 'outlined'
                         on_press: root.choose_preset('Mint')
                         MDButtonText:
                             text: 'Mint'
-                    MDButton:
-                        style: 'outlined'
+                    FancyMDButton:
+                        variant: 'outlined'
                         on_press: root.choose_preset('Mono')
                         MDButtonText:
                             text: 'Mono'
-                    MDButton:
-                        style: 'outlined'
+                    FancyMDButton:
+                        variant: 'outlined'
                         on_press: root.choose_preset('Daylight')
                         MDButtonText:
                             text: 'Daylight'
@@ -1351,22 +1510,20 @@
             height: dp(56)
             padding: dp(12)
             spacing: dp(10)
-            MDButton:
-                style: 'filled'
-                theme_bg_color: 'Custom'
-                md_bg_color: app.theme_colors['primary']
+            FancyMDButton:
+                variant: 'primary'
                 on_press: root.save_config()
                 MDButtonText:
                     text: 'Save'
                     text_color: app.theme_colors['btn_text']
-            MDButton:
-                style: 'outlined'
+            FancyMDButton:
+                variant: 'outlined'
                 on_press: root.reset_config()
                 MDButtonText:
                     text: 'Reset'
                     text_color: app.theme_colors['text']
-            MDButton:
-                style: 'outlined'
+            FancyMDButton:
+                variant: 'outlined'
                 on_press: app.root.current = 'main'
                 MDButtonText:
                     text: 'Back'

@@ -26,6 +26,7 @@ import hashlib
 import secrets
 import threading
 import updater
+import store
 from collections import defaultdict, deque
 
 import RNS
@@ -53,7 +54,8 @@ ATTACHMENT_EXT    = {"png", "jpg", "jpeg", "gif", "webp", "mp3", "ogg", "wav",
                      "flac", "mp4", "webm", "pdf", "txt"}
 
 # Channel kinds: chat, a NomadNet micron "site", or a terminal stream.
-CHANNEL_KINDS     = ("chat", "site", "term", "announce")
+# Defined in store.py; imported here so existing references keep working.
+CHANNEL_KINDS = store.CHANNEL_KINDS
 
 # Permission bitmask (U5). Guild-wide bits (MANAGE_*/ADMIN) live on roles;
 # channel-scoped bits (VIEW/POST) live in channel_overwrites keyed by role
@@ -143,135 +145,39 @@ FIELD_ATTACHMENTS = LXMF.FIELD_FILE_ATTACHMENTS  # 0x05 — envelope ours (plan 
 
 # P11 version bridge: the server knows its own version. Lockstep with
 # buildozer.spec and kivy_client.APP_VERSION (tests/test_update_meta.py).
-SERVER_VERSION = "0.36.25"
+SERVER_VERSION = "0.36.24"
 
 # ----------------------------------------------------------------------------------
 # Database
 # ----------------------------------------------------------------------------------
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS guilds (
-    id TEXT PRIMARY KEY, name TEXT, node_hash TEXT, delivery_hash TEXT, prop_hash TEXT);
-CREATE TABLE IF NOT EXISTS channels (
-    id TEXT PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE, created REAL,
-    kind TEXT NOT NULL DEFAULT 'chat', manifest TEXT NOT NULL DEFAULT '{}',
-    topic TEXT, position INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS channel_state (
-    channel_id TEXT PRIMARY KEY, seq INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS members (
-    channel_id TEXT, member_hash TEXT, last_post REAL,
-    PRIMARY KEY (channel_id, member_hash));
-CREATE TABLE IF NOT EXISTS users (
-    dest_hash TEXT PRIMARY KEY, username TEXT UNIQUE COLLATE NOCASE,
-    profile_node TEXT, avatar_path TEXT, registered_at REAL);
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, msg_id TEXT UNIQUE,
-    channel_id TEXT, ts REAL, author_hash TEXT, content TEXT,
-    edited_at REAL, deleted_at REAL);
-CREATE TABLE IF NOT EXISTS message_edits (
-    msg_id TEXT NOT NULL, edited_at REAL NOT NULL, prior_content TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS idx_message_edits ON message_edits(msg_id, edited_at);
-CREATE TABLE IF NOT EXISTS attachments (
-    msg_id TEXT, idx INTEGER, name TEXT, mime TEXT, size INTEGER, path TEXT,
-    PRIMARY KEY (msg_id, idx));
-CREATE TABLE IF NOT EXISTS blobs (
-    id TEXT PRIMARY KEY, name TEXT, mime TEXT, size INTEGER, path TEXT,
-    ts REAL, by TEXT);
-CREATE TABLE IF NOT EXISTS banned (
-    dest_hash TEXT PRIMARY KEY, reason TEXT, at REAL);
-CREATE TABLE IF NOT EXISTS muted (
-    dest_hash TEXT PRIMARY KEY, reason TEXT, at REAL, by TEXT);
-CREATE TABLE IF NOT EXISTS receipts (
-    channel_id TEXT, user_hash TEXT, last_id INTEGER NOT NULL DEFAULT 0, ts REAL,
-    PRIMARY KEY (channel_id, user_hash));
-CREATE TABLE IF NOT EXISTS reactions (
-    msg_id TEXT, user_hash TEXT, emoji TEXT, ts REAL,
-    PRIMARY KEY (msg_id, user_hash, emoji));
-CREATE TABLE IF NOT EXISTS roles (
-    role_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE COLLATE NOCASE, color TEXT, position INTEGER DEFAULT 0,
-    perms INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS user_roles (
-    user_hash TEXT, role_id INTEGER,
-    PRIMARY KEY (user_hash, role_id));
-CREATE TABLE IF NOT EXISTS channel_overwrites (
-    channel_id TEXT, role_id INTEGER, perms INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (channel_id, role_id));
-CREATE TABLE IF NOT EXISTS audit_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts REAL, actor TEXT, action TEXT, target TEXT, detail TEXT);
-CREATE TABLE IF NOT EXISTS server_config (
-    key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS invites (
-    code TEXT PRIMARY KEY, label TEXT, created_at REAL, expires_at REAL,
-    max_uses INTEGER NOT NULL DEFAULT 0, uses INTEGER NOT NULL DEFAULT 0,
-    created_by TEXT, channel_id TEXT);
-CREATE TABLE IF NOT EXISTS guild_joins (
-    user_hash TEXT PRIMARY KEY, joined_at REAL, code TEXT);
-CREATE INDEX IF NOT EXISTS idx_reactions_msg ON reactions(msg_id);
-CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
-CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, id);
-"""
+# Schema lives in store.py; this alias keeps sHades.SCHEMA working for
+# callers (including the unit tests, which execute it directly).
+SCHEMA = store.SCHEMA
 
-def _migrate_schema(conn):
-    """Additive migrations for databases written by earlier versions.
+# Storage lives in store.py (schema, connection, channel/sequence helpers).
+# These aliases and wrappers bind the guild's module-global `db` at call
+# time, so the rest of the server — and the unit tests, which assign
+# sHades.db directly — keep calling the same names with the same signatures.
+_migrate_schema = store.migrate_schema
+open_db = store.open_db
 
-    CREATE TABLE IF NOT EXISTS never alters an existing table, so a column added
-    to SCHEMA after a guild has already booted has to be added explicitly."""
-    have = {r["name"] for r in conn.execute("PRAGMA table_info(channels)").fetchall()}
-    for col, decl in (("kind", "TEXT NOT NULL DEFAULT 'chat'"), ("manifest", "TEXT"),
-                      ("topic", "TEXT"), ("position", "INTEGER NOT NULL DEFAULT 0")):
-        if col not in have:
-            conn.execute("ALTER TABLE channels ADD COLUMN %s %s" % (col, decl))
-    have_inv = {r["name"] for r in conn.execute("PRAGMA table_info(invites)").fetchall()}
-    if "channel_id" not in have_inv:
-        conn.execute("ALTER TABLE invites ADD COLUMN channel_id TEXT")
-
-def open_db(path):
-    conn = sqlite3.connect(path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
-    conn.executescript(SCHEMA)
-    _migrate_schema(conn)
-    conn.commit()
-    return conn
 
 def ensure_channel(name, kind="chat"):
-    """Create a channel + its revision counter if needed. Returns channel id.
+    """Create a channel + its revision counter if needed. Returns channel id."""
+    return store.ensure_channel(db, db_lock, GUILD_ID, name, kind, emit=_emit_event)
 
-    A channel's id is a hash of its name, so it is case-sensitive, while the
-    channels.name unique index is COLLATE NOCASE. The name lookup below is
-    therefore NOCASE: '#General' resolves to the existing 'general' channel
-    instead of computing a different id that the unique index then refuses.
-    """
-    with db_lock:
-        row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
-                         (name,)).fetchone()
-        if row:
-            return row["id"]
-        cid = hexstr(RNS.Identity.full_hash(f"{GUILD_ID}:{name}".encode()))
-        db.execute("INSERT OR IGNORE INTO channels (id, name, created, kind) "
-                   "VALUES (?, ?, ?, ?)",
-                   (cid, name, time.time(), kind if kind in CHANNEL_KINDS else "chat"))
-        db.execute("INSERT OR IGNORE INTO channel_state (channel_id, seq) VALUES (?, 0)", (cid,))
-        db.commit()
-        # v0.28: a NEW channel must reach stream subscribers (the 3s state
-        # poller that used to notice renames/creates is being deleted);
-        # name changes ride the same event.
-        _emit_event(cid, "channels_changed", {"channel": name}, guild_wide=True)
-    return cid
 
 def channel_name(cid):
-    row = db.execute("SELECT name FROM channels WHERE id=?", (cid,)).fetchone()
-    return row["name"] if row else "unknown"
+    return store.channel_name(db, cid)
+
 
 def bump_seq(cid):
-    db.execute("UPDATE channel_state SET seq = seq + 1 WHERE channel_id=?", (cid,))
+    return store.bump_seq(db, cid)
+
 
 def get_seq(cid):
-    row = db.execute("SELECT seq FROM channel_state WHERE channel_id=?", (cid,)).fetchone()
-    return row["seq"] if row else 0
+    return store.get_seq(db, cid)
 
 # ----------------------------------------------------------------------------------
 # Small helpers
@@ -358,17 +264,13 @@ def render_content(content):
     return "\n".join(out)
 
 def get_username(author_hash):
-    with db_lock:
-        row = db.execute("SELECT username FROM users WHERE dest_hash=?", (author_hash,)).fetchone()
-    return row["username"] if row else "user-" + author_hash[:6]
+    return store.get_username(db, db_lock, author_hash)
 
 def username_fragment(author_hash):
     """§5 rendering rule: linked username when the user registered a profile node,
     otherwise a BOLD plain name. (A micron link cannot be nested inside a bold
     formatting run — the parser would break — so links render unbolded.)"""
-    with db_lock:
-        row = db.execute("SELECT username, profile_node FROM users WHERE dest_hash=?",
-                         (author_hash,)).fetchone()
+    row = store.user_row(db, db_lock, author_hash)
     name = (row["username"] if row else None) or ("user-" + author_hash[:6])
     if row and row["profile_node"] and re.match(r"^[0-9a-f]{32}$", row["profile_node"]):
         # bare 32-hex target = that node's home page (Browser.py parse_url)
@@ -423,38 +325,26 @@ def rate_ok(sender, channel_id, max_posts=None, window_s=None):
         return True
 
 def is_banned(sender):
-    with db_lock:
-        return db.execute("SELECT 1 FROM banned WHERE dest_hash=?", (sender,)).fetchone() is not None
+    return store.is_banned(db, db_lock, sender)
 
 def can_delete(viewer, row):
     """Author or guild moderator (plan §7)."""
     return viewer is not None and (row["author_hash"] == viewer or is_moderator(viewer))
 
 def ban_user(user, reason="", by=None):
-    with db_lock:
-        db.execute("INSERT OR REPLACE INTO banned (dest_hash, reason, at) VALUES (?, ?, ?)",
-                   (user, (reason or "")[:200], now()))
-        db.commit()
+    store.ban_user(db, db_lock, user, reason, by)
 
 def unban_user(user):
-    with db_lock:
-        db.execute("DELETE FROM banned WHERE dest_hash=?", (user,))
-        db.commit()
+    store.unban_user(db, db_lock, user)
 
 def is_muted(sender):
-    with db_lock:
-        return db.execute("SELECT 1 FROM muted WHERE dest_hash=?", (sender,)).fetchone() is not None
+    return store.is_muted(db, db_lock, sender)
 
 def mute_user(user, reason="", by=None):
-    with db_lock:
-        db.execute("INSERT OR REPLACE INTO muted (dest_hash, reason, at, by) VALUES (?, ?, ?, ?)",
-                   (user, (reason or "")[:200], now(), by))
-        db.commit()
+    store.mute_user(db, db_lock, user, reason, by)
 
 def unmute_user(user):
-    with db_lock:
-        db.execute("DELETE FROM muted WHERE dest_hash=?", (user,))
-        db.commit()
+    store.unmute_user(db, db_lock, user)
 
 def load_moderators(path):
     """moderators.txt: one canonical (lxmf.delivery) user hash per line, '#' comments.
@@ -499,29 +389,12 @@ def has_role_perm(user, bits):
     if user in MODERATORS and bits & (PERMS["MANAGE_MESSAGES"] |
                                       PERMS["MANAGE_CHANNEL"]):
         return True
-    with db_lock:
-        row = db.execute(
-            "SELECT 1 FROM user_roles ur JOIN roles r ON r.role_id = ur.role_id "
-            "WHERE ur.user_hash = ? AND (r.perms & ?) != 0 LIMIT 1",
-            (user, bits)).fetchone()
-    return row is not None
+    return store.user_has_role_perm(db, db_lock, user, bits)
 
 def _effective_perms(user_hash, channel_id, base):
     """The union: base + each of the user's roles' perms + each role's
     per-channel overwrite. The admin short-circuit lives in has_perm."""
-    if user_hash is None:
-        return 0
-    with db_lock:
-        rows = db.execute(
-            "SELECT co.perms AS operms, r.perms AS rperms "
-            "FROM user_roles ur JOIN roles r ON r.role_id = ur.role_id "
-            "LEFT JOIN channel_overwrites co ON co.role_id = ur.role_id "
-            "AND co.channel_id=? WHERE ur.user_hash=?",
-            (channel_id, user_hash)).fetchall()
-    perms = base
-    for r in rows:
-        perms |= (r["operms"] or 0) | (r["rperms"] or 0)
-    return perms
+    return store.effective_perms(db, db_lock, user_hash, channel_id, base)
 
 def _announce_post_ok(user_hash, channel_id):
     """kind=='announce' POST gate (P8): moderators/admins always; everyone
@@ -532,12 +405,9 @@ def _announce_post_ok(user_hash, channel_id):
         return True
     if user_hash is None:
         return False
-    with db_lock:
-        base_row = db.execute("SELECT perms FROM channel_overwrites "
-                              "WHERE channel_id=? AND role_id=0",
-                              (channel_id,)).fetchone()
+    base = store.channel_base_perms(db, db_lock, channel_id)
     perms = _effective_perms(user_hash, channel_id,
-                             base_row["perms"] if base_row else 0)
+                             base if base is not None else 0)
     return (perms & PERMS["POST"]) != 0
 
 def has_perm(user, channel_id, bit):
@@ -549,16 +419,10 @@ def has_perm(user, channel_id, bit):
         return False
     if bit & _GUILD_MANAGE_BITS:
         return has_role_perm(user, bit)
-    with db_lock:
-        base = db.execute("SELECT perms FROM channel_overwrites "
-                          "WHERE channel_id=? AND role_id=0",
-                          (channel_id,)).fetchone()
-        is_admin = db.execute(
-            "SELECT 1 FROM user_roles ur JOIN roles r ON r.role_id = ur.role_id "
-            "WHERE ur.user_hash=? AND (r.perms & ?) != 0 LIMIT 1",
-            (user, PERMS["ADMIN"])).fetchone()
+    base = store.channel_base_perms(db, db_lock, channel_id)
+    is_admin = store.user_has_role_perm(db, db_lock, user, PERMS["ADMIN"])
     perms = _effective_perms(user, channel_id,
-                             base["perms"] if base else DEFAULT_CHANNEL_PERMS)
+                             base if base is not None else DEFAULT_CHANNEL_PERMS)
     if is_admin:
         return True
     return (perms & bit) != 0
@@ -570,11 +434,8 @@ def page_can_view(user, channel_id):
     makes the anonymous lane a separate question. (tay fork tier-1)"""
     if user is not None:
         return has_perm(user, channel_id, PERMS["VIEW"])
-    with db_lock:
-        row = db.execute("SELECT perms FROM channel_overwrites "
-                         "WHERE channel_id=? AND role_id=0",
-                         (channel_id,)).fetchone()
-    perms = row["perms"] if row else DEFAULT_CHANNEL_PERMS
+    base = store.channel_base_perms(db, db_lock, channel_id)
+    perms = base if base is not None else DEFAULT_CHANNEL_PERMS
     return bool(perms & PERMS["VIEW"])
 
 def attachment_visible(viewer, fname):
@@ -582,30 +443,15 @@ def attachment_visible(viewer, fname):
     message. Serving a hash-keyed file with no message linkage would let
     anyone with a node link pull every stored blob by name (or after its
     message was deleted). (tay fork tier-1)"""
-    with db_lock:
-        rows = db.execute(
-            "SELECT DISTINCT m.channel_id FROM attachments a "
-            "JOIN messages m ON m.msg_id=a.msg_id "
-            "WHERE a.path=? AND m.deleted_at IS NULL", (fname,)).fetchall()
+    rows = store.attachment_channels(db, db_lock, fname)
     return any(page_can_view(viewer, row["channel_id"]) for row in rows)
 
 def _ensure_role(name, perms, position=0, color=None):
     """Create a role if missing (boot seeding / role editor). Returns id."""
-    with db_lock:
-        row = db.execute("SELECT role_id FROM roles WHERE name=? COLLATE NOCASE",
-                         (name,)).fetchone()
-        if row:
-            return row["role_id"]
-        cur = db.execute("INSERT INTO roles (name, color, position, perms) "
-                         "VALUES (?, ?, ?, ?)", (name, color, position, perms))
-        db.commit()
-        return cur.lastrowid
+    return store.ensure_role(db, db_lock, name, perms, position, color)
 
 def _assign_role(user_hash, role_id):
-    with db_lock:
-        db.execute("INSERT OR IGNORE INTO user_roles (user_hash, role_id) "
-                   "VALUES (?, ?)", (user_hash, role_id))
-        db.commit()
+    store.assign_role(db, db_lock, user_hash, role_id)
 
 FOUNDER_ROLE_NAME = "Founder"
 
@@ -621,13 +467,11 @@ def _maybe_founder(viewer):
     can ever reach it, and existing deployments with members are never
     touched.
     """
-    with db_lock:
-        n = db.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
-        if n != 1:
-            return
-        rid = _ensure_role(FOUNDER_ROLE_NAME, PERM_ALL, position=200, color="FB8")
-        _assign_role(viewer, rid)
-        _audit(viewer, "role.founder", None, "first member granted Founder")
+    if store.count_users(db, db_lock) != 1:
+        return
+    rid = _ensure_role(FOUNDER_ROLE_NAME, PERM_ALL, position=200, color="FB8")
+    _assign_role(viewer, rid)
+    _audit(viewer, "role.founder", None, "first member granted Founder")
 
 def load_role_seeds(storage):
     """Boot-time role seeding (U5): admin.txt hashes get the Admin role
@@ -833,9 +677,7 @@ def ingest(channel_id, author_hash, content, ts=None, attachments=None):
         return None
     if is_muted(author_hash):
         return None  # muted: post silently dropped
-    with db_lock:
-        _kind_row = db.execute("SELECT kind FROM channels WHERE id=?",
-                               (channel_id,)).fetchone()
+    _kind_row = store.channel_row(db, db_lock, channel_id)
     _chn_kind = _kind_row["kind"] if _kind_row else "chat"
     if _chn_kind == "announce":
         # P8: announcements only -- explicit grants (or mods); the open
@@ -870,38 +712,28 @@ def ingest(channel_id, author_hash, content, ts=None, attachments=None):
     msg_id = hexstr(RNS.Identity.full_hash(
         f"{channel_id}|{author_hash}|{ts}|{content}".encode()))
     att_meta = []
-    with db_lock:
-        if db.execute("SELECT 1 FROM messages WHERE msg_id=?", (msg_id,)).fetchone():
-            dlog(f"ingest: duplicate msg_id {msg_id[:12]}")
-            return None  # duplicate
-        # zero-login: auto-register placeholder username on first post
-        db.execute("INSERT OR IGNORE INTO users (dest_hash, username, registered_at) "
-                   "VALUES (?, ?, ?)", (author_hash, "user-" + author_hash[:6], now()))
-        db.execute(
-            "INSERT INTO messages (msg_id, channel_id, ts, author_hash, content) "
-            "VALUES (?, ?, ?, ?, ?)", (msg_id, channel_id, ts, author_hash, content))
-        for idx, att in enumerate((attachments or [])[:MAX_ATTACHMENTS]):
-            try:
-                name, mime, blob = att
-            except Exception:
-                dlog(f"ingest: malformed attachment at idx {idx}, skipping")
-                continue
-            fname = store_attachment(str(name)[:128], str(mime)[:64],
-                                     blob, by=author_hash)
-            if fname:
-                dlog(f"ingest: stored attachment idx={idx} name={name} fname={fname}")
-                db.execute("INSERT OR REPLACE INTO attachments "
-                           "(msg_id, idx, name, mime, size, path) VALUES (?, ?, ?, ?, ?, ?)",
-                           (msg_id, idx, str(name)[:128], str(mime)[:64], len(blob), fname))
-                att_meta.append({"name": str(name)[:128], "mime": str(mime)[:64],
-                                 "size": len(blob), "path": "/file/attachments/" + fname})
-            else:
-                dlog(f"ingest: store_attachment returned None for idx={idx} name={name}")
-        db.execute("INSERT INTO members (channel_id, member_hash, last_post) VALUES (?, ?, ?) "
-                   "ON CONFLICT(channel_id, member_hash) DO UPDATE SET last_post=excluded.last_post",
-                   (channel_id, author_hash, ts))
-        bump_seq(channel_id)
-        db.commit()
+    if store.message_exists(db, db_lock, msg_id):
+        dlog(f"ingest: duplicate msg_id {msg_id[:12]}")
+        return None  # duplicate
+    att_rows = []
+    for idx, att in enumerate((attachments or [])[:MAX_ATTACHMENTS]):
+        try:
+            name, mime, blob = att
+        except Exception:
+            dlog(f"ingest: malformed attachment at idx {idx}, skipping")
+            continue
+        fname = store_attachment(str(name)[:128], str(mime)[:64],
+                                 blob, by=author_hash)
+        if fname:
+            dlog(f"ingest: stored attachment idx={idx} name={name} fname={fname}")
+            att_rows.append((idx, str(name)[:128], str(mime)[:64], len(blob), fname))
+            att_meta.append({"name": str(name)[:128], "mime": str(mime)[:64],
+                             "size": len(blob), "path": "/file/attachments/" + fname})
+        else:
+            dlog(f"ingest: store_attachment returned None for idx={idx} name={name}")
+    if not store.ingest_insert(db, db_lock, msg_id, channel_id, ts, author_hash,
+                               content, att_rows):
+        return None  # duplicate raced in
     RNS.log(f"ingest #{channel_name(channel_id)} msg {msg_id[:12]} from {author_hash[:12]}",
             RNS.LOG_DEBUG)
     # Stream event: subscribers of this channel get the full message row.
@@ -990,11 +822,8 @@ PAGE_IDENTITY_REQUIRED = (page_header() + "> Identification needed for this acti
     "c(message the guild address with a #channel first token).")
 
 def msg_row_json(row):
-    with db_lock:
-        atts = db.execute("SELECT idx, name, mime, size, path FROM attachments "
-                          "WHERE msg_id=? ORDER BY idx", (row["msg_id"],)).fetchall()
-        rx = db.execute("SELECT emoji, user_hash FROM reactions "
-                        "WHERE msg_id=? ORDER BY ts", (row["msg_id"],)).fetchall()
+    atts = store.message_attachments(db, db_lock, row["msg_id"])
+    rx = store.message_reactions(db, db_lock, row["msg_id"])
     summary = {}
     for r in rx:
         e = summary.setdefault(r["emoji"],
@@ -1020,8 +849,7 @@ def page_index(path, data, request_id, link_id, remote_identity, requested_at):
     out.append("`F8a8Reticulum-native chat`f  `[Settings`:/page/sHades/settings.mu]\n")
     out.append("-\n")
     out.append("> Channels\n")
-    with db_lock:
-        chans = db.execute("SELECT id, name FROM channels ORDER BY name ASC").fetchall()
+    chans = store.list_channel_names(db, db_lock)
     viewer = viewer_of(remote_identity)
     # anonymous / insufficient-VIEW lanes never even see the channel names
     chans = [c for c in chans if page_can_view(viewer, c["id"])]
@@ -1035,8 +863,7 @@ def page_index(path, data, request_id, link_id, remote_identity, requested_at):
 @route("/page/sHades/channel.mu")
 def page_channel(path, data, request_id, link_id, remote_identity, requested_at):
     cid = get_data(data, "channel")
-    with db_lock:
-        chan = db.execute("SELECT id, name FROM channels WHERE id=?", (cid,)).fetchone()
+    chan = store.channel_row(db, db_lock, cid)
     if not chan:
         return (page_header() + "> Unknown channel\n"
                 "cPick one from `[Channels`:/page/index.mu]\n").encode("utf-8")
@@ -1061,21 +888,16 @@ def page_messages(path, data, request_id, link_id, remote_identity, requested_at
     cid = get_data(data, "channel")
     before = get_data(data, "before")
     viewer = viewer_of(remote_identity)
-    with db_lock:
-        chan = db.execute("SELECT id, name FROM channels WHERE id=?", (cid,)).fetchone()
-        if not chan:
-            return b"cUnknown channel."
-        if before and str(before).isdigit():
-            rows = db.execute(
-                "SELECT * FROM messages WHERE channel_id=? AND id<? "
-                "ORDER BY id DESC LIMIT ?", (cid, int(before), PAGE_SIZE)).fetchall()
-        else:
-            rows = db.execute(
-                "SELECT * FROM messages WHERE channel_id=? "
-                "ORDER BY id DESC LIMIT ?", (cid, PAGE_SIZE)).fetchall()
-        oldest = rows[-1]["id"] if rows else None
-        total_before = (db.execute("SELECT COUNT(*) AS n FROM messages WHERE channel_id=? AND id<?",
-                                   (cid, oldest)).fetchone()["n"] if oldest else 0)
+    chan = store.channel_row(db, db_lock, cid)
+    if not chan:
+        return b"cUnknown channel."
+    if before and str(before).isdigit():
+        rows = store.channel_messages(db, db_lock, cid, int(before), PAGE_SIZE)
+    else:
+        rows = store.channel_messages(db, db_lock, cid, None, PAGE_SIZE)
+    oldest = rows[-1]["id"] if rows else None
+    total_before = (store.count_messages_before(db, db_lock, cid, oldest)
+                    if oldest else 0)
     if not page_can_view(viewer, cid):
         return (page_header() + "> Channel unavailable\n").encode("utf-8")
     rows = list(reversed(rows))  # newest last, Discord order
@@ -1090,9 +912,7 @@ def page_messages(path, data, request_id, link_id, remote_identity, requested_at
             out.append("`F555<message deleted>`f\n")
         else:
             out.append(render_content(r["content"]) + "\n")
-            with db_lock:
-                atts = db.execute("SELECT name, path FROM attachments WHERE msg_id=? ORDER BY idx",
-                                  (r["msg_id"],)).fetchall()
+            atts = store.message_attachments(db, db_lock, r["msg_id"])
             for a in atts:
                 out.append("`F8a8[attachment]`f `[Download " + esc_micron_text(a["name"]) +
                            "`/file/attachments/" + a["path"] + "]\n")
@@ -1123,8 +943,7 @@ def page_update(path, data, request_id, link_id, remote_identity, requested_at):
     cid = get_data(data, "channel")
     body = get_data(data, "msg") or ""
     token = get_data(data, "token") or ""
-    with db_lock:
-        chan = db.execute("SELECT id FROM channels WHERE id=?", (cid,)).fetchone()
+    chan = store.channel_row(db, db_lock, cid)
     if not chan or not isinstance(body, str) or not body.strip():
         return (page_header() + "> Nothing to send\ncEmpty message.\n").encode("utf-8")
     if not check_token(viewer, f"post:{cid}", token):
@@ -1143,8 +962,7 @@ def page_edit(path, data, request_id, link_id, remote_identity, requested_at):
     if viewer is None:
         return PAGE_IDENTITY_REQUIRED.encode("utf-8")
     msg_id = get_data(data, "msg") or ""
-    with db_lock:
-        row = db.execute("SELECT * FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
+    row = store.message_by_msg_id(db, db_lock, msg_id)
     if not row or row["deleted_at"] or row["author_hash"] != viewer:
         return (page_header() + "> Not allowed\ncYou can only edit your own messages.\n"
                 ).encode("utf-8")
@@ -1167,22 +985,16 @@ def page_save_edit(path, data, request_id, link_id, remote_identity, requested_a
     msg_id = get_data(data, "msg") or ""
     token = get_data(data, "token") or ""
     content = get_data(data, "content") or ""
-    with db_lock:
-        row = db.execute("SELECT * FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
+    row = store.message_by_msg_id(db, db_lock, msg_id)
     if not row or row["author_hash"] != viewer:
         return (page_header() + "> Not allowed\n").encode("utf-8")
     if not check_token(viewer, f"edit:{msg_id}", token):
         return (page_header() + "> Expired form\ncReload and retry.\n").encode("utf-8")
     if not isinstance(content, str) or not content.strip():
         return (page_header() + "> Empty edit\ncUse delete instead.\n").encode("utf-8")
-    with db_lock:
-        edited_at = now()
-        db.execute("INSERT INTO message_edits (msg_id, edited_at, prior_content) "
-                   "VALUES (?, ?, ?)", (msg_id, edited_at, row["content"]))
-        db.execute("UPDATE messages SET content=?, edited_at=? WHERE msg_id=?",
-                   (content.strip()[:MAX_CONTENT_LEN], edited_at, msg_id))
-        bump_seq(row["channel_id"])
-        db.commit()
+    store.save_message_edit(db, db_lock, msg_id,
+                            content.strip()[:MAX_CONTENT_LEN], row["content"],
+                            now(), row["channel_id"])
     return page_messages(path, {"var_channel": row["channel_id"]},
                          request_id, link_id, remote_identity, requested_at)
 
@@ -1192,8 +1004,7 @@ def page_delete(path, data, request_id, link_id, remote_identity, requested_at):
     if viewer is None:
         return PAGE_IDENTITY_REQUIRED.encode("utf-8")
     msg_id = get_data(data, "msg") or ""
-    with db_lock:
-        row = db.execute("SELECT * FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
+    row = store.message_by_msg_id(db, db_lock, msg_id)
     if not row or row["deleted_at"] or not can_delete(viewer, row):
         return (page_header() + "> Not allowed\n"
                 "cOnly the author or a guild moderator can delete this.\n").encode("utf-8")
@@ -1213,32 +1024,24 @@ def page_do_delete(path, data, request_id, link_id, remote_identity, requested_a
         return PAGE_IDENTITY_REQUIRED.encode("utf-8")
     msg_id = get_data(data, "msg") or ""
     token = get_data(data, "token") or ""
-    with db_lock:
-        row = db.execute("SELECT * FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
+    row = store.message_by_msg_id(db, db_lock, msg_id)
     if not row or not page_can_view(viewer, row["channel_id"]):
         return (page_header() + "> Not allowed\n").encode("utf-8")
     if not can_delete(viewer, row):
         return (page_header() + "> Not allowed\n").encode("utf-8")
     if not check_token(viewer, f"del:{msg_id}", token):
         return (page_header() + "> Expired form\ncReload and retry.\n").encode("utf-8")
-    with db_lock:
-        db.execute("UPDATE messages SET deleted_at=? WHERE msg_id=?", (now(), msg_id))
-        bump_seq(row["channel_id"])
-        db.commit()
+    store.soft_delete_message(db, db_lock, msg_id, now(), row["channel_id"])
     return page_messages(path, {"var_channel": row["channel_id"]},
                          request_id, link_id, remote_identity, requested_at)
 
 @route("/page/sHades/members.mu")
 def page_members(path, data, request_id, link_id, remote_identity, requested_at):
     cid = get_data(data, "channel")
-    with db_lock:
-        chan = db.execute("SELECT id, name FROM channels WHERE id=?", (cid,)).fetchone()
-        if not chan:
-            return b"cUnknown channel."
-        rows = db.execute(
-            "SELECT m.member_hash, m.last_post, u.username FROM members m "
-            "LEFT JOIN users u ON u.dest_hash = m.member_hash "
-            "WHERE m.channel_id=? ORDER BY m.last_post DESC LIMIT 100", (cid,)).fetchall()
+    chan = store.channel_row(db, db_lock, cid)
+    if not chan:
+        return b"cUnknown channel."
+    rows = store.channel_members(db, db_lock, cid)
     viewer = viewer_of(remote_identity)
     if not page_can_view(viewer, cid):
         return (page_header() + "> Channel unavailable\n").encode("utf-8")
@@ -1294,10 +1097,7 @@ def page_mod(path, data, request_id, link_id, remote_identity, requested_at):
         return (page_header() + "> Not a moderator\ncAsk a guild operator to add your\n"
                 "chash to moderators.txt on the guild host.\n").encode("utf-8").replace(
                     b"chash", b"hash")
-    with db_lock:
-        rows = db.execute(
-            "SELECT b.dest_hash, b.reason, b.at, u.username FROM banned b "
-            "LEFT JOIN users u ON u.dest_hash = b.dest_hash ORDER BY b.at DESC").fetchall()
+    rows = store.list_banned(db, db_lock)
     out = [page_header()]
     out.append("> Moderation\n-\n")
     out.append("You are a guild moderator.\n\n")
@@ -1384,9 +1184,7 @@ def page_settings(path, data, request_id, link_id, remote_identity, requested_at
     viewer = viewer_of(remote_identity)
     if viewer is None:
         return PAGE_IDENTITY_REQUIRED.encode("utf-8")
-    with db_lock:
-        row = db.execute("SELECT username, profile_node FROM users WHERE dest_hash=?",
-                         (viewer,)).fetchone()
+    row = store.user_row(db, db_lock, viewer)
     username = (row["username"] if row and row["username"] else "")
     profile_node = (row["profile_node"] if row and row["profile_node"] else "")
     token = issue_token(viewer, f"settings:{viewer}")
@@ -1417,18 +1215,9 @@ def page_save_settings(path, data, request_id, link_id, remote_identity, request
         return (page_header() + "> Invalid profile node hash\nc32 hex characters.\n"
                 ).encode("utf-8")
     profile_node = profile_node.lower() if profile_node else None
-    with db_lock:
-        clash = db.execute("SELECT dest_hash FROM users WHERE username=? COLLATE NOCASE "
-                           "AND dest_hash<>?", (username, viewer)).fetchone()
-        if clash:
-            return (page_header() + "> Username taken\ncPick another one.\n").encode("utf-8")
-        db.execute("INSERT INTO users (dest_hash, username, profile_node, registered_at) "
-                   "VALUES (?, ?, ?, ?) "
-                   "ON CONFLICT(dest_hash) DO UPDATE SET username=excluded.username, "
-                   "profile_node=excluded.profile_node",
-                   (viewer, username, profile_node, now()))
-        db.commit()
-        _maybe_founder(viewer)
+    if store.register_user(db, db_lock, viewer, username, profile_node, now(),
+                           FOUNDER_ROLE_NAME, PERM_ALL):
+        return (page_header() + "> Username taken\ncPick another one.\n").encode("utf-8")
     out = [page_header()]
     out.append("> Saved\n-\n")
     out.append("Username: `!" + esc_micron_text(username) + "!`\n")
@@ -1470,12 +1259,10 @@ def wrap_api(fn):
 @wrap_api
 def api_state(viewer, data):
     cid = data.get("channel")
-    with db_lock:
-        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
-            return api_error("unknown channel", 404)
-        seq = get_seq(cid)
-        row = db.execute("SELECT msg_id, max(coalesce(edited_at,0), coalesce(deleted_at,0)) AS mt "
-                         "FROM messages WHERE channel_id=? ORDER BY id DESC LIMIT 1", (cid,)).fetchone()
+    if not store.channel_exists(db, db_lock, cid):
+        return api_error("unknown channel", 404)
+    seq = get_seq(cid)
+    row = store.latest_message_stamp(db, db_lock, cid)
     return msgpack.packb({"ok": 1, "seq": seq,
                           "last": row["msg_id"] if row else None,
                           "last_ts": row["mt"] if row else 0.0})
@@ -1486,56 +1273,12 @@ def api_messages(viewer, data):
     cid = data.get("channel")
     if not has_perm(viewer, cid, PERMS["VIEW"]):
         return api_error("view permission required", 403)
-    with db_lock:
-        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
-            return api_error("unknown channel", 404)
-        seq = get_seq(cid)
-        since_id = data.get("since_id")
-        since_ts = data.get("since_ts")
-        before   = data.get("before")
-        limit = min(int(data.get("limit", PAGE_SIZE)), 200)
-        if before:
-            brow = db.execute("SELECT id FROM messages WHERE msg_id=?", (before,)).fetchone()
-            new_rows = db.execute(
-                "SELECT * FROM messages WHERE channel_id=? AND id<? ORDER BY id DESC LIMIT ?",
-                (cid, brow["id"] if brow else 0, limit)).fetchall()
-            new_rows = list(reversed(new_rows))
-        elif isinstance(since_id, int):
-            new_rows = db.execute(
-                "SELECT * FROM messages WHERE channel_id=? AND id>? ORDER BY id ASC LIMIT ?",
-                (cid, since_id, limit)).fetchall()
-        elif isinstance(since_id, str) and since_id:
-            # since_id is a msg_id hash string, not the integer PK. Resolve it
-            # first so delta polling returns rows after the last seen message.
-            bound = db.execute(
-                "SELECT id FROM messages WHERE msg_id=? AND channel_id=?",
-                (since_id, cid)).fetchone()
-            if bound:
-                new_rows = db.execute(
-                    "SELECT * FROM messages WHERE channel_id=? AND id>? ORDER BY id ASC LIMIT ?",
-                    (cid, bound["id"], limit)).fetchall()
-            else:
-                new_rows = []
-        else:
-            new_rows = db.execute(
-                "SELECT * FROM messages WHERE channel_id=? ORDER BY id DESC LIMIT ?",
-                (cid, limit)).fetchall()
-            new_rows = list(reversed(new_rows))
-        upd_rows = []
-        if isinstance(since_ts, (int, float)) and since_ts > 0:
-            id_bound = since_id if isinstance(since_id, int) else None
-            if id_bound is not None:
-                upd_rows = db.execute(
-                    "SELECT * FROM messages WHERE channel_id=? AND id<=? AND "
-                    "(coalesce(edited_at,0) > ? OR coalesce(deleted_at,0) > ?) "
-                    "ORDER BY id ASC LIMIT ?",
-                    (cid, id_bound, since_ts, since_ts, limit)).fetchall()
-            else:
-                upd_rows = db.execute(
-                    "SELECT * FROM messages WHERE channel_id=? AND "
-                    "(coalesce(edited_at,0) > ? OR coalesce(deleted_at,0) > ?) "
-                    "ORDER BY id ASC LIMIT ?",
-                    (cid, since_ts, since_ts, limit)).fetchall()
+    res = store.fetch_messages(db, db_lock, cid, data.get("since_id"),
+                               data.get("since_ts"), data.get("before"),
+                               data.get("limit", PAGE_SIZE))
+    if res is None:
+        return api_error("unknown channel", 404)
+    seq, new_rows, upd_rows = res
     return msgpack.packb({
         "ok": 1, "seq": seq,
         "messages": [msg_row_json(r) for r in new_rows],
@@ -1554,9 +1297,8 @@ def api_post(viewer, data):
     if not isinstance(atts, list):
         atts = []
     dlog(f"api_post: viewer={viewer[:12]} channel={cid} content_len={len(content or '')} attachments={len(atts)}")
-    with db_lock:
-        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
-            return api_error("unknown channel", 404)
+    if not store.channel_exists(db, db_lock, cid):
+        return api_error("unknown channel", 404)
     if not isinstance(content, str):
         return api_error("empty content", 400)
     # A message may be attachment-only (no text); require at least one.
@@ -1570,11 +1312,8 @@ def api_post(viewer, data):
         return api_error("rejected", 400)
     dlog(f"api_post: ingest ok msg_id={msg_id[:12]}")
     # Return stored attachment metadata so the client knows it's server-stored.
-    with db_lock:
-        att_row = db.execute(
-            "SELECT name, mime, size, path FROM attachments WHERE msg_id=? ORDER BY idx LIMIT 1",
-            (msg_id,),
-        ).fetchone()
+    _atts = store.message_attachments(db, db_lock, msg_id)
+    att_row = _atts[0] if _atts else None
     resp = {"ok": 1, "msg_id": msg_id}
     if att_row:
         dlog(f"api_post: attachment metadata name={att_row['name']} path={att_row['path']}")
@@ -1588,35 +1327,16 @@ def api_post(viewer, data):
 
 def _mutate_msg(viewer, data, action):
     msg_id = data.get("msg")
-    with db_lock:
-        row = db.execute("SELECT * FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
-        if not row:
-            return api_error("unknown message", 404)
-        if row["author_hash"] != viewer:
-            return api_error("not your message", 403)
-        if action == "edit":
-            content = data.get("content")
-            if not isinstance(content, str) or not content.strip():
-                return api_error("empty content", 400)
-            new_content = content.strip()[:MAX_CONTENT_LEN]
-            edited_at = now()
-            db.execute("INSERT INTO message_edits (msg_id, edited_at, prior_content) "
-                       "VALUES (?, ?, ?)", (msg_id, edited_at, row["content"]))
-            db.execute("UPDATE messages SET content=?, edited_at=? WHERE msg_id=?",
-                       (new_content, edited_at, msg_id))
-            event = {"msg_id": msg_id, "content": new_content,
-                     "edited_at": edited_at, "deleted_at": None}
-        else:
-            deleted_at = now()
-            db.execute("UPDATE messages SET deleted_at=? WHERE msg_id=?", (deleted_at, msg_id))
-            db.execute("DELETE FROM reactions WHERE msg_id=?", (msg_id,))
-            db.execute("DELETE FROM message_edits WHERE msg_id=?", (msg_id,))
-            event = {"msg_id": msg_id, "content": "", "edited_at": None,
-                     "deleted_at": deleted_at}
-        bump_seq(row["channel_id"])
-        db.commit()
-        seq = get_seq(row["channel_id"])
-    _emit_event(row["channel_id"], action, event)
+    err, channel_id, seq, event = store.mutate_message(
+        db, db_lock, msg_id, viewer, action, data.get("content"),
+        MAX_CONTENT_LEN, now())
+    if err == "unknown message":
+        return api_error("unknown message", 404)
+    if err == "not your message":
+        return api_error("not your message", 403)
+    if err == "empty content":
+        return api_error("empty content", 400)
+    _emit_event(channel_id, action, event)
     return msgpack.packb({"ok": 1, "seq": seq})
 
 @api_route("/api/edit")
@@ -1643,18 +1363,10 @@ def api_register(viewer, data):
         return api_error("invalid username", 400)
     if profile_node and not re.match(r"^[0-9a-fA-F]{32}$", profile_node):
         return api_error("invalid profile node hash", 400)
-    with db_lock:
-        clash = db.execute("SELECT dest_hash FROM users WHERE username=? COLLATE NOCASE "
-                           "AND dest_hash<>?", (username, viewer)).fetchone()
-        if clash:
-            return api_error("username taken", 409)
-        db.execute("INSERT INTO users (dest_hash, username, profile_node, registered_at) "
-                   "VALUES (?, ?, ?, ?) "
-                   "ON CONFLICT(dest_hash) DO UPDATE SET username=excluded.username, "
-                   "profile_node=excluded.profile_node",
-                   (viewer, username, profile_node.lower() or None, now()))
-        db.commit()
-        _maybe_founder(viewer)
+    if store.register_user(db, db_lock, viewer, username,
+                           profile_node.lower() or None, now(),
+                           FOUNDER_ROLE_NAME, PERM_ALL):
+        return api_error("username taken", 409)
     return msgpack.packb({"ok": 1})
 
 @api_route("/api/register_node")
@@ -1757,17 +1469,14 @@ def api_avatar(viewer, data):
     fname = viewer + ".img"
     with open(os.path.join(adir, fname), "wb") as f:
         f.write(blob)
-    with db_lock:
-        db.execute("UPDATE users SET avatar_path=? WHERE dest_hash=?", (fname, viewer))
-        db.commit()
+    store.set_avatar_path(db, db_lock, viewer, fname)
     return msgpack.packb({"ok": 1})
 
 @api_route("/api/avatar_get")
 @wrap_api
 def api_avatar_get(viewer, data):
     uh = data.get("user") or viewer
-    with db_lock:
-        row = db.execute("SELECT avatar_path FROM users WHERE dest_hash=?", (uh,)).fetchone()
+    row = store.user_avatar_path(db, db_lock, uh)
     if not row or not row["avatar_path"]:
         return msgpack.packb({"ok": 1, "avatar": None})
     fpath = os.path.join(STORAGE, "avatars", row["avatar_path"])
@@ -1983,12 +1692,7 @@ def _presence_payload():
 @api_route("/api/v1/channels/list")
 @wrap_json_api
 def api_v1_channels_list(viewer, data, link_id):
-    with db_lock:
-        rows = db.execute("SELECT id, name, kind, created, topic, position FROM channels "
-                          "ORDER BY position ASC, name ASC").fetchall()
-        chans = [{"id": r["id"], "name": r["name"], "kind": r["kind"],
-                  "created": r["created"], "topic": r["topic"],
-                  "position": r["position"], "seq": get_seq(r["id"])} for r in rows]
+    chans = store.list_channels(db, db_lock)
     # VIEW permission: channels the viewer cannot read are absent entirely
     chans = [c for c in chans if has_perm(viewer, c["id"], PERMS["VIEW"])]
     for c in chans:
@@ -2015,14 +1719,9 @@ def api_v1_channels_reorder(viewer, data, link_id):
             or not all(isinstance(c, str) for c in order) \
             or len(set(order)) != len(order):
         return {"ok": 0, "error": "order must be a unique cid list", "code": 400}
-    with db_lock:
-        known = {r["id"] for r in db.execute("SELECT id FROM channels").fetchall()}
-        if set(order) != known:
-            return {"ok": 0, "error": "order must cover every channel exactly once",
-                    "code": 400}
-        for idx, cid in enumerate(order, start=1):
-            db.execute("UPDATE channels SET position=? WHERE id=?", (idx, cid))
-        db.commit()
+    if not store.reorder_channels(db, db_lock, order):
+        return {"ok": 0, "error": "order must cover every channel exactly once",
+                "code": 400}
     # every subscriber sees the new order through their own channel's stream
     _audit(viewer, "channel.reorder", None, "channels=%d" % len(order))
     _emit_event(None, "channels_changed", {"order": order}, guild_wide=True)
@@ -2043,18 +1742,10 @@ def _create_channel_txn(viewer, name, kind, manifest=None):
         return None, "manifest must be an object"
     manifest_json = json.dumps(manifest)[:4096] if manifest else "{}"
     cid = hexstr(RNS.Identity.full_hash(f"{GUILD_ID}:{name}".encode()))
-    with db_lock:
-        if db.execute("SELECT 1 FROM channels WHERE id=? OR (name=? COLLATE NOCASE)",
-                      (cid, name)).fetchone():
-            return None, "channel exists"
-        # explicit ordering: new channels sink to the end of the drag list
-        nxt = (db.execute("SELECT COALESCE(MAX(position), 0) + 1 AS nxt "
-                          "FROM channels").fetchone()["nxt"])
-        db.execute("INSERT INTO channels (id, name, created, kind, manifest, position) "
-                   "VALUES (?, ?, ?, ?, ?, ?)",
-                   (cid, name, now(), kind, manifest_json, nxt))
-        db.execute("INSERT OR IGNORE INTO channel_state (channel_id, seq) VALUES (?, 0)", (cid,))
-        db.commit()
+    cid, err = store.create_channel(db, db_lock, cid, name, kind,
+                                    manifest_json, now())
+    if err:
+        return None, err
     if kind == "site":
         # outside db_lock: the seed is a file write + handler registration
         _seed_default_site(cid)
@@ -2079,16 +1770,14 @@ def api_v1_channels_create(viewer, data, link_id):
 @wrap_json_api
 def api_v1_channels_info(viewer, data, link_id):
     cid = data.get("channel")
-    with db_lock:
-        r = db.execute("SELECT id, name, kind, manifest, created, topic FROM channels "
-                       "WHERE id=?", (cid,)).fetchone()
-        if not r:
-            return {"ok": 0, "error": "unknown channel", "code": 404}
-        seq = get_seq(cid)
-        try:
-            manifest = json.loads(r["manifest"] or "{}")
-        except Exception:
-            manifest = {}
+    r = store.channel_row(db, db_lock, cid)
+    if not r:
+        return {"ok": 0, "error": "unknown channel", "code": 404}
+    seq = get_seq(cid)
+    try:
+        manifest = json.loads(r["manifest"] or "{}")
+    except Exception:
+        manifest = {}
     return {"ok": 1, "channel": {"id": r["id"], "name": r["name"], "kind": r["kind"],
                                  "manifest": manifest, "created": r["created"],
                                  "topic": r["topic"], "seq": seq}}
@@ -2099,8 +1788,7 @@ def api_v1_channels_info(viewer, data, link_id):
 @wrap_json_api
 def api_v1_stream_subscribe(viewer, data, link_id):
     cid = data.get("channel")
-    with db_lock:
-        chan = db.execute("SELECT id, kind FROM channels WHERE id=?", (cid,)).fetchone()
+    chan = store.channel_row(db, db_lock, cid)
     if not chan:
         return {"ok": 0, "error": "unknown channel", "code": 404}
     if not has_perm(viewer, cid, PERMS["VIEW"]):
@@ -2185,9 +1873,8 @@ def api_v1_stream_unsubscribe(viewer, data, link_id):
 def api_v1_typing(viewer, data, link_id):
     cid = data.get("channel")
     active = bool(data.get("active"))
-    with db_lock:
-        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
-            return {"ok": 0, "error": "unknown channel", "code": 404}
+    if not store.channel_exists(db, db_lock, cid):
+        return {"ok": 0, "error": "unknown channel", "code": 404}
     with TYPING_LOCK:
         bucket = TYPING.setdefault(cid, {})
         was_active = bucket.get(viewer, 0) >= now()
@@ -2241,9 +1928,7 @@ def _blob_fname(digest):
     # registry, so the disk scan misses -- but the blobs metadata row
     # persists in both modes, and its path is exactly the fname the
     # serve paths (RAM-first, then disk) use.
-    with db_lock:
-        row = db.execute("SELECT path FROM blobs WHERE id=?",
-                         (digest,)).fetchone()
+    row = store.blob_path(db, db_lock, digest)
     if row and row["path"]:
         return row["path"]
     return None
@@ -2463,14 +2148,9 @@ def _blob_commit(blob, name, mime, by=None):
         node_destination.register_request_handler(
             "/file/blobs/" + fname, serve_blob_file,
             allow=RNS.Destination.ALLOW_ALL, auto_compress=32_000_000)
-    with db_lock:
-        db.execute(
-            "INSERT OR IGNORE INTO blobs (id, name, mime, size, path, ts, by) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (digest, name or fname,
-             EXT_MIME.get(ext, mime or "application/octet-stream"),
-             len(blob), fname, now(), by))
-        db.commit()
+    store.record_blob(db, db_lock, digest, name or fname,
+                      EXT_MIME.get(ext, mime or "application/octet-stream"),
+                      len(blob), fname, by)
     return {"ok": 1, "blob_id": digest, "size": len(blob),
             "mime": EXT_MIME.get(ext, mime or "application/octet-stream"),
             "name": name or fname, "path": "/file/blobs/" + fname}
@@ -2697,9 +2377,8 @@ def api_v1_post(viewer, data, link_id):
     Same ingest path as the msgpack /api/post (rate limit, moderation, ledger)."""
     cid = data.get("channel")
     content = data.get("content")
-    with db_lock:
-        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
-            return {"ok": 0, "error": "unknown channel", "code": 404}
+    if not store.channel_exists(db, db_lock, cid):
+        return {"ok": 0, "error": "unknown channel", "code": 404}
     if not isinstance(content, str):
         return {"ok": 0, "error": "empty content", "code": 400}
     triples, err = _resolve_v1_attachments(data.get("attachments"))
@@ -2712,9 +2391,7 @@ def api_v1_post(viewer, data, link_id):
     msg_id = ingest(cid, viewer, content, attachments=triples)
     if msg_id is None:
         return {"ok": 0, "error": "rejected", "code": 400}
-    with db_lock:
-        atts = db.execute("SELECT name, mime, size, path FROM attachments "
-                          "WHERE msg_id=? ORDER BY idx", (msg_id,)).fetchall()
+    atts = store.message_attachments(db, db_lock, msg_id)
     return {"ok": 1, "msg_id": msg_id,
             "attachments": [{"name": a["name"], "mime": a["mime"], "size": a["size"],
                              "path": "/file/attachments/" + a["path"]} for a in atts]}
@@ -2791,8 +2468,7 @@ def _seed_default_site(cid):
     RNS.log(f"site channel seeded: {cid}/index.mu", RNS.LOG_INFO)
 
 def _site_channel(cid):
-    with db_lock:
-        r = db.execute("SELECT id, kind FROM channels WHERE id=?", (cid,)).fetchone()
+    r = store.channel_row(db, db_lock, cid)
     return r if (r and r["kind"] == "site") else None
 
 @api_route("/api/v1/site/put")
@@ -2877,8 +2553,7 @@ def api_v1_site_get(viewer, data, link_id):
 def api_v1_site_manifest(viewer, data, link_id):
     """Get a site channel's manifest: {channel} -> {manifest}."""
     cid = data.get("channel")
-    with db_lock:
-        r = db.execute("SELECT kind, manifest FROM channels WHERE id=?", (cid,)).fetchone()
+    r = store.channel_row(db, db_lock, cid)
     if not r or r["kind"] != "site":
         return {"ok": 0, "error": "unknown or non-site channel", "code": 404}
     try:
@@ -2901,10 +2576,7 @@ def api_v1_site_manifest_put(viewer, data, link_id):
     manifest = data.get("manifest")
     if not isinstance(manifest, dict):
         return {"ok": 0, "error": "manifest must be an object", "code": 400}
-    with db_lock:
-        db.execute("UPDATE channels SET manifest=? WHERE id=?",
-                   (json.dumps(manifest)[:4096], cid))
-        db.commit()
+    store.set_channel_manifest(db, db_lock, cid, json.dumps(manifest)[:4096])
     _emit_event(cid, "site_patch", {"manifest": manifest})
     return {"ok": 1, "channel": cid, "manifest": manifest}
 
@@ -2968,9 +2640,7 @@ def _resolve_user(token):
     token = (token or "").strip()
     if re.match(r"^[0-9a-f]{32}$", token):
         return token
-    with db_lock:
-        row = db.execute("SELECT dest_hash FROM users WHERE username=? COLLATE NOCASE",
-                         (token,)).fetchone()
+    row = store.user_by_username(db, db_lock, token)
     return row["dest_hash"] if row else None
 
 def _dispatch_command(viewer, line):
@@ -3015,8 +2685,7 @@ def _dispatch_command(viewer, line):
                     channel_name(active.get(u["user_hash"], "")) or "-")
                 for u in sorted(users.values(), key=lambda x: x["username"].lower()))
     elif cmd == "channels":
-        with db_lock:
-            rows = db.execute("SELECT name, kind FROM channels ORDER BY name").fetchall()
+        rows = store.list_channel_name_kind(db, db_lock)
         out = "\r\n".join("  #%s (%s)" % (r["name"], r["kind"]) for r in rows) or "  (none)"
     elif cmd == "msg":
         chan, _, text = arg.partition(" ")
@@ -3025,9 +2694,7 @@ def _dispatch_command(viewer, line):
         if not chan or not text:
             out = "usage: msg <channel> <text>"
         else:
-            with db_lock:
-                row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
-                                 (chan,)).fetchone()
+            row = store.channel_id_by_name(db, db_lock, chan)
             if not row:
                 out = "unknown channel: #%s" % chan
             elif not rate_ok(viewer, row["id"]):
@@ -3037,9 +2704,7 @@ def _dispatch_command(viewer, line):
                 out = "posted to #%s" % chan if mid else "rejected"
     elif cmd == "info":
         chan = arg.lstrip("#").strip()
-        with db_lock:
-            row = db.execute("SELECT id, kind, created, topic FROM channels "
-                             "WHERE name=? COLLATE NOCASE", (chan,)).fetchone()
+        row = store.channel_by_name(db, db_lock, chan)
         if not row:
             out = "unknown channel: #%s" % chan
         else:
@@ -3063,9 +2728,7 @@ def _dispatch_command(viewer, line):
         out = ("created #%s" % name.strip()) if cid else err
     elif cmd == "delete":
         chan = arg.lstrip("#").strip()
-        with db_lock:
-            row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
-                             (chan,)).fetchone()
+        row = store.channel_id_by_name(db, db_lock, chan)
         if not row:
             out = "unknown channel: #%s" % chan
         else:
@@ -3078,39 +2741,28 @@ def _dispatch_command(viewer, line):
                 not re.match(r"^[a-zA-Z0-9_\-]{1,32}$", new):
             out = "usage: rename <channel> <newname>"
         else:
-            with db_lock:
-                row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
-                                 (chan.lstrip("#").strip(),)).fetchone()
+            row = store.channel_id_by_name(db, db_lock, chan.lstrip("#").strip())
             if not row:
                 out = "unknown channel: #%s" % chan
             elif not has_perm(viewer, row["id"], PERMS["MANAGE_CHANNEL"]):
                 out = "manage channel permission required"
-            elif db.execute("SELECT 1 FROM channels WHERE name=? COLLATE NOCASE "
-                            "AND id<>?", (new, row["id"])).fetchone():
+            elif store.channel_name_taken(db, db_lock, new, row["id"]):
                 out = "name already taken"
             else:
-                with db_lock:
-                    db.execute("UPDATE channels SET name=? WHERE id=?",
-                               (new, row["id"]))
-                    db.commit()
+                store.rename_channel(db, db_lock, new, row["id"])
                 _emit_event(row["id"], "channels_changed",
                             {"channel": new}, guild_wide=True)
                 out = "renamed #%s -> #%s" % (chan, new)
     elif cmd == "topic":
         chan, _, text = arg.partition(" ")
         text = text.strip()[:200]
-        with db_lock:
-            row = db.execute("SELECT id FROM channels WHERE name=? COLLATE NOCASE",
-                             (chan.lstrip("#").strip(),)).fetchone()
+        row = store.channel_id_by_name(db, db_lock, chan.lstrip("#").strip())
         if not row:
             out = "unknown channel: #%s" % chan
         elif not has_perm(viewer, row["id"], PERMS["MANAGE_CHANNEL"]):
             out = "manage channel permission required"
         else:
-            with db_lock:
-                db.execute("UPDATE channels SET topic=? WHERE id=?",
-                           (text or None, row["id"]))
-                db.commit()
+            store.set_channel_topic(db, db_lock, row["id"], text or None)
             _emit_event(row["id"], "channels_changed",
                         {"channel": chan.lstrip("#").strip()},
                         guild_wide=True)
@@ -3164,8 +2816,7 @@ def api_v1_term_open(viewer, data, link_id):
     """Open a console session on a term channel. {channel, rows?, cols?} ->
     {session}. The banner + prompt arrive as term_data stream events."""
     cid = data.get("channel")
-    with db_lock:
-        row = db.execute("SELECT id, kind FROM channels WHERE id=?", (cid,)).fetchone()
+    row = store.channel_row(db, db_lock, cid)
     if not row or row["kind"] != "term":
         return {"ok": 0, "error": "unknown or non-term channel", "code": 404}
     if not has_perm(viewer, cid, PERMS["VIEW"]):
@@ -3275,16 +2926,10 @@ def _emoji_ok(emoji):
     return len(emoji.encode("utf-8")) <= 32 and bool(_EMOJI_CORE_RE.match(emoji))
 
 def _receipt_last_id(cid, viewer):
-    with db_lock:
-        row = db.execute("SELECT last_id FROM receipts WHERE channel_id=? AND user_hash=?",
-                         (cid, viewer)).fetchone()
-    return row["last_id"] if row else 0
+    return store.receipt_last_id(db, db_lock, cid, viewer)
 
 def _unread_count(cid, last_id):
-    with db_lock:
-        row = db.execute("SELECT COUNT(*) AS n FROM messages WHERE channel_id=? AND id>?",
-                         (cid, last_id)).fetchone()
-    return row["n"]
+    return store.unread_count(db, db_lock, cid, last_id)
 
 @api_route("/api/v1/receipts")
 @wrap_json_api
@@ -3292,24 +2937,14 @@ def api_v1_receipts(viewer, data, link_id):
     """Read watermarks. With msg_id: mark read up to that message (it must
     belong to the channel). Without: report {last_read_id, unread}."""
     cid = data.get("channel")
-    with db_lock:
-        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
-            return {"ok": 0, "error": "unknown channel", "code": 404}
+    if not store.channel_exists(db, db_lock, cid):
+        return {"ok": 0, "error": "unknown channel", "code": 404}
     if not has_perm(viewer, cid, PERMS["VIEW"]):
         return {"ok": 0, "error": "view permission required", "code": 403}
     msg_id = data.get("msg_id")
     if msg_id:
-        with db_lock:
-            row = db.execute("SELECT id FROM messages WHERE msg_id=? AND channel_id=?",
-                             (msg_id, cid)).fetchone()
-            if not row:
-                return {"ok": 0, "error": "unknown message in channel", "code": 404}
-            db.execute("INSERT INTO receipts (channel_id, user_hash, last_id, ts) "
-                       "VALUES (?, ?, ?, ?) "
-                       "ON CONFLICT(channel_id, user_hash) DO UPDATE SET "
-                       "last_id=MAX(receipts.last_id, excluded.last_id), ts=excluded.ts",
-                       (cid, viewer, row["id"], now()))
-            db.commit()
+        if store.mark_read(db, db_lock, msg_id, cid, viewer, now()) is None:
+            return {"ok": 0, "error": "unknown message in channel", "code": 404}
     last_id = _receipt_last_id(cid, viewer)
     return {"ok": 1, "channel": cid, "last_read_id": last_id,
             "unread": _unread_count(cid, last_id)}
@@ -3325,32 +2960,15 @@ def api_v1_react(viewer, data, link_id):
     if not _emoji_ok(emoji):
         return {"ok": 0, "error": "emoji must be an emoji or a shortcode (a-z0-9_+-)",
                 "code": 400}
-    with db_lock:
-        row = db.execute("SELECT channel_id, deleted_at FROM messages WHERE msg_id=?",
-                         (msg_id,)).fetchone()
-        if not row:
-            return {"ok": 0, "error": "unknown message", "code": 404}
+    row = store.message_by_msg_id(db, db_lock, msg_id)
+    if not row:
+        return {"ok": 0, "error": "unknown message", "code": 404}
     if not has_perm(viewer, row["channel_id"], PERMS["VIEW"]):
         return {"ok": 0, "error": "view permission required", "code": 403}
-    with db_lock:
-        existing = db.execute("SELECT 1 FROM reactions WHERE msg_id=? AND user_hash=? "
-                              "AND emoji=?", (msg_id, viewer, emoji)).fetchone()
-        if existing:
-            db.execute("DELETE FROM reactions WHERE msg_id=? AND user_hash=? AND emoji=?",
-                       (msg_id, viewer, emoji))
-            active = False
-        else:
-            distinct = db.execute("SELECT COUNT(DISTINCT emoji) AS n FROM reactions "
-                                  "WHERE msg_id=?", (msg_id,)).fetchone()["n"]
-            if distinct >= MAX_EMOJI_PER_MSG:
-                return {"ok": 0, "error": "too many reactions on this message", "code": 400}
-            db.execute("INSERT INTO reactions (msg_id, user_hash, emoji, ts) "
-                       "VALUES (?, ?, ?, ?)", (msg_id, viewer, emoji, now()))
-            active = True
-        counts = {r["emoji"]: r["n"] for r in db.execute(
-            "SELECT emoji, COUNT(*) AS n FROM reactions WHERE msg_id=? "
-            "GROUP BY emoji", (msg_id,)).fetchall()}
-        db.commit()
+    err, active, counts = store.toggle_reaction(db, db_lock, msg_id, viewer, emoji,
+                                                MAX_EMOJI_PER_MSG, now())
+    if err:
+        return {"ok": 0, "error": err, "code": 400}
     _emit_event(row["channel_id"], "reaction", {
         "msg_id": msg_id, "emoji": emoji, "user_hash": viewer,
         "username": get_username(viewer), "active": active, "counts": counts,
@@ -3374,9 +2992,8 @@ def api_v1_search(viewer, data, link_id):
     args = ["%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"]
     cid = data.get("channel")
     if cid:
-        with db_lock:
-            if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
-                return {"ok": 0, "error": "unknown channel", "code": 404}
+        if not store.channel_exists(db, db_lock, cid):
+            return {"ok": 0, "error": "unknown channel", "code": 404}
         if not has_perm(viewer, cid, PERMS["VIEW"]):
             return {"ok": 0, "error": "view permission required", "code": 403}
         sql += "AND channel_id=? "
@@ -3386,9 +3003,7 @@ def api_v1_search(viewer, data, link_id):
         # matches afterwards can return an empty page when hidden-channel
         # posts are newer than a visible match — and the trim also leaks
         # the mere existence of results it discarded.
-        with db_lock:
-            channel_ids = [r["id"] for r in
-                           db.execute("SELECT id FROM channels").fetchall()]
+        channel_ids = [r["id"] for r in store.list_channel_ids(db, db_lock)]
         visible = [ch for ch in channel_ids
                    if has_perm(viewer, ch, PERMS["VIEW"])]
         if not visible:
@@ -3397,8 +3012,7 @@ def api_v1_search(viewer, data, link_id):
         args.extend(visible)
     sql += "ORDER BY id DESC LIMIT ?"
     args.append(limit)
-    with db_lock:
-        rows = db.execute(sql, args).fetchall()
+    rows = store.search_messages(db, db_lock, sql, args)
     return {"ok": 1, "query": q, "results": [msg_row_json(r) for r in rows]}
 
 # ---- whoami + moderation + channel deletion (U3: context-menu backend) -------------
@@ -3409,11 +3023,7 @@ def api_v1_whoami(viewer, data, link_id):
     """The requester's own identity as the guild sees it. The client uses
     this to show/hide moderator affordances (menus are a convenience —
     every action is still enforced server-side)."""
-    with db_lock:
-        rows = db.execute(
-            "SELECT r.role_id, r.name, r.perms, r.color FROM user_roles ur "
-            "JOIN roles r ON r.role_id = ur.role_id WHERE ur.user_hash=? "
-            "ORDER BY r.position DESC", (viewer,)).fetchall()
+    rows = store.user_roles(db, db_lock, viewer)
     roles = [{"role_id": r["role_id"], "name": r["name"], "perms": r["perms"],
               "color": r["color"]} for r in rows]
     is_admin = any(r["perms"] & PERMS["ADMIN"] for r in roles)
@@ -3471,33 +3081,16 @@ def _audit(actor, action, target=None, detail=None):
     """Append one row to the audit log (U8). Every privileged mutation
     (ban/mute/delete/channel/role/config) lands here. Never raises — an
     audit failure must not break the action that was being audited."""
-    try:
-        with db_lock:
-            db.execute("INSERT INTO audit_log (ts, actor, action, target, detail) "
-                       "VALUES (?, ?, ?, ?, ?)",
-                       (now(), actor or "-", str(action)[:64],
-                        (target or "")[:128], (detail or "")[:400]))
-            db.commit()
-    except Exception as e:
-        RNS.log("audit write failed: %s" % e, RNS.LOG_ERROR)
+    store.audit(db, db_lock, actor, action, target, detail)
 
 def _cfg_get(key, default=None):
-    with db_lock:
-        row = db.execute("SELECT value FROM server_config WHERE key=?",
-                         (key,)).fetchone()
-    return row["value"] if row else default
+    return store.config_get(db, db_lock, key, default)
 
 def _cfg_set(key, value):
-    with db_lock:
-        db.execute("INSERT INTO server_config (key, value) VALUES (?, ?) "
-                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                   (key, str(value)))
-        db.commit()
+    store.config_set(db, db_lock, key, value)
 
 def _cfg_all():
-    with db_lock:
-        rows = db.execute("SELECT key, value FROM server_config").fetchall()
-    return {r["key"]: r["value"] for r in rows}
+    return store.config_all(db, db_lock)
 
 # Server settings the admin panel may change (U8). Everything else in
 # server_config is server-internal.
@@ -3509,61 +3102,11 @@ SERVER_CONFIG_KEYS = {
     "guild_icon": "",            # empty = no icon; else a stored blob_id
     "banner": "",                # empty = no banner; else a stored blob_id
     "attachments": "saved",      # saved | ephemeral (P2: RAM-only bytes)
-    "update_channel": "off",     # P11: off | github | rns
+    "update_channel": "off",     # P11: off | github | rns (rns unwired yet)
     "update_check_minutes": "360",  # P11: soft check interval; 0 = boot only
-    "update_channel_peer": "",   # P11d: the pinned peer's node destination
-                                 # hash (64-hex); the software channel's
-                                 # trust anchor for serve and pull
-    "update_channel_shapin": "",  # P11e: the admin-pinned artifact sha256
-                                  # (64-hex); the pull's authority for what
-                                  # bytes may run. Sourced out-of-band (the
-                                  # release body, another admin). When set,
-                                  # the serving peer is a courier only.
-    "update_trusted_hub": "",     # P11f: the DISTRIBUTED hub's node dest
-                                  # hash (64-hex) - the sole trusted
-                                  # initiating update source. Any other hub
-                                  # may be compromised; a non-trusted pull
-                                  # needs the artifact pin to run at all.
 }
 
 # ---------------------------------------------------------------------- P11 updater
-
-def _update_boot_guard(tree=None):
-    """P11f failback: a DIRECT boot (no update_run parent, marker still
-    set) restores the backup members BEFORE serving. The pending-version
-    marker means: a swap was interrupted mid-flight (power loss, a
-    process manager kill) or a previous update never proved its boot.
-    The supervised path (SHADES_UPDATE_RUN=1, from update_run.py) owns
-    its own rollback loop; the guard stands out of its way and covers
-    every other boot."""
-    root = tree or os.path.dirname(os.path.abspath(__file__))
-    marker = os.path.join(root, "update_staging", "pending_version")
-    if not os.path.isfile(marker):
-        return None
-    if (os.environ.get("SHADES_UPDATE_RUN") == "1"
-            and tree is None):
-        return None
-    bdir = os.path.join(root, "update_backup")
-    n = 0
-    try:
-        names = sorted(os.listdir(bdir))
-    except OSError:
-        names = []
-    for name in names:
-        src = os.path.join(bdir, name)
-        if os.path.isfile(src):
-            shutil.copy2(src, os.path.join(root, name))
-            n += 1
-    try:
-        os.remove(marker)
-    except OSError:
-        pass
-    updater._note(
-        "rolled-back",
-        "the previous update never confirmed its boot; restored %d "
-        "backup members" % n)
-    return n
-
 _UPDATE_LOCK = threading.Lock()
 _UPDATE_LAST = [0.0]
 _BOOT_ARGV = []
@@ -3575,8 +3118,7 @@ def _update_worker():
             tree = os.path.dirname(os.path.abspath(__file__))
             res = updater.check_and_apply(
                 tree, SERVER_VERSION, _cfg_get,
-                argv=(["sHades.py"] + _BOOT_ARGV), exec_restart=True,
-                rns_fetch=_rns_pull)
+                argv=(["sHades.py"] + _BOOT_ARGV), exec_restart=True)
             RNS.log("updater: %s" % (res,), RNS.LOG_INFO)
         except Exception as e:
             RNS.log("updater: failed: %s" % e, RNS.LOG_ERROR)
@@ -3612,217 +3154,7 @@ def api_v1_update_status(viewer, data, request_id, link_id,
     out = updater.get_status()
     out["channel"] = _cfg_get("update_channel", "off")
     out["interval"] = _cfg_get("update_check_minutes", "360")
-    out["peer"] = _cfg_get("update_channel_peer", "")
-    out["shapin"] = _cfg_get("update_channel_shapin", "")
-    out["trusted"] = _cfg_get("update_trusted_hub", "")
     return out
-
-
-# ------------------------------------------------------------------------ P11d
-# The RNS software channel: tay's contingency, rncp's PATTERN on raw RNS
-# primitives (no rncp code, no HTTP anywhere). A pinned peer's node
-# destination hash rides admin_config update_channel_peer; the serve
-# routes gate on an admin OR that pin; the pull side establishes an
-# outbound link, identifies this server's own identity on it, requests
-# serve_info + chunked bytes, verify's the sha, then hands
-# {version, sha256, bundle_bytes, bundle_name} to the same P11a core
-# the github channel uses. Each updated server serves its bundle, so
-# one GitHub seed propagates through the mesh peer to peer.
-_SERVE_CACHE = {"version": None, "path": None, "sha": None}
-_SERVE_EXCLUDE = {"update_staging", "update_backup", "__pycache__",
-                  "scratch_probes", ".git", "dist", "build", "bin",
-                  ".buildozer", ".github"}
-_SERVE_SKIP_EXT = (".pyc", ".log", ".sha256", ".tar.gz")
-
-
-def _serve_peer_ok(viewer, remote_identity):
-    """P11d gate: an admin, or the pin's identity identified on the link."""
-    if _require_admin(viewer) is None:
-        return True
-    pin = (_cfg_get("update_channel_peer", "") or "").strip().lower()
-    if not pin or remote_identity is None:
-        return False
-    try:
-        return remote_identity.hash.hex() == pin
-    except Exception:
-        return False
-
-
-def _build_update_bundle():
-    """Tar this running tree (the swap members + their data files),
-    name it sHades-server-<V>.tar.gz (the release-name contract),
-    memoize (version, path, sha)."""
-    if (_SERVE_CACHE["version"] == SERVER_VERSION
-            and _SERVE_CACHE["path"]
-            and os.path.isfile(_SERVE_CACHE["path"])):
-        return _SERVE_CACHE["path"], _SERVE_CACHE["sha"]
-    import tarfile
-    import tempfile
-    import hashlib
-    tree = os.path.dirname(os.path.abspath(__file__))
-    out = os.path.join(tempfile.mkdtemp(prefix="sHades-serve-"),
-                       "sHades-server-%s.tar.gz" % SERVER_VERSION)
-    with tarfile.open(out, "w:gz") as tf:
-        for root, dirs, files in os.walk(tree):
-            dirs[:] = sorted(d for d in dirs if d not in _SERVE_EXCLUDE)
-            for fn in sorted(files):
-                if fn.endswith(_SERVE_SKIP_EXT):
-                    continue
-                p = os.path.join(root, fn)
-                tf.add(p, arcname=os.path.relpath(p, tree))
-    b = open(out, "rb").read()
-    _SERVE_CACHE.update(version=SERVER_VERSION, path=out,
-                        sha=hashlib.sha256(b).hexdigest())
-    return out, _SERVE_CACHE["sha"]
-
-
-@api_route("/api/v1/update/serve_info")
-def api_v1_update_serve_info(viewer, data, request_id, link_id,
-                             remote_identity, requested_at):
-    """P11d: the software channel's fingerprint. Returns this running
-    tree's bundle name + version + sha256; the version gate rides the
-    puller, the bytes ride serve_chunk with the same gate."""
-    if not _serve_peer_ok(viewer, remote_identity):
-        return {"ok": 0, "error": "peer not allowed", "code": 403}
-    tree = os.path.dirname(os.path.abspath(__file__))
-    for m in updater.TREE_MEMBERS:
-        if not os.path.isfile(os.path.join(tree, m)):
-            return {"ok": 0, "error": "serving tree incomplete: missing %s"
-                    % m, "code": 500}
-    bpath, sha = _build_update_bundle()
-    return {"ok": 1, "version": SERVER_VERSION,
-            "bundle_name": os.path.basename(bpath),
-            "bundle_sha256": sha}
-
-
-@api_route("/api/v1/update/serve_chunk")
-def api_v1_update_serve_chunk(viewer, data, request_id, link_id,
-                              remote_identity, requested_at):
-    """P11d: chunked bundle read, the same shape as /api/v1/blobs/get."""
-    if not _serve_peer_ok(viewer, remote_identity):
-        return {"ok": 0, "error": "peer not allowed", "code": 403}
-    bpath, _ = _build_update_bundle()
-    offset, length = _chunk_params(data or {})
-    total, chunk = _read_slice(bpath, offset, length)
-    if total is None:
-        return {"ok": 0, "error": "bundle unreadable", "code": 500}
-    return {"ok": 1, "total": total, "offset": offset,
-            "eof": offset + len(chunk) >= total,
-            "data_b64": base64.b64encode(chunk).decode("ascii")}
-
-
-def _rns_pull():
-    """P11d pull: rncp's shape on raw RNS primitives. Link to the
-    pinned peer (the 64-hex update_channel_peer), identify with this
-    server's own identity, request serve_info -> serve_chunk slices,
-    verify the sha, return the fetch dict for updater.check_and_apply.
-    None on any refusal; verdicts ride the updater's status note."""
-    import RNS
-    import msgpack
-    pin = (_cfg_get("update_channel_peer", "") or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", pin):
-        updater._note("refused", "update_channel_peer is not a 64-hex pin")
-        return None
-    nid = RNS.Identity.recall(bytes.fromhex(pin))
-    if nid is None:
-        updater._note("no-bundle", "pinned peer's announce not heard yet")
-        return None
-    nd = RNS.Destination(nid, RNS.Destination.OUT, RNS.Destination.SINGLE,
-                         "nomadnetwork", "node")
-    link = RNS.Link(nd)
-    for _ in range(200):
-        if link.status == RNS.Link.ACTIVE:
-            break
-        time.sleep(0.1)
-    if link.status != RNS.Link.ACTIVE:
-        updater._note("no-bundle", "link to pinned peer never went ACTIVE")
-        return None
-    # identify so the serving gate sees this server as the trusted peer
-    link.identify(node_destination.identity)
-
-    def _req(path, data=None, timeout=30.0):
-        receipt = link.request(path, data=data or {})
-        deadline = time.time() + timeout
-        while getattr(receipt, "response", None) is None \
-                and time.time() < deadline:
-            time.sleep(0.05)
-        resp = getattr(receipt, "response", None)
-        if resp is None:
-            raise TimeoutError(path)
-        return msgpack.unpackb(resp, raw=False)
-
-    try:
-        info = _req("/api/v1/update/serve_info")
-        if not info.get("ok"):
-            updater._note("no-bundle", "peer serve_info refused: %s"
-                          % info.get("error"))
-            return None
-        cur = updater.parse_version(SERVER_VERSION)
-        new = updater.parse_version(info.get("version") or "")
-        if cur is None or new is None:
-            updater._note("refused", "peer carried no parseable version")
-            return None
-        if new <= cur:
-            updater._note("current",
-                          "%s is the newest peer bundle" % info["version"])
-            return None
-        # P11e: the artifact pin outranks the wire. The admin pins the
-        # sha out-of-band (the release body, another admin); a served
-        # fingerprint that disagrees with it is refused BEFORE any
-        # bytes move, and the assembled bytes are verified against the
-        # PIN, never against the peer's own claim. Empty pin =
-        # peer-only mode (integrity only; provenance rides the identity
-        # pin, and the status line says so).
-        shapin = (_cfg_get("update_channel_shapin", "") or
-                  "").strip().lower()
-        trusted = (_cfg_get("update_trusted_hub", "") or "").strip().lower()
-        pin = (_cfg_get("update_channel_peer", "") or "").strip().lower()
-        target_sha = shapin
-        sha_source = "pin"
-        if not shapin:
-            target_sha = (info.get("bundle_sha256") or "").lower()
-            # P11f tiers: the DISTRIBUTED hub (the sole trusted
-            # initiating source) may act as the sha oracle by itself;
-            # any other hub without the artifact pin stays peer-only.
-            sha_source = ("trusted-hub" if trusted and pin == trusted
-                          else "peer-only")
-        elif (info.get("bundle_sha256") or "").lower() != shapin:
-            updater._note("refused",
-                          "peer bundle disagrees with the pinned "
-                          "artifact sha")
-            return None
-        total = None
-        parts = []
-        offset = 0
-        while True:
-            res = _req("/api/v1/update/serve_chunk", {"offset": offset})
-            if not res.get("ok"):
-                updater._note("refused", "peer chunk refused: %s"
-                              % res.get("error"))
-                return None
-            total = res["total"]
-            parts.append(base64.b64decode(res["data_b64"]))
-            offset += len(parts[-1])
-            if res.get("eof") or offset >= total:
-                break
-        data = b"".join(parts)
-        if len(data) != total:
-            updater._note("refused", "bundle size disagree: %d of %d"
-                          % (len(data), total))
-            return None
-        if not updater.verify_sha(data, target_sha):
-            updater._note("refused",
-                          "bundle bytes disagree with the %s sha"
-                          % ("pinned artifact" if shapin else "peer's"))
-            return None
-        return {"version": info["version"],
-                "sha256": target_sha,
-                "sha_source": sha_source,
-                "bundle_name": info["bundle_name"],
-                "bundle_bytes": data}
-    except Exception as e:
-        updater._note("no-bundle", "peer fetch failed: %s" % e)
-        return None
 
 def _require_admin(viewer):
     """Admin gate for the panel endpoints (U8). ADMIN role only — the
@@ -3855,32 +3187,6 @@ def api_v1_admin_config(viewer, data, link_id):
     if key == "registration" and value not in ("open", "code"):
         return {"ok": 0, "error": "registration must be 'open' or 'code'",
                 "code": 400}
-    if key == "update_channel_peer" and value:
-        # P11d: the pin is an RNS node destination hash: 32 bytes = 64 hex
-        digest = value.strip().lower()
-        if not re.match(r"^[0-9a-f]{64}$", digest):
-            return {"ok": 0,
-                    "error": "update_channel_peer must be a 64-hex node "
-                             "destination hash", "code": 400}
-        value = digest
-    if key == "update_channel_shapin" and value:
-        # P11e: the artifact pin is a sha256 hex digest: 64 hex. Empty
-        # is allowed (and means the pull trusts the peer's own sha -
-        # integrity only, provenance rides the identity pin).
-        digest = value.strip().lower()
-        if not re.match(r"^[0-9a-f]{64}$", digest):
-            return {"ok": 0,
-                    "error": "update_channel_shapin must be a 64-hex "
-                             "sha256 digest", "code": 400}
-        value = digest
-    if key == "update_trusted_hub" and value:
-        # P11f: the trusted hub is an RNS node destination hash
-        digest = value.strip().lower()
-        if not re.match(r"^[0-9a-f]{64}$", digest):
-            return {"ok": 0,
-                    "error": "update_trusted_hub must be a 64-hex node "
-                             "destination hash", "code": 400}
-        value = digest
     if key == "guild_icon" and value:
         # the icon rides the standard blob store: the value must resolve to
         # a committed blob (uploaded via blobs/put or the chunked flow)
@@ -3954,10 +3260,7 @@ def api_v1_admin_audit(viewer, data, link_id):
     except (TypeError, ValueError):
         limit = 100
     limit = max(1, min(limit, 500))
-    with db_lock:
-        rows = db.execute("SELECT ts, actor, action, target, detail FROM "
-                          "audit_log ORDER BY id DESC LIMIT ?",
-                          (limit,)).fetchall()
+    rows = store.list_audit(db, db_lock, limit)
     return {"ok": 1, "entries": [
         {"ts": r["ts"], "actor": r["actor"], "action": r["action"],
          "target": r["target"], "detail": r["detail"]} for r in rows]}
@@ -4023,15 +3326,7 @@ def _has_joined(user_hash):
     """True if this user is already in the guild for gate purposes: either
     they joined with a code, or they already registered a username (so
     turning the gate on never locks existing members out)."""
-    if not user_hash:
-        return False
-    with db_lock:
-        if db.execute("SELECT 1 FROM guild_joins WHERE user_hash=?",
-                      (user_hash,)).fetchone():
-            return True
-        row = db.execute("SELECT username FROM users WHERE dest_hash=?",
-                         (user_hash,)).fetchone()
-    return bool(row and row["username"])
+    return store.has_joined(db, db_lock, user_hash)
 
 def _new_invite_code():
     """Short unambiguous code (Crockford-ish base32, no I/O/0/1)."""
@@ -4059,36 +3354,22 @@ def api_v1_join(viewer, data, link_id):
         # open guild: joining is implicit, but still record it so the state
         # is consistent if the policy is tightened later. A channel-targeted
         # code still resolves its landing channel in an open guild.
-        channel_id = None
-        with db_lock:
-            db.execute("INSERT OR IGNORE INTO guild_joins (user_hash, joined_at, "
-                       "code) VALUES (?, ?, ?)", (viewer, now(), code))
-            db.commit()
-            row = db.execute("SELECT channel_id FROM invites WHERE code=?",
-                             (code,)).fetchone()
-            channel_id = (row["channel_id"] or None) if row else None
+        channel_id = store.record_join_open(db, db_lock, viewer, code, now())
         return {"ok": 1, "required": False, "joined": True, "policy": policy,
                 "channel_id": channel_id}
     if not re.match(r"^[A-Z0-9]{6,16}$", code):
         return {"ok": 0, "error": "invalid code", "code": 400}
-    with db_lock:
-        row = db.execute("SELECT * FROM invites WHERE code=?", (code,)).fetchone()
-        if not row:
-            return {"ok": 0, "error": "invalid code", "code": 403}
-        if row["expires_at"] and now() > row["expires_at"]:
-            return {"ok": 0, "error": "code expired", "code": 403}
-        if row["max_uses"] and row["uses"] >= row["max_uses"]:
-            return {"ok": 0, "error": "code exhausted", "code": 403}
-        db.execute("UPDATE invites SET uses = uses + 1 WHERE code=?", (code,))
-        db.execute("INSERT OR IGNORE INTO guild_joins (user_hash, joined_at, "
-                   "code) VALUES (?, ?, ?)", (viewer, now(), code))
-        db.commit()
+    err = store.redeem_invite(db, db_lock, viewer, code, now())
+    if err == "invalid code":
+        return {"ok": 0, "error": "invalid code", "code": 403}
+    if err == "code expired":
+        return {"ok": 0, "error": "code expired", "code": 403}
+    if err == "code exhausted":
+        return {"ok": 0, "error": "code exhausted", "code": 403}
     _audit(viewer, "join", None, "code=%s" % code)
-    with db_lock:
-        row = db.execute("SELECT channel_id FROM invites WHERE code=?",
-                         (code,)).fetchone()
+    channel_id = store.invite_channel(db, db_lock, code)
     return {"ok": 1, "required": True, "joined": True, "policy": policy,
-            "channel_id": (row["channel_id"] or None) if row else None}
+            "channel_id": channel_id}
 
 @api_route("/api/v1/invites")
 @wrap_json_api
@@ -4101,9 +3382,7 @@ def api_v1_invites(viewer, data, link_id):
         return denied
     op = (data.get("op") or "list").lower()
     if op == "list":
-        with db_lock:
-            rows = db.execute("SELECT * FROM invites ORDER BY created_at DESC"
-                              ).fetchall()
+        rows = store.list_invites(db, db_lock)
         return {"ok": 1, "invites": [
             {"code": r["code"], "label": r["label"], "created_at": r["created_at"],
              "expires_at": r["expires_at"], "max_uses": r["max_uses"],
@@ -4124,21 +3403,14 @@ def api_v1_invites(viewer, data, link_id):
         # optional channel target: the joiner is told which channel to open
         channel = data.get("channel")
         if channel:
-            with db_lock:
-                if not db.execute("SELECT 1 FROM channels WHERE id=?",
-                                  (channel,)).fetchone():
-                    return {"ok": 0, "error": "unknown channel", "code": 400}
+            if not store.channel_exists(db, db_lock, channel):
+                return {"ok": 0, "error": "unknown channel", "code": 400}
         code = _new_invite_code()
-        with db_lock:
-            if db.execute("SELECT 1 FROM invites WHERE code=?", (code,)).fetchone():
-                code = _new_invite_code()
-            expires_at = (now() + expires_in) if expires_in else 0
-            db.execute("INSERT INTO invites (code, label, created_at, "
-                       "expires_at, max_uses, uses, created_by, channel_id) "
-                       "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
-                       (code, label, now(), expires_at, max_uses, viewer,
-                        channel or None))
-            db.commit()
+        if store.invite_exists(db, db_lock, code):
+            code = _new_invite_code()
+        expires_at = (now() + expires_in) if expires_in else 0
+        store.create_invite(db, db_lock, code, label, now(), expires_at,
+                            max_uses, viewer, channel or None)
         _audit(viewer, "invite.create", code, label)
         return {"ok": 1, "code": code, "label": label, "max_uses": max_uses,
                 "expires_at": expires_at, "channel_id": channel or None}
@@ -4146,10 +3418,7 @@ def api_v1_invites(viewer, data, link_id):
         code = (data.get("code") or "").strip().upper()
         if not re.match(r"^[A-Z0-9]{6,16}$", code):
             return {"ok": 0, "error": "invalid code", "code": 400}
-        with db_lock:
-            cur = db.execute("DELETE FROM invites WHERE code=?", (code,))
-            db.commit()
-        if not cur.rowcount:
+        if not store.revoke_invite(db, db_lock, code):
             return {"ok": 0, "error": "unknown code", "code": 404}
         _audit(viewer, "invite.revoke", code)
         return {"ok": 1, "code": code}
@@ -4160,23 +3429,9 @@ def _delete_channel_txn(cid, viewer):
     (error_or_None, name_or_None)."""
     if not has_perm(viewer, cid, PERMS["MANAGE_CHANNEL"]):
         return "manage channel permission required", None
-    with db_lock:
-        row = db.execute("SELECT id, name FROM channels WHERE id=?", (cid,)).fetchone()
-        if not row:
-            return "unknown channel", None
-        n = db.execute("SELECT COUNT(*) AS n FROM channels").fetchone()["n"]
-        if n <= 1:
-            return "cannot delete the last channel", None
-        name = row["name"]
-        msg_ids = "SELECT msg_id FROM messages WHERE channel_id=?"
-        db.execute("DELETE FROM attachments WHERE msg_id IN (%s)" % msg_ids, (cid,))
-        db.execute("DELETE FROM reactions WHERE msg_id IN (%s)" % msg_ids, (cid,))
-        db.execute("DELETE FROM messages WHERE channel_id=?", (cid,))
-        db.execute("DELETE FROM receipts WHERE channel_id=?", (cid,))
-        db.execute("DELETE FROM members WHERE channel_id=?", (cid,))
-        db.execute("DELETE FROM channel_state WHERE channel_id=?", (cid,))
-        db.execute("DELETE FROM channels WHERE id=?", (cid,))
-        db.commit()
+    err, name = store.delete_channel_data(db, db_lock, cid)
+    if err:
+        return err, None
     with TERM_SESSIONS_LOCK:
         for sid in [s for s, t in TERM_SESSIONS.items() if t["channel"] == cid]:
             TERM_SESSIONS.pop(sid, None)
@@ -4230,9 +3485,7 @@ def _require_manage_roles(viewer):
     return None
 
 def _role_row(r):
-    with db_lock:
-        members = db.execute("SELECT user_hash FROM user_roles WHERE role_id=? "
-                             "ORDER BY user_hash LIMIT 64", (r["role_id"],)).fetchall()
+    members = store.role_members(db, db_lock, r["role_id"])
     return {"role_id": r["role_id"], "name": r["name"], "color": r["color"],
             "position": r["position"], "perms": r["perms"],
             "members": [m["user_hash"] for m in members]}
@@ -4240,8 +3493,7 @@ def _role_row(r):
 @api_route("/api/v1/roles/list")
 @wrap_json_api
 def api_v1_roles_list(viewer, data, link_id):
-    with db_lock:
-        rows = db.execute("SELECT * FROM roles ORDER BY position DESC, name").fetchall()
+    rows = store.list_roles(db, db_lock)
     return {"ok": 1, "roles": [_role_row(r) for r in rows]}
 
 @api_route("/api/v1/roles/create")
@@ -4264,14 +3516,9 @@ def api_v1_roles_create(viewer, data, link_id):
         position = max(0, min(int(position), 1000))
     except (TypeError, ValueError):
         position = 0
-    with db_lock:
-        if db.execute("SELECT 1 FROM roles WHERE name=? COLLATE NOCASE",
-                      (name,)).fetchone():
-            return {"ok": 0, "error": "role exists", "code": 409}
-        cur = db.execute("INSERT INTO roles (name, color, position, perms) "
-                         "VALUES (?, ?, ?, ?)", (name, color or None, position, perms))
-        db.commit()
-        role_id = cur.lastrowid
+    role_id = store.create_role(db, db_lock, name, color or None, position, perms)
+    if role_id is None:
+        return {"ok": 0, "error": "role exists", "code": 409}
     return {"ok": 1, "role": {"role_id": role_id, "name": name, "perms": perms,
                               "color": color or None, "position": position}}
 
@@ -4280,16 +3527,12 @@ def api_v1_roles_create(viewer, data, link_id):
 def api_v1_message_edits(viewer, data, link_id):
     """Prior versions are visible only to viewers of this channel."""
     msg_id = data.get("msg")
-    with db_lock:
-        row = db.execute("SELECT channel_id, deleted_at FROM messages WHERE msg_id=?",
-                         (msg_id,)).fetchone()
-        if row is None or row["deleted_at"]:
-            return {"ok": 0, "error": "message unavailable", "code": 404}
-        if not has_perm(viewer, row["channel_id"], PERMS["VIEW"]):
-            return {"ok": 0, "error": "view permission required", "code": 403}
-        edits = db.execute("SELECT edited_at, prior_content FROM message_edits "
-                           "WHERE msg_id=? ORDER BY edited_at DESC LIMIT 50",
-                           (msg_id,)).fetchall()
+    row = store.message_by_msg_id(db, db_lock, msg_id)
+    if row is None or row["deleted_at"]:
+        return {"ok": 0, "error": "message unavailable", "code": 404}
+    if not has_perm(viewer, row["channel_id"], PERMS["VIEW"]):
+        return {"ok": 0, "error": "view permission required", "code": 403}
+    edits = store.message_edits(db, db_lock, msg_id)
     return {"ok": 1, "edits": [dict(r) for r in edits]}
 
 
@@ -4302,16 +3545,12 @@ def api_v1_account_export(viewer, data, link_id):
         limit = max(1, min(100, int(data.get("limit", 100))))
     except (TypeError, ValueError):
         return {"ok": 0, "error": "invalid cursor", "code": 400}
-    with db_lock:
-        rows = db.execute("SELECT * FROM messages WHERE author_hash=? AND id>? "
-                          "ORDER BY id LIMIT ?", (viewer, after, limit)).fetchall()
-        messages = []
-        for row in rows:
-            msg = msg_row_json(row)
-            msg["edits"] = [dict(e) for e in db.execute(
-                "SELECT edited_at, prior_content FROM message_edits WHERE msg_id=? "
-                "ORDER BY edited_at ASC", (row["msg_id"],)).fetchall()]
-            messages.append(msg)
+    rows = store.list_own_messages(db, db_lock, viewer, after, limit)
+    messages = []
+    for row in rows:
+        msg = msg_row_json(row)
+        msg["edits"] = [dict(e) for e in store.message_edits_asc(db, db_lock, row["msg_id"])]
+        messages.append(msg)
     return {"ok": 1, "messages": messages,
             "next_after": rows[-1]["id"] if len(rows) == limit else None,
             "scope": "own guild posts and attachment metadata; no attachment bytes"}
@@ -4323,46 +3562,9 @@ def api_v1_account_delete_posts(viewer, data, link_id):
     """Erase this identity's ledger text and references; retain tombstones."""
     if data.get("confirm") != "DELETE MY POSTS":
         return {"ok": 0, "error": "confirmation required", "code": 400}
-    with db_lock:
-        rows = db.execute("SELECT msg_id, channel_id FROM messages WHERE "
-                          "author_hash=? AND deleted_at IS NULL", (viewer,)).fetchall()
-        all_ids = [r["msg_id"] for r in db.execute(
-            "SELECT msg_id FROM messages WHERE author_hash=?", (viewer,)).fetchall()]
-        paths = set()
-        for msg_id in all_ids:
-            paths.update(r["path"] for r in db.execute(
-                "SELECT path FROM attachments WHERE msg_id=?", (msg_id,)).fetchall())
-            db.execute("DELETE FROM attachments WHERE msg_id=?", (msg_id,))
-            db.execute("DELETE FROM reactions WHERE msg_id=?", (msg_id,))
-            db.execute("DELETE FROM message_edits WHERE msg_id=?", (msg_id,))
-        deleted_at = now()
-        db.execute("UPDATE messages SET content='', deleted_at=coalesce(deleted_at, ?) "
-                   "WHERE author_hash=?", (deleted_at, viewer))
-        channels = {r["channel_id"] for r in rows}
-        for cid in channels:
-            bump_seq(cid)
-        db.commit()
-        orphaned = [path for path in paths if not db.execute(
-            "SELECT 1 FROM attachments WHERE path=? LIMIT 1", (path,)).fetchone()]
-        orphaned_blobs = []
-        for path in orphaned:
-            if not re.fullmatch(r"[0-9a-f]{32}\.[a-z0-9]{1,8}", path):
-                continue
-            digest = path.split(".", 1)[0]
-            record = db.execute("SELECT path FROM blobs WHERE id=? AND by=?",
-                                (digest, viewer)).fetchone()
-            if record and not db.execute(
-                    "SELECT 1 FROM attachments WHERE path LIKE ? LIMIT 1",
-                    (digest + ".%",)).fetchone():
-                orphaned_blobs.append(record["path"])
-                db.execute("DELETE FROM blobs WHERE id=?", (digest,))
-        db.commit()
-        # Clear the live WAL and compact historical page versions where possible.
-        try:
-            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            db.execute("VACUUM")
-        except sqlite3.Error as exc:
-            RNS.log("post compaction deferred: %s" % exc, RNS.LOG_WARNING)
+    deleted_at = now()
+    all_ids, channels, orphaned, orphaned_blobs = store.delete_own_posts(
+        db, db_lock, viewer, deleted_at)
     for path in orphaned:
         if re.fullmatch(r"[0-9a-f]{32}\.[a-z0-9]{1,8}", path):
             for directory, name in (("attachments", path),
@@ -4391,15 +3593,7 @@ def api_v1_account_leave(viewer, data, link_id):
     """Release registration and roles without silently deleting messages."""
     if data.get("confirm") != "LEAVE GUILD":
         return {"ok": 0, "error": "confirmation required", "code": 400}
-    with db_lock:
-        avatar = db.execute("SELECT avatar_path FROM users WHERE dest_hash=?",
-                            (viewer,)).fetchone()
-        db.execute("DELETE FROM guild_joins WHERE user_hash=?", (viewer,))
-        db.execute("DELETE FROM user_roles WHERE user_hash=?", (viewer,))
-        db.execute("DELETE FROM receipts WHERE user_hash=?", (viewer,))
-        db.execute("DELETE FROM members WHERE member_hash=?", (viewer,))
-        db.execute("DELETE FROM users WHERE dest_hash=?", (viewer,))
-        db.commit()
+    avatar_path = store.leave_guild(db, db_lock, viewer)
     with NODE_REGISTRY_LOCK:
         for node, record in list(NODE_REGISTRY.items()):
             if record.get("user_hash") == viewer:
@@ -4410,7 +3604,7 @@ def api_v1_account_leave(viewer, data, link_id):
     if viewer in ADMIN_USERS:
         ADMIN_USERS.discard(viewer)
         _write_hash_file(os.path.join(STORAGE, "admin.txt"), sorted(ADMIN_USERS))
-    if avatar and avatar["avatar_path"] == viewer + ".img":
+    if avatar_path == viewer + ".img":
         try:
             os.unlink(os.path.join(STORAGE, "avatars", viewer + ".img"))
         except OSError:
@@ -4424,31 +3618,24 @@ def api_v1_account_leave(viewer, data, link_id):
 @wrap_json_api
 def api_v1_catchup(viewer, data, link_id):
     """Small per-channel summary after the member's own read watermark."""
-    with db_lock:
-        channels = db.execute("SELECT id, name FROM channels ORDER BY name").fetchall()
-        result = []
-        for channel in channels:
-            cid = channel["id"]
-            if not has_perm(viewer, cid, PERMS["VIEW"]):
-                continue
-            receipt = db.execute("SELECT last_id FROM receipts WHERE channel_id=? "
-                                 "AND user_hash=?", (cid, viewer)).fetchone()
-            if receipt is None:
-                continue
-            last_id = receipt["last_id"]
-            count = db.execute("SELECT count(*) FROM messages WHERE channel_id=? "
-                               "AND id>? AND author_hash!=? AND deleted_at IS NULL",
-                               (cid, last_id, viewer)).fetchone()[0]
-            if not count:
-                continue
-            samples = db.execute("SELECT author_hash, content, ts FROM messages "
-                                 "WHERE channel_id=? AND id>? AND author_hash!=? "
-                                 "AND deleted_at IS NULL ORDER BY id DESC LIMIT 3",
-                                 (cid, last_id, viewer)).fetchall()
-            result.append({"channel": cid, "name": channel["name"], "count": count,
-                           "recent": [{"username": get_username(r["author_hash"]),
-                                       "content": r["content"][:100], "ts": r["ts"]}
-                                      for r in reversed(samples)]})
+    channels = store.list_channel_names(db, db_lock)
+    result = []
+    for channel in channels:
+        cid = channel["id"]
+        if not has_perm(viewer, cid, PERMS["VIEW"]):
+            continue
+        receipt = store.receipt_row(db, db_lock, cid, viewer)
+        if receipt is None:
+            continue
+        last_id = receipt["last_id"]
+        count = store.catchup_count(db, db_lock, cid, last_id, viewer)
+        if not count:
+            continue
+        samples = store.catchup_samples(db, db_lock, cid, last_id, viewer)
+        result.append({"channel": cid, "name": channel["name"], "count": count,
+                       "recent": [{"username": get_username(r["author_hash"]),
+                                   "content": r["content"][:100], "ts": r["ts"]}
+                                  for r in reversed(samples)]})
     return {"ok": 1, "channels": result[:100]}
 
 
@@ -4465,11 +3652,7 @@ def api_v1_moderation_public(viewer, data, link_id):
     actions = ("mod.muted", "mod.unmuted", "mod.banned", "mod.unbanned",
                "mods.add", "mods.remove", "admins.add", "admins.remove",
                "channel.delete", "role.assign", "role.unassign")
-    with db_lock:
-        rows = db.execute(
-            "SELECT ts, actor, action, target FROM audit_log WHERE action IN "
-            "(%s) ORDER BY id DESC LIMIT ?" % ",".join("?" for _ in actions),
-            (*actions, limit)).fetchall()
+    rows = store.public_moderation_log(db, db_lock, actions, limit)
     return {"ok": 1, "entries": [
         {"ts": r["ts"], "actor": r["actor"], "action": r["action"],
          "target": r["target"]} for r in rows]}
@@ -4482,16 +3665,11 @@ def api_v1_roles_delete(viewer, data, link_id):
     if denied:
         return denied
     role_id = data.get("role_id")
-    with db_lock:
-        row = db.execute("SELECT name FROM roles WHERE role_id=?", (role_id,)).fetchone()
-        if not row:
-            return {"ok": 0, "error": "unknown role", "code": 404}
-        db.execute("DELETE FROM user_roles WHERE role_id=?", (role_id,))
-        db.execute("DELETE FROM channel_overwrites WHERE role_id=?", (role_id,))
-        db.execute("DELETE FROM roles WHERE role_id=?", (role_id,))
-        db.commit()
+    name = store.delete_role(db, db_lock, role_id)
+    if name is None:
+        return {"ok": 0, "error": "unknown role", "code": 404}
     _audit(viewer, "role.delete", None, "role_id=%s" % role_id)
-    return {"ok": 1, "role_id": role_id, "name": row["name"]}
+    return {"ok": 1, "role_id": role_id, "name": name}
 
 @api_route("/api/v1/roles/assign")
 @wrap_json_api
@@ -4503,12 +3681,8 @@ def api_v1_roles_assign(viewer, data, link_id):
     target = _resolve_user(data.get("user"))
     if not target:
         return {"ok": 0, "error": "unknown user", "code": 404}
-    with db_lock:
-        if not db.execute("SELECT 1 FROM roles WHERE role_id=?", (role_id,)).fetchone():
-            return {"ok": 0, "error": "unknown role", "code": 404}
-        db.execute("INSERT OR IGNORE INTO user_roles (user_hash, role_id) VALUES (?, ?)",
-                   (target, role_id))
-        db.commit()
+    if not store.assign_role_checked(db, db_lock, target, role_id):
+        return {"ok": 0, "error": "unknown role", "code": 404}
     _audit(viewer, "role.assign", target, "role_id=%s" % role_id)
     return {"ok": 1, "role_id": role_id, "user": target}
 
@@ -4522,10 +3696,7 @@ def api_v1_roles_unassign(viewer, data, link_id):
     target = _resolve_user(data.get("user"))
     if not target:
         return {"ok": 0, "error": "unknown user", "code": 404}
-    with db_lock:
-        db.execute("DELETE FROM user_roles WHERE user_hash=? AND role_id=?",
-                   (target, role_id))
-        db.commit()
+    store.unassign_role(db, db_lock, target, role_id)
     _audit(viewer, "role.unassign", target, "role_id=%s" % role_id)
     return {"ok": 1, "role_id": role_id, "user": target}
 
@@ -4537,17 +3708,13 @@ def api_v1_channels_patch(viewer, data, link_id):
     must also carry MANAGE_CHANNEL; overwrites are {role_id: perms} with
     perms null deleting the row (falling back to the default)."""
     cid = data.get("channel")
-    with db_lock:
-        if not db.execute("SELECT 1 FROM channels WHERE id=?", (cid,)).fetchone():
-            return {"ok": 0, "error": "unknown channel", "code": 404}
+    if not store.channel_exists(db, db_lock, cid):
+        return {"ok": 0, "error": "unknown channel", "code": 404}
     if not has_perm(viewer, cid, PERMS["MANAGE_CHANNEL"]):
         return {"ok": 0, "error": "manage channel permission required", "code": 403}
     topic = data.get("topic")
     if topic is not None:
-        with db_lock:
-            db.execute("UPDATE channels SET topic=? WHERE id=?",
-                       (str(topic).strip()[:200] or None, cid))
-            db.commit()
+        store.set_channel_topic(db, db_lock, cid, str(topic).strip()[:200] or None)
         _emit_event(cid, "channels_changed", {"channel": channel_name(cid)},
                     guild_wide=True)
     overwrites = data.get("overwrites")
@@ -4559,20 +3726,14 @@ def api_v1_channels_patch(viewer, data, link_id):
                 rid = int(rid)
             except (TypeError, ValueError):
                 return {"ok": 0, "error": "role_id must be an integer", "code": 400}
-            with db_lock:
-                if perms is None:
-                    db.execute("DELETE FROM channel_overwrites "
-                               "WHERE channel_id=? AND role_id=?", (cid, rid))
-                else:
-                    if not isinstance(perms, int) or perms < 0 or perms > PERM_ALL:
-                        return {"ok": 0, "error": "perms must be a bitmask 0-127",
-                                "code": 400}
-                    db.execute("INSERT INTO channel_overwrites "
-                               "(channel_id, role_id, perms) VALUES (?, ?, ?) "
-                               "ON CONFLICT(channel_id, role_id) "
-                               "DO UPDATE SET perms=excluded.perms", (cid, rid, perms))
-        with db_lock:
-            db.commit()
+            if perms is None:
+                store.delete_channel_overwrite(db, db_lock, cid, rid)
+            else:
+                if not isinstance(perms, int) or perms < 0 or perms > PERM_ALL:
+                    return {"ok": 0, "error": "perms must be a bitmask 0-127",
+                            "code": 400}
+                store.set_channel_overwrite(db, db_lock, cid, rid, perms)
+        store.commit(db, db_lock)
     return {"ok": 1, "channel": cid}
 
 # ----------------------------------------------------------------------------------
@@ -4696,9 +3857,7 @@ def run(argv=None):
                                                   allow=RNS.Destination.ALLOW_ALL)
 
     # re-register attachment files from previous runs
-    with db_lock:
-        paths = [r["path"] for r in
-                 db.execute("SELECT DISTINCT path FROM attachments").fetchall()]
+    paths = [r["path"] for r in store.list_attachment_paths(db, db_lock)]
     for fname in paths:
         node_destination.register_request_handler(
             "/file/attachments/" + fname, serve_attachment_file,
@@ -4751,11 +3910,7 @@ def run(argv=None):
     node_hash     = hexstr(node_destination.hash)
     delivery_hash = hexstr(guild_delivery.hash)
     prop_hash     = hexstr(router.propagation_destination.hash)
-    with db_lock:
-        db.execute("INSERT OR REPLACE INTO guilds (id, name, node_hash, delivery_hash, prop_hash) "
-                   "VALUES (?, ?, ?, ?, ?)",
-                   (GUILD_ID, GUILD_NAME, node_hash, delivery_hash, prop_hash))
-        db.commit()
+    store.save_guild(db, db_lock, GUILD_ID, GUILD_NAME, node_hash, delivery_hash, prop_hash)
 
     info = {"name": GUILD_NAME, "node_hash": node_hash,
             "delivery_hash": delivery_hash, "prop_hash": prop_hash,
@@ -4792,8 +3947,4 @@ if __name__ == "__main__":
     # every boot (bare or flagged) since P11 chain 2, and a guard
     # alone would restart a flagged hub flagless. The entry feeds the
     # real CLI here so _BOOT_ARGV carries the flags through a restart.
-    try:
-        _update_boot_guard()  # P11f: an interrupted swap never serves
-    except Exception as e:
-        RNS.log("boot guard: %s" % e, RNS.LOG_ERROR)
     run(sys.argv[1:])
