@@ -17,7 +17,10 @@ env:
 jobs:
   lint-and-test:
     name: lint + import test (Linux)
-    runs-on: ubuntu-22.04
+    # 24.04, pinned: sanguis/bch (the script interpreter binary this
+    # job's real-runner tests exec) is a glibc 2.38 build; 22.04
+    # ships 2.35 and the loader refuses it ("GLIBC_2.38' not found").
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # actions/checkout@v4
       - name: Set up Python
