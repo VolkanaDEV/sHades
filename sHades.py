@@ -1875,6 +1875,8 @@ def api_v1_typing(viewer, data, link_id):
     active = bool(data.get("active"))
     if not store.channel_exists(db, db_lock, cid):
         return {"ok": 0, "error": "unknown channel", "code": 404}
+    if not has_perm(viewer, cid, PERMS["VIEW"]):
+        return {"ok": 0, "error": "view permission required", "code": 403}
     with TYPING_LOCK:
         bucket = TYPING.setdefault(cid, {})
         was_active = bucket.get(viewer, 0) >= now()
@@ -2097,7 +2099,13 @@ def api_v1_att_get(viewer, data, link_id):
 
 def serve_blob_file(path, data, request_id, link_id, remote_identity, requested_at):
     """Raw /file/blobs/<fname> handler (one per stored blob, attachments
-    pattern). Path is the registration key; validate before touching disk."""
+    pattern). Path is the registration key; validate before touching disk.
+    Unlike attachments there is no message linkage to gate on, so the
+    gate is: an identified link, and nothing else. Anonymous fetches are
+    refused. (Per-blob ACLs need blob<->message reference tracking; not
+    built. The digest is a 256-bit capability for identified members.)"""
+    if viewer_of(remote_identity) is None:
+        return b"not found"
     fname = path.rsplit("/", 1)[-1]
     if not re.match(r"^[0-9a-f]{32}\.[a-z0-9]{1,8}$", fname):
         return b"not found"
@@ -2949,31 +2957,43 @@ def api_v1_receipts(viewer, data, link_id):
     return {"ok": 1, "channel": cid, "last_read_id": last_id,
             "unread": _unread_count(cid, last_id)}
 
-@api_route("/api/v1/react")
-@wrap_json_api
-def api_v1_react(viewer, data, link_id):
-    """Toggle a reaction (one emoji per user per message). Emoji are unicode
-    emoji characters (BMP symbols, supplementary plane, ZWJ composites) or
-    legacy ASCII shortcodes ('+1', 'laugh', ...) for older rows."""
-    msg_id = data.get("msg")
-    emoji = (data.get("emoji") or "").strip().lower()
+def _react_as(actor, msg_id, emoji):
+    """Shared react path: the human /api/v1/react and the bot
+    /api/v1/bots/react both toggle through here, passing the actor
+    (human viewer, or a bot's owner). Validates, toggles the reaction
+    as `actor` via the store, and emits kind "reaction". Returns a
+    response dict."""
+    if is_banned(actor):
+        return {"ok": 0, "error": "banned", "code": 403}
+    if is_muted(actor):
+        return {"ok": 0, "error": "muted", "code": 403}
+    emoji = (emoji or "").strip().lower() if isinstance(emoji, str) else ""
     if not _emoji_ok(emoji):
         return {"ok": 0, "error": "emoji must be an emoji or a shortcode (a-z0-9_+-)",
                 "code": 400}
     row = store.message_by_msg_id(db, db_lock, msg_id)
     if not row:
         return {"ok": 0, "error": "unknown message", "code": 404}
-    if not has_perm(viewer, row["channel_id"], PERMS["VIEW"]):
+    if not has_perm(actor, row["channel_id"], PERMS["VIEW"]):
         return {"ok": 0, "error": "view permission required", "code": 403}
-    err, active, counts = store.toggle_reaction(db, db_lock, msg_id, viewer, emoji,
+    err, active, counts = store.toggle_reaction(db, db_lock, msg_id, actor, emoji,
                                                 MAX_EMOJI_PER_MSG, now())
     if err:
         return {"ok": 0, "error": err, "code": 400}
     _emit_event(row["channel_id"], "reaction", {
-        "msg_id": msg_id, "emoji": emoji, "user_hash": viewer,
-        "username": get_username(viewer), "active": active, "counts": counts,
+        "msg_id": msg_id, "emoji": emoji, "user_hash": actor,
+        "username": get_username(actor), "active": active, "counts": counts,
     })
     return {"ok": 1, "active": active, "counts": counts}
+
+
+@api_route("/api/v1/react")
+@wrap_json_api
+def api_v1_react(viewer, data, link_id):
+    """Toggle a reaction (one emoji per user per message). Emoji are unicode
+    emoji characters (BMP symbols, supplementary plane, ZWJ composites) or
+    legacy ASCII shortcodes ('+1', 'laugh', ...) for older rows."""
+    return _react_as(viewer, data.get("msg"), data.get("emoji"))
 
 @api_route("/api/v1/search")
 @wrap_json_api
@@ -3456,33 +3476,6 @@ def api_v1_admin_config(viewer, data, link_id):
         if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
                 or not _blob_fname(digest):
             return {"ok": 0, "error": "guild_icon must be a stored blob_id",
-                    "code": 400}
-        value = digest
-    if key == "banner" and value:
-        # P5: same shape as guild_icon -- the asset rides the standard
-        # blob store; the config only references it
-        digest = value.strip().lower()
-        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
-                or not _blob_fname(digest):
-            return {"ok": 0, "error": "banner must be a stored blob_id",
-                    "code": 400}
-        value = digest
-    if key == "banner" and value:
-        # P5: same shape as guild_icon -- the asset rides the standard
-        # blob store; the config only references it
-        digest = value.strip().lower()
-        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
-                or not _blob_fname(digest):
-            return {"ok": 0, "error": "banner must be a stored blob_id",
-                    "code": 400}
-        value = digest
-    if key == "banner" and value:
-        # P5: same shape as guild_icon -- the asset rides the standard
-        # blob store; the config only references it
-        digest = value.strip().lower()
-        if len(digest) > 32 or not re.match(r"^[0-9a-f]{32}$", digest) \
-                or not _blob_fname(digest):
-            return {"ok": 0, "error": "banner must be a stored blob_id",
                     "code": 400}
         value = digest
     if key == "banner" and value:
@@ -4099,6 +4092,10 @@ def run(argv=None):
     else:
         guild_identity = RNS.Identity()
         guild_identity.to_file(ipath)
+        try:
+            os.chmod(ipath, 0o600)
+        except OSError:
+            pass
 
     # LXMF router: ingest + propagation (mesh reachability)
     router = LXMF.LXMRouter(identity=guild_identity, storagepath=STORAGE)
