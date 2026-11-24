@@ -802,7 +802,17 @@
                     # list above shrinks instead of the field overflowing.
                     id: composer_bar
                     size_hint_y: None
-                    height: max(dp(56), msg_input.height + dp(12))
+                    # v0.36.9 recipe restored: bar fixed at dp(56), field
+                    # fixed at dp(40). G1's grow-up bar
+                    # (max(dp(56), field + dp(12)) + height bound to the
+                    # multiline minimum_height) came in with the phase-2
+                    # tarball and breaks the phone: tay 2026-11-24 shots
+                    # show the field's fill painting as a partial band
+                    # beside the send pill - the GLES batcher trips on
+                    # the bar-height rebind. Pre-tarball builds with the
+                    # fixed recipe rendered the composer correctly on the
+                    # same device.
+                    height: dp(56)
                     padding: [dp(4), dp(6)]
                     spacing: dp(4)
                     canvas.before:
@@ -864,16 +874,13 @@
                         multiline: True
                         size_hint_x: 1
                         size_hint_y: None
-                        # G1 (fixes.md #10): the field grows with its text
-                        # up to ~4+ lines instead of capping at one line.
-                        # max(dp(40), minimum_height): bare minimum_height
-                        # is 37.5px for one line, which would shrink the
-                        # single-line field below the 40px the layout test
-                        # pins. max_height caps it at dp(160); the composer
-                        # bar grows with it (see composer_bar above).
-                        height: max(dp(40), self.minimum_height)
+                        # v0.36.9 recipe restored (see composer_bar): the
+                        # field stays one line inside the bar; the G1
+                        # grow-up binding (max(dp(40), minimum_height))
+                        # is tarball-introduced and phone-broken.
+                        height: dp(40)
                         min_height: dp(40)
-                        max_height: dp(160)
+                        max_height: dp(40)
                         # G5 (UIX P2-4): border tokens (see hub_address).
                         theme_line_color: 'Custom'
                         line_color_normal: app.theme_colors['border_subtle']
