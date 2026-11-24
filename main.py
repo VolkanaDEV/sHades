@@ -119,28 +119,7 @@ def _export_bootlog_for_user():
                 cv = autoclass("android.content.ContentValues")()
                 cv.put("_display_name", "sHades_boot.log")
                 cv.put("mime_type", "text/plain")
-                try:
-                    uri = resolver.insert(coll, cv)
-                except Exception as e:
-                    # Device receipt (log.log_3/log.log_4, 2026-11-24):
-                    # ContentResolver.insert dies with
-                    # IllegalStateException "Failed to build unique file"
-                    # when the Download collection state collides with an
-                    # unscanned leftover of a prior export. A timestamped
-                    # name cannot collide; it trades file-name stability
-                    # for export survival.
-                    print("bootlog insert failed (%s); "
-                          "retrying with a timestamped name" % e,
-                          flush=True)
-                    cv2 = autoclass("android.content.ContentValues")()
-                    cv2.put("_display_name", "sHades_boot_%d.log"
-                            % int(time.time()))
-                    cv2.put("mime_type", "text/plain")
-                    try:
-                        uri = resolver.insert(coll, cv2)
-                    except Exception as e2:
-                        print("bootlog export failed:", e2, flush=True)
-                        return False
+                uri = resolver.insert(coll, cv)
                 if uri is None:
                     return False
             try:

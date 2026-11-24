@@ -279,7 +279,14 @@ PLANNED, priced, build order below. No code until tay calls it.
   intent (ACTION_VIEW + FLAG_GRANT_READ), user taps Install. Mismatch
   refuses and prints. ~120 lines + a fake-jnius functional lane (the
   receipt-lanes recipe) asserting the intent ARGUMENTS.
-- **P11d — the contingency (RNS bundle carrier)**: tay's framing is
+- **P11d — the contingency (RNS bundle carrier)**: **BUILT as fold-9**
+  (the rns branch of check_and_apply + the serve/pull routes + a
+  12/0 lane; the toggle reads "off | github | rns"). **P11e (fold-11):
+  the admin-pinned artifact sha** (update_channel_shapin) is the
+  pull's authority, sourced out-of-band — the serving peer is a
+  courier, never the hash oracle; fingerprint mismatch refuses before
+  any bytes move, mangled bytes refuse against the pin. tay's framing
+  is
   exact — git is SSH + blobs, so the mesh-carrier shape is the RNS
   Link + Resource protocol, NOT HTTP-over-something. The wheel's
   rncp proves the pattern (listener with an identity allowlist +

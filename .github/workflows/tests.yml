@@ -14,8 +14,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # actions/checkout@v4
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - name: Install deps
@@ -48,8 +48,8 @@ jobs:
     name: kivy client tests (ubuntu)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # actions/checkout@v4
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       # pycairo builds from source when no wheel matches the resolver's
@@ -61,7 +61,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq libcairo2-dev pkg-config
       - name: Install client deps
-        run: python -m pip install --disable-pip-version-check "kivy[base]==2.3.1" "kivymd==2.0.0" pillow rns==1.1.3 lxmf==0.9.4 msgpack
+        run: python -m pip install --disable-pip-version-check "kivy[base]==2.3.1" "kivymd==2.0.0" pillow pytest rns==1.1.3 lxmf==0.9.4 msgpack
       # github run 42720783680: after the cairo fix, kivy 2.3.1 imports fine,
       # but the suites open a real Window ("Provider: sdl2 ... Couldn't
       # connect to X server", exit 102) and the mtdev input provider wants
@@ -89,14 +89,15 @@ jobs:
           xvfb-run -a python tests/test_fullscreen_parent.py
           xvfb-run -a python tests/test_default_hub.py
           xvfb-run -a python tests/test_fresh_install.py
+          xvfb-run -a python tests/test_edit_ref_tap.py
           xvfb-run -a python tests/test_ui_layout.py
 
   integ-test:
     name: integration mesh (ubuntu)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # actions/checkout@v4
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - name: Install deps

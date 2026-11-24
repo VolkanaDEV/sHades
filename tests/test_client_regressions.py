@@ -677,7 +677,6 @@ def test_resume_heal_rebuilds_lxmf_and_dead_links():
         _heal_after_resume = kc.sHadesClientApp._heal_after_resume
         _init_lxmf_router = kc.sHadesClientApp._init_lxmf_router
         _dm_announce_loop = kc.sHadesClientApp._dm_announce_loop
-        _DMA_INTERVAL = kc.sHadesClientApp._DMA_INTERVAL
         _on_dm_delivery = kc.sHadesClientApp._on_dm_delivery
         _do_reestablish = kc.sHadesClientApp._do_reestablish
         client_identity = object()
@@ -741,15 +740,13 @@ def test_resume_heal_rebuilds_lxmf_and_dead_links():
 
 def test_channel_management_gates_and_kinds():
     """v0.31.6 founder/channel work: the create-gate mirrors the server's
-    MANAGE_CHANNEL|ADMIN rule, and the kind chooser carries tay's four
-    kinds (tay 2026-11-24 added voice: the server lane already accepted
-    kind "voice" - store.CHANNEL_KINDS, the /api/v1 voice join/roster
-    handlers - but the picker had no button for it)."""
+    MANAGE_CHANNEL|ADMIN rule, and the kind chooser carries exactly tay's
+    three kinds (text / site (micron) / text stream -> chat / site / term)."""
 
     kind_map = dict(kc.sHadesClientApp.CHANNEL_KIND_LABELS)
-    check("kind chooser: tay's four kinds (text/site/term/voice)",
+    check("kind chooser: exactly tay's three kinds",
           kind_map == {"text": "chat", "site (micron)": "site",
-                       "text stream": "term", "voice": "voice"}, kind_map)
+                       "text stream": "term"}, kind_map)
 
     class _App(object):
         i_am_admin = False
@@ -765,7 +762,6 @@ def test_channel_management_gates_and_kinds():
     app.my_roles = [{"perms": 0}]
     app.i_am_admin = True
     check("admin flag: gate open", app._can_create_channels() is True)
-
 
 
 def test_send_failure_restores_compose():
@@ -832,7 +828,7 @@ def test_send_failure_restores_compose():
         def _set_status(self, msg):
             self.statuses.append(msg)
 
-        def _render_message(self, grid, m, animate=False):
+        def _render_message(self, grid, m):
             self.rendered.append(m)
 
     real_clock = kc.Clock
@@ -928,6 +924,7 @@ def test_send_failure_restores_compose():
         kc.Clock = real_clock
         kc.threading = real_kc_threading
 
+
 def test_restore_without_server_row_dials_default():
     """P11h: tay's import-stall receipt (0.36.24). A restored kit with no
     dialable server row parked the member on connect (hub blank, Connect
@@ -986,6 +983,7 @@ def test_restore_without_server_row_dials_default():
     started3 = app3._enter_restored_account()
     check("an invalid kit port parks with prefill instead of dialing",
           started3 is False and app3.deliveries == [], app3.deliveries)
+
 
 def main():
     for fn in (test_display_name_preserved,

@@ -45,7 +45,6 @@ def main():
     from kivy.lang import Builder
     from kivy.metrics import dp
     from kivy.uix.gridlayout import GridLayout
-    from kivy.uix.label import Label  # noqa: F401 - isinstance filter below
 
     Builder.load_file("kv_md.kv")
 
@@ -79,11 +78,7 @@ def main():
     check("embed_container is a direct child of the content box",
           ec in content_box.children)
 
-    # fold-18: the content node is MicronRefLabel again (pre-split shape,
-    # ref-capable); isinstance keeps the check's intent - the row's content
-    # text node lives in content_box - across the plain-label and the
-    # ref-converting shapes (exact-class match broke on the latter).
-    labels = [c for c in content_box.children if isinstance(c, Label)]
+    labels = [c for c in content_box.children if c.__class__.__name__ == "Label"]
     check("content label present in content box", len(labels) >= 1)
 
     row.width = dp(400)

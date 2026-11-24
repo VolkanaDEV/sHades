@@ -208,16 +208,11 @@ components:
     backgroundColor: "{colors.bg-input-focus}"
     textColor: "{colors.text}"
     size: 40px
-  site-nav-bar:
-    backgroundColor: "{colors.bg-input-focus}"
-    textColor: "{colors.text-dim}"
-    typography: "{typography.label}"
-    height: 40px
   input-bar:
     backgroundColor: "{colors.bg-raised}"
     textColor: "{colors.text}"
     typography: "{typography.body}"
-    height: 56px
+    height: 48px
   scrollbar:
     backgroundColor: "{colors.border-subtle}"
     rounded: "{rounded.pill}"
@@ -343,13 +338,6 @@ and verified at 4.5:1 or better (text) and 3:1 or better (UI boundaries).
 | `accent` | `#58D6C3` | live and presence state |
 | `border` | `#637A87` | field boundaries, 3.15:1 on focused input |
 | `border_subtle` | `#2A3B49` | dividers |
-| `aurora_a` | `#F4B75E`, alpha 0.22 | amber aurora orb |
-| `aurora_b` | `#59D6C4`, alpha 0.18 | teal aurora orb |
-| `aurora_c` | `#7F66F2`, alpha 0.20 | violet aurora orb |
-
-The aurora tokens are translucent by design (alpha 0.18–0.22): the config
-screen's hex fields carry no alpha, so saving a theme preserves each
-key's live alpha instead of resetting it to opaque (see `save_config`).
 
 These are the actual default values in `DEFAULT_THEME_COLORS`. A saved custom
 palette in `ui_config.json` continues to take precedence until the user
@@ -398,18 +386,11 @@ Two rules the codebase already learned the hard way:
 - A 56px header keeps **Channels** (canvas hamburger), the channel name,
   **People**, search, and profile visible. The channel and member drawers
   also open by edge swipe.
-- While a site page is on screen, a 40px nav bar sits under the header,
-  outside the page content: **Back** and **Forward** controls (40px tall,
-  amber when usable, dimmed when not) and the current page path as a
-  breadcrumb (`#channel /path`, `text_dim` 13px). It collapses to 0px on
-  chat channels. The in-page `< Back` link keeps working as well.
 - The left drawer combines a 64px server rail and a 220px channel list;
   the right drawer is up to 200px wide. Opening one closes the other.
   Each drawer caps its width on narrow windows. Choosing a channel closes
   the left drawer below 720px.
-- The 56px composer (grown from 48px to hold the 42px pfp) contains a
-  40px input that grows with multi-line text to a 160px cap, with the bar
-  growing to match it, and two 40px buttons.
+- The 48px composer contains a 40px capped input and two 40px buttons.
   Rows grow with message content and embeds; own posts use the raised
   `msg_own` fill and a 2px amber rail.
 - The connection screen scrolls vertically. Its form caps at 420px wide,
@@ -420,67 +401,6 @@ Two rules the codebase already learned the hard way:
   Presence uses the teal accent; the 11px metadata text is `text_dim`.
 - The Appearance screen generates fields from `THEME_KEYS`. A complete
   palette is saved as hex in `ui_config.json`; Reset restores these defaults.
-
-### Buttons
-
-One widget, `FancyMDButton` (`client_widgets.py`), carries every
-action button in the app. Hover swaps the background to the hover
-token, press runs the `tap dip` (`ui_fx.tap_feedback`), and disabled
-dims the whole button to 0.45 opacity — KivyMD's own disabled wash
-is only ~9% darker, so the widget dims explicitly instead of relying
-on it. Hover is a state, not motion, so it still applies under
-reduced motion while the press dip is skipped. Text colour lives on
-the `MDButtonText` child and is not owned by the widget. `danger`
-has no hover token in the spec, so hover keeps its base colour; a
-`danger-hover` token would be needed to change that (proposal, not
-added — see below).
-
-| Variant | Base | Hover | Pressed | Disabled |
-|---|---|---|---|---|
-| `primary` | `primary` (`#F5B75F`) | `primary-hover` (`#FFD090`) | tap dip (opacity 0.55, 0.06s + 0.28s return) | opacity 0.45 |
-| `accent` | `accent` (`#58D6C3`) | `accent-hover` (`#7CE5D5`) | tap dip | opacity 0.45 |
-| `secondary` | `bg-raised` (`panel`, `#111925`) | `bg-overlay` (`msg_own`, `#1B2C3A`) | tap dip | opacity 0.45 |
-| `danger` | `error` (`#FF6B6B`) | unchanged (no hover token) | tap dip | opacity 0.45 |
-| `ghost` | `bg-main` (`#0B1017`) | `bg-raised` (`panel`, `#111925`) | tap dip | opacity 0.45 |
-| `outlined` | transparent | faint `bg-overlay` tint (alpha 0.35) | tap dip | opacity 0.45 |
-
-`primary-hover`, `accent-hover` and `error` are not keys of
-`theme_colors` yet, so the widget falls back to the DESIGN.md hex
-values above whenever the theme lacks them; a missing key never
-raises. Proposal (not done here): add those three keys to
-`DEFAULT_THEME_COLORS` and to `THEME_KEYS`, so the Appearance
-screen can edit them and a custom theme can recolour hover and
-danger states. That is safe for existing saved themes —
-`_load_ui_config` only overwrites keys already in `theme_colors` —
-but it adds three config rows, so it is a separate change.
-
-## Motion
-
-One motion language across the app (`ui_fx.py` is the implementation;
-durations below are the spec). Only opacity moves for entrances, never
-position or size, so a reveal never shifts layout.
-
-| Token | Duration | Use |
-|---|---|---|
-| `screen fade` | 0.18s | every ScreenManager switch (connect, onboarding, main, profile, config, site editor, server config), `FadeTransition` |
-| `drawer slide` | 0.22s | both swipe drawers (channels, members) sliding 0 <-> open width, `out_quint` (`ui_fx.slide_property`) |
-| `popup fade` | 0.15s | every `Popup` opening, opacity 0 -> 1 (`ui_fx.popup_entrance`) |
-| `reveal` | 0.42s | messages, site pages and screen sections fading in (`ui_fx.reveal`) |
-| `stagger` | 0.45s each, 0.06s apart | lists revealing one row after another (`ui_fx.stagger`) |
-| `tap dip` | 0.06s down to 0.55 opacity + 0.28s back | press acknowledgement (`ui_fx.tap_feedback`) |
-
-Easing tokens: `EASE_OUT` (`out_quint`) for things arriving,
-`EASE_IN_OUT` (`in_out_cubic`) for things drifting,
-`EASE_SPRING` (`out_back`) for small playful settles.
-
-Reduced motion: when `ui_fx.set_reduced_motion(True)` is on, every effect
-lands in its final state instantly: the screen fade duration becomes 0,
-`reveal` sets opacity 1 at once, `tap_feedback` does nothing, the drawer
-slide lands at its open/closed width at once, the popup fade opens at
-opacity 1 at once, while the underlying switch or state change still
-happens exactly as before.
-The live ScreenManager is registered with `ui_fx` at build time so the
-flag retimes its transition without touching any screen-switch call site.
 
 ## Implementation checks
 

@@ -3,7 +3,7 @@
 import re
 
 
-REPLY_RE = re.compile(r"^[↳>] @([^\n·]{1,48}) · ([^\n]{1,160})\n\n", re.UNICODE)
+REPLY_RE = re.compile(r"^↳ @([^\n·]{1,48}) · ([^\n]{1,160})\n\n", re.UNICODE)
 
 
 def link_state(active, hops=None):
@@ -38,7 +38,7 @@ def reply_wire(username, excerpt, body):
     """Readable on older clients; new clients display the prefix as a card."""
     name = re.sub(r"[\n\r·]", " ", username or "user").strip()[:48]
     snippet = re.sub(r"\s+", " ", excerpt or "").strip()[:160]
-    return "> @%s · %s\n\n%s" % (name, snippet, body)
+    return "↳ @%s · %s\n\n%s" % (name, snippet, body)
 
 
 def split_reply(content):

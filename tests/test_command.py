@@ -37,10 +37,6 @@ sHades.db.execute("INSERT INTO users (dest_hash, username, registered_at) VALUES
                   (MOD, "boss", sHades.now()))
 sHades.db.commit()
 sHades.MODERATORS.add(MOD)
-# hard channel delete is ADMIN-only (U5 tightening): the slash-path test
-# identity must hold an Admin role, not just legacy moderator status
-_admin_role = sHades._ensure_role("Admin", sHades.PERM_ALL, position=100)
-sHades._assign_role(MOD, _admin_role)
 
 other = RNS.Identity()
 OTHER = sHades.hexstr(RNS.Destination(other, RNS.Destination.OUT,

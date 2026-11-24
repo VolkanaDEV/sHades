@@ -23,6 +23,7 @@ import tempfile
 import threading
 import random
 from collections import OrderedDict
+import mimetypes
 from PIL import Image as PILImage
 from PIL import ImageDraw as PILImageDraw
 from PIL import ImageChops as PILImageChops
@@ -30,11 +31,6 @@ from PIL import ImageChops as PILImageChops
 from ui_scale import scaled
 from mesh_ui import grouped_with, link_state, reply_wire, split_reply
 from ui_theme import preset_colors
-from client_util import (  # noqa: F401  (rgba_to_hex: kc.* tests)
-    ATT_EPHEMERAL, ATT_SERVER, _escape, dlog, hex_to_rgba, hexstr,
-    md_to_kivy, now, parse_slash_help, rgba_to_hex,
-)
-import client_util
 
 # ---------------------------------------------------------------------------
 # P11 version bridge: the running build knows its own version.
@@ -83,10 +79,10 @@ try:
     from kivy.uix.boxlayout import BoxLayout
     from kivy.uix.floatlayout import FloatLayout
     from kivy.uix.label import Label
-    from kivy.uix.image import Image
+    from kivy.uix.image import Image, AsyncImage
     from kivy.uix.scrollview import ScrollView
     from kivy.uix.gridlayout import GridLayout
-    from kivy.uix.screenmanager import ScreenManager, Screen, FadeTransition
+    from kivy.uix.screenmanager import ScreenManager, Screen
     from kivy.core.window import Window
     from kivy.clock import Clock
     from kivy.properties import (
@@ -97,10 +93,11 @@ try:
     from kivy.uix.filechooser import FileChooserListView
     from kivy.uix.popup import Popup
     from kivy.uix.button import Button
+    from kivy.uix.textinput import TextInput
     from kivy.uix.widget import Widget
-    from kivy.graphics import (Color, Ellipse, Line, Rectangle,
-                               StencilPop, StencilPush, StencilUnUse,
-                               StencilUse)
+    from kivy.uix.slider import Slider
+    from kivy.graphics import Color, Ellipse, Line, Rectangle, \
+        RoundedRectangle
     from kivy.metrics import dp, sp
     KIVY = True
 except Exception as _e:  # pragma: no cover - Kivy missing at import time
@@ -247,7 +244,111 @@ def _boot_hide():
     _boot_label["ref"] = None
 
 
+class _AudioAttachRow(BoxLayout):
+    """Embedded audio attachment row (tay, v0.30): play/pause/stop,
+    download and volume controls around the sound itself, rendered inside
+    the message bubble. Playback delegates to the app's _play_audio():
+    Android MediaPlayer when on device, kivy SoundLoader on desktop
+    (desktop pause is stop-then-restart; the mixer backend has no pause)."""
+
+    def __init__(self, path="", name="", size=0, player=None, **kw):
+        super().__init__(orientation="horizontal", size_hint_y=None,
+                         height=dp(40), spacing=dp(6), **kw)
+        self._path = path
+        self._player = player
+        self._playing = False
+        self._paused = False
+        short = (name or "audio")[:28]
+        self.add_widget(Label(
+            text="[audio] %s (%d KB)" % (short, size // 1024),
+            size_hint_x=1, font_size=sp(12), color=(0.7, 0.73, 0.77, 1)))
+        self.btn_play = Button(text="play", size_hint_x=None, width=dp(56),
+                               font_size=sp(11))
+        self.btn_play.bind(on_release=self._toggle)
+        self.add_widget(self.btn_play)
+        self.btn_stop = Button(text="stop", size_hint_x=None, width=dp(48),
+                               font_size=sp(11))
+        self.btn_stop.bind(on_release=self._stop)
+        self.add_widget(self.btn_stop)
+        self.btn_save = Button(text="save", size_hint_x=None, width=dp(52),
+                               font_size=sp(11))
+        self.btn_save.bind(on_release=self._report)
+        self.add_widget(self.btn_save)
+        self.vol = Slider(min=0, max=1, value=0.8, size_hint_x=None,
+                          width=dp(80))
+        self.vol.bind(value=self._volume)
+        self.add_widget(self.vol)
+
+    def _toggle(self, w=None):
+        p = self._player
+        if not p:
+            return
+        mp = getattr(p, "_audio_media", None)
+        if self._playing and mp is not None:
+            try:
+                if hasattr(mp, "pause"):
+                    mp.pause()
+                    self._paused = True
+                else:
+                    mp.stop()
+                    p._audio_media = None
+                    self._playing = False
+            except Exception:
+                pass
+            self.btn_play.text = "play"
+        elif self._paused and mp is not None:
+            try:
+                mp.start()
+                self._playing = True
+                self._paused = False
+            except Exception:
+                pass
+            self.btn_play.text = "pause"
+        else:
+            if p._play_audio(self._path) is not None:
+                self._playing = True
+                self._paused = False
+                self.btn_play.text = "pause"
+
+    def _stop(self, w=None):
+        p = self._player
+        self._playing = False
+        self._paused = False
+        if p:
+            mp = getattr(p, "_audio_media", None)
+            if mp is not None:
+                try:
+                    mp.stop()
+                    rel = getattr(mp, "release", None)
+                    if rel:
+                        rel()
+                except Exception:
+                    pass
+                p._audio_media = None
+        self.btn_play.text = "play"
+
+    def _report(self, w=None):
+        p = self._player
+        if p:
+            p._set_status("audio in app storage: %s"
+                          % os.path.basename(self._path or "attachment"))
+
+    def _volume(self, w=None, v=0.8):
+        p = self._player
+        mp = getattr(p, "_audio_media", None) if p else None
+        if mp is None:
+            return
+        try:
+            if hasattr(mp, "setVolume"):
+                mp.setVolume(float(v), float(v))
+            elif hasattr(mp, "volume"):
+                mp.volume = float(v)
+        except Exception:
+            pass
+
+
 import RNS  # noqa: E402  (after the guarded kivy/diagnostics block, by design)
+from RNS.vendor import umsgpack as msgpack  # noqa: E402
 import invite  # noqa: E402
 import dms  # noqa: E402
 import recovery  # noqa: E402
@@ -255,26 +356,8 @@ import qr_tools  # noqa: E402
 import offline_store  # noqa: E402
 import profile_card  # noqa: E402
 import ui_geom  # noqa: E402
-from guild_api import GuildAPI, BOT_PERM_BITS  # noqa: E402
-from client_widgets import (  # noqa: E402, F401
-    _AudioAttachRow, ImageCache, ContextMenuMixin, ContextMenuOverlay,
-    MeshPulse, MeshConstellation, SkeletonRow, FancyMDButton,
-    ClickableLabel, ChannelButton, _app_data_dir, cache_dir,
-    blircle, BlircleTextInput,
-)  # noqa: E402, F401
-# Blircle kit: tay 2026-11-23 -- every input box is a blircle; the local
-# name TextInput keeps all call sites untouched (defined after the
-# client_widgets import so the class exists).
-TextInput = BlircleTextInput
-from app_channels import ChannelsMixin  # noqa: E402
-from app_settings import SettingsMixin  # noqa: E402
-from app_site import SiteMixin  # noqa: E402
-from app_stream import StreamMixin  # noqa: E402
-from app_voice_panel import VoicePanelMixin  # noqa: E402
-from app_menus import MenusMixin  # noqa: E402
-from app_attachments import AttachmentsMixin  # noqa: E402
-if KIVY:
-    from app_site import MessageEmbed  # noqa: E402, F401
+from micron import (micron_parse, micron_page_bg, micron_media_target,  # noqa: E402
+                    runs_to_markup)
 
 # TEMP boot diagnostics: the absence of this line in sHades_boot.log
 # pins a crash INSIDE the import chain above (RNS / LXMF / micron...).
@@ -283,14 +366,14 @@ if BOOT_DEBUG and _kv_mod is not None:
     _boot_file("kivy_client module imported ok (KIVY=%s KIVYMD=%s) "
                "kivy=%s" % (KIVY, KIVYMD, _kv_mod.__version__))
 
+# Attachment storage styles:
+#   server   - file is stored on the guild; bytes re-fetched via /file/attachments
+#              path (survives restart, shown with a loading placeholder until received).
+#   ephemeral - file is sent inline as [name, mime, blob] (p2p); bytes kept locally
+#              so they survive restart, but there is no server copy to re-fetch.
+ATT_SERVER = "server"
+ATT_EPHEMERAL = "ephemeral"
 ATT_PLACEHOLDER_TEXT = "[loading image…]"
-
-# G3 (UIX P3-4): guard the KV load. build() is called by app.run(),
-# but test harnesses also call it directly; loading kv_md.kv twice
-# makes Kivy warn "loaded multiples times" and re-declare every class.
-# The flag makes a second build() a no-op for the KV load only.
-_KV_LOADED = False
-
 
 # Default UI palette — the single source of truth for theme colors. The app
 # seeds theme_colors from this, the config screen's Reset restores it, and
@@ -348,9 +431,6 @@ THEME_LABELS = {
     "btn_text": "Button text",
     "border": "Borders / outlines",
     "border_subtle": "Dividers",
-    "aurora_a": "Aurora amber",
-    "aurora_b": "Aurora teal",
-    "aurora_c": "Aurora violet",
 }
 
 DEBUG = False  # set via --debug CLI arg; enables verbose attachment/ingest logging
@@ -379,6 +459,15 @@ DEFAULT_HUB_ADDRESS = "%s:%d" % (DEFAULT_HUB_HOST, DEFAULT_HUB_PORT)
 DEFAULT_GUILD_NODE_HASH = ""
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def hexstr(b):
+    if isinstance(b, str):
+        return b
+    return RNS.hexrep(b, delimit=False)
+
+
 def default_username(user_hash):
     """A unique fallback display name for a user who has not chosen one.
 
@@ -397,42 +486,60 @@ def default_username(user_hash):
     return "user-" + str(user_hash)[:6]
 
 
-def _free_client_port(preferred=29222):
-    """Pick a free TCP listen port for the client's RNS server interface.
+def now():
+    return time.time()
 
-    H1: the client used to hardcode 29222; if another process held it,
-    RNS's bind raised inside Reticulum.__init__, which calls
-    RNS.panic() = os._exit(255) -- the app vanished with no error and
-    no chance for the caller's try/except to run. Probe-bind the
-    preferred port first; on EADDRINUSE walk upward (29222+N), and
-    fall back to an OS-assigned port (bind 0) if the whole range is
-    busy. A tiny TOCTOU gap remains (the port could be taken between
-    the probe and RNS's bind) but the common case -- a second client
-    instance, or a stale holder -- is covered.
+
+def cache_dir():
+    d = os.path.join(_app_data_dir(), "cache")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def cached_path(key):
+    return os.path.join(cache_dir(), hashlib.sha256(key.encode()).hexdigest()[:32])
+
+
+def parse_slash_help(text):
+    """Parse the hub dispatcher's /help output into (cmd, usage) rows.
+
+    Lines look like "  msg <channel> <text>   post <text> to..." —
+    the first token after the indent is the command, the remainder
+    (with run-length whitespace collapsed) is the usage string. The
+    "commands:" header and empty lines are dropped. This must track
+    sHades.py's help table by construction: the palette is the
+    discovery surface for bot & script integration.
     """
-    import socket
+    rows = []
+    if not text:
+        return rows
+    for raw in str(text).splitlines():
+        if not raw.startswith("  "):
+            continue  # the dispatcher's table is indented exactly two
+        line = raw.strip()
+        if not line or line == "commands:":
+            continue
+        parts = line.split(None, 1)
+        cmd = parts[0]
+        usage = re.sub(r"\s+", " ", parts[1].strip()) if len(parts) > 1 else ""
+        if cmd in ("help", "?"):
+            usage = "this list"
+        rows.append(("/" + cmd, usage))
+    return rows
 
-    def _try(port):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            s.bind(("0.0.0.0", port))
-            return True
-        except OSError:
-            return False
-        finally:
-            s.close()
 
-    if _try(preferred):
-        return preferred
-    for port in range(preferred + 1, preferred + 100):
-        if _try(port):
-            return port
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def _app_data_dir():
+    """Cross-platform writable app data directory.
+
+    On Android (p4a) uses the app's internal storage directory so scoped
+    storage (Android 10+) doesn't block writes. On desktop falls back to
+    ~/.sHades_client.
+    """
     try:
-        s.bind(("0.0.0.0", 0))
-        return s.getsockname()[1]
-    finally:
-        s.close()
+        from android.storage import app_storage_path  # p4a only, no-op on desktop
+        return app_storage_path()
+    except Exception:
+        return os.path.join(os.path.expanduser("~"), ".sHades_client")
 
 
 def _app_dir():
@@ -474,126 +581,747 @@ def _register_ui_fonts():
                        fn_regular=os.path.join(fonts, "Phosphor.ttf"))
 
 
+def rgba_to_hex(rgba):
+    return "#%02x%02x%02x" % (
+        int(max(0, min(1, rgba[0])) * 255),
+        int(max(0, min(1, rgba[1])) * 255),
+        int(max(0, min(1, rgba[2])) * 255),
+    )
+
+
+def hex_to_rgba(text):
+    text = (text or "").lstrip("#").strip()
+    if len(text) != 6 or any(c not in "0123456789abcdefABCDEF" for c in text):
+        raise ValueError("bad hex color: %r" % text)
+    return (
+        int(text[0:2], 16) / 255.0,
+        int(text[2:4], 16) / 255.0,
+        int(text[4:6], 16) / 255.0,
+        1.0,
+    )
+
+
 # ---------------------------------------------------------------------------
-# API client over RNS link — GuildAPI lives in guild_api.py now
-# (imported above; re-exported here so kc.GuildAPI keeps working).
+# Markdown -> Kivy markup (NomadNet subset, mirrored with the guild renderer)
 # ---------------------------------------------------------------------------
+# The guild translates this same message-markdown subset to Micron
+# (sHades.md_to_micron_line); the client renders it to Kivy markup instead.
+# Subset: **bold**, *italic*, __underline__, `code`, [label](target).
+# Links are inert text — there is no HTTP on Reticulum, and micron link
+# targets (node hashes, /page/... paths) are not browsable from the Kivy
+# client — so no clickable hyperlinks are ever created.
+_MD = re.compile(
+    r"`(?P<code>[^`\n]{1,120})`"
+    r"|\*\*(?P<bold>[^*\n]{1,200})\*\*"
+    r"|__(?P<under>[^_\n]{1,200})__"
+    r"|\[(?P<label>[^\]\n]{1,128})\]\((?P<target>[^)\s]{1,256})\)"
+    r"|\*(?P<i>[^*\n]{1,200})\*"
+)
+
+
+def md_to_kivy(text):
+    """Convert the NomadNet message-markdown subset to Kivy markup."""
+    if not text:
+        return ""
+    out = []
+    pos = 0
+    for m in _MD.finditer(text):
+        out.append(_escape(text[pos:m.start()]))
+        if m.group("code") is not None:
+            out.append("[color=#BFBFBF]" + _escape(m.group("code")) + "[/color]")
+        elif m.group("bold") is not None:
+            out.append("[b]" + _escape(m.group("bold")) + "[/b]")
+        elif m.group("under") is not None:
+            out.append("[u]" + _escape(m.group("under")) + "[/u]")
+        elif m.group("label") is not None:
+            out.append(_escape(m.group("label")) + " (" + _escape(m.group("target")) + ")")
+        elif m.group("i") is not None:
+            out.append("[i]" + _escape(m.group("i")) + "[/i]")
+        pos = m.end()
+    out.append(_escape(text[pos:]))
+    return "".join(out)
+
+
+def _escape(s):
+    s = s.replace("&", "&" + "amp;")
+    s = s.replace("[", "&bl;")
+    s = s.replace("]", "&br;")
+    return s
+
+
+def dlog(msg):
+    """Debug log — only prints when --debug is passed."""
+    if DEBUG:
+        print(f"[DEBUG] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# API client over RNS link
+# ---------------------------------------------------------------------------
+class GuildAPI:
+    """Thin wrapper around an RNS Link to the sHades guild node."""
+
+    def __init__(self, reticulum, link, on_error=None, on_dead=None):
+        self.reticulum = reticulum
+        self.link = link
+        self.on_error = on_error or (lambda *a: None)
+        # v0.31.2 link self-heal: called when a request lands on a link
+        # that is no longer ACTIVE (or raises) -- the app re-establishes
+        # and re-primes in one place instead of dying until restart.
+        self.on_dead = on_dead or (lambda *a: None)
+
+    def _check_dead(self):
+        st = getattr(self.link, "status", None)
+        if st is not None and st != RNS.Link.ACTIVE:
+            try:
+                self.on_dead(st)
+            except Exception:
+                pass
+            return True
+        return False
+
+    def _request(self, path, data, timeout=10):
+        if not isinstance(data, dict):
+            data = {}
+        if self._check_dead():
+            return {"ok": 0, "error": "link dead"}
+        try:
+            receipt = self.link.request(path, data=data)
+        except Exception as e:
+            print("request on link failed: %r" % (e,))
+            try:
+                self.on_dead("raise")
+            except Exception:
+                pass
+            return {"ok": 0, "error": "link dead"}
+        # link.request() may return a Receipt object (with .response) or
+        # True/False (bool) depending on RNS version. Handle both.
+        if isinstance(receipt, bool):
+            if not receipt:
+                return {"ok": 0, "error": "request failed"}
+            # v0.26: the old fallback RE-ISSUED the same call with empty
+            # data "to poll for a response" -- which double-sent posts
+            # and re-ran side-effecting calls (register, avatar). A bool
+            # receipt carries nothing pollable; report unconfirmed and
+            # let the caller decide.
+            return {"ok": 1, "unconfirmed": True}
+        deadline = time.time() + timeout
+        while (hasattr(receipt, "response")
+               and receipt.response is None
+               and time.time() < deadline):
+            time.sleep(0.05)
+        if not hasattr(receipt, "response") or receipt.response is None:
+            return {"ok": 0, "error": "timeout"}
+        try:
+            return msgpack.unpackb(receipt.response, raw=False)
+        except Exception as e:
+            return {"ok": 0, "error": "bad response: %s" % e}
+
+    def state(self, channel):
+        return self._request("/api/state", {"channel": channel})
+
+    def messages(self, channel, since_id=None, since_ts=None, before=None, limit=50):
+        data = {"channel": channel, "limit": limit}
+        if since_id is not None:
+            data["since_id"] = since_id
+        if since_ts is not None:
+            data["since_ts"] = since_ts
+        if before is not None:
+            data["before"] = before
+        return self._request("/api/messages", data)
+
+    def post(self, channel, content, attachments=None):
+        data = {"channel": channel, "content": content}
+        if attachments:
+            data["attachments"] = attachments
+        return self._request("/api/post", data)
+
+    def edit(self, msg_id, content):
+        return self._request("/api/edit", {"msg": msg_id, "content": content})
+
+    def delete(self, msg_id):
+        return self._request("/api/delete", {"msg": msg_id})
+
+    def register_node(self, node_hash):
+        """Register this client's node destination hash with the guild index.
+
+        v0.29: a ONE-SHOT directory write at connect (and on reconnect).
+        Presence is not this call any more: the guild derives presence from
+        link liveness (RNS keepalives and teardowns), so the client holds no
+        heartbeat of its own. RNS is cryptographically addressed — members
+        reach a node by its destination hash (Identity.recall + RNS.Link),
+        never by ip:port, so address/port left the protocol. No identity is
+        asserted in the payload — the guild derives the user hash from the
+        identity this link was identified with, so it cannot be forged.
+        """
+        return self._request("/api/register_node", {"node_hash": node_hash})
+
+    def lookup_node(self, node_hash):
+        return self._request("/api/lookup_node", {"node_hash": node_hash})
+
+    def register(self, username, profile_node=""):
+        return self._request("/api/register",
+                             {"username": username, "profile_node": profile_node})
+
+    def avatar_upload(self, blob, timeout=30):
+        # v0.26: timeout raised from 10s -- the avatar payload moves as
+        # an RNS resource transfer and slower links need the headroom.
+        return self._request("/api/avatar", {"avatar": blob}, timeout=timeout)
+
+    def avatar_get(self, user_hash):
+        return self._request("/api/avatar_get", {"user": user_hash})
+
+    def nodes(self):
+        """Fetch the current active node registry from the guild."""
+        return self._request("/api/nodes", {})
+
+    def presence(self):
+        """Fetch the active user list — who is currently pinging the guild.
+
+        Stale clients are absent from the response, not flagged, so a caller
+        that mirrors this list is pruned automatically.
+        """
+        return self._request("/api/presence", {})
+
+    # ---- JSON API v1 (json bytes over the same RNS link; no HTTP anywhere) ----
+
+    def _request_json(self, path, data, timeout=10.0):
+        payload = json.dumps(data if data is not None else {}).encode("utf-8")
+        if self._check_dead():
+            return {"ok": 0, "error": "link dead"}
+        try:
+            receipt = self.link.request(path, data=payload)
+        except Exception as e:
+            print("json request on link failed: %r" % (e,))
+            try:
+                self.on_dead("raise")
+            except Exception:
+                pass
+            return {"ok": 0, "error": "link dead"}
+        # link.request() may return a Receipt object or True/False depending
+        # on the RNS version (see _request). Re-issue with the SAME payload.
+        if isinstance(receipt, bool):
+            if not receipt:
+                return {"ok": 0, "error": "request failed"}
+            receipt = self.link.request(path, data=payload)
+        deadline = time.time() + timeout
+        while (hasattr(receipt, "response")
+               and receipt.response is None
+               and time.time() < deadline):
+            time.sleep(0.05)
+        if not hasattr(receipt, "response") or receipt.response is None:
+            # v0.31.1 diag: a deadline without a response means different
+            # things -- "the wire transfer died" (receipt concluded FAILED)
+            # vs "still moving, we gave up early" (receipt unsettled; the
+            # resource outlives us client-side and RNS's watchdog owns
+            # it). Distinguish, do not guess.
+            try:
+                st = getattr(receipt, "status", None)
+                if st is not None:
+                    return {"ok": 0, "error": "timeout",
+                            "receipt_state": str(st)}
+            except Exception:
+                pass
+            return {"ok": 0, "error": "timeout"}
+        try:
+            return json.loads(receipt.response.decode("utf-8"))
+        except Exception as e:
+            return {"ok": 0, "error": "bad response: %s" % e}
+
+    def channels_list(self):
+        return self._request_json("/api/v1/channels/list", {})
+
+    def channels_create(self, name, kind="chat", manifest=None):
+        data = {"name": name, "kind": kind}
+        if manifest is not None:
+            data["manifest"] = manifest
+        return self._request_json("/api/v1/channels/create", data)
+
+    def channels_reorder(self, order):
+        return self._request_json("/api/v1/channels/reorder",
+                                  {"order": order})
+
+    def channels_info(self, channel):
+        return self._request_json("/api/v1/channels/info", {"channel": channel})
+
+    def stream_subscribe(self, channel, cursor=None):
+        data = {"channel": channel}
+        if cursor is not None:
+            data["cursor"] = cursor
+        return self._request_json("/api/v1/stream/subscribe", data)
+
+    def stream_poll(self, cursor=None, timeout_s=4.0):
+        data = {"timeout_s": timeout_s}
+        if cursor is not None:
+            data["cursor"] = cursor
+        # server may hold the poll for timeout_s; allow RTT on top
+        return self._request_json("/api/v1/stream/poll", data, timeout=timeout_s + 8)
+
+    def stream_unsubscribe(self):
+        return self._request_json("/api/v1/stream/unsubscribe", {})
+
+    def typing(self, channel, active=True):
+        return self._request_json("/api/v1/typing",
+                                  {"channel": channel, "active": bool(active)})
+
+    def presence_v1(self):
+        """Active users plus the channel each one is streaming."""
+        return self._request_json("/api/v1/presence", {})
+
+    def blobs_put(self, name, mime, data, on_progress=None):
+        """Upload one content-addressed blob (v1). Returns
+        {ok, blob_id, size, path} — reference blob_id from post_v1.
+
+        Chunked automatically (v0.29-c, tay: "The payload should be maximum
+        of 10mb & automatically chunked, not timer based"): init -> byte-
+        offset slices -> finish, the loop driven by each ack's next_offset.
+        Retries rewrite the same offset, so they cannot corrupt the stream.
+        Payloads above the limit fail fast with a named error.
+
+        v0.32 mobile receipts: uploads timed out on the phone while the
+        identical code sat fine on desktop (receipt: tay, "Neither one
+        works"). The chunk deadline now matches the download doctrine
+        (15s), and a receipt timeout shrinks the chunk and resumes from
+        the last acked offset -- the server stores offset-addressed bytes
+        (seek+write), so resuming rewrites bytes it already has instead of
+        corrupting anything. Bounded: six shrink steps, then up to three
+        retries at the floor; an aged-out staged handle re-inits once."""
+        size = len(data)
+        if size > 10 * 1024 * 1024:
+            return {"ok": 0, "error": "payload too large: limit is 10 MB",
+                    "size": size}
+        res = self._request_json("/api/v1/blobs/put/init",
+                                 {"name": name, "mime": mime, "size": size},
+                                 timeout=15)
+        if not res.get("ok"):
+            res.setdefault("phase", "init")
+            return res
+        upload_id = res["upload_id"]
+        step = int(res.get("chunk_size") or (256 * 1024))
+        offset = 0
+        fails = 0
+        restarted = False
+        while offset < size:
+            piece = data[offset:offset + step]
+            body = {
+                "upload_id": upload_id, "offset": offset,
+                "data_b64": base64.b64encode(piece).decode("ascii"),
+            }
+            if on_progress:
+                on_progress(offset, size)
+            res = self._request_json("/api/v1/blobs/put/chunk", body,
+                                     timeout=15)
+            if not res.get("ok"):
+                err = res.get("error", "chunk failed")
+                # the staged handle aged out mid-upload (600s idle law):
+                # one deterministic restart, offsets driven anew
+                if err == "unknown upload_id" and not restarted:
+                    restarted = True
+                    res2 = self._request_json(
+                        "/api/v1/blobs/put/init",
+                        {"name": name, "mime": mime, "size": size},
+                        timeout=15)
+                    if res2.get("ok"):
+                        upload_id = res2["upload_id"]
+                        continue
+                # receipt timeout on a slow/high-RTT pipe: shrink the chunk
+                # and resume from the last acked offset (bounded)
+                if err == "timeout" and fails < 6 and step > 32 * 1024:
+                    fails += 1
+                    step = max(32 * 1024, step // 2)
+                    res["phase"] = "chunk@%d/%d" % (offset, step)
+                    continue
+                if err == "timeout" and fails < 3:
+                    fails += 1
+                    continue
+                print("blobs_put FAIL off=%s step=%s err=%s state=%s"
+                      % (offset, step, err, res.get("receipt_state")))
+                res.setdefault("error", err or "chunk failed")
+                res["phase"] = "chunk@%d" % offset
+                return res
+            fails = 0
+            offset = int(res.get("next_offset") or (offset + len(piece)))
+        res = self._request_json("/api/v1/blobs/put/finish",
+                                 {"upload_id": upload_id}, timeout=15)
+        if not res.get("ok"):
+            res.setdefault("error", "finish failed")
+            res["phase"] = "finish"
+        elif on_progress:
+            on_progress(size, size)
+        return res
+
+    def post_v1(self, channel, content, attachments=None):
+        """JSON chat post; attachments are [{blob_id, name?, mime?}] refs or
+        inline {name, mime, data_b64} dicts."""
+        data = {"channel": channel, "content": content}
+        if attachments:
+            data["attachments"] = attachments
+        return self._request_json("/api/v1/post", data, timeout=30)
+
+    def blobs_get(self, blob_id, offset=0, length=None):
+        """Chunked blob read; returns {data_b64, total, offset, eof}."""
+        data = {"blob_id": blob_id, "offset": offset}
+        if length is not None:
+            data["len"] = length
+        return self._request_json("/api/v1/blobs/get", data)
+
+    def att_get(self, path, offset=0, length=None):
+        """Chunked attachment read (v0.31). Returns {data_b64, total,
+        offset, eof} for a /file/attachments/... path — the same slice
+        machinery as blobs_get, keyed by the path the server puts in
+        message metadata."""
+        data = {"path": path, "offset": offset}
+        if length is not None:
+            data["len"] = length
+        return self._request_json("/api/v1/att/get", data, timeout=15)
+
+    def site_get(self, channel, path, offset=0, length=None):
+        """Chunked site resource read (micron pages, images, media)."""
+        data = {"channel": channel, "path": path, "offset": offset}
+        if length is not None:
+            data["len"] = length
+        return self._request_json("/api/v1/site/get", data)
+
+    def site_put(self, channel, path, data_b64, mime=None):
+        """Store one site resource (P7b: moderator or channel SITE_EDIT)."""
+        data = {"channel": channel, "path": path, "data_b64": data_b64}
+        if mime:
+            data["mime"] = mime
+        return self._request_json("/api/v1/site/put", data, timeout=15)
+
+    def site_manifest(self, channel):
+        return self._request_json("/api/v1/site/manifest", {"channel": channel})
+
+    def term_open(self, channel):
+        """Open a guild console session on a term channel."""
+        return self._request_json("/api/v1/term/open", {"channel": channel},
+                                  timeout=15)
+
+    def term_data(self, session, text):
+        """Feed one line (or fragment) of console input."""
+        return self._request_json("/api/v1/term/data", {
+            "session": session,
+            "data_b64": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+        })
+
+    def term_close(self, session, timeout=10.0):
+        return self._request_json("/api/v1/term/close",
+                                  {"session": session}, timeout=timeout)
+
+    def receipts(self, channel, msg_id=None):
+        """Read watermark: mark up to msg_id, or report {last_read_id, unread}."""
+        data = {"channel": channel}
+        if msg_id:
+            data["msg_id"] = msg_id
+        return self._request_json("/api/v1/receipts", data)
+
+    def react(self, msg_id, emoji):
+        """Toggle a reaction (ASCII shortcode)."""
+        return self._request_json("/api/v1/react",
+                                  {"msg": msg_id, "emoji": emoji})
+
+    def search(self, q, channel=None, limit=None):
+        data = {"q": q}
+        if channel:
+            data["channel"] = channel
+        if limit:
+            data["limit"] = limit
+        return self._request_json("/api/v1/search", data)
+
+    def whoami(self):
+        return self._request_json("/api/v1/whoami", {})
+
+    def mod_ban(self, user_hash, reason=""):
+        return self._request_json("/api/v1/mod/ban",
+                                  {"user": user_hash, "reason": reason})
+
+    def mod_unban(self, user_hash):
+        return self._request_json("/api/v1/mod/unban", {"user": user_hash})
+
+    def mod_mute(self, user_hash, reason=""):
+        return self._request_json("/api/v1/mod/mute",
+                                  {"user": user_hash, "reason": reason})
+
+    def mod_unmute(self, user_hash):
+        return self._request_json("/api/v1/mod/unmute", {"user": user_hash})
+
+    def channels_delete(self, channel):
+        return self._request_json("/api/v1/channels/delete", {"channel": channel})
+
+    def command(self, line):
+        """Slash-command passthrough: runs the shared console dispatcher,
+        returns the output ephemerally."""
+        return self._request_json("/api/v1/command", {"input": line})
+
+    # ---- roles (U5) ----
+    def roles_list(self):
+        return self._request_json("/api/v1/roles/list", {})
+
+    def roles_create(self, name, perms=0, color=None, position=0):
+        return self._request_json("/api/v1/roles/create",
+                                  {"name": name, "perms": perms,
+                                   "color": color, "position": position})
+
+    def roles_delete(self, role_id):
+        return self._request_json("/api/v1/roles/delete", {"role_id": role_id})
+
+    def roles_assign(self, role_id, user):
+        return self._request_json("/api/v1/roles/assign",
+                                  {"role_id": role_id, "user": user})
+
+    def roles_unassign(self, role_id, user):
+        return self._request_json("/api/v1/roles/unassign",
+                                  {"role_id": role_id, "user": user})
+
+    # ---- admin panel (U8) ----
+    def admin_config(self, key=None, value=None):
+        data = {}
+        if key is not None:
+            data["key"] = key
+        if value is not None:
+            data["value"] = value
+        return self._request_json("/api/v1/admin/config", data)
+
+    def admin_audit(self, limit=100):
+        return self._request_json("/api/v1/admin/audit", {"limit": limit})
+
+    def update_status(self, timeout=10):
+        """P11 chain 5 tail: the updater's verdict + channel + peer pin,
+        admin-only read (the General tab's status line consumes this)."""
+        return self._request_json("/api/v1/update_status", {},
+                                  timeout=timeout)
+
+    def member_moderation(self, limit=50):
+        return self._request_json("/api/v1/moderation/public", {"limit": limit})
+
+    def message_edits(self, msg_id):
+        return self._request_json("/api/v1/messages/edits", {"msg": msg_id})
+
+    def account_export(self, after=0, limit=100):
+        return self._request_json("/api/v1/account/export",
+                                  {"after": after, "limit": limit})
+
+    def account_delete_posts(self):
+        return self._request_json("/api/v1/account/delete-posts",
+                                  {"confirm": "DELETE MY POSTS"})
+
+    def account_leave(self):
+        return self._request_json("/api/v1/account/leave",
+                                  {"confirm": "LEAVE GUILD"})
+
+    def catchup(self):
+        return self._request_json("/api/v1/catchup", {})
+
+    def admin_mods(self, op="list", user=None):
+        data = {"op": op}
+        if user:
+            data["user"] = user
+        return self._request_json("/api/v1/admin/mods", data)
+
+    # ---- join gate (U6b) ----
+    def join(self, code=None):
+        """Join status (no code) or join with an invite code."""
+        data = {}
+        if code:
+            data["code"] = code
+        return self._request_json("/api/v1/join", data)
+
+    def invites(self, op="list", code=None, label=None, max_uses=None,
+                expires_in=None, channel=None):
+        data = {"op": op}
+        if code:
+            data["code"] = code
+        if label is not None:
+            data["label"] = label
+        if max_uses is not None:
+            data["max_uses"] = max_uses
+        if expires_in is not None:
+            data["expires_in"] = expires_in
+        if channel:
+            data["channel"] = channel
+        return self._request_json("/api/v1/invites", data)
+
+    def fetch_file(self, path):
+        """Fetch raw bytes from a /file/... request handler on the guild."""
+        dlog(f"fetch_file: requesting {path}")
+        receipt = self.link.request(path, data={})
+        # link.request() may return a Receipt object (with .response) or
+        # True/False (bool) depending on RNS version. Handle both.
+        if isinstance(receipt, bool):
+            if not receipt:
+                dlog(f"fetch_file: link.request returned False for {path}")
+                return None
+            receipt = self.link.request(path, data={})
+        deadline = time.time() + 15
+        while receipt.response is None and time.time() < deadline:
+            time.sleep(0.05)
+        if receipt.response is None:
+            dlog(f"fetch_file: timeout for {path}")
+            return None
+        dlog(f"fetch_file: received {len(receipt.response)} bytes for {path}")
+        return receipt.response
+
+
+# ---------------------------------------------------------------------------
+# Image cache (pfps + attachments)
+# ---------------------------------------------------------------------------
+class ImageCache:
+    def __init__(self):
+        self._paths = {}   # key -> cached file path
+        self._loading = set()
+
+    def get(self, key):
+        return self._paths.get(key)
+
+    def begin_load(self, key):
+        """Claim the right to fetch `key`. False if it is already cached or
+        an in-flight fetch owns it -- that is what keeps a history of many
+        messages from one author from issuing one avatar request each."""
+        if key in self._paths or key in self._loading:
+            return False
+        self._loading.add(key)
+        return True
+
+    def end_load(self, key):
+        """Release a claim taken by begin_load. Call this even when the
+        fetch failed, or the key stays blocked forever."""
+        self._loading.discard(key)
+
+    def set_bytes(self, key, data, ext="png"):
+        try:
+            # Keys are "av:<hash>"; ':' is illegal in a Windows filename,
+            # so hash the key instead of using it verbatim.
+            fpath = cached_path(key) + "." + ext
+            with open(fpath, "wb") as f:
+                f.write(data)
+            self._paths[key] = fpath
+            return fpath
+        except Exception as e:
+            print("image cache error:", e)
+            return None
+
+    def forget(self, key):
+        """Drop one cache entry and its file (P1 account purge: the
+        cached avatar of the account leaving must not survive it)."""
+        path = self._paths.pop(key, None)
+        if path and os.path.isfile(path):
+            try:
+                os.unlink(path)
+            except OSError as e:
+                print("image cache forget error:", e)
+
+    def fetch_and_cache(self, api, path, key, ext="png"):
+        if not self.begin_load(key):
+            return self._paths.get(key)
+
+        def work():
+            try:
+                data = api.fetch_file(path)
+                if data:
+                    Clock.schedule_once(lambda dt: self.set_bytes(key, data, ext))
+            finally:
+                self.end_load(key)
+
+        threading.Thread(target=work, daemon=True).start()
+        return None
 
 
 IMAGE_CACHE = ImageCache()
 
 
 # ---------------------------------------------------------------------------
-# Widgets — moved to client_widgets.py (re-exported above).
+# Widgets
 # ---------------------------------------------------------------------------
+class ContextMenuMixin:
+    """Right-click (desktop) / long-press (touch) context menu, Discord-style.
+
+    Subclasses implement `build_context_menu()` returning a list of
+    (label, enabled, callable). Right-click opens immediately; a 0.5 s hold
+    opens it on touch (mouse left-press never does). One code path, two
+    gestures; the menu itself is the app's Window-level overlay.
+
+    NOTE: this class must be defined BEFORE the widgets that inherit from
+    it (MessageRow, ChannelButton, ...). A base class is evaluated at class
+    -definition time, so a mixin defined further down the file makes the
+    module fail to import with NameError."""
+
+    LONG_PRESS_S = 0.5
+
+    def build_context_menu(self):
+        return []
+
+    def _open_ctx_menu(self, window_pos):
+        app = App.get_running_app()
+        if app is not None:
+            app.open_context_menu(self.build_context_menu(), window_pos)
+
+    def on_touch_down(self, touch):
+        if touch.grab_current is self:
+            return super().on_touch_down(touch)
+        if getattr(touch, "button", None) == "right":
+            # desktop right-click: menu instead of the left-press action
+            self._open_ctx_menu(self.to_window(touch.x, touch.y))
+            return True
+        if "button" not in getattr(touch, "profile", []) or \
+                touch.profile == []:
+            # real touch (finger): long-press opens the menu
+            touch.ud["shades_ctx_pos"] = self.to_window(touch.x, touch.y)
+            touch.ud["shades_ctx_fired"] = False
+            touch.grab(self)
+            self._ctx_clock = Clock.schedule_once(
+                lambda dt: self._ctx_fire(touch), self.LONG_PRESS_S)
+        return super().on_touch_down(touch)
+
+    def _ctx_fire(self, touch):
+        touch.ud["shades_ctx_fired"] = True
+        self._open_ctx_menu(touch.ud.get("shades_ctx_pos")
+                            or self.to_window(*self.center))
+
+    def _ctx_is_button(self):
+        # True when this widget is also ButtonBehavior-backed. Checked here
+        # and not at class definition so a non-kivy import (lint) survives.
+        from kivy.uix.behaviors.button import ButtonBehavior
+        return isinstance(self, ButtonBehavior)
+
+    def on_touch_up(self, touch):
+        clock = getattr(self, "_ctx_clock", None)
+        if clock:
+            clock.cancel()
+            self._ctx_clock = None
+        if touch.ud.get("shades_ctx_fired"):
+            # the long-press fired: swallow the corresponding up
+            touch.ud["shades_ctx_fired"] = False
+            touch.ungrab(self)
+            touch.ud["shades_ctx_up_done"] = True
+            return True
+        if self._ctx_is_button() and self not in touch.ud:
+            # ButtonBehavior's on_touch_down was short-circuited (a child
+            # widget consumed the press), so only the mixin's grab entry
+            # exists. Forwarding this up would enter ButtonBehavior.on_touch_up
+            # through the grab pass without its down-state: `time() -
+            # self.__touch_time` at kivy/uix/behaviors/button.py:173 turns
+            # float - None (caught on-device as the 1137 crash; desktop asserts
+            # first). The consuming child receives its own up from its own
+            # grab entry, so swallowing here starves nothing.
+            touch.ungrab(self)
+            touch.ud["shades_ctx_up_done"] = True
+            return True
+        if touch.ud.get("shades_ctx_up_done"):
+            # The mixin grab plus ButtonBehavior's own grab put this widget in
+            # the touch's grab list twice, and kivy delivers the up once per
+            # entry (base.py post_dispatch_input). One release is the
+            # contract; the second delivery would double-fire on_release.
+            return True
+        result = super().on_touch_up(touch)
+        if result:
+            touch.ud["shades_ctx_up_done"] = True
+        return result
 
 
 if KIVY:
     class PfpImage(Image):
-        """Avatar with a theme fallback.
-
-        An Image with no texture draws its rect solid white, so every
-        avatar-less user showed a stark white square (message rows,
-        member rows, composer, profile, onboarding preview). While no
-        texture is loaded the rect is hidden (color alpha 0) and a
-        theme disc with the user's initial shows instead -- the same
-        letter-tile pattern the server rail already uses. When a real
-        avatar loads, the disc and letter hide and the texture shows.
-        """
-        fallback_letter = StringProperty("")
-
-        def __init__(self, **kw):
-            super().__init__(**kw)
-            with self.canvas.before:
-                # tay 2026-11-23: images are blircles -- the avatars are
-                # discs, so a loaded avatar texture is masked to the same
-                # circle that the letter fallback already draws. The
-                # fallback itself stays inside the mask (pushed first).
-                StencilPush()
-                self._fb_mask = Ellipse(pos=self.pos, size=self.size)
-                StencilUse()
-                self._fb_color = Color(
-                    rgba=list(DEFAULT_THEME_COLORS["sidebar_ctrl"]))
-                self._fb_disc = Ellipse(pos=self.pos, size=self.size)
-            with self.canvas.after:
-                # White: the CoreLabel texture already carries the
-                # theme letter color; this must not tint it twice.
-                self._fb_letter_color = Color(rgba=(1, 1, 1, 1))
-                self._fb_letter_rect = Rectangle(texture=None,
-                                                 pos=self.pos, size=(0, 0))
-                StencilUnUse()
-                StencilPop()
-            self.bind(texture=self._sync_fallback,
-                      size=self._sync_fallback, pos=self._sync_fallback,
-                      fallback_letter=self._sync_fallback)
-            app = App.get_running_app()
-            if app is not None:
-                try:
-                    app.bind(theme_colors=self._sync_fallback)
-                except Exception:
-                    pass
-            self._sync_fallback()
-
-        def _fb_bg(self):
-            app = App.get_running_app()
-            if app is not None:
-                try:
-                    return list(app.theme_colors["sidebar_ctrl"])
-                except Exception:
-                    pass
-            return list(DEFAULT_THEME_COLORS["sidebar_ctrl"])
-
-        def _fb_fg(self):
-            app = App.get_running_app()
-            if app is not None:
-                try:
-                    return list(app.theme_colors["text_muted"])
-                except Exception:
-                    pass
-            return list(DEFAULT_THEME_COLORS["text_muted"])
-
-        def _sync_fallback(self, *args):
-            self._fb_disc.pos = self.pos
-            self._fb_disc.size = self.size
-            self._fb_mask.pos = self.pos
-            self._fb_mask.size = self.size
-            if self.texture is not None:
-                self.color = (1, 1, 1, 1)
-                self._fb_color.a = 0
-                self._fb_letter_color.a = 0
-                self._fb_letter_rect.texture = None
-                self._fb_letter_rect.size = (0, 0)
-                return
-            # No avatar: hide the white rect, show the disc + initial.
-            self.color = (1, 1, 1, 0)
-            self._fb_color.rgba = self._fb_bg()
-            self._fb_color.a = 1
-            letter = (self.fallback_letter or "")[:1]
-            if not letter or min(self.width, self.height) <= 0:
-                self._fb_letter_color.a = 0
-                self._fb_letter_rect.texture = None
-                self._fb_letter_rect.size = (0, 0)
-                return
-            from kivy.core.text import Label as CoreLabel
-            label = CoreLabel(
-                text=letter, bold=True,
-                font_size=max(10, min(self.width, self.height) * 0.45),
-                color=self._fb_fg())
-            label.refresh()
-            tex = label.texture
-            self._fb_letter_rect.texture = tex
-            self._fb_letter_rect.size = tex.size
-            # Task 2: compute from pos/size, not from center -- center
-            # is an AliasProperty whose cached value can still be stale
-            # inside a size/pos dispatch (a layout-sized avatar, e.g.
-            # the onboarding one with size_hint_y=1, synced its letter
-            # to a transient center and the letter landed at the top
-            # edge of the disc).
-            x, y = self.pos
-            w, h = self.size
-            self._fb_letter_rect.pos = (
-                x + (w - tex.width) / 2, y + (h - tex.height) / 2)
-            self._fb_letter_color.a = 1
+        """Circular-ish avatar placeholder with fallback color."""
+        pass
 
     class PassThroughImage(Image):
         """Image that passes touch events through to parent widget."""
@@ -711,6 +1439,26 @@ if KIVY:
                 self._last_pos = None
                 return True
             return super().on_touch_up(touch)
+
+    class MessageEmbed(AsyncImage, ButtonBehavior):
+        """Clickable image embed - click to expand to full screen, click again to minimize.
+
+        Renders at a fixed uniform height (STANDARD_HEIGHT) and scales to fit
+        without stretching (allow_stretch=False, keep_ratio=True).
+        """
+        STANDARD_HEIGHT = dp(200)
+        is_expanded = BooleanProperty(False)
+
+        def on_release(self):
+            app = App.get_running_app()
+            if not app:
+                return True
+            if self.is_expanded:
+                app.dismiss_fullscreen_image(self)
+            else:
+                app.show_fullscreen_image(self.source, embed=self)
+                self.is_expanded = True
+            return True
 
 
     class FullScreenImageOverlay(FloatLayout):
@@ -875,6 +1623,200 @@ if KIVY:
             pass
 
 
+class ContextMenuOverlay(FloatLayout):
+    """Full-screen overlay hosting one context menu; a tap anywhere outside
+    the menu dismisses it, a tap on an item acts then dismisses. Parented to
+    Window by the app."""
+
+    def __init__(self, actions, window_pos, **kw):
+        super().__init__(**kw)
+        menu = BoxLayout(orientation="vertical", size_hint=(None, None),
+                         spacing=dp(1),
+                         size=(dp(230), dp(36) * max(1, len(actions))))
+        menu.pos = (max(dp(4), min(window_pos[0],
+                                   Window.width - menu.width - dp(4))),
+                    max(dp(4), min(window_pos[1] - menu.height,
+                                   Window.height - menu.height - dp(4))))
+        for label, enabled, cb in actions:
+            btn = Button(text=label, size_hint_y=None, height=scaled(dp(34)),
+                         background_color=(0.18, 0.2, 0.24, 1) if enabled
+                         else (0.12, 0.13, 0.15, 1),
+                         color=(0.9, 0.92, 0.95, 1) if enabled
+                         else (0.4, 0.42, 0.46, 1),
+                         font_size=sp(13))
+            if enabled:
+                btn.bind(on_press=lambda inst, cb=cb: self._run(cb))
+            else:
+                btn.disabled = True
+            menu.add_widget(btn)
+        self.add_widget(menu)
+        self.menu = menu
+
+    def on_touch_down(self, touch):
+        # overlay covers the window, so window coords are local coords
+        inside = self.menu.collide_point(*touch.pos)
+        if not inside:
+            self.dismiss_now()
+            return True
+        # let the button get its press; remove the overlay right after
+        Clock.schedule_once(lambda dt: self.dismiss_now(), 0.2)
+        return super().on_touch_down(touch)
+
+    def dismiss_now(self, *a):
+        parent = self.parent
+        if parent is not None:
+            parent.remove_widget(self)
+
+    def _run(self, cb):
+        try:
+            cb()
+        finally:
+            Clock.schedule_once(lambda dt: self.dismiss_now(), 0.1)
+
+
+class MeshPulse(Widget):
+    """A path-state ring; pace and colour reflect the observed guild link."""
+    mode = StringProperty("offline")
+    phase = NumericProperty(0)
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.size_hint = (None, None)
+        self.size = (dp(40), dp(40))
+        self.bind(pos=self._draw, size=self._draw, mode=self._draw,
+                  phase=self._draw)
+        self._pulse_clock = Clock.schedule_interval(self._tick, 0.1)
+
+    def _tick(self, dt):
+        speed = 0.0 if self.mode == "offline" else (0.11 if self.mode == "relay" else 0.25)
+        self.phase = (self.phase + speed * dt) % 1.0
+
+    def _draw(self, *a):
+        from math import sin, pi
+        palette = {"direct": (0.35, 0.84, 0.77),
+                   "relay": (0.96, 0.72, 0.37),
+                   "offline": (0.38, 0.43, 0.48)}
+        rgb = palette.get(self.mode, palette["offline"])
+        wave = 0.0 if self.mode == "offline" else (sin(self.phase * 2 * pi) + 1) / 2
+        self.canvas.clear()
+        with self.canvas:
+            Color(*rgb, 0.17 + 0.20 * wave)
+            Line(circle=(self.center_x, self.center_y, min(self.width, self.height) * 0.42),
+                 width=dp(4))
+            Color(*rgb, 0.85)
+            Line(circle=(self.center_x, self.center_y, min(self.width, self.height) * 0.34),
+                 width=dp(1.4))
+            Color(*rgb, 0.8)
+            Ellipse(pos=(self.center_x - dp(3), self.center_y - dp(3)),
+                    size=(dp(6), dp(6)))
+
+
+class MeshConstellation(Widget):
+    """A compact path diagram. Dots are capped when the route is longer."""
+    mode = StringProperty("offline")
+    hops = NumericProperty(0)
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.size_hint = (None, None)
+        self.size = (dp(52), dp(20))
+        self.bind(pos=self._draw, size=self._draw, mode=self._draw,
+                  hops=self._draw)
+
+    def _draw(self, *a):
+        count = max(2, min(5, int(self.hops) + 1))
+        rgb = ((0.35, 0.84, 0.77) if self.mode == "direct"
+               else (0.96, 0.72, 0.37) if self.mode == "relay"
+               else (0.38, 0.43, 0.48))
+        points = [(self.x + dp(5) + i * (self.width - dp(10)) / (count - 1),
+                   self.center_y + (dp(3) if i % 2 else -dp(3)))
+                  for i in range(count)]
+        self.canvas.clear()
+        with self.canvas:
+            Color(*rgb, 0.4 if self.mode != "offline" else 0.2)
+            Line(points=[c for p in points for c in p], width=dp(1))
+            for i, (x, y) in enumerate(points):
+                Color(*rgb, 0.85 if self.mode != "offline" or i == 0 else 0.3)
+                Ellipse(pos=(x - dp(2.5), y - dp(2.5)), size=(dp(5), dp(5)))
+
+
+class SkeletonRow(Widget):
+    """Two quiet shimmer bars while a history page is on its way."""
+    phase = NumericProperty(0)
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.size_hint_y = None
+        self.height = dp(70)
+        self.bind(pos=self._draw, size=self._draw, phase=self._draw)
+        from kivy.animation import Animation
+        self._anim = Animation(phase=1, duration=1.6, t="linear")
+        self._anim.repeat = True
+        self._anim.start(self)
+
+    def _draw(self, *a):
+        self.canvas.clear()
+        width = max(dp(40), self.width - dp(72))
+        with self.canvas:
+            Color(0.64, 0.75, 0.76, 0.12)
+            Ellipse(pos=(self.x + dp(12), self.y + dp(18)), size=(dp(34), dp(34)))
+            RoundedRectangle(pos=(self.x + dp(58), self.y + dp(44)),
+                             size=(width * 0.45, dp(10)), radius=[dp(5)] * 4)
+            RoundedRectangle(pos=(self.x + dp(58), self.y + dp(21)),
+                             size=(width * 0.8, dp(10)), radius=[dp(5)] * 4)
+            # Short highlight moves within the body bar.
+            Color(0.70, 0.92, 0.89, 0.13)
+            RoundedRectangle(pos=(self.x + dp(58) + width * 0.64 * self.phase,
+                                  self.y + dp(21)),
+                             size=(width * 0.16, dp(10)), radius=[dp(5)] * 4)
+
+
+class MicronRefLabel(Label):
+    """Markup label whose ref taps survive nesting inside a ScrollView.
+
+    Kivy 2.3.1 walks site pages 2+ levels under the messages ScrollView
+    (scroll > GridLayout > SitePage > label), and the touch reaches those
+    widgets in the SCROLL's content frame (scrollview.py to_local folds a
+    single g_translate over the whole subtree; the walk applies no per-hop
+    pos transforms). Label.on_touch_down's ref check assumes its own
+    parent space, so the zones miss by the accumulated offsets and the
+    tap dies (0.36.x device receipt: [ Edit page ] did nothing).
+
+    Convert the delivered frame by subtracting this label's own offset
+    chain up to the wrapping ScrollView, then run kivy's ref-zone check
+    with the same top-down texture y that label.py uses. The scroll's own
+    translation stays in the delivered frame, so stopping the walk there
+    is both correct and the only cheap anchor kivy gives us.
+    """
+
+    def _content_anchor(self):
+        ox, oy = self.x, self.y  # offsets up to (and incl.) this label
+        node = self.parent
+        while node is not None and type(node).__name__ != "ScrollView":
+            ox += node.x
+            oy += node.y
+            node = node.parent
+        return ox, oy
+
+    def on_touch_down(self, touch):
+        if super().on_touch_down(touch):
+            return True
+        if not len(self.refs):
+            return False
+        ox, oy = self._content_anchor()
+        lx = touch.x - ox
+        ly = touch.y - oy
+        tex_h = self.texture_size[1] or 18.0
+        ty = tex_h - ly  # label zones are top-down like label.py's math
+        for uid, zones in self.refs.items():
+            for zone in zones:
+                x, y, w, h = zone
+                if x <= lx <= w and y <= ty <= h:
+                    self.dispatch('on_ref_press', uid)
+                    return True
+        return False
+
+
 class CtxHeaderLabel(ContextMenuMixin, Label):
     """Guild header: right-click/long-press offers the invite share-link
     and (for admins) the server settings panel."""
@@ -889,6 +1831,145 @@ class CtxHeaderLabel(ContextMenuMixin, Label):
         actions.append(("copy boot log", True,
                         lambda: app and app._copy_bootlog()))
         return actions
+
+
+class ClickableLabel(ContextMenuMixin, ButtonBehavior, Label):
+    """Username label: tap opens a profile, right-click/long-press offers
+    mention + profile."""
+    target_hash = StringProperty("")
+
+    def build_context_menu(self):
+        app = App.get_running_app()
+        name = self.text or ""
+        actions = [("open profile", True,
+                    lambda: app and app.open_profile(
+                        self.target_hash, name)),
+                   ("mention @%s" % name, True,
+                    lambda: app and app._mention(name))]
+        return actions
+
+
+
+
+class ChannelButton(ContextMenuMixin, ButtonBehavior, BoxLayout):
+    channel_name = StringProperty("")
+    badge = NumericProperty(0)
+    selected = BooleanProperty(False)
+    _dragging = False   # set True once a grabbed touch passes dp(8)
+
+    def build_context_menu(self):
+        app = App.get_running_app()
+        name = self.channel_name
+        cid = app._channels.get(name) if app else None
+        actions = [("open #" + name, True,
+                    lambda: app and app._switch_channel(name))]
+        if app and app._can_create_channels():
+            actions.append(("create channel...", True,
+                            lambda: app and app._open_create_channel_popup()))
+        if cid:
+            if getattr(app, "i_am_admin", False):
+                actions.append(("invite to #%s..." % name, True,
+                                lambda: app and app._invite_to_channel(cid, name)))
+            actions.append(("copy channel id", True,
+                            lambda: app and app._copy_text(cid)))
+            muted = cid in app._muted_channels
+            actions.append(("unmute channel" if muted else "mute channel", True,
+                            lambda: app and app._toggle_mute_channel(name, cid)))
+            if app and app.i_am_moderator:
+                actions.append(("delete channel", True,
+                                lambda: app and app._delete_channel(name, cid)))
+        return actions
+
+    # ---- drag reorder (task 7) --------------------------------------------
+    # A grabbed touch that moves more than dp(8) cancels the long-press
+    # clock (tay: presses over a channel label belong to the drag/menu
+    # logic, never to the drawer) and reorders the grid live; on release
+    # the final order goes to /api/v1/channels/reorder once.
+    def on_touch_down(self, touch):
+        touch.ud["shades_drag_origin"] = (touch.x, touch.y)
+        self._dragging = False
+        return super().on_touch_down(touch)
+
+    def _ch_drag_check(self, touch):
+        """One move step: threshold -> live reorder. Returns True when the
+        touch has become a drag."""
+        origin = touch.ud.get("shades_drag_origin")
+        if origin is None:
+            return False
+        dx, dy = touch.x - origin[0], touch.y - origin[1]
+        if not getattr(self, "_dragging", False):
+            if dx * dx + dy * dy < dp(8) * dp(8):
+                return False
+            self._dragging = True
+            clock = getattr(self, "_ctx_clock", None)
+            if clock:
+                clock.cancel()
+                self._ctx_clock = None
+            # The owning ScrollView has the touch: take it back so the
+            # list stops panning under the drag (v0.32 device note).
+            node = self.parent
+            while node is not None \
+                    and node.__class__.__name__ != "ScrollView":
+                node = node.parent
+            if node is not None:
+                node._touch = None
+                try:
+                    touch.ungrab(node)
+                except Exception:
+                    pass
+        self._ch_drag_step(touch)
+        return True
+
+    def on_touch_move(self, touch):
+        # v0.32 (tay device note): the channel list's ScrollView grabs
+        # every press, so grab_current never names the button and this
+        # branch never delivered moves; the origin stamp on the touch is
+        # ours (set in on_touch_down), accept moves on that instead.
+        if touch.ud.get("shades_drag_origin") is not None:
+            self._ch_drag_check(touch)
+        return super().on_touch_move(touch)
+
+    def on_touch_up(self, touch):
+        was_dragging = getattr(self, "_dragging", False)
+        self._dragging = False
+        result = super().on_touch_up(touch)
+        if was_dragging:
+            app = App.get_running_app()
+            if app is not None:
+                app._post_channel_reorder()
+            return True  # a drag end is consumed, not a press
+        return result
+
+    def _ch_drag_step(self, touch):
+        """Swap with the neighbouring row when the pointer crosses it."""
+        grid = self.parent
+        if grid is None:
+            return
+        buttons = [w for w in reversed(grid.children)
+                   if isinstance(w, ChannelButton)]
+        if len(buttons) < 2:
+            return
+        top = grid.top
+        row_h = 0.0
+        for b in buttons:
+            row_h = b.height
+        my_row = None
+        for i, b in enumerate(buttons):
+            if b is self:
+                my_row = i
+        if my_row is None or not row_h:
+            return
+        # which row does the pointer sit in?
+        offset = int(round((top - touch.y - row_h / 2.0) / row_h))
+        target = max(0, min(len(buttons) - 1, offset))
+        if target == my_row:
+            return
+        # move self within the children list so the visual order changes
+        # GridLayout fills rows in reversed-children order: children index
+        # (len-1-row) is row 0 (top).
+        child_at_row = len(buttons) - 1 - target
+        grid.remove_widget(self)
+        grid.add_widget(self, index=child_at_row)
 
 
 if KIVY:
@@ -978,6 +2059,48 @@ if KIVY:
                             lambda: app and app._remove_server(self.index)))
             return actions
 
+    class SitePage(BoxLayout):
+        """One rendered micron page (site channels). bg_color paints the page
+        canvas; the blocks are added as children by _render_site_page."""
+        bg_color = ListProperty([0, 0, 0, 0])
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.orientation = "vertical"
+            self.size_hint_y = None
+            self.spacing = dp(4)
+            self.padding = [dp(8), dp(8), dp(8), dp(8)]
+            self.bind(minimum_height=lambda w, h: setattr(w, "height", h))
+            with self.canvas.before:
+                self._bg_instr = Color(rgba=self.bg_color)
+                self._bg_rect = Rectangle(pos=self.pos, size=self.size)
+            self.bind(pos=self._update_bg, size=self._update_bg,
+                      bg_color=self._update_bg)
+
+        def _update_bg(self, *a):
+            self._bg_instr.rgba = self.bg_color
+            self._bg_rect.pos = self.pos
+            self._bg_rect.size = self.size
+
+    class MicronSep(Widget):
+        """A thin micron separator line."""
+
+        def __init__(self, color=None, **kw):
+            super().__init__(**kw)
+            self.size_hint_y = None
+            self.height = dp(2)
+            app = App.get_running_app()
+            if color is None:
+                color = app.theme_colors.get(
+                    'text_dim', (0.35, 0.37, 0.42, 1)) if app else (0.35, 0.37, 0.42, 1)
+            with self.canvas:
+                Color(*color)
+                self._rect = Rectangle(pos=self.pos, size=self.size)
+            self.bind(pos=self._up, size=self._up)
+
+        def _up(self, *a):
+            self._rect.pos = self.pos
+            self._rect.size = self.size
 
     class IconBase(ButtonBehavior, Widget):
         """Canvas-drawn top-bar icon. The default Kivy font (Roboto) has no
@@ -1037,6 +2160,40 @@ if KIVY:
                 Line(points=[x1, y1, x2, y2], width=dp(1.4))
             Ellipse(pos=(cx - dp(2.5), cy - dp(2.5)), size=(dp(5), dp(5)))
 
+    class TermPage(BoxLayout):
+        """Guild console view for term channels: one scrolling output label.
+        Output arrives as term_data stream events (server-sanitised text);
+        input goes through the main input bar -> /api/v1/term/data."""
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.orientation = "vertical"
+            self.size_hint_y = None
+            self.padding = [dp(8), dp(8), dp(8), dp(8)]
+            self.bind(minimum_height=lambda w, h: setattr(w, "height", h))
+            app = App.get_running_app()
+            term_text_color = app.theme_colors.get(
+                'text_muted', (0.85, 0.88, 0.9, 1)) if app else (0.85, 0.88, 0.9, 1)
+            self.output = Label(markup=False, halign="left",
+                                color=term_text_color,
+                                font_size=sp(13))
+            self.output.size_hint_y = None
+            self.output.bind(width=lambda inst, w: setattr(
+                inst, "text_size", (w, None)))
+            self.output.bind(texture_size=lambda inst, ts: setattr(
+                inst, "height", max(dp(20), ts[1] if ts else 0)))
+            self.add_widget(self.output)
+
+        def append(self, text):
+            """Append output; keep the buffer bounded (last ~8000 chars)."""
+            buf = (self.output.text or "") + text
+            if len(buf) > 8000:
+                buf = buf[-8000:]
+            self.output.text = buf
+
+        def clear(self):
+            self.output.text = ""
+
 
 # ---------------------------------------------------------------------------
 # KV UI
@@ -1045,6 +2202,7 @@ if KIVY:
 # duplicated here as an inline KV string; keeping two copies meant edits
 # landed in one file and not the other, which broke the app. Do not
 # re-add an inline copy — edit kv_md.kv only.
+
 
 
 # ---------------------------------------------------------------------------
@@ -1059,51 +2217,15 @@ if KIVY:
 
         def __init__(self, **kw):
             super().__init__(**kw)
-            # Task 2: the screen had no background (transparent -- the
-            # window's black showed through), default grey bar buttons
-            # and a white default TextInput. Theme it like the rest of
-            # the app, live-bound so a theme change re-tints it.
-            with self.canvas.before:
-                self._bg_color = Color(
-                    rgba=list(DEFAULT_THEME_COLORS["bg_main"]))
-                self._bg_rect = Rectangle(pos=self.pos, size=self.size)
-            self.bind(size=self._update_bg, pos=self._update_bg)
             col = BoxLayout(orientation="vertical", padding=dp(8),
                             spacing=dp(6))
             bar = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(6))
-            self._bar_btns = []
-            # Polish group 5: the bar buttons are FancyMDButtons, not
-            # plain Buttons -- Publish is primary, Back/Preview
-            # secondary. theme_width Custom + size_hint_x 1 keeps the
-            # three buttons sharing the bar equally (a plain MDButton
-            # auto-sizes to its text instead).
-            from kivymd.uix.button import MDButtonText
-            for text, meth, primary in (
-                    ("< Back", "_site_editor_back", False),
-                    ("Preview", "_site_editor_preview", False),
-                    ("Publish", "_site_editor_publish", True)):
-                btn = FancyMDButton(
-                    variant="primary" if primary else "secondary",
-                    theme_width="Custom", size_hint_x=1)
-                # theme_text_color Custom or KivyMD's own rule
-                # overwrites the assigned text_color with a theme value.
-                label = MDButtonText(text=text, theme_text_color="Custom")
-                btn.add_widget(label)
-                btn._fancy_label = label
-                # Plain .text attribute (not a FancyMDButton property:
-                # the audio-row test pins the button itself textless).
-                # The bar's tests read btn.text to find each button.
-                btn.text = text
-                if not primary:
-                    # The bar keeps the sidebar_ctrl fill the sitenav
-                    # tests pin; the secondary variant's panel base
-                    # would change it. Override the base key, then
-                    # repaint (construction already painted once).
-                    btn._base_key = "sidebar_ctrl"
-                    btn._apply_state()
+            for text, meth in (("< Back", "_site_editor_back"),
+                               ("Preview", "_site_editor_preview"),
+                               ("Publish", "_site_editor_publish")):
+                btn = Button(text=text)
                 btn.bind(on_press=lambda inst, m=meth: self._tap(m))
                 bar.add_widget(btn)
-                self._bar_btns.append((btn, primary))
             self._src = TextInput(multiline=True, size_hint_y=0.5,
                                   font_size=sp(13),
                                   hint_text="micron source")
@@ -1124,39 +2246,6 @@ if KIVY:
             col.add_widget(self._status)
             col.add_widget(prev_scroll)
             self.add_widget(col)
-            app = App.get_running_app()
-            if app is not None:
-                app.bind(theme_colors=self._apply_theme)
-            self._apply_theme()
-
-        def _update_bg(self, *args):
-            self._bg_rect.pos = self.pos
-            self._bg_rect.size = self.size
-
-        def _apply_theme(self, *args):
-            """Re-tint the editor after a theme change."""
-            app = App.get_running_app()
-            colors = (app.theme_colors if app is not None
-                      else DEFAULT_THEME_COLORS)
-
-            def get(key):
-                try:
-                    return colors.get(key, DEFAULT_THEME_COLORS[key])
-                except Exception:
-                    return DEFAULT_THEME_COLORS[key]
-
-            self._bg_color.rgba = list(get("bg_main"))
-            # Polish group 5: FancyMDButton owns its own bg (variant)
-            # and re-tints itself on theme change; only the label text
-            # colour still needs updating here.
-            for btn, primary in self._bar_btns:
-                btn._fancy_label.text_color = (get("btn_text") if primary
-                                               else get("text"))
-            self._src.background_color = get("input_bg")
-            self._src.foreground_color = get("text")
-            self._src.cursor_color = get("text")
-            self._status.color = get("text_muted")
-            self._update_bg()
 
         def _tap(self, meth):
             app = App.get_running_app()
@@ -1282,52 +2371,7 @@ if KIVY:
         # SWIPE, not by tap -- see on_touch_* below).
         left_open = BooleanProperty(False)
         right_open = BooleanProperty(False)
-        # Animated drawer widths (polish group 3): KV binds each
-        # sidebar's width to one of these, and _slide_drawer animates
-        # it 0 <-> open width. The booleans above stay the source of
-        # truth for touch gating and mutual exclusion.
-        left_width = NumericProperty(0)
-        right_width = NumericProperty(0)
         _current_channel = StringProperty("general")
-
-        def __init__(self, **kw):
-            super().__init__(**kw)
-            self.bind(size=lambda *_: self._sync_drawer_widths())
-
-        def _drawer_target(self, side):
-            import ui_fx
-            return ui_fx.drawer_open_width(self.width, side)
-
-        def _slide_drawer(self, side, opened):
-            """Slide one drawer to its open width (or back to 0).
-
-            A mid-slide toggle cancels the running slide and restarts
-            from the current width, so the boolean and the width can
-            never disagree at rest.
-            """
-            import ui_fx
-            prop = "left_width" if side == "left" else "right_width"
-            target = self._drawer_target(side) if opened else 0
-            anim = ui_fx.slide_property(self, prop, target)
-            if anim is not None:
-                anim.bind(on_complete=lambda *_: self._sync_drawer_widths())
-
-        def _sync_drawer_widths(self, *_args):
-            """Keep an open drawer's width right across resizes.
-
-            The KV formula used to recompute from root.width; with the
-            width animated, a resize has to land it instead. A drawer
-            whose slide is running is skipped (the animation owns its
-            width until it lands, then on_complete re-syncs).
-            """
-            import ui_fx
-            for side, prop, flag in (("left", "left_width", self.left_open),
-                                     ("right", "right_width",
-                                      self.right_open)):
-                if ui_fx.is_animating(self, prop):
-                    continue
-                target = self._drawer_target(side) if flag else 0
-                setattr(self, prop, target)
 
         def toggle_left(self):
             self.left_open = not self.left_open
@@ -1339,7 +2383,6 @@ if KIVY:
             if opened:
                 self.right_open = False
                 Clock.schedule_once(self._log_left_panel_width, 0.2)
-            self._slide_drawer("left", opened)
 
         def _log_left_panel_width(self, *_dt):
             try:
@@ -1353,7 +2396,6 @@ if KIVY:
         def on_right_open(self, instance, opened):
             if opened:
                 self.left_open = False
-            self._slide_drawer("right", opened)
 
         # -- swipe gestures (edge bands + drawn-panel travel) ------------
         # Kivy routes on_touch_down to parent before children, so we only
@@ -1462,11 +2504,7 @@ if KIVY:
             from kivy.app import App as _App
             app = _App.get_running_app()
             for key in THEME_KEYS:
-                # G6: rows are dp(60), not dp(44) -- a filled MDTextField
-                # floors its own height at dp(56) (adjust_height), so a
-                # 44px row let each field stick 12px out of its row and
-                # the fields merged into one continuous block.
-                row = BoxLayout(size_hint_y=None, height=dp(60),
+                row = BoxLayout(size_hint_y=None, height=dp(44),
                                 padding=[0, dp(2)])
                 lbl = Label(text=THEME_LABELS.get(key, key),
                             size_hint_x=0.34)
@@ -1532,15 +2570,7 @@ if KIVY:
                 if fld is None:
                     continue
                 try:
-                    rgba = hex_to_rgba(fld.text)
-                    # G4 (UIX P3-2): the hex fields carry no alpha, and
-                    # hex_to_rgba returns 1.0 -- so restore the key's
-                    # live alpha (the aurora orbs ship at 0.18-0.22 and
-                    # a plain Save used to blow them out to opaque).
-                    orig = app.theme_colors.get(key, (1, 1, 1, 1))
-                    if len(orig) == 4:
-                        rgba = (rgba[0], rgba[1], rgba[2], orig[3])
-                    updated[key] = rgba
+                    updated[key] = hex_to_rgba(fld.text)
                 except Exception as e:
                     if status:
                         status.text = "Invalid color for %s: %s" % (key, e)
@@ -1591,556 +2621,11 @@ if KIVY:
             if status:
                 status.text = "%s preset applied." % name
 
-    class BotsScreen(Screen):
-        """Bots setup/config screen (Group 3): list, create, revoke, edit.
-
-        The kv rule carries only the static chrome (title, scroll body,
-        status line, Refresh/Back bar); the create form, the one-time key
-        display and the bot rows are built in Python on first entry
-        (like ConfigScreen._ensure_color_rows), because the rows are
-        dynamic. All API traffic goes through app.guild_api
-        (bots_list / bots_create / bots_update / bots_revoke); when
-        there is no guild connection the screen shows a status error
-        and keeps whatever list was last fetched.
-
-        Revoke is a two-tap confirm on the button itself (no popup):
-        the first tap arms it ("Confirm revoke"), the second calls
-        bots_revoke. The arm clears whenever the list re-renders.
-        No animation here -- state changes only -- so REDUCED_MOTION
-        needs no special-casing.
-        """
-
-        def __init__(self, **kwargs):
-            super().__init__(**kwargs)
-            self._built = False
-            self._bots = []            # last fetched bot dicts (or [])
-            self._create_checks = {}   # perm bit -> CheckBox
-            self._key = None           # one-time API key from last create
-            self._gateway_text = ""    # formatted gateway block, for copy
-            self._revoke_armed = {}    # bot_id -> bool (two-tap confirm)
-            self._edit_boxes = {}      # bot_id -> editor BoxLayout
-            self._edit_checks = {}     # bot_id -> {bit: CheckBox}
-
-        # -- lifecycle --------------------------------------------------
-        def on_pre_enter(self):
-            """Build the form (first entry) and refresh the list."""
-            self._build()
-            self.refresh()
-
-        # -- construction ------------------------------------------------
-        def _build(self):
-            """Build the create form, key box and list container (once)."""
-            if self._built:
-                return
-            try:
-                body = self.ids["bots_body"]
-            except Exception:
-                return
-            from kivy.app import App as _App
-            from kivy.uix.checkbox import CheckBox
-            from kivymd.uix.textfield import MDTextField
-            app = _App.get_running_app()
-            colors = getattr(app, "theme_colors", {}) if app else {}
-            text = colors.get("text", (1, 1, 1, 1))
-            muted = colors.get("text_muted", (0.6, 0.6, 0.6, 1))
-
-            body.add_widget(self._section("Create a bot"))
-            name_lbl = Label(text="Bot name", font_size=sp(13),
-                             color=muted, size_hint_y=None, height=dp(20),
-                             halign="left", valign="middle")
-            name_lbl.bind(width=lambda w, v: setattr(
-                w, "text_size", (v, None)))
-            body.add_widget(name_lbl)
-            self._name_field = MDTextField(text="", mode="filled",
-                                           size_hint_y=None, height=dp(56))
-            self._name_field.fill_color_normal = colors.get(
-                "input_bg", (0.09, 0.09, 0.09, 1))
-            self._name_field.fill_color_focus = colors.get(
-                "input_bg_focus", (0.11, 0.11, 0.11, 1))
-            self._name_field.text_color_normal = text
-            self._name_field.text_color_focus = text
-            self._name_field.cursor_color = text
-            body.add_widget(self._name_field)
-
-            body.add_widget(self._section("Permissions"))
-            for bit, label in BOT_PERM_BITS:
-                row = BoxLayout(size_hint_y=None, height=dp(40),
-                                spacing=dp(8))
-                cb = CheckBox(size_hint=(None, None), size=(dp(40), dp(40)))
-                row.add_widget(cb)
-                lbl = Label(text=label, font_size=sp(14), color=text,
-                            halign="left", valign="middle")
-                lbl.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
-                row.add_widget(lbl)
-                self._create_checks[bit] = cb
-                body.add_widget(row)
-
-            create = self._fancy_button("Create bot", "primary")
-            create.size_hint_x = None
-            create.width = dp(160)
-            create.bind(on_press=lambda *_: self.create_bot())
-            body.add_widget(create)
-
-            # One-time key display: hidden (height 0, opacity 0) until a
-            # create succeeds. Children are static; Python fills the texts.
-            self._key_box = BoxLayout(orientation="vertical",
-                                      size_hint_y=None, height=0, opacity=0,
-                                      spacing=dp(8))
-            err = colors.get("error", (1, 0.42, 0.42, 1))
-            warn = Label(
-                text=("API key shown ONCE -- copy it now. It cannot be "
-                      "retrieved again."),
-                font_size=sp(13), bold=True, color=err,
-                size_hint_y=None, height=dp(40), halign="left",
-                valign="middle")
-            warn.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
-            self._key_box.add_widget(warn)
-            self._key_label = Label(text="", font_size=sp(13), color=text,
-                                    size_hint_y=None, height=dp(56),
-                                    halign="left", valign="top")
-            self._key_label.bind(
-                width=lambda w, v: setattr(w, "text_size", (v, None)))
-            self._key_box.add_widget(self._key_label)
-            self._gateway_label = Label(text="", font_size=sp(11),
-                                        color=muted, size_hint_y=None,
-                                        height=dp(120), halign="left",
-                                        valign="top")
-            self._gateway_label.bind(
-                width=lambda w, v: setattr(w, "text_size", (v, None)))
-            self._key_box.add_widget(self._gateway_label)
-            key_row = BoxLayout(size_hint_y=None, height=dp(40),
-                                spacing=dp(10))
-            copy_key = self._fancy_button("Copy API key", "outlined")
-            copy_key.size_hint_x = None
-            copy_key.width = dp(150)
-            copy_key.bind(on_press=lambda *_: self.copy_api_key())
-            key_row.add_widget(copy_key)
-            copy_gw = self._fancy_button("Copy gateway info", "outlined")
-            copy_gw.size_hint_x = None
-            copy_gw.width = dp(180)
-            copy_gw.bind(on_press=lambda *_: self.copy_gateway())
-            key_row.add_widget(copy_gw)
-            dismiss = self._fancy_button("Dismiss", "primary")
-            dismiss.size_hint_x = None
-            dismiss.width = dp(110)
-            dismiss.bind(on_press=lambda *_: self.dismiss_key())
-            key_row.add_widget(dismiss)
-            self._key_box.add_widget(key_row)
-            body.add_widget(self._key_box)
-
-            body.add_widget(self._section("Your bots"))
-            self._list_box = BoxLayout(orientation="vertical",
-                                       size_hint_y=None, spacing=dp(8))
-            self._list_box.bind(
-                minimum_height=self._list_box.setter("height"))
-            body.add_widget(self._list_box)
-            self._built = True
-
-        def _section(self, text):
-            lbl = Label(text=text, font_size=sp(16), bold=True,
-                        color=(App.get_running_app().theme_colors.get(
-                            "text_muted", (0.6, 0.6, 0.6, 1))),
-                        size_hint_y=None, height=dp(28), halign="left",
-                        valign="middle")
-            lbl.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
-            return lbl
-
-        def _fancy_button(self, text, variant):
-            """FancyMDButton with its MDButtonText child (40px tall).
-
-            The text child is kept as ``_bots_label`` so callers can
-            re-label the button (the revoke two-tap confirm does).
-            """
-            from kivymd.uix.button import MDButtonText
-            app = App.get_running_app()
-            colors = getattr(app, "theme_colors", {}) if app else {}
-            btn = FancyMDButton(variant=variant, size_hint_y=None,
-                                height=dp(40))
-            if variant == "primary":
-                fg = colors.get("btn_text", (1, 1, 1, 1))
-            elif variant == "danger":
-                fg = (1, 1, 1, 1)
-            else:
-                fg = colors.get("text", (1, 1, 1, 1))
-            label = MDButtonText(text=text, text_color=fg)
-            btn.add_widget(label)
-            btn._bots_label = label
-            return btn
-
-        # -- data ---------------------------------------------------------
-        def _api(self):
-            app = App.get_running_app()
-            return getattr(app, "guild_api", None) if app else None
-
-        def refresh(self):
-            """Re-fetch the bot list; on failure keep the last list."""
-            self._build()
-            api = self._api()
-            if api is None:
-                self._set_bots_status(
-                    "Bots unavailable: no guild connection.")
-                return
-            try:
-                res = api.bots_list()
-            except Exception as e:
-                self._set_bots_status("Bots unavailable: %s" % e)
-                return
-            if not res.get("ok"):
-                self._set_bots_status("Bots unavailable: %s" % res.get(
-                    "error", "unknown error"))
-                return
-            self._bots = res.get("bots") or []
-            self._render_bots()
-            if self._bots:
-                self._set_bots_status("Loaded %d bot(s)." % len(self._bots))
-            else:
-                self._set_bots_status("No bots yet -- create one above.")
-
-        def _render_bots(self):
-            self._list_box.clear_widgets()
-            self._revoke_armed = {}
-            self._edit_boxes = {}
-            self._edit_checks = {}
-            if not self._bots:
-                empty = Label(text="No bots fetched yet.", font_size=sp(13),
-                              color=(App.get_running_app().theme_colors.get(
-                                  "text_muted", (0.6, 0.6, 0.6, 1))),
-                              size_hint_y=None, height=dp(24), halign="left",
-                              valign="middle")
-                empty.bind(width=lambda w, v: setattr(
-                    w, "text_size", (v, None)))
-                self._list_box.add_widget(empty)
-                return
-            for bot in self._bots:
-                self._list_box.add_widget(self._bot_row(bot))
-
-        def _bot_row(self, bot):
-            from kivy.uix.checkbox import CheckBox
-            app = App.get_running_app()
-            colors = getattr(app, "theme_colors", {}) if app else {}
-            text = colors.get("text", (1, 1, 1, 1))
-            muted = colors.get("text_muted", (0.6, 0.6, 0.6, 1))
-            bot_id = bot.get("bot_id")
-            revoked = bool(bot.get("revoked_at"))
-            name = bot.get("name") or "(unnamed bot)"
-            row = BoxLayout(orientation="vertical", size_hint_y=None,
-                            spacing=dp(2))
-            row.bind(minimum_height=row.setter("height"))
-            if revoked:
-                # Revoked bots stay visible, dimmed, with their actions off.
-                row.opacity = 0.6
-
-            head = BoxLayout(size_hint_y=None, height=dp(28), spacing=dp(8))
-            nm = Label(text=name, font_size=sp(16), bold=True, color=text,
-                       halign="left", valign="middle")
-            nm.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
-            head.add_widget(nm)
-            state = Label(text="Revoked" if revoked else "Active",
-                          font_size=sp(12),
-                          color=muted if revoked else colors.get(
-                              "accent", (0.35, 0.84, 0.76, 1)),
-                          size_hint_x=None, width=dp(80), halign="right",
-                          valign="middle")
-            head.add_widget(state)
-            row.add_widget(head)
-
-            owner = bot.get("owner_hash") or ""
-            own_row = BoxLayout(size_hint_y=None, height=dp(40),
-                                spacing=dp(8))
-            own = Label(text="Owner: %s" % self._trunc(owner),
-                        font_size=sp(12), color=muted, halign="left",
-                        valign="middle")
-            own.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
-            own_row.add_widget(own)
-            copy_btn = self._fancy_button("Copy", "outlined")
-            copy_btn.size_hint_x = None
-            copy_btn.width = dp(80)
-            copy_btn.bind(on_press=lambda *_a, h=owner: self._copy(
-                h, "owner address"))
-            own_row.add_widget(copy_btn)
-            row.add_widget(own_row)
-
-            perms = Label(text=self._perm_text(bot.get("perms") or 0),
-                          font_size=sp(12), color=muted, size_hint_y=None,
-                          height=dp(40), halign="left", valign="top")
-            perms.bind(width=lambda w, v: setattr(
-                w, "text_size", (v, None)))
-            row.add_widget(perms)
-
-            meta = Label(
-                text=("Created %s  ·  Last seen %s"
-                      % (self._fmt_ts(bot.get("created_at")),
-                         self._fmt_ts(bot.get("last_seen")))),
-                font_size=sp(11), color=muted, size_hint_y=None,
-                height=dp(20), halign="left", valign="middle")
-            meta.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
-            row.add_widget(meta)
-
-            actions = BoxLayout(size_hint_y=None, height=dp(40),
-                                spacing=dp(10))
-            edit = self._fancy_button("Edit permissions", "outlined")
-            edit.size_hint_x = None
-            edit.width = dp(180)
-            edit.disabled = revoked
-            edit.bind(on_press=lambda *_a, b=bot_id: self.toggle_edit(b))
-            actions.add_widget(edit)
-            revoke = self._fancy_button("Revoke", "danger")
-            revoke.size_hint_x = None
-            revoke.width = dp(120)
-            revoke.disabled = revoked
-            revoke.bind(on_press=lambda *_a, b=bot_id, n=name, btn=revoke:
-                        self.revoke_bot(b, n, btn))
-            actions.add_widget(revoke)
-            row.add_widget(actions)
-
-            editor = BoxLayout(orientation="vertical", size_hint_y=None,
-                               height=0, opacity=0, spacing=dp(2))
-            checks = {}
-            cur = bot.get("perms") or 0
-            for bit, label in BOT_PERM_BITS:
-                erow = BoxLayout(size_hint_y=None, height=dp(40),
-                                 spacing=dp(8))
-                cb = CheckBox(size_hint=(None, None), size=(dp(40), dp(40)))
-                cb.active = bool(cur & bit)
-                erow.add_widget(cb)
-                elbl = Label(text=label, font_size=sp(14), color=text,
-                             halign="left", valign="middle")
-                elbl.bind(width=lambda w, v: setattr(
-                    w, "text_size", (v, None)))
-                erow.add_widget(elbl)
-                checks[bit] = cb
-                editor.add_widget(erow)
-            save_row = BoxLayout(size_hint_y=None, height=dp(40),
-                                 spacing=dp(10))
-            save = self._fancy_button("Save", "primary")
-            save.size_hint_x = None
-            save.width = dp(110)
-            save.bind(on_press=lambda *_a, b=bot_id: self.save_edit(b))
-            save_row.add_widget(save)
-            cancel = self._fancy_button("Cancel", "outlined")
-            cancel.size_hint_x = None
-            cancel.width = dp(110)
-            cancel.bind(on_press=lambda *_a, b=bot_id: self.toggle_edit(b))
-            save_row.add_widget(cancel)
-            editor.add_widget(save_row)
-            self._edit_boxes[bot_id] = editor
-            self._edit_checks[bot_id] = checks
-            row.add_widget(editor)
-            return row
-
-        # -- create -------------------------------------------------------
-        def create_bot(self):
-            name = (self._name_field.text or "").strip()
-            if not name:
-                self._set_bots_status("Enter a bot name.")
-                return
-            perms = sum(bit for bit, cb in self._create_checks.items()
-                        if cb.active)
-            api = self._api()
-            if api is None:
-                self._set_bots_status(
-                    "Bots unavailable: no guild connection.")
-                return
-            try:
-                res = api.bots_create(name, perms)
-            except Exception as e:
-                self._set_bots_status("Create failed: %s" % e)
-                return
-            if not res.get("ok"):
-                self._set_bots_status("Create failed: %s" % res.get(
-                    "error", "unknown error"))
-                return
-            bot = res.get("bot") or {}
-            self._show_key(res.get("api_key") or "",
-                           res.get("gateway") or {})
-            self._name_field.text = ""
-            for cb in self._create_checks.values():
-                cb.active = False
-            self._set_bots_status(
-                "Bot '%s' created -- copy the API key now." % (
-                    bot.get("name") or name))
-
-        def _show_key(self, api_key, gateway):
-            """Reveal the one-time key + gateway block after a create."""
-            self._key = api_key
-            self._gateway_text = self._gateway_block(gateway)
-            self._key_label.text = "API key: %s" % api_key
-            self._gateway_label.text = self._gateway_text
-            self._key_box.opacity = 1
-            self._key_box.height = self._key_box.minimum_height
-
-        def _gateway_block(self, gateway):
-            """Gateway facts: the client's own hub/node/delivery hashes
-            plus the endpoint paths the create response supplies."""
-            app = App.get_running_app()
-            eps = (gateway or {}).get("endpoints") or {}
-            defaults = {"subscribe": "/api/v1/stream/subscribe",
-                        "poll": "/api/v1/stream/poll",
-                        "post": "/api/v1/bots/post",
-                        "react": "/api/v1/bots/react"}
-            lines = [
-                "Hub: %s" % (getattr(app, "hub_address", "") or ""),
-                "Guild node: %s" % (getattr(app, "guild_node_hash", "") or ""),
-                "Delivery: %s" % (getattr(app, "delivery_hash", "") or ""),
-            ]
-            for key in ("subscribe", "poll", "post", "react"):
-                lines.append("%s: %s" % (key, eps.get(key)
-                                         or defaults[key]))
-            return "\n".join(lines)
-
-        def copy_api_key(self):
-            if self._key:
-                self._copy(self._key, "API key")
-
-        def copy_gateway(self):
-            if self._gateway_text:
-                self._copy(self._gateway_text, "gateway info")
-
-        def dismiss_key(self):
-            """Hide the one-time key and refresh the list (the key is
-            gone for good once dismissed)."""
-            self._key = None
-            self._gateway_text = ""
-            self._key_box.opacity = 0
-            self._key_box.height = 0
-            self.refresh()
-
-        # -- per-bot actions ----------------------------------------------
-        def toggle_edit(self, bot_id):
-            editor = self._edit_boxes.get(bot_id)
-            if editor is None:
-                return
-            if editor.opacity:
-                editor.opacity = 0
-                editor.height = 0
-            else:
-                editor.opacity = 1
-                editor.height = editor.minimum_height
-
-        def save_edit(self, bot_id):
-            checks = self._edit_checks.get(bot_id)
-            if checks is None:
-                return
-            perms = sum(bit for bit, cb in checks.items() if cb.active)
-            api = self._api()
-            if api is None:
-                self._set_bots_status(
-                    "Bots unavailable: no guild connection.")
-                return
-            try:
-                res = api.bots_update(bot_id, perms=perms)
-            except Exception as e:
-                self._set_bots_status("Save failed: %s" % e)
-                return
-            if not res.get("ok"):
-                self._set_bots_status("Save failed: %s" % res.get(
-                    "error", "unknown error"))
-                return
-            # Refresh first: it writes its own "Loaded N bot(s)" line,
-            # then the confirmation lands on top of it.
-            self.refresh()
-            self._set_bots_status("Permissions saved.")
-
-        def revoke_bot(self, bot_id, name, btn):
-            """Two-tap confirm on the button itself: first tap arms it
-            (re-labels to 'Confirm revoke'), second tap revokes."""
-            if not self._revoke_armed.get(bot_id):
-                self._revoke_armed[bot_id] = True
-                btn._bots_label.text = "Confirm revoke"
-                self._set_bots_status(
-                    "Tap Confirm revoke to revoke '%s' -- this cannot "
-                    "be undone." % name)
-                return
-            api = self._api()
-            if api is None:
-                self._set_bots_status(
-                    "Bots unavailable: no guild connection.")
-                return
-            try:
-                res = api.bots_revoke(bot_id)
-            except Exception as e:
-                self._set_bots_status("Revoke failed: %s" % e)
-                return
-            if not res.get("ok"):
-                self._set_bots_status("Revoke failed: %s" % res.get(
-                    "error", "unknown error"))
-                return
-            # Refresh first: it writes its own "Loaded N bot(s)" line,
-            # then the confirmation lands on top of it.
-            self.refresh()
-            self._set_bots_status("Bot '%s' revoked." % name)
-
-        # -- helpers --------------------------------------------------------
-        def _set_bots_status(self, text):
-            try:
-                self.ids["bots_status"].text = str(text)
-            except Exception:
-                pass
-
-        def _copy(self, text, what):
-            """Copy via the app's clipboard helper (MenusMixin._copy_text),
-            falling back to Clipboard directly."""
-            try:
-                app = App.get_running_app()
-                if app is not None and hasattr(app, "_copy_text"):
-                    app._copy_text(text)
-                else:
-                    raise AttributeError("_copy_text missing")
-            except Exception:
-                try:
-                    from kivy.core.clipboard import Clipboard
-                    Clipboard.copy(text)
-                except Exception:
-                    self._set_bots_status("Copy failed.")
-                    return
-            self._set_bots_status("Copied %s to clipboard." % what)
-
-        @staticmethod
-        def _trunc(value):
-            value = value or ""
-            return value[:12] + "…" if len(value) > 12 else value
-
-        @staticmethod
-        def _perm_text(perms):
-            labels = [label for bit, label in BOT_PERM_BITS if perms & bit]
-            return ", ".join(labels) if labels else "No permissions"
-
-        @staticmethod
-        def _fmt_ts(value):
-            """created_at / last_seen: epoch seconds render as a date,
-            ISO strings pass through (first 19 chars), missing is never."""
-            if value in (None, "", 0):
-                return "never"
-            try:
-                return time.strftime("%Y-%m-%d %H:%M",
-                                     time.localtime(float(value)))
-            except (TypeError, ValueError, OverflowError):
-                return str(value)[:19]
-
 
 # ---------------------------------------------------------------------------
 # Main app
 # ---------------------------------------------------------------------------
-def _fail_validation(app, text):
-    """Validation rejection: show it where the user can see it.
-
-    H5: _set_status writes to the connect/profile screens' status
-    label only. On a fresh install the app sits on the onboarding
-    screen, so a rejection was invisible. Switch to the connect
-    screen first, then write the status. Module-level (not a method)
-    so unbound connect_to_guild callers with a minimal stub -- which
-    only defines _set_status -- keep working.
-    """
-    try:
-        app.root.current = "connect"
-    except Exception:
-        pass
-    app._set_status(text)
-
-
-class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
-                      VoicePanelMixin, StreamMixin, MenusMixin,
-                      AttachmentsMixin, MDApp):
+class sHadesClientApp(MDApp):
     title = "sHades"
 
     guild_api = ObjectProperty(None, allownone=True)
@@ -2149,20 +2634,8 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
     # Unified UI palette: edited in the config screen, persisted to
     # ui_config.json, referenced by kv_md.kv as app.theme_colors['key'].
     theme_colors = DictProperty({})
-    # sitenav (d/g): persistent site nav bar state, bound by kv_md.kv.
-    # visible = a site page is on screen; path = "#channel /path" crumb;
-    # can_back/can_forward gate the bar's Back/Forward controls.
-    site_nav_visible = BooleanProperty(False)
-    site_nav_path = StringProperty("")
-    site_nav_can_back = BooleanProperty(False)
-    site_nav_can_forward = BooleanProperty(False)
-    # polish (g): composer upload progress bar state, bound by kv_md.kv.
-    # upload_active shows the 4dp strip above the composer; upload_pct
-    # (0-100) is the fill. Driven from _send_with_attachment's pstage
-    # (via Clock, worker thread) and cleared by _attach_composer_stage("")
-    # on every exit path of the send flow.
-    upload_pct = NumericProperty(0)
-    upload_active = BooleanProperty(False)
+    # task 9: the composer rail's pfp; "" = letterless default disc
+    composer_pfp_path = StringProperty("")
     # P5: sidebar banner strip (above the channel list); "" = letter tile
     banner_channel_path = StringProperty("")
     # P5: config-pane header strip (stays empty; bindings tolerate "")
@@ -2185,11 +2658,6 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
     # live.
     avatar_preview = StringProperty("")
     connect_username_required = BooleanProperty(True)
-    # Task 2: username is a StringProperty (was a plain attribute) so
-    # KV bindings on app.username stay live -- the composer avatar's
-    # fallback letter and the connect screen's username field both
-    # read it, and both were stale at the provisional "user" value.
-    username = StringProperty("user")
     # path-state chip: the observed RNS path to the guild node
     # (offline / direct / relay + hop count), rendered by MeshPulse,
     # MeshConstellation and the header label in kv_md.kv
@@ -2258,15 +2726,12 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         self._stream_tick_event = None
         # site channels: kind per cid, the rendered page stack, the page
         # currently shown, and the active theme from the manifest
-        self._channel_kinds = {}     # cid -> chat|site|term|voice|announce
-        self._voice_state_init()     # item 6: voice rows + join panel
+        self._channel_kinds = {}     # cid -> chat|site|term|announce
         self._channel_can_post = {}  # cid -> can_post (P8)
         self._channel_pos = {}       # name -> position (task 7 ordering)
         self._channel_order = {}     # cid -> position (server-side index)
-        self._site_stack = []        # [(cid, path, scroll_y)] back stack
-        self._site_forward = []      # [(cid, path, scroll_y)] forward stack
+        self._site_stack = []        # [(cid, path)] back stack
         self._site_current = None    # (cid, path)
-        self._site_pending_scroll = 1.0  # scroll_y the next render restores
         self._site_theme = {}
         # term channels: one console session per channel, the live TermPage
         self._term_sessions = {}     # cid -> session id
@@ -2359,11 +2824,71 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         self._dm_popup_input = None
         self._admin_popup = None
 
+    def _select_random_banners(self):
+        """No-op kept for the banner kv bindings (app.banner_*_path).
+
+        tay (receipt 2026-11-19): "cull the media images, it's bloating
+        the repo and they are random placeholders" - the fork's 18 MB
+        z-image-turbo set is gone from the tree and the APK. The kv
+        widgets tolerate the empty source (source: app.banner_... or '').
+        If real banners ever return, land them as vetted assets, not
+        an 18 MB placeholder folder that ships in every binary.
+        """
+        self.banner_config_path = ""
+        self.banner_channel_path = ""
+
     # -- UI theme / config ----------------------------------------------
+
+    def _ui_config_path(self):
+        return os.path.join(_app_data_dir(), "ui_config.json")
+
+    def _load_ui_config(self):
+        """Load persisted user theme colors from ui_config.json, if any."""
+        try:
+            with open(self._ui_config_path()) as f:
+                saved = json.load(f)
+        except Exception:
+            return
+        if not isinstance(saved, dict):
+            return
+        for key, value in list(self.theme_colors.items()):
+            if key in saved and isinstance(saved[key], str):
+                try:
+                    self.theme_colors[key] = hex_to_rgba(saved[key])
+                except Exception:
+                    pass
+
+    def _save_ui_config(self):
+        """Persist the current theme colors to ui_config.json."""
+        try:
+            os.makedirs(_app_data_dir(), exist_ok=True)
+            data = {key: rgba_to_hex(value)
+                    for key, value in self.theme_colors.items()}
+            with open(self._ui_config_path(), "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print("save ui config failed:", repr(e))
+
+    def open_config(self):
+        """Open the config screen (theme colors)."""
+        self.root.current = "config"
+
+
+    def _channel_cid(self, name):
+        """Convert a channel name to its RNS destination hash ID,
+        matching the guild's ensure_channel() formula."""
+        return hexstr(RNS.Identity.full_hash(b"main_guild:" + name.encode()))
+
+    def _channel_name(self, cid):
+        """Inverse of the channel map (name -> cid): the ticket push
+        (v0.31) arrives keyed by cid, the fetch path speaks names."""
+        for name, c in self._channels.items():
+            if c == cid:
+                return name
+        return None
 
     # -- lifecycle -------------------------------------------------------
     def build(self):
-        global _KV_LOADED
         if BOOT_DEBUG:
             _boot_mark("0.3 build(): python + kivy window alive")
         if Window:
@@ -2375,24 +2900,13 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         from kivymd.uix.appbar import MDTopAppBar  # noqa: F401
         from kivy.lang import Builder
         _register_ui_fonts()
-        if not _KV_LOADED:
-            Builder.load_file(os.path.join(_app_dir(), "kv_md.kv"))
-            _KV_LOADED = True
+        Builder.load_file(os.path.join(_app_dir(), "kv_md.kv"))
         sm = ScreenManager()
-        # Polish group 1: one short fade for every screen switch (connect,
-        # onboarding, main, profile, config, site editor, server config),
-        # same language as ui_fx.reveal(). ui_fx owns the duration and
-        # retimes it to instant while reduced motion is on.
-        import ui_fx
-        sm.transition = FadeTransition(
-            duration=ui_fx.SCREEN_TRANSITION_DURATION)
-        ui_fx.register_screen_manager(sm)
         sm.add_widget(ConnectScreen(name="connect"))
         sm.add_widget(OnboardingScreen(name="onboarding"))
         sm.add_widget(MainScreen(name="main"))
         sm.add_widget(ProfileScreen(name="profile"))
         sm.add_widget(ConfigScreen(name="config"))
-        sm.add_widget(BotsScreen(name="bots"))
         sm.add_widget(SiteEditorScreen(name="site_editor"))
         # Phase 1 task 5: the tabbed server-config screen replaces the U8
         # popup; its tabs are keyed to the caller's roles on entry.
@@ -2531,13 +3045,6 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         if BOOT_DEBUG:
             _boot_mark("on_start")
         self._apply_system_gesture_exclusions()
-        # Draw-order + texture instrument (device receipts; tay's order
-        # verdict) with the keyboard-resize texture-rebuild medicine.
-        try:
-            import client_diag
-            client_diag.bind_resize(self)
-        except Exception as e:
-            print("client_diag bind failed:", e, flush=True)
         # 0.36.14: the frame meter (main.py, UI-thread listener) feeds
         # this tick; it pads the chat container so the composer group
         # rides above the keyboard.
@@ -2891,8 +3398,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
 
         filt.bind(text=render)
         render(filt, None)
-        import ui_fx
-        ui_fx.popup_entrance(popup)
+        popup.open()
         # tay (2026-11): a live '/'-trigger seeds the filter from the
         # channel input and takes the keyboard, so the palette is the
         # selection surface while typing.
@@ -2901,6 +3407,27 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         filt.focus = True
         note.text = "client commands + hub dispatcher (fetching...)"
         Clock.schedule_once(lambda dt: fetch_hub(), 0)
+
+    def _accept_hub_rows(self, rows, rerender):
+        """Apply the fetched /help table to the palette (and drop the
+        fetching note on the next render)."""
+        self._slash_hub_rows = rows or []
+        try:
+            note_lbl = self._palette_popup.content.children[0]
+            if isinstance(note_lbl, Label):
+                note_lbl.text = ("" if rows else
+                                 "hub unreachable - client commands only")
+        except Exception:
+            pass
+        if callable(rerender):
+            rerender()
+
+    def _slash_client_rows(self):
+        """The client-local slash verbs (kivy_client._handle_slash)."""
+        return [("/me", "emote an action line"),
+                ("/join", "switch to a channel"),
+                ("/search", "search channel history"),
+                ("/invite", "copy this guild's invite")]
 
     def open_recovery_sheet(self, onboarding_name=None):
         """Make an encrypted kit before first connection or from Profile."""
@@ -2931,15 +3458,12 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         status.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
         box.add_widget(status)
         actions = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
-        save = blircle(Button(
-            text="Save kit", background_normal="",
-            background_color=[1, 1, 1, 0],
-            color=self.theme_colors["btn_text"]),
-            bg_token="primary", bg_fallback="#FFD54F")
-        later = blircle(Button(
-            text="Skip for now" if onboarding_name is not None else "Close",
-            background_normal="", background_color=[1, 1, 1, 0],
-            color=self.theme_colors["text"]), bg_token="sidebar_ctrl")
+        save = Button(text="Save kit", background_normal="",
+                      background_color=self.theme_colors["primary"],
+                      color=self.theme_colors["btn_text"])
+        later = Button(text="Skip for now" if onboarding_name is not None else "Close",
+                       background_normal="", background_color=self.theme_colors["sidebar_ctrl"],
+                       color=self.theme_colors["text"])
         actions.add_widget(save)
         actions.add_widget(later)
         box.add_widget(actions)
@@ -2979,8 +3503,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                        onboarding_name, getattr(self, "_onboard_hub", None)))
                    if onboarding_name is not None
                    else sheet.dismiss())
-        import ui_fx
-        ui_fx.popup_entrance(sheet)
+        sheet.open()
 
     def show_qr(self, payload, title, note=""):
         """Display a scannable QR without exposing the payload as plain text."""
@@ -2999,8 +3522,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                                  font_size=sp(12), size_hint_y=None, height=dp(46)))
         popup = Popup(title=title, content=box, size_hint=(0.9, 0.72))
         popup.bind(on_dismiss=lambda *_: os.path.exists(path) and os.unlink(path))
-        import ui_fx
-        ui_fx.popup_entrance(popup)
+        popup.open()
 
     def show_invite_qr(self):
         host, port = getattr(self, "hub_host", None), getattr(self, "hub_port", None)
@@ -3040,8 +3562,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             except Exception as exc:
                 self._set_status("Transfer QR failed: %s" % exc)
         show.bind(on_press=create)
-        import ui_fx
-        ui_fx.popup_entrance(sheet)
+        sheet.open()
 
     def scan_qr(self, on_value):
         """Open a camera QR scanner where its native decoder is installed."""
@@ -3085,8 +3606,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             sheet.dismiss()
             on_value(value)
         scanner.bind(symbols=decoded)
-        import ui_fx
-        ui_fx.popup_entrance(sheet)
+        sheet.open()
 
     def scan_invite_qr(self):
         def apply(value):
@@ -3193,16 +3713,12 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                 chooser.path = os.path.expanduser("~")
             box.add_widget(chooser)
         actions = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
-        restore_btn = blircle(Button(
-            text="Choose kit" if self._android_platform()
-            else "Restore selected",
-            background_normal="", background_color=[1, 1, 1, 0],
-            color=self.theme_colors["btn_text"]),
-            bg_token="primary", bg_fallback="#FFD54F")
-        cancel = blircle(Button(
-            text="Cancel", background_normal="",
-            background_color=[1, 1, 1, 0],
-            color=self.theme_colors["text"]), bg_token="sidebar_ctrl")
+        restore_btn = Button(text="Choose kit" if self._android_platform() else "Restore selected",
+                             background_normal="", background_color=self.theme_colors["primary"],
+                             color=self.theme_colors["btn_text"])
+        cancel = Button(text="Cancel", background_normal="",
+                        background_color=self.theme_colors["sidebar_ctrl"],
+                        color=self.theme_colors["text"])
         actions.add_widget(restore_btn)
         actions.add_widget(cancel)
         box.add_widget(actions)
@@ -3260,8 +3776,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
 
         restore_btn.bind(on_press=pick)
         cancel.bind(on_press=lambda *_: sheet.dismiss())
-        import ui_fx
-        ui_fx.popup_entrance(sheet)
+        sheet.open()
 
     def _restore_recovery_file(self, path, passphrase):
         if os.path.exists(self._identity_file()):
@@ -3301,7 +3816,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                              and 0 < len(s["hub_address"]) <= 256]
             metadata_ok = self._save_servers() and metadata_ok
             self._active_server_idx = 0 if self._servers else -1
-        # tay's transfer contract (0.36.24, re-applied at 0.36.25): the restored device resumes
+        # tay's transfer contract (0.36.24): the restored device resumes
         # exactly like the device the kit came from. The kit's
         # last-active guild becomes the saved session, so the next boot
         # reconnects instead of re-staging, and the portable profile
@@ -3348,7 +3863,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             pass
 
     def _enter_restored_account(self):
-        """tay's transfer contract (0.36.24, re-applied at 0.36.25): a restored kit whose server
+        """tay's transfer contract (0.36.24): a restored kit whose server
         row is complete transfers the account ALIVE - dial the kit's
         last-active guild exactly as the device it came from. Returns
         True when an attempt started.
@@ -3445,21 +3960,6 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             self._restore_avatar_from_disk()
             self._refresh_channels_ui()
             self._refresh_server_sidebar()
-            # H4: render the offline cache at boot even with no guild_api
-            # (dead hub). The old path only rendered history once the
-            # guild API was up (_load_history_ui rescheduled forever
-            # while guild_api was None), so a dead hub left an empty
-            # channel although cached messages existed.
-            try:
-                main = self.root.get_screen("main")
-                grid = main.ids.message_grid
-                name = getattr(main, "_current_channel", "general")
-                had_rows, was_at_bottom = self._follow_snapshot(grid)
-                if self._show_cached_channel(grid, self._channel_cid(name)):
-                    self._scroll_to_bottom_if_following(
-                        had_rows, was_at_bottom)
-            except Exception as e:
-                print("open main cache render error:", repr(e))
         except Exception as e:
             print("open main error:", repr(e))
 
@@ -3500,14 +4000,6 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         return os.path.join(d, "session.json")
 
     def _save_session(self):
-        # Hardening only (fixes.md #17, plaintext half): the write is
-        # already atomic (tmp + os.replace); the session file now also
-        # gets owner-only permissions so other local users cannot read
-        # the stored hub address/hashes. This is NOT encryption -- a
-        # device-key scheme needs the user's call, so none is designed
-        # here. A failed write removes the stray tmp file and leaves
-        # the previous session intact.
-        tmp = None
         try:
             path = self._session_path()
             tmp = path + ".tmp"
@@ -3527,17 +4019,8 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                     "hub_port": self.hub_port,
                 }, f)
             os.replace(tmp, path)  # atomic on POSIX and Windows
-            tmp = None  # replaced: nothing to clean up on failure below
-            try:
-                os.chmod(path, 0o600)
-            except Exception:
-                pass
         except Exception:
-            if tmp:
-                try:
-                    os.remove(tmp)
-                except Exception:
-                    pass
+            pass
 
     def _load_session(self):
         try:
@@ -3665,6 +4148,24 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
     # -- message history persistence (so embeds survive close/re-open) -----
     def _history_path(self):
         return os.path.join(_app_data_dir(), "history.json")
+
+    def _attachments_dir(self):
+        d = os.path.join(_app_data_dir(), "attachments")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _save_attachment_blob(self, blob, name):
+        """Persist an ephemeral attachment blob to disk; return its local path."""
+        d = self._attachments_dir()
+        safe = "".join(c for c in name if c.isalnum() or c in "._-") or "attachment"
+        fname = "%s_%s" % (hashlib.sha256(blob).hexdigest()[:12], safe)
+        fpath = os.path.join(d, fname)
+        try:
+            with open(fpath, "wb") as f:
+                f.write(blob)
+        except Exception:
+            return None
+        return fpath
 
     def _offline_path(self):
         return os.path.join(_app_data_dir(), "offline.sqlite3")
@@ -3794,10 +4295,9 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         if grid is None:
             Clock.schedule_once(self._load_history_ui, 0.5)
             return
-        had_rows, was_at_bottom = self._follow_snapshot(grid)
         for m in self._load_history():
             self._render_message(grid, m)
-        self._scroll_to_bottom_if_following(had_rows, was_at_bottom)
+        Clock.schedule_once(lambda dt: self._scroll_to_bottom(), 0.1)
         if not self._scroll_bound:
             self._scroll_bound = True
             try:
@@ -3824,13 +4324,13 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
 
     def connect_to_guild(self, hub_address, username, node_hash="", delivery_hash=""):
         if not (hub_address or "").strip():
-            _fail_validation(self, "Hub address required.")
+            self._set_status("Hub address required.")
             return
         # tay (2026-11): a username is required before connecting to a
         # hub for the first time; no silent "user" fallback.
         username = (username or "").strip()
         if not username:
-            _fail_validation(self, "A username is required before connecting.")
+            self._set_status("A username is required before connecting.")
             return
         node_hash = (node_hash or "").strip().lower()
         delivery_hash = (delivery_hash or "").strip().lower()
@@ -3847,31 +4347,31 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                 node_hash = inv["node_hash"]
 
         if not hub_address:
-            _fail_validation(self, "Hub address required (ip:port)")
+            self._set_status("Hub address required (ip:port)")
             return
 
         # Parse ip:port
         if ":" not in hub_address:
-            _fail_validation(self, "Hub address must be ip:port (e.g. 192.168.1.50:29221)")
+            self._set_status("Hub address must be ip:port (e.g. 192.168.1.50:29221)")
             return
         host, port_str = hub_address.rsplit(":", 1)
         try:
             port = int(port_str)
         except ValueError:
-            _fail_validation(self, "Invalid port number")
+            self._set_status("Invalid port number")
             return
 
         if (not host.strip() or any(ch.isspace() for ch in host)
                 or not 1 <= port <= 65535):
-            _fail_validation(self, "Hub address needs a host and port from 1 to 65535")
+            self._set_status("Hub address needs a host and port from 1 to 65535")
             return
 
         # Validate hashes if provided
         if node_hash and not re.fullmatch(r"[0-9a-f]{32}", node_hash):
-            _fail_validation(self, "Invalid node_hash (need 32 hex)")
+            self._set_status("Invalid node_hash (need 32 hex)")
             return
         if delivery_hash and not re.fullmatch(r"[0-9a-f]{32}", delivery_hash):
-            _fail_validation(self, "Invalid delivery_hash (need 32 hex)")
+            self._set_status("Invalid delivery_hash (need 32 hex)")
             return
 
         # Add/update server in the list
@@ -3897,61 +4397,13 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         self.delivery_hash = delivery_hash or None
         self._set_status("Connecting...")
         self._save_session()
-        # H2: one connect at a time. A second connect while one is in
-        # flight is ignored -- two concurrent _connect_after_rns workers
-        # would race on self.link / self.guild_api.
-        if not self._begin_connect():
-            _fail_validation(self, "Already connecting...")
-            return
         # RNS.Reticulum() installs signal handlers and must run on the main
         # thread. Schedule it there, then do blocking link work in a bg thread.
         # If RNS is already initialized (retry), skip initialization.
         if self.reticulum is not None:
-            self._start_connect_after_rns()
+            Clock.schedule_once(lambda dt: self._connect_after_rns(), 0)
         else:
             Clock.schedule_once(lambda dt: self._init_reticulum(), 0)
-
-    def _begin_connect(self):
-        """Claim the single in-flight connect slot.
-
-        Returns False when a connect is already running (the caller must
-        ignore the new request); True when the slot was claimed. The
-        slot is released by the _connect_after_rns worker's finally, or
-        by _init_reticulum if RNS construction fails before the worker
-        starts -- otherwise a failed init would wedge every later
-        connect.
-        """
-        if getattr(self, "_connect_in_flight", False):
-            return False
-        self._connect_in_flight = True
-        return True
-
-    def _start_connect_after_rns(self):
-        """Run _connect_after_rns on a daemon worker, never the main thread.
-
-        H2: _connect_after_rns blocks up to ~150s (60s discover + 30s
-        recall wait + 3x20s link attempts). Called from a Clock callback
-        it froze the UI for a minute on every connect, server switch and
-        re-establish. All UI touches inside it already hop through
-        Clock.schedule_once, so the worker is safe; a second worker is
-        never spawned while one is alive.
-        Returns True when a worker was started.
-        """
-        worker = getattr(self, "_connect_worker", None)
-        if worker is not None and worker.is_alive():
-            return False
-        self._connect_workers_started = getattr(
-            self, "_connect_workers_started", 0) + 1
-
-        def _run():
-            try:
-                self._connect_after_rns()
-            finally:
-                self._connect_in_flight = False
-        thread = threading.Thread(target=_run, daemon=True)
-        self._connect_worker = thread
-        thread.start()
-        return True
 
     # -- server sidebar ------------------------------------------------------
     def _refresh_server_sidebar(self):
@@ -4016,17 +4468,14 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
 
         def work():
             try:
-                if hasattr(api, "blobs_get_full"):
-                    raw = api.blobs_get_full(blob_id)
-                else:
-                    import base64 as _b64
-                    res = api.blobs_get(blob_id)
-                    if not res.get("ok"):
-                        return
-                    raw = _b64.b64decode(res.get("data_b64") or b"")
+                res = api.blobs_get(blob_id)
             except Exception as e:
                 print("asset fetch failed (%s):" % subdir, repr(e))
                 return
+            if not res.get("ok"):
+                return
+            import base64 as _b64
+            raw = _b64.b64decode(res.get("data_b64") or b"")
             if not raw:
                 return
             ext = "png"
@@ -4081,13 +4530,6 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         self._stream_tick_event = None
         self._site_stack.clear()
         self._site_current = None
-        fwd = getattr(self, "_site_forward", None)
-        if fwd is not None:
-            fwd.clear()
-        # sitenav (d): a server switch leaves every site page behind.
-        _refresh_nav = getattr(self, "_refresh_site_nav", None)
-        if _refresh_nav is not None:
-            _refresh_nav(visible=False)
         self._site_theme.clear()
         self._term_sessions.clear()
         self._term_page = None
@@ -4100,15 +4542,114 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         except Exception:
             pass
         self._channels_added = False
-        # Reconnect to the new server (H2: guarded + threaded like a
-        # fresh connect -- the old Clock-scheduled _connect_after_rns
-        # ran its ~150s of blocking sleeps on the main thread).
-        if self._begin_connect():
-            if self.reticulum is not None:
-                self._start_connect_after_rns()
-            else:
-                Clock.schedule_once(lambda dt: self._init_reticulum(), 0)
+        # Reconnect to the new server
+        if self.reticulum is not None:
+            Clock.schedule_once(lambda dt: self._connect_after_rns(), 0)
+        else:
+            Clock.schedule_once(lambda dt: self._init_reticulum(), 0)
         self._set_status("Switching to %s..." % self._servers[idx].get("display_name", "server"))
+
+    def _open_add_server_popup(self):
+        """Popup to add a new server (guild)."""
+        from kivy.uix.popup import Popup
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.textinput import TextInput
+        from kivy.uix.label import Label
+        from kivy.uix.button import Button
+        from kivy.metrics import dp, sp
+
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
+        box.add_widget(Label(text="Add Server", font_size=sp(18), size_hint_y=None,
+                       height=dp(30), color=self.theme_colors['text']))
+
+        hub_in = TextInput(hint_text="Hub address (ip:port or shades://...)",
+                           multiline=False, size_hint_y=None, height=dp(40),
+                           background_color=self.theme_colors['input_bg'],
+                           foreground_color=self.theme_colors['text'],
+                           cursor_color=self.theme_colors['text'])
+        box.add_widget(hub_in)
+
+        user_in = TextInput(hint_text="Username",
+                            multiline=False, size_hint_y=None, height=dp(40),
+                            background_color=self.theme_colors['input_bg'],
+                            foreground_color=self.theme_colors['text'],
+                            cursor_color=self.theme_colors['text'])
+        user_in.text = self.username
+        box.add_widget(user_in)
+
+        node_in = TextInput(hint_text="Node hash (32 hex, optional)",
+                            multiline=False, size_hint_y=None, height=dp(40),
+                            background_color=self.theme_colors['input_bg'],
+                            foreground_color=self.theme_colors['text'],
+                            cursor_color=self.theme_colors['text'])
+        box.add_widget(node_in)
+
+        delivery_in = TextInput(hint_text="Delivery hash (32 hex, optional)",
+                                multiline=False, size_hint_y=None, height=dp(40),
+                                background_color=self.theme_colors['input_bg'],
+                                foreground_color=self.theme_colors['text'],
+                                cursor_color=self.theme_colors['text'])
+        box.add_widget(delivery_in)
+
+        name_in = TextInput(hint_text="Display name (optional)",
+                            multiline=False, size_hint_y=None, height=dp(40),
+                            background_color=self.theme_colors['input_bg'],
+                            foreground_color=self.theme_colors['text'],
+                            cursor_color=self.theme_colors['text'])
+        box.add_widget(name_in)
+
+        status = Label(text="", size_hint_y=None, height=dp(
+            20), color=self.theme_colors['accent'], font_size=sp(11))
+        box.add_widget(status)
+
+        btn_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+
+        def do_add(*_):
+            hub = (hub_in.text or "").strip()
+            user = (user_in.text or "").strip() or "user"
+            node = (node_in.text or "").strip().lower()
+            delivery = (delivery_in.text or "").strip().lower()
+            name = (name_in.text or "").strip() or None
+            if not hub:
+                status.text = "Hub address required"
+                return
+            if ":" not in hub and not hub.startswith("shades://"):
+                status.text = "Hub must be ip:port or shades://..."
+                return
+            if node and not re.fullmatch(r"[0-9a-f]{32}", node):
+                status.text = "Invalid node hash"
+                return
+            if delivery and not re.fullmatch(r"[0-9a-f]{32}", delivery):
+                status.text = "Invalid delivery hash"
+                return
+            self._add_server(hub, user, node, delivery, name)
+            self._refresh_server_sidebar()
+            popup.dismiss()
+            # Connect to the new server
+            self.connect_to_guild(hub, user, node, delivery)
+
+        add_btn = Button(
+            text="Add & Connect",
+            size_hint_y=None,
+            height=scaled(dp(44)),
+            pos_hint={"center_y": 0.5},
+            background_color=self.theme_colors['primary'],
+            color=self.theme_colors['btn_text'])
+        add_btn.bind(on_press=do_add)
+        cancel_btn = Button(
+            text="Cancel",
+            size_hint_y=None,
+            height=scaled(dp(44)),
+            pos_hint={"center_y": 0.5},
+            background_color=self.theme_colors['sidebar_ctrl'],
+            color=self.theme_colors['text'])
+        cancel_btn.bind(on_press=lambda *_: popup.dismiss())
+        btn_row.add_widget(add_btn)
+        btn_row.add_widget(cancel_btn)
+        box.add_widget(btn_row)
+
+        popup = Popup(title="", content=box, size_hint=(0.8, 0.75), auto_dismiss=False)
+        popup.open()
 
     @staticmethod
     def _wait_path_mtu(nh, tries=15):
@@ -4208,19 +4749,10 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         one everywhere (self.link, GuildAPI, push callback) and the
         stream subscription is re-primed from the watermark (the
         server binds one subscription per link; a new link has none).
-
-        H2: the blocking work runs on a daemon worker, not the main
-        thread -- _establish_guild_link sleeps up to 60s and the old
-        Clock-scheduled call froze the UI for the whole attempt.
         """
         if getattr(self, "_reestablishing", False):
             return
         self._reestablishing = True
-        threading.Thread(target=self._do_reestablish_work,
-                         daemon=True).start()
-
-    def _do_reestablish_work(self):
-        """Worker half of _do_reestablish (see its docstring)."""
         try:
             old = getattr(self, "link", None)
             if old is not None and getattr(old, "status", None) == RNS.Link.ACTIVE:
@@ -4237,8 +4769,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             link = self._establish_guild_link()
             self.link = link
             self.guild_api = GuildAPI(self.reticulum, link,
-                                      on_dead=self._on_guild_link_dead,
-                                      log=dlog)
+                                      on_dead=self._on_guild_link_dead)
             try:
                 link.set_packet_callback(self._on_push_frame)
             except Exception as e:
@@ -4255,15 +4786,6 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
     def _init_reticulum(self):
         """Main thread only: create RNS instance (signal handlers), then
         spawn a background thread for the blocking link establishment."""
-        # H2: never rebuild RNS while a connect worker is alive, and
-        # never rebuild it at all once it exists -- the retry path goes
-        # straight to the worker.
-        _worker = getattr(self, "_connect_worker", None)
-        if _worker is not None and _worker.is_alive():
-            return
-        if self.reticulum is not None:
-            self._start_connect_after_rns()
-            return
         if BOOT_DEBUG:
             _boot_mark("RNS: writing config")
         try:
@@ -4273,10 +4795,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             # Write an RNS config that routes to the guild. If a hub address was
             # provided, use a TCPClientInterface to reach it directly;
             # otherwise use AutoInterface for LAN multicast discovery.
-            # H1: never hand RNS a busy listen port -- its bind failure
-            # panics the process (os._exit(255)) past every try/except.
-            # Probe first; a held 29222 falls back to 29222+N.
-            self.client_port = _free_client_port(29222)
+            self.client_port = 29222
             cfgfile = os.path.join(storage, "config")
             if not os.path.exists(cfgfile) or self._config_needs_update(cfgfile):
                 with open(cfgfile, "w") as f:
@@ -4347,27 +4866,14 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         except Exception as e:
             print("init reticulum error:", repr(e))
             self._set_status("connect failed: %s" % e)
-            # H2: no worker was spawned, so release the slot claimed by
-            # _begin_connect -- otherwise every later connect is ignored.
-            self._connect_in_flight = False
             return
         # Identity and the LXMRouter must be built on the MAIN thread --
         # see _init_identity_and_lxmf. Only the blocking link work below
         # moves to a worker.
         self._init_identity_and_lxmf()
-        if getattr(self, "_identity_damaged", False):
-            # H3: the stored identity is corrupt -- do not connect with
-            # a minted replacement. Release the connect slot and park
-            # on the connect screen with the recovery message.
-            self._connect_in_flight = False
-            msg = ("Identity damaged — restore your recovery kit "
-                   "or start fresh")
-            Clock.schedule_once(
-                lambda dt: self._return_to_connect_screen(msg), 0)
-            return
         if BOOT_DEBUG:
             _boot_mark("identity + LXMF router ok, link worker starting")
-        self._start_connect_after_rns()
+        threading.Thread(target=self._connect_after_rns, daemon=True).start()
 
     def _config_needs_update(self, cfgfile):
         """Check if the stored RNS config matches the current hub address."""
@@ -4384,48 +4890,11 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             # config can be compared -- a session can be missing either one,
             # and "%d" % None raises TypeError.
             if self.hub_address and self.hub_host and self.hub_port:
-                if ("target_host = %s" % self.hub_host) not in content or \
-                        ("target_port = %d" % int(self.hub_port)) not in content:
-                    return True
-            elif "AutoInterface" not in content:
-                return True
-            # H1: the listen port is part of the config too -- a stale
-            # file holding the old (now busy) port must be rewritten
-            # with the probed fallback, or RNS would bind the busy one.
-            port = getattr(self, "client_port", 29222)
-            return ("listen_port = %d" % port) not in content
+                return ("target_host = %s" % self.hub_host) not in content or \
+                       ("target_port = %d" % int(self.hub_port)) not in content
+            return "AutoInterface" not in content
         except Exception:
             return True
-
-    def _hub_tcp_connected(self):
-        """TCP link state to our hub: True when the TCPClientInterface
-        to (hub_host, hub_port) is online, False when it exists but
-        never connected, None when there is no such interface to judge
-        (AutoInterface mode, or no hub configured).
-
-        H7a: RNS only logs a refused endpoint to stdout ([Errno 111]);
-        the interface's `online` flag is the programmatic signal.
-        """
-        try:
-            if not self.hub_host or not self.hub_port:
-                return None
-            for iface in RNS.Transport.interfaces:
-                if getattr(iface, "target_ip", None) is None:
-                    continue
-                if (str(getattr(iface, "target_ip", "")) ==
-                        str(self.hub_host)
-                        and int(getattr(iface, "target_port", -1)) ==
-                        int(self.hub_port)):
-                    return bool(getattr(iface, "online", False))
-            return None
-        except Exception:
-            return None
-
-    def _hub_unreachable_error(self):
-        """H7a: the fault is the hub endpoint, not node_hash discovery."""
-        return ("Could not reach hub %s (connection refused / "
-                "unreachable). Check the hub is running and the "
-                "address is right." % (self.hub_address or ""))
 
     def _discover_node_hash(self, reticulum):
         """Listen for RNS announces from the hub's nomadnetwork.node destination.
@@ -4466,9 +4935,8 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
 
         return None
 
-    _up_active = False  # an attachment/blob upload is in flight (held by
-    # blob_put_healed, the one standard upload path); while true, keepalive
-    # misses are ignored --
+    _up_active = False  # an attachment/blob upload is in flight (set at both
+    # blobs_put call sites); while true, keepalive misses are ignored --
     # an upload monopolizes the priority-agnostic link FIFO and legitimately
     # delays the poll's receipt past its deadline (manual receipt: RNS is
     # priority-agnostic on general traffic). Two counting misses here would
@@ -4537,6 +5005,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         except Exception as e:
             print("resume heal error:", repr(e))
 
+
     def _announce_dm_once(self):
         if self.lxmf_router and self.lxmf_delivery:
             try:
@@ -4570,26 +5039,15 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         """
         if self.client_identity is not None:
             return
-        self._identity_damaged = False
         try:
             storage = os.path.join(_app_data_dir(), "rns")
             ipath = os.path.join(storage, "identity")
             if os.path.exists(ipath):
-                try:
-                    self.client_identity = RNS.Identity.from_file(ipath)
-                except Exception:
-                    self.client_identity = None
+                self.client_identity = RNS.Identity.from_file(ipath)
                 if self.client_identity is None:
-                    # H3: corrupted or empty identity file -- DO NOT mint
-                    # a fresh one. That silently changed my_hash and the
-                    # user permanently lost their identity, username
-                    # claim, DMs and roles. This is the boot equivalent
-                    # of _ensure_identity_file's ValueError("identity is
-                    # damaged; restore a recovery kit"): stop the
-                    # connect (see _init_reticulum) and leave the
-                    # damaged file untouched for recovery.
-                    self._identity_damaged = True
-                    return
+                    # Corrupted or empty identity file — create a fresh one
+                    self.client_identity = RNS.Identity()
+                    self.client_identity.to_file(ipath)
             else:
                 self.client_identity = RNS.Identity()
                 self.client_identity.to_file(ipath)
@@ -4633,24 +5091,8 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             # The hub announces nomadnetwork.node over the TCPClientInterface
             # we just connected through; we capture the hash from the announce.
             if not self.guild_node_hash:
-                # H7a: a refused/unreachable TCP endpoint can never
-                # deliver an announce -- fail fast with the real fault
-                # instead of waiting 60s and then blaming node_hash
-                # discovery. The interface retries every 5s, so a
-                # ~12s poll covers two connect attempts before
-                # concluding the endpoint is down.
-                if self.hub_address and \
-                        self._hub_tcp_connected() is False:
-                    for _ in range(24):
-                        time.sleep(0.5)
-                        if self._hub_tcp_connected() is not False:
-                            break
-                    if self._hub_tcp_connected() is False:
-                        raise RuntimeError(self._hub_unreachable_error())
                 self.guild_node_hash = self._discover_node_hash(reticulum)
                 if not self.guild_node_hash:
-                    if self._hub_tcp_connected() is False:
-                        raise RuntimeError(self._hub_unreachable_error())
                     raise RuntimeError(
                         "Could not discover guild node_hash from hub announces. "
                         "Ask the hub admin for its node_hash and try again.")
@@ -4677,10 +5119,6 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                     if nid is not None:
                         break
             if nid is None:
-                # H7a: no announce can arrive over a dead TCP link --
-                # say so instead of blaming the announce wait.
-                if self._hub_tcp_connected() is False:
-                    raise RuntimeError(self._hub_unreachable_error())
                 raise RuntimeError(
                     "RNS does not know identity for node_hash %s — "
                     "the guild's announce was not heard within 30s. "
@@ -4692,8 +5130,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             link = self._establish_guild_link()
             self.link = link
             self.guild_api = GuildAPI(self.reticulum, link,
-                                      on_dead=self._on_guild_link_dead,
-                                      log=dlog)
+                                      on_dead=self._on_guild_link_dead)
             Clock.schedule_once(lambda dt: self._update_mesh(), 0)
             # v0.28 push: stream frames arrive on this link the moment
             # events exist. The callback is the client's entire intake;
@@ -4767,103 +5204,160 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         self._stream_cid = self._channel_cid(name)
         self._stream_cursor = None
 
-    def blob_put_healed(self, name, mime, data, on_progress=None,
-                        status_fn=None, attempt_cb=None, label="blob"):
-        """THE standard blob-upload entry (tay: "all attachments/uploads
-        should follow roughly the same path"). One retry policy for every
-        upload: message attachments (v1), site attachments, icon/banner.
-
-        Receipted mechanism: the SAF picker stop aborts the TCP interface
-        ([Errno 103]) -- RNS reconnects in ~5-15 s, but a link request
-        in flight inside the window is lost and its receipt sticks at
-        RequestReceipt.SENT (boot receipts: receipt_state=1, init phase).
-        The per-flow gates then gave up in one real case: 0.31.8 retried
-        only while the RNS link object still reported ACTIVE, and the
-        object drops when the server's link-closed aftereffect lands
-        ~15-25 s later (boot_2/boot_3) -- the banner pick showed exactly
-        that (attempt 0 timeout + link object gone -> status line, no
-        retry) while the icon pick in the same boot absorbed its 5 s gap
-        and landed on attempt 2.
-
-        Unified rule: retry "timeout" as long as attempts remain. When
-        the link object is down, poke the re-establish machinery and
-        keep the window open: every attempt re-reads self.guild_api, so
-        a retry lands on the re-established link when one comes up
-        (idempotent by construction: the chunked upload is offset-
-        addressed and an orphaned upload id expires server-side).
-        Retryable: 'timeout' and 'link dead' -- both link-layer, both
-        idempotent to redo (banner log 2026-11-22 19:40: attempt 1
-        timeout at init receipt_state=1, attempt 2 link dead, link
-        re-established 8 s later, attempts unused). Non-retryable:
-        protocol errors (server rejects, payload limit). Gate: holds
-        _up_active so the keepalive reaper does not tear the
-        link under a waiting retry (no counting, like both legacy call
-        sites; concurrent uploads are rare and the last finisher may
-        lower the gate early -- pre-existing accepted race)."""
-
-        def _dead(api):
-            return getattr(getattr(api, "link", None), "status",
-                           None) != RNS.Link.ACTIVE
-
-        up = None
-        self._up_active = True
-        try:
-            for attempt in range(4):
-                if attempt_cb is not None:
-                    attempt_cb(attempt + 1)
-                api = getattr(self, "guild_api", None)
-                if api is None:
-                    up = {"ok": 0, "error": "no link to the guild",
-                          "phase": "init"}
-                    break
+    def _start_poll(self):
+        # v0.28: no polling loops anywhere in the client. This one-shot
+        # keeps what the first poll tick did (seed the UI once); every
+        # later update arrives as a server push on the link.
+        def bootstrap(dt):
+            self._ensure_general_channel()
+            if not getattr(self, "_ui_populated", False):
+                self._ui_populated = True
                 try:
-                    up = api.blobs_put(name, mime, data,
-                                       on_progress=on_progress)
-                except Exception as e:
-                    # A raise is a protocol/endpoint problem (or a link
-                    # tear mid-call), not a retryable receipt: no retry,
-                    # mark it so the v1 send flow can still fall back to
-                    # the legacy inline post for pre-/api/v1 guilds
-                    # (LegacyApi doctrine: blobs_put raising there is the
-                    # deterministic "no v1 here" signal). Transport
-                    # timeout/dead failures stay final for that flow
-                    # (0.31.9 boot_2: never re-push the blob inline).
-                    up = {"ok": 0, "error": repr(e)[:120], "phase": "init",
-                          "raise": True}
-                    break
-                if up.get("ok"):
-                    return up
-                err = up.get("error", "unknown")
-                # Retry the receipted link-layer failures: 'timeout'
-                # (receipt stuck at SENT, request lost in the gap) and
-                # 'link dead' (the link object torn mid-window by the
-                # server's link-closed aftereffect). Banner log
-                # 2026-11-22 19:40 receipt: attempt 1 timeout at init
-                # (receipt_state=1), attempt 2 link dead at init, the
-                # guild link re-established 8 s later at 19:40:24 while
-                # two attempts remained -- the old timeout-only gate
-                # gave up inside a window that the heal was already
-                # closing. Both responses are link-layer and idempotent
-                # to redo (offset-addressed chunks; orphaned upload ids
-                # expire server-side). The legacy-flow protection stays
-                # exactly where 0.31.9 pinned it: only a raise falls
-                # through to the inline post.
-                if attempt < 3 and err in ("timeout", "link dead"):
-                    if _dead(api):
-                        self._do_reestablish()
-                    if status_fn is not None:
-                        status_fn(label + " upload: waiting for the link "
-                                  "(%s, attempt %d of 4)"
-                                  % (err, attempt + 1))
-                    time.sleep(8.0)
-                    continue
-                break
-            if up is not None and status_fn is not None:
-                status_fn(label + " upload: %s" % up.get("error", "failed"))
-            return up if up is not None else {"ok": 0, "error": "unknown",
-                                              "phase": "init"}
-        finally:
-            self._up_active = False
+                    main = self.root.get_screen("main")
+                    name = getattr(main, "_current_channel", "general")
+                    self._fetch_messages(name)
+                    self._refresh_members_ui(self._channel_cid(name))
+                except Exception:
+                    pass
+        Clock.schedule_once(bootstrap, 0)
+
+    def _on_push_frame(self, plaintext, packet=None):
+        """v0.28 push: the guild delivers stream frames down the link the
+        moment events exist (RNS.Packet(link, bytes), context NONE, which
+        is the only traffic this callback receives). Runs on an RNS
+        thread: threadsafe updates + Clock marshalling only."""
+        try:
+            frame = msgpack.unpackb(plaintext, raw=False)
+            if not isinstance(frame, dict) or frame.get("k") != "stream":
+                return
+            self._handle_stream_frame(frame)
+        except Exception as e:
+            print("push frame failed:", repr(e))
+
+    def _handle_stream_frame(self, frame):
+        """v0.31: the push-receive path, split out of the raw callback so
+        frame handling is directly testable."""
+        if frame.get("reset"):
+            # replay window rotated past our cursor: resync
+            self._stream_cursor = None
+            Clock.schedule_once(
+                lambda dt: self._resync_stream_channel(), 0)
+            return
+        if frame.get("ticket"):
+            # ticket push (v0.31): the frame carries seq + refs only, so
+            # no MTU ceiling exists above it. Pull the delta now through
+            # the resource path -- the same path poll and history use --
+            # instead of receiving bodies that can overflow the packet.
+            self._stream_cursor = frame.get("seq", self._stream_cursor)
+            cid = frame.get("channel")
+            Clock.schedule_once(lambda dt: self._ticket_pull(cid), 0)
+            events = frame.get("events") or []
+            if events:                     # legacy frame: still applies
+                self._apply_stream_events(events)
+            return
+        events = frame.get("events") or []
+        if events:
+            self._stream_cursor = frame.get("seq", self._stream_cursor)
+            self._apply_stream_events(events)
+
+    def _ticket_pull(self, cid):
+        """Delta-fetch the channel a ticket pointed at. Current channel
+        refreshes in place; other subscribed channels update through the
+        same render path (unread/older state), exactly like poll events
+        did."""
+        if not cid:
+            return
+        name = self._channel_name(cid)
+        if name:
+            self._fetch_messages(name)
+
+    def _start_streamer(self):
+        """Establish (or re-establish) the stream subscription on the link.
+
+        v0.31 truth: the server binds the channel AT SUBSCRIBE TIME and
+        replaces the binding on every call (one subscription per link,
+        api_v1_stream_subscribe) -- pointing _stream_cid alone changes
+        nothing on the wire. Callers:
+
+        - connect / guild-link attach: prime the entry channel;
+        - _switch_channel: re-point at the newly opened channel, letting
+          the server replace the binding;
+        - keepalive self-heal: after SUB_TTL_S of quiet the subscription
+          is purged server-side; the 45s keepalive sees {ok: 0, code:
+          409} and calls this again. _stream_cursor still holds the
+          watermark then, so the subscribe replays the gap from the
+          event log instead of jumping to head.
+
+        Setting the cursor here follows the same rule as upload offsets:
+        a subscribe with a kept cursor cannot lose or double-deliver
+        what the push path already rendered (render dedupes by msg_id).
+        """
+        if not self.guild_api or not self._stream_cid:
+            return
+        try:
+            res = self.guild_api.stream_subscribe(
+                self._stream_cid, cursor=self._stream_cursor)
+            if res.get("ok"):
+                if self._stream_cursor is None:
+                    self._stream_cursor = res.get("seq", 0)
+            else:
+                self._stream_cursor = None
+        except Exception as e:
+            print("stream subscribe failed:", repr(e))
+            self._stream_cursor = None
+
+    def _start_stream_keepalive(self):
+        """v0.31: keep the stream subscription alive through quiet minutes.
+
+        Receipted mechanics: SUB_TTL_S = 120 (sHades.py) drops
+        subscriptions the poll path has not touched; the push path only
+        refreshes subscriptions it is actively pushing to (sHades.py
+        _push_stream refreshes s["at"] on push), so a channel with no
+        traffic for two minutes is purged and the app goes silent until
+        restart. The poll is the designed refresh (the server's own
+        SUB_TTL comment names it); delivery stays push-only -- the tick
+        issues a zero-wait poll purely to touch the subscription and
+        self-heals a 409 by resubscribing from the watermark. The old
+        v0.28 "no polling loops" rule stands: nothing here polls for
+        content; a silent channel costs one empty request per 45s.
+        """
+        if getattr(self, "_stream_tick_event", None) is not None:
+            return
+        self._stream_tick_event = Clock.schedule_interval(
+            self._stream_tick, 45)
+
+    def _stream_tick(self, dt):
+        # the network call goes on a thread; the tick itself is instant
+        threading.Thread(target=self._stream_keepalive_once,
+                         daemon=True).start()
+
+    def _stream_keepalive_once(self):
+        api = self.guild_api
+        if not api or not self._stream_cid:
+            return
+        try:
+            res = api.stream_poll(cursor=self._stream_cursor, timeout_s=0)
+        except Exception:
+            self._ka_miss()
+            return
+        if res.get("ok"):
+            self._ka_fail = 0
+            self._stream_cursor = res.get("cursor", self._stream_cursor)
+            events = res.get("events") or []
+            if events:
+                # a quiet-channel poll can win a race with the push; the
+                # application is idempotent (render dedupes by msg_id)
+                self._apply_stream_events(events)
+        elif res.get("code") == 409:
+            # subscription expired (two quiet minutes): re-subscribe from
+            # the watermark so the TTL-eaten gap replays
+            Clock.schedule_once(lambda dt: self._start_streamer(), 0)
+        else:
+            # v0.31.2 zombie detection: a non-ok poll that is NOT the 409
+            # subscribe-expiry is a dead-or-zombie link. One miss stays a
+            # miss (uploads can legitimately tie up a link); two in a row
+            # through the 45s keepalive = the link no longer answers.
+            self._ka_miss()
 
     def _ka_miss(self):
         # Uploads in flight: no counting (see _up_active note). A busy link
@@ -4879,6 +5373,132 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         if misses >= 2:
             self._ka_fail = 0
             Clock.schedule_once(self._do_reestablish, 0)
+
+    def _release_stream(self):
+        """Drop this link's stream subscription: switching to a push-less
+        channel kind (site/term) releases the one-subscription-per-link
+        slot instead of letting the old channel flow into the void."""
+        api = self.guild_api
+        if not api:
+            return
+        try:
+            api.stream_unsubscribe()
+        except Exception as e:
+            dlog("stream unsubscribe failed: %r" % (e,))
+
+    def _resync_stream_channel(self):
+        """Fetch the subscribed channel's history after a gap/reset."""
+        try:
+            main = self.root.get_screen("main")
+            name = getattr(main, "_current_channel", "general")
+            if self._channel_cid(name) == self._stream_cid:
+                self._fetch_messages(name)
+        except Exception:
+            pass
+
+    def _apply_stream_events(self, events):
+        """Dispatch stream events. Runs on the stream thread: UI changes go
+        through _fetch_messages (which Clock-schedules) or Clock directly."""
+        cid = self._stream_cid
+        touched = False
+        for ev in events:
+            kind = ev.get("kind")
+            data = ev.get("data") or {}
+            if kind == "msg":
+                if (data.get("msg") or {}).get("channel_id") == cid:
+                    touched = True
+                if isinstance(data.get("msg"), dict):
+                    self._queue_cache(data["msg"])
+            elif kind in ("edit", "del"):
+                touched = True
+            elif kind == "presence":
+                users = {}
+                for u in data.get("users") or []:
+                    if not isinstance(u, dict):
+                        continue
+                    uh = (u.get("user_hash") or "").lower()
+                    if uh:
+                        users[uh] = {"username": u.get("username") or "",
+                                     "node_hash": u.get("node_hash")}
+                self._active_users = users
+                self._presence_ok = True
+                Clock.schedule_once(lambda dt: self._refresh_presence_ui(), 0)
+            elif kind == "site_patch":
+                # a site resource or the manifest changed under us: re-theme
+                # and re-render the page we are on
+                if isinstance(data.get("manifest"), dict):
+                    self._site_theme = data["manifest"].get("theme") or self._site_theme
+                if self._site_current:
+                    Clock.schedule_once(lambda dt: self._site_load_page(
+                        self._site_current[0], self._site_current[1]), 0)
+            elif kind == "reaction":
+                # update the affected row's chips in place (react does not
+                # bump the channel seq, so the reconciler will not refetch)
+                def apply_rxn(dt):
+                    self._set_row_reactions(data.get("msg_id"),
+                                            self._reactions_from_counts(
+                                                data.get("msg_id"), data))
+                Clock.schedule_once(apply_rxn, 0)
+            elif kind == "channel_deleted":
+                # a channel (possibly the one we are watching) was deleted
+                def apply_del(dt):
+                    dead = data.get("channel")
+                    self._channel_kinds.pop(dead, None)
+                    self._channel_can_post.pop(dead, None)
+                    self._channel_unread.pop(dead, None)
+                    self._term_sessions.pop(dead, None)
+                    name = data.get("name") or "channel"
+                    self._refresh_channels_from_guild()
+                    try:
+                        main = self.root.get_screen("main")
+                        cur = self._channel_cid(
+                            getattr(main, "_current_channel", "general"))
+                        if cur == dead:
+                            self._set_status("#%s was deleted" % name)
+                            self._switch_channel("general")
+                    except Exception:
+                        pass
+                Clock.schedule_once(apply_del, 0)
+            elif kind == "term_data":
+                # console output (server-sanitised); "clear" wipes the buffer
+                def apply_term(dt):
+                    if not self._term_page:
+                        return
+                    if data.get("clear"):
+                        self._term_page.clear()
+                    elif data.get("text"):
+                        self._term_page.append(data["text"])
+                Clock.schedule_once(apply_term, 0)
+            elif kind == "channels_changed":
+                # v0.28: channel create/rename/topic arrive as pushes; the
+                # 3s state poller that used to notice them is deleted.
+                Clock.schedule_once(
+                    lambda dt: self._refresh_channels_from_guild(), 0)
+            # "typing" events are consumed by a later phase
+        if touched:
+            # full refresh of the visible channel; _render_message dedupes
+            # by msg_id, so events already rendered are skipped
+            self._resync_stream_channel()
+
+    def _start_presence(self):
+        """v0.28: the presence POLL was deleted. Presence now arrives as a
+        guild-wide push event on the link (server \"presence\" kind);
+        _apply_stream_events applies it. Nothing runs on an interval here."""
+        self._active_users = {}
+
+    def _refresh_presence_ui(self):
+        """Rebuild the member sidebar from the presence list.
+
+        The list is *rebuilt*, never just recoloured: members come straight from
+        the guild's active-user list, so a client that stops pinging is dropped
+        by the guild's reaper and then disappears from the sidebar on the next
+        presence tick. Nothing accumulates.
+        """
+        try:
+            main = self.root.get_screen("main")
+        except Exception:
+            return
+        self._refresh_members_ui_main(getattr(main, "_current_channel", "general"))
 
     def _fetch_messages(self, channel, since_id=None, since_ts=None,
                         before=None, limit=50, prepend=False):
@@ -4928,27 +5548,6 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                     main = self.root.get_screen("main")
                     grid = main.ids.message_grid
                     self._remove_skeleton(cid)
-                    # Polish 2 (scroll settle): snapshot the
-                    # follow-bottom state BEFORE this page renders --
-                    # the render itself moves both halves of it.
-                    # getattr: minimal test stubs bind _fetch_messages
-                    # without the rest of the app (see the
-                    # _clear_fetch_status call below); without the
-                    # helper, fall back to the old unconditional
-                    # scroll.
-                    _snap = getattr(self, "_follow_snapshot", None)
-                    if _snap is not None:
-                        had_rows, was_at_bottom = _snap(grid)
-                    else:
-                        had_rows, was_at_bottom = False, True
-                    # H6: a later success clears a stale fetch-failure
-                    # status -- the old code only ever set it. getattr:
-                    # minimal test stubs bind _fetch_messages without
-                    # the rest of the app; a missing helper must not
-                    # break rendering.
-                    _clear = getattr(self, "_clear_fetch_status", None)
-                    if _clear is not None:
-                        _clear()
                     if prepend:
                         if not msgs:
                             # Server has no older pages; stop trying.
@@ -4984,11 +5583,6 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                         st["has_older"] = len(msgs) == limit
                         st["loading"] = False
                     else:
-                        # Live/delta fetch only: since_id/since_ts set
-                        # means these rows arrived after the last render,
-                        # so they fade in. The initial bulk load (neither
-                        # set) renders at full opacity.
-                        live = bool(since_id or since_ts)
                         for m in msgs:
                             if m.get("edited_at"):
                                 row = self._msg_widgets.get(m.get("msg_id"))
@@ -4997,41 +5591,10 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                                     # row is newer, refresh its content
                                     self._do_update(row, m.get("content") or "",
                                                     False)
-                            _n = len(grid.children)
-                            try:
-                                self._render_message(grid, m, animate=live)
-                            except TypeError:
-                                # Minimal test stubs bind _render_message
-                                # as (grid, m) with no animate kwarg
-                                # (test_offline_cache.py); the real method
-                                # and recording stubs accept it. Retry
-                                # plain only if the failed call added no
-                                # row, so a genuine internal TypeError is
-                                # never retried into a duplicate.
-                                if len(grid.children) == _n:
-                                    self._render_message(grid, m)
-                                else:
-                                    raise
+                            self._render_message(grid, m)
                         self._regroup_messages(grid)
-                        # Polish 2 (scroll settle): scroll in this
-                        # same tick, not a 0.1s Clock hop later -- the
-                        # first frame that shows these rows already
-                        # shows them at the bottom. getattr: see the
-                        # snapshot above.
-                        _follow_scroll = getattr(
-                            self, "_scroll_to_bottom_if_following", None)
-                        if _follow_scroll is not None:
-                            _follow_scroll(had_rows, was_at_bottom)
-                        else:
-                            self._scroll_to_bottom()
-                    # H7b: a fetch that returns nothing leaves an empty
-                    # grid -- show the placeholder (a later render or
-                    # push removes it via _render_message). getattr: see
-                    # the _clear_fetch_status call above.
-                    _refresh_ph = getattr(
-                        self, "_refresh_empty_placeholder", None)
-                    if _refresh_ph is not None:
-                        _refresh_ph(grid)
+                        Clock.schedule_once(
+                            lambda dt: self._scroll_to_bottom(), 0.1)
                     for u in updates:
                         self._apply_update(u)
                 except Exception as e:
@@ -5082,44 +5645,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         st["loading"] = True
         self._fetch_messages(name, before=oldest, limit=50, prepend=True)
 
-    def _refresh_empty_placeholder(self, grid=None):
-        """Show 'No messages yet' when the message grid holds no rows.
-
-        H7b: an empty channel used to show a blank grid with no cue.
-        The placeholder is removed as soon as a real row lands (via
-        _render_message) or the grid is cleared for another channel;
-        _regroup_messages skips non-MessageRow children, so the label
-        never disturbs grouping.
-        """
-        try:
-            main = self.root.get_screen("main")
-            grid = grid or main.ids.message_grid
-        except Exception:
-            return
-        has_rows = any(isinstance(c, MessageRow) for c in grid.children)
-        ph = getattr(self, "_empty_placeholder", None)
-        if has_rows:
-            # NOTE: main.ids.* are WeakProxy objects, so parent
-            # identity must use == (a proxy `is` never the widget).
-            if ph is not None and ph.parent == grid:
-                grid.remove_widget(ph)
-            self._empty_placeholder = None
-            return
-        if ph is None:
-            from kivy.uix.label import Label
-            from kivy.metrics import dp, sp
-            ph = Label(text="No messages yet",
-                       color=self.theme_colors.get(
-                           "text_dim", (0.57, 0.64, 0.71, 1)),
-                       font_size=sp(14), size_hint_y=None, height=dp(40),
-                       halign="center", valign="middle")
-            ph.bind(width=lambda inst, w: setattr(
-                inst, "text_size", (w, None)))
-            self._empty_placeholder = ph
-        if ph.parent != grid:
-            grid.add_widget(ph)
-
-    def _render_message(self, grid, m, animate=False):
+    def _render_message(self, grid, m):
         msg_id = m.get("msg_id")
         if msg_id in self._msg_widgets:
             return
@@ -5146,11 +5672,6 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                 # empty authors: system rows like command notices)
                 def _do_av(a=author, k=key):
                     try:
-                        # H4: no guild_api while offline -- there is
-                        # nothing to fetch from; skip instead of
-                        # raising AttributeError in the worker thread.
-                        if self.guild_api is None:
-                            return
                         res = self.guild_api.avatar_get(a)
                         if res.get("ok") and res.get("avatar"):
                             IMAGE_CACHE.set_bytes(k, res["avatar"], "png")
@@ -5174,13 +5695,6 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         row._message_meta = {"author_hash": author, "ts": m.get("ts", 0)}
         self._msg_widgets[msg_id] = row
         grid.add_widget(row)
-        if animate:
-            # Polish group 2: live arrivals fade in; bulk history renders
-            # at full opacity (animate defaults False). reveal() is
-            # opacity-only, so layout never moves, and reduced motion
-            # lands the row at opacity 1 at once.
-            import ui_fx
-            ui_fx.reveal(row)
         sHadesClientApp._regroup_messages(grid)
 
         # attachment embeds (files uploaded with the message)
@@ -5223,12 +5737,6 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
 
         # reaction summary line (tappable: toggles that emoji for me)
         self._set_row_reactions(msg_id, m.get("reactions") or [])
-        # H7b: a rendered row dismisses the empty-channel placeholder.
-        # getattr: minimal test stubs bind _render_message without the
-        # rest of the app; a missing helper must not break rendering.
-        _refresh_ph = getattr(self, "_refresh_empty_placeholder", None)
-        if _refresh_ph is not None:
-            _refresh_ph(grid)
 
     @staticmethod
     def _regroup_messages(grid):
@@ -5247,6 +5755,8 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
     # as-is; old rows carry ascii aliases and stay renderable (they show as
     # :name). The presets are the picker's face; the server accepts any
     # gated emoji (phase 1 unicode gate).
+    REACTION_PRESETS = ("👍", "👎", "😂", "❤️", "👀", "❓", "😮", "🙃",
+                        "🎉", "🔥", "🙏", "👏", "💯", "🤔", "😭", "💀")
 
     def _set_row_reactions(self, msg_id, reactions):
         """Replace a row's reaction chips with the given summary. Safe to
@@ -5319,7 +5829,85 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         return [{"emoji": e, "count": n, "users": []}
                 for e, n in sorted(counts.items())]
 
+    def _open_emoji_picker(self, msg_id):
+        """Emoji picker (task 8): a grid of the 16 presets; picking one
+        toggles the reaction and closes the picker."""
+        try:
+            self.root.get_screen("main")
+        except Exception:
+            return
+        box = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(10))
+        grid = GridLayout(cols=8, size_hint_y=None, spacing=dp(6),
+                          padding=[dp(2)] * 2)
+        grid.bind(minimum_height=grid.setter("height"))
+        for emoji in self.REACTION_PRESETS:
+            btn = Button(text=emoji, font_size=sp(18),
+                         size_hint_y=None, height=scaled(dp(44)))
+            btn.bind(on_press=lambda inst, m=msg_id, em=emoji:
+                     (self._toggle_reaction(m, em), popup.dismiss()))
+            grid.add_widget(btn)
+        scroll = ScrollView(size_hint=(1, 1))
+        scroll.add_widget(grid)
+        box.add_widget(scroll)
+        popup = Popup(title="react", content=box, size_hint=(0.7, 0.5))
+        self._popup = popup
+        popup.open()
+
+    def _open_reaction_popup(self, msg_id):
+        """Backward-compatible alias for the emoji picker."""
+        self._open_emoji_picker(msg_id)
+
     # -- search (phase 6) --------------------------------------------------
+    def open_search(self, prefill=""):
+        try:
+            self.root.get_screen("main")
+        except Exception:
+            return
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
+        query = TextInput(text=prefill or "", multiline=False, size_hint_y=None,
+                          height=dp(40),
+                          hint_text="search messages (min 2 chars)")
+        results = Label(markup=True, halign="left", valign="top",
+                        color=(0.85, 0.88, 0.9, 1), font_size=sp(13))
+        results.size_hint_y = 1
+        results.bind(width=lambda inst, w: setattr(inst, "text_size", (w, None)))
+
+        def run_search(*a):
+            q = (query.text or "").strip()
+            if len(q) < 2:
+                return
+
+            def work():
+                try:
+                    res = self.guild_api.search(q)
+                except Exception as e:
+                    res = {"ok": 0, "error": repr(e)}
+
+                def apply(dt):
+                    if not res.get("ok"):
+                        results.text = "[i]search failed: %s[/i]" % res.get("error", "")
+                        return
+                    rows = res.get("results") or []
+                    if not rows:
+                        results.text = "[i]no matches[/i]"
+                        return
+                    out = []
+                    for r in rows[:20]:
+                        ts = time.strftime("%m-%d %H:%M", time.localtime(r.get("ts", 0)))
+                        snippet = (r.get("content") or "")[:80].replace("\n", " ")
+                        out.append("[b]%s[/b]  %s\n  %s" % (r.get("username", "?"), ts, snippet))
+                    results.text = "\n".join(out)
+                Clock.schedule_once(apply, 0)
+            threading.Thread(target=work, daemon=True).start()
+        query.bind(on_text_validate=run_search)
+        btn = Button(text="search", size_hint_y=None, height=scaled(dp(36)))
+        btn.bind(on_press=run_search)
+        box.add_widget(query)
+        box.add_widget(btn)
+        box.add_widget(results)
+        popup = Popup(title="search", content=box, size_hint=(0.85, 0.6))
+        self._popup = popup
+        popup.open()
 
     ATT_MEDIA_IMAGE = (".png", ".jpg", ".jpeg", ".gif", ".webp")
     ATT_MEDIA_AUDIO = (".mp3", ".ogg", ".wav", ".flac", ".m4a", ".opus",
@@ -5354,6 +5942,236 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             return "video"
         return "file"
 
+    def _add_attachment_embed(self, row, name, blob):
+        """Render one attachment. tay's v0.30 spec: images render inline, or
+        audio as play/pause/stop, download, volume and the stream itself
+        embedded; video and other files present as tappable download rows
+        (embedded video playback is a named follow-up, not hidden)."""
+        dlog(
+            f"_add_attachment_embed: name={name} "
+            f"blob_size={len(blob)} ext={os.path.splitext(name)[1].lower()}")
+        kind = self._attachment_kind(name)
+        container = row.ids.embed_container
+        path = self._save_attachment_blob(blob, name)
+        if kind == "image":
+            source = path
+            if not source:
+                import tempfile
+                tmp = tempfile.NamedTemporaryFile(suffix=os.path.splitext(name)[1] or ".png",
+                                                  delete=False)
+                tmp.write(blob)
+                tmp.close()
+                source = tmp.name
+            emb = MessageEmbed(source=source,
+                               size_hint_y=None, height=dp(200))
+            emb.bind(on_release=lambda w, n=name: self._status(
+                "%s (%d KB)" % (n, len(blob) // 1024)))
+            container.add_widget(emb)
+        elif kind == "audio":
+            container.add_widget(
+                _AudioAttachRow(path=path, name=name, size=len(blob),
+                                player=self))
+        else:
+            # video + every other file: tappable download row
+            lbl = Label(
+                text="[file] %s -- tap to (%d KB) save" % (name, len(blob) // 1024)
+                if kind == "file" else
+                "[video] %s -- tap to (%d KB) save" % (name, len(blob) // 1024),
+                size_hint_y=None,
+                height=dp(20),
+                color=(0.7, 0.73, 0.77, 1),
+                font_size=sp(12),
+                markup=True,
+            )
+            lbl.bind(on_touch_down=self._download_tap(
+                name, blob, getattr(row, "msg_id", None)))
+            container.add_widget(lbl)
+
+    def _download_tap(self, name, blob, msg_id):
+        """Touch handler for tap-to-save attachment rows: saves the bytes
+        into the app attachments dir and names where in the status line."""
+
+        def handler(widget, touch):
+            if widget.collide_point(*touch.pos) and touch.button == "left":
+                self._save_and_report(name, blob, widget)
+                return True
+            return False
+        return handler
+
+    def _save_and_report(self, name, blob, widget=None):
+        path = self._save_attachment_blob(blob, name)
+        if path:
+            self._set_status("saved %s to app storage (%d KB)"
+                             % (name, len(blob) // 1024))
+        else:
+            self._set_status("save failed for %s" % name)
+
+    def _play_audio(self, path):
+        """Play an embedded sound file (tay's v0.30 player spec):
+        android uses the platform MediaPlayer (play/pause/stop/volume
+        real); desktop builds fall back to kivy SoundLoader (load,
+        play/stop/volume with pause as best effort). One active sound
+        at a time: starting a new one stops the previous."""
+        try:
+            import platform as _pf
+            old = getattr(self, "_audio_media", None)
+            if old is not None:
+                try:
+                    old.stop()
+                    old.release()
+                except Exception:
+                    pass
+                self._audio_media = None
+            if _pf.system() == "Android":
+                from jnius import autoclass
+                MediaPlayer = autoclass("android.media.MediaPlayer")
+                mp = MediaPlayer()
+                # load from the app dir; MediaPlayer.setDataSource wants a
+                # file descriptor for sandboxed paths (no root, SAF law)
+                FileInputStream = autoclass("java.io.FileInputStream")
+                fd = FileInputStream(path).getFD()
+                mp.setDataSource(fd)
+                mp.prepare()
+                mp.start()
+                self._audio_media = mp
+            else:
+                from kivy.core.audio import SoundLoader
+                snd = SoundLoader.load(path)
+                if snd is None:
+                    self._set_status("audio format not loadable on desktop")
+                    return None
+                snd.play()
+                self._audio_media = snd
+            return self._audio_media
+        except Exception as e:
+            dlog("audio play failed: %r" % (e,))
+            self._set_status("audio play failed: %s" % str(e)[:48])
+            return None
+
+    def _att_get_chunked(self, path):
+        """Download a stored attachment in server-side slices.
+
+        Receipted mechanics (v0.31): the receive path's single-shot
+        request carries one receipt and one deadline; attachments
+        fetched with size > 128 KB walk /api/v1/att/get instead, one
+        slice per request, each with its own deadline, loop driven by
+        the server's {offset, eof} echoes the same way the upload loop
+        follows its acks. A slice failure raises with the phase named;
+        nothing here is a timer-based retry."""
+        api = self.guild_api
+        if not api:
+            raise OSError("attachment fetch: no guild link")
+        blob = b""
+        off = 0
+        for _ in range(64):          # 64 slices x slice cap >> 10 MB law
+            res = api.att_get(path, off)
+            if not res.get("ok"):
+                raise OSError("attachment slice %d failed: %s"
+                              % (off, res.get("error") or res.get("code")
+                                 or "unknown"))
+            chunk = base64.b64decode(res.get("data_b64") or "")
+            if not chunk:
+                if res.get("eof"):
+                    return blob
+                raise OSError("attachment slice %d empty" % off)
+            blob += chunk
+            off += len(chunk)
+            total = res.get("total")
+            if total is not None and off >= total:
+                return blob
+            if res.get("eof"):
+                return blob
+        raise OSError("attachment fetch exceeded 64 slices at offset %d"
+                      % off)
+
+    def _fetch_attachment(self, row, msg_id, att):
+        """Download an attachment blob from the guild and render it.
+
+        The guild only returns metadata; the bytes are served by its
+        /file/attachments/... handler. Download off the main thread and add
+        the embed back on the UI thread. A loading placeholder is shown until
+        the image has been received.
+        """
+        print(
+            f"[TRACE] _fetch_attachment: msg_id={msg_id} "
+            f"name={att.get('name')!r} path={att.get('path')!r}", flush=True)
+        dlog(
+            f"_fetch_attachment: msg_id={msg_id} name={att.get('name')!r} path={att.get('path')!r}")
+        name = att.get("name") or ""
+        path = att.get("path") or ""
+        if not path:
+            print("[TRACE] _fetch_attachment: no path, skipping", flush=True)
+            dlog("_fetch_attachment: no path, skipping")
+            return
+
+        self._add_loading_placeholder(row, name)
+
+        def work():
+            print(f"[TRACE] _fetch_attachment.work: fetching {path}", flush=True)
+            dlog(f"_fetch_attachment.work: fetching {path}")
+            Clock.schedule_once(
+                lambda dt: self._set_status(
+                    "attachment: fetching %s ..." % name), 0)
+            # v0.31: big attachments download in server-side slices, the
+            # same chunk shape as the upload law: one receipt per slice
+            # with its own deadline instead of the whole file on a single
+            # 15s receipt that a multi-MB transfer is guaranteed to
+            # overrun (receipted: the embed spun forever, no error).
+            # Small attachments keep the single-shot path; every slice
+            # failure still surfaces by name.
+            try:
+                if int(att.get("size") or 0) > 128 * 1024:
+                    blob = self._att_get_chunked(path)
+                else:
+                    blob = self.guild_api.fetch_file(path)
+            except Exception as e:
+                blob = None
+                dlog("_fetch_attachment.work: fetch raised %r" % (e,))
+            if not blob:
+                print(
+                    f"[TRACE] _fetch_attachment.work: fetch returned empty for {path}", flush=True)
+                dlog(f"_fetch_attachment.work: fetch returned empty for {path}")
+                Clock.schedule_once(
+                    lambda dt, m="attachment fetch failed: %s"
+                    % name: self._set_status(m), 0)
+                Clock.schedule_once(
+                    lambda dt: self._remove_placeholder(row), 0)
+                return
+            Clock.schedule_once(
+                lambda dt: self._set_status(
+                    "attachment loaded (%d KB)" % (len(blob) // 1024)), 0)
+            print(
+                f"[TRACE] _fetch_attachment.work: received {len(blob)} bytes "
+                f"for {path}", flush=True)
+            dlog(f"_fetch_attachment.work: received {len(blob)} bytes for {path}")
+
+            def apply(dt):
+                try:
+                    self._remove_placeholder(row)
+                    # Always add the embed to the row's container. The row may
+                    # have been removed from the grid (channel switch) while the
+                    # download was in flight, but the embed container still
+                    # exists on the row object and the embed will show when the
+                    # row is re-added to the grid.
+                    main = self.root.get_screen("main")
+                    if main is None:
+                        return
+                    if msg_id and msg_id not in self._msg_widgets:
+                        # Row was removed from widgets; re-add it to the grid
+                        # so the embed is visible.
+                        grid = main.ids.message_grid
+                        if grid is not None and row.parent is None:
+                            grid.add_widget(row)
+                    print(f"[TRACE] _fetch_attachment.apply: adding embed for {name}", flush=True)
+                    dlog(f"_fetch_attachment.apply: adding embed for {name}")
+                    self._add_attachment_embed(row, name, blob)
+                except Exception as e:
+                    print("attachment render error:", e)
+
+            Clock.schedule_once(apply, 0)
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _refresh_avatar(self, key):
         # re-render rows that use this avatar (messages + sidebar rows)
         path = IMAGE_CACHE.get(key)
@@ -5366,53 +6184,43 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                 row.avatar_source = ""   # force Kivy to re-bind source
                 row.avatar_source = path
 
+    def _apply_update(self, u):
+        # edit / delete delta
+        msg_id = u.get("msg_id")
+        content = u.get("content", "")
+        deleted = bool(u.get("deleted_at"))
+        # fork merge: mirror the delta into the offline cache
+        try:
+            c_cid = u.get("channel_id") or self._channel_cid(getattr(
+                self.root.get_screen("main"), "_current_channel", "general"))
+            guild = self._cache_guild()
+            if guild and c_cid and msg_id:
+                threading.Thread(target=offline_store.apply_update,
+                                 args=(self._offline_path(), guild, c_cid,
+                                       msg_id, content, deleted),
+                                 daemon=True).start()
+        except Exception:
+            pass
+        # find widget
+        row = self._msg_widgets.get(msg_id)
+        if not row:
+            return
+        Clock.schedule_once(lambda dt: self._do_update(row, content, deleted), 0)
+
+    def _do_update(self, row, content, deleted):
+        if deleted:
+            try:
+                grid = self.root.get_screen("main").ids.message_grid
+                grid.remove_widget(row)
+            except Exception:
+                pass
+            self._msg_widgets.pop(row.msg_id, None)
+        else:
+            row.content = content
+            row.content_markup = md_to_kivy(content)
             # No embed rebuild: embeds come only from message attachments
             # (RNS-fetched bytes rendered at post time), never from URLs in
             # the text, so a text edit cannot add or remove one.
-
-    def _follow_snapshot(self, grid):
-        """Snapshot the follow-bottom state BEFORE a page renders.
-
-        Returns (had_rows, was_at_bottom): whether the grid already
-        held message rows, and whether the view was already at (or
-        within a hair of) the bottom. The snapshot is taken before
-        rendering because the render itself changes both halves of
-        it. A view that cannot be read (minimal test stubs without a
-        scroll view) defaults to following, which is the old
-        unconditional-scroll behaviour.
-        """
-        try:
-            had_rows = any(isinstance(c, MessageRow)
-                           for c in grid.children)
-        except Exception:
-            had_rows = False
-        try:
-            scroll = self.root.get_screen("main").ids.scroll
-            was_at_bottom = scroll.scroll_y <= 0.05
-        except Exception:
-            was_at_bottom = True
-        return had_rows, was_at_bottom
-
-    def _scroll_to_bottom_if_following(self, had_rows, was_at_bottom):
-        """Land at the bottom NOW (same tick), but only when following.
-
-        Polish 2 (scroll settle): the scroll used to be a separate
-        Clock hop 0.1s after the render, and that hop costs a whole
-        frame -- under software GL a frame carrying a fresh 40-row
-        list takes ~1s, so the rows appeared at the top and only
-        jumped to the bottom a beat later. Scrolling synchronously
-        at the end of the render means the first frame that shows
-        the new rows already shows them at the bottom. A reader
-        scrolled up (rows present, view not at bottom) is never
-        yanked; a fresh load (no rows yet) still lands at the bottom.
-        No delayed re-assert is scheduled: once scroll_y is 0 the
-        ScrollView re-pins it at the bottom whenever the grid grows
-        (its effect bounds track scroll_y), so rows that grow later
-        -- an image embed landing -- keep the view pinned.
-        """
-        if had_rows and not was_at_bottom:
-            return
-        self._scroll_to_bottom()
 
     def _scroll_to_bottom(self):
         try:
@@ -5422,6 +6230,12 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             pass
 
     # -- channels / members ---------------------------------------------
+    def _ensure_general_channel(self):
+        # only add once
+        if not hasattr(self, "_channels_added"):
+            self._channels_added = True
+            for name in ("general", "announcements", "random"):
+                self._add_channel(name)
 
     def _refresh_channels_from_guild(self):
         """Pull the channel index from the guild (v1 JSON): fills the sidebar
@@ -5449,32 +6263,31 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                     self._channel_pos[name] = c.get("position") or 0
                     if name not in self._channels:
                         self._channels[name] = cid
-                        # H7c: a seed button for this name may already
-                        # exist (offline navigation seeds general /
-                        # announcements / random); adopt it instead of
-                        # adding a duplicate button for the same channel.
-                        if not self._has_channel_button(name):
-                            self._add_channel(name)
+                        self._add_channel(name)
                     else:
                         self._channels[name] = cid
-                # H7c: drop seeds the guild does not know. Selecting
-                # one the guild lacks used to give an empty grid plus
-                # "fetch failed: unknown channel". Offline (no guild
-                # list) the seeds stay -- they are needed for cache
-                # navigation. Runs here, on the main thread, after the
-                # add loop has populated _channels (so a removed
-                # visible seed can fall back to a real channel).
-                guild_names = {c.get("name") for c in chans
-                               if isinstance(c, dict) and c.get("name")}
-                for seed in ("general", "announcements", "random"):
-                    if seed not in guild_names:
-                        self._remove_channel_button(seed)
             self._channel_unread.update(
                 {c["id"]: c.get("unread", 0) for c in chans
                  if isinstance(c, dict) and c.get("id")})
             Clock.schedule_once(lambda dt: self._update_channel_badges(), 0)
             Clock.schedule_once(apply, 0)
         threading.Thread(target=work, daemon=True).start()
+
+    def _channel_kind(self, cid):
+        return self._channel_kinds.get(cid, "chat")
+
+    def _sync_composer_props(self, name, cid):
+        """P8: mirror the channel's post truth into the composer's
+        kivy Properties (announce channels read-only for non-grants)."""
+        kind = self._channel_kind(cid)
+        if kind == "announce":
+            can = self._channel_can_post.get(cid, True)
+        else:
+            can = True
+        self.composer_readonly = (kind == "announce" and not can)
+        self.composer_send_label = ("Announce" if kind == "announce"
+                                    else "Send")
+
 
     # whoami is the admin-menu gate; failure retries are bounded and
     # lane-tunable (never an unbounded loop)
@@ -5509,7 +6322,6 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             if res.get("ok"):
                 self.i_am_moderator = bool(res.get("is_moderator"))
                 self.i_am_admin = bool(res.get("is_admin"))
-                self.my_user_hash = (res.get("user_hash") or "").lower()
                 self.my_roles = res.get("roles") or []
                 # the whole whoami verdict rides the boot log: the
                 # Downloads copy then answers "why is the admin item
@@ -5567,6 +6379,32 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         """Bind whoami's guild motd to the sidebar strip ('' hides it)."""
         self.server_motd = value or ""
 
+    def _build_motd_popup(self):
+        """The full-text motd popup (the strip clips long messages)."""
+        box = BoxLayout(orientation="vertical", padding=dp(8),
+                        spacing=dp(6))
+        scroll_box = ScrollView()
+        full = Label(markup=True, font_size=sp(13),
+                     color=self.theme_colors.get("text",
+                                                 (0.92, 0.94, 0.96, 1)))
+        full.text = self.server_motd or ""
+        full.bind(width=lambda inst, w: setattr(
+            inst, "text_size", (w, None)))
+        full.bind(texture_size=full.setter("size"))
+        scroll_box.add_widget(full)
+        box.add_widget(scroll_box)
+        close = Button(text="Close", size_hint_y=None, height=dp(36))
+        box.add_widget(close)
+        popup = Popup(title="Server message", content=box,
+                      size_hint=(0.8, 0.5), auto_dismiss=True)
+        close.bind(on_press=lambda inst: popup.dismiss())
+        return popup
+
+    def _open_motd_popup(self):
+        if not self.server_motd:
+            return
+        self._build_motd_popup().open()
+
     # ------------------------------------------------- P11 arrow 5 flow
     def _open_update_prompt(self):
         target = self.client_update_version or ""
@@ -5611,8 +6449,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             Clock.schedule_once(
                 lambda dt: self._update_start(inst), 0)))
         self._update_status_label = status
-        import ui_fx
-        ui_fx.popup_entrance(popup)
+        popup.open()
 
     def _update_start(self, *a):
         """The consented path, on a worker thread; every leg reports
@@ -5655,11 +6492,227 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _can_manage_roles(self):
+        """UI gate: any of my roles carries MANAGE_ROLES or ADMIN."""
+        return any(r.get("perms", 0) & (self.PERM_MANAGE_ROLES |
+                                        self.PERM_ADMIN)
+                   for r in self.my_roles)
+
     # tay (channel kinds): "Channels can be text, site (micron pages), or
     # a text stream." Server CHANNEL_KINDS keys are stable ("chat", "site",
     # "term") — existing channels keep working; the labels are the user's
     # words. "term" IS the text-stream channel: text arrives as live
     # pushed rows, no chat framing.
+    CHANNEL_KIND_LABELS = (
+        ("text", "chat"),
+        ("site (micron)", "site"),
+        ("text stream", "term"),
+    )
+
+    def _can_create_channels(self):
+        """UI gate: any of my roles carries MANAGE_CHANNEL or ADMIN (the
+        Founder role carries both; server enforces the same bits)."""
+        return bool(self.i_am_admin) or any(
+            r.get("perms", 0) & (self.PERM_MANAGE_CHANNEL | self.PERM_ADMIN)
+            for r in self.my_roles)
+
+    def _open_create_channel_popup(self):
+        """Add a channel (text / site / text stream) -- the add half of
+        tay's "the creator should be able to add/delete channels". The
+        delete half already exists in the channel context menu. Server
+        enforces MANAGE_CHANNEL/ADMIN; a successful create lands in the
+        sidebar through the channels_changed push."""
+        if not self.guild_api or not self._can_create_channels():
+            return
+        box = BoxLayout(orientation="vertical", spacing=4, padding=4)
+        title = Label(text="new channel", size_hint_y=None, height=22)
+        box.add_widget(title)
+        name_in = TextInput(hint_text="channel name (a-z 0-9 _ -)",
+                            multiline=False)
+        box.add_widget(name_in)
+        kind_box = BoxLayout(size_hint_y=None, height=scaled(30), spacing=4)
+        box.add_widget(kind_box)
+        kind_state = ["chat"]  # chosen server kind
+        kind_btns = {}
+
+        def make_pick(mine):
+            def pick(_btn):
+                kind_state[0] = mine
+                for key, cb in kind_btns.items():
+                    cb.background_color = ((0.2, 0.35, 0.2, 1) if key == mine
+                                           else (0.2, 0.2, 0.25, 1))
+            return pick
+
+        for label, k in self.CHANNEL_KIND_LABELS:
+            btn = Button(text=label, font_size=sp(13),
+                         background_color=((0.2, 0.35, 0.2, 1) if k == "chat"
+                                           else (0.2, 0.2, 0.25, 1)))
+            kind_btns[k] = btn
+            btn.bind(on_press=make_pick(k))
+            kind_box.add_widget(btn)
+        create_btn = Button(text="create", size_hint_y=None, height=scaled(30),
+                            font_size=sp(14))
+        box.add_widget(create_btn)
+        close = Button(text="close", size_hint_y=None, height=scaled(28))
+        box.add_widget(close)
+        popup = Popup(title="create channel", content=box,
+                      size_hint=(0.7, 0.5))
+        self._popup = popup
+
+        def do_create(_btn):
+            name = (name_in.text or "").strip()
+            if not name:
+                self._show_notice("channel name required")
+                return
+            kind = kind_state[0]
+
+            def work():
+                try:
+                    res = self.guild_api.channels_create(name, kind)
+                except Exception as e:
+                    err = "create: %r" % e
+                    Clock.schedule_once(
+                        lambda dt: self._show_notice(err), 0)
+                    return
+                ok = res.get("ok")
+                err = res.get("error", "failed")
+                Clock.schedule_once(
+                    lambda dt: ((popup.dismiss(),
+                                 self._set_status("#%s created" % name))
+                                if ok else
+                                self._show_notice("create: %s" % err)), 0)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        create_btn.bind(on_press=do_create)
+        close.bind(on_press=lambda _b: popup.dismiss())
+        popup.open()
+
+    def _open_roles_popup(self, target_hash, target_name):
+        """Role manager (U5): list roles, toggle assignment for one user,
+        create a new role. Server enforces MANAGE_ROLES; this popup only
+        appears for users who have it."""
+        if not self.guild_api or not self._can_manage_roles():
+            return
+        box = BoxLayout(orientation="vertical", spacing=4, padding=4)
+        title = Label(text="roles: @%s" % (target_name or target_hash[:8]),
+                      size_hint_y=None, height=22)
+        box.add_widget(title)
+        scroll = ScrollView(size_hint=(1, 1))
+        grid = GridLayout(cols=1, size_hint_y=None, spacing=2)
+        grid.bind(minimum_height=grid.setter("height"))
+        scroll.add_widget(grid)
+        box.add_widget(scroll)
+        row = BoxLayout(size_hint_y=None, height=30, spacing=4)
+        name_in = TextInput(hint_text="new role name", multiline=False)
+        row.add_widget(name_in)
+        create_btn = Button(text="create", size_hint_x=None, width=70,
+                            size_hint_y=None, height=scaled(30),
+                            font_size=sp(14), pos_hint={"center_y": 0.5})
+        row.add_widget(create_btn)
+        box.add_widget(row)
+        close = Button(text="close", size_hint_y=None, height=scaled(28))
+        box.add_widget(close)
+        popup = Popup(title="roles", content=box, size_hint=(0.7, 0.6))
+        self._popup = popup
+
+        # load_gen guards against out-of-order responses: toggling two roles
+        # quickly starts two overlapping fetches, and without this the
+        # slower one appends its rows on top of the faster one's.
+        load_gen = [0]
+
+        def refresh():
+            """Reload the role list.
+
+            The guild call blocks on the RNS link for up to the request
+            timeout, so it runs on a worker thread; the widget rebuild
+            happens back on the main thread.
+            """
+            grid.clear_widgets()
+            load_gen[0] += 1
+            gen = load_gen[0]
+
+            def add_role(r, member):
+                def toggle(btn):
+                    def work():
+                        try:
+                            if member:
+                                res = self.guild_api.roles_unassign(
+                                    r["role_id"], target_hash)
+                            else:
+                                res = self.guild_api.roles_assign(
+                                    r["role_id"], target_hash)
+                        except Exception as e:
+                            # Bind the message to a plain local: Python unbinds
+                            # `e` when the except block exits, so a lambda
+                            # closing over it would raise NameError later.
+                            err = "roles: %r" % e
+                            Clock.schedule_once(
+                                lambda dt: self._show_notice(err), 0)
+                            return
+                        if res.get("ok"):
+                            Clock.schedule_once(lambda dt: refresh(), 0)
+                        else:
+                            Clock.schedule_once(
+                                lambda dt: self._show_notice(
+                                    "roles: %s" % res.get("error", "failed")), 0)
+                    threading.Thread(target=work, daemon=True).start()
+                mark = "[x] " if member else "[  ] "
+                btn = Button(text=mark + r["name"], size_hint_y=None,
+                             height=scaled(24), font_size=sp(13),
+                             background_color=(0.2, 0.2, 0.25, 1))
+                btn.bind(on_press=toggle)
+                grid.add_widget(btn)
+
+            def work():
+                try:
+                    res = self.guild_api.roles_list()
+                except Exception as e:
+                    err = "roles: %r" % e
+                    Clock.schedule_once(
+                        lambda dt: self._show_notice(err), 0)
+                    return
+
+                def apply(dt):
+                    if gen != load_gen[0]:
+                        return  # a newer refresh superseded this response
+                    if not res.get("ok"):
+                        self._show_notice(
+                            "roles: %s" % res.get("error", "failed"))
+                        return
+                    members = set()
+                    for r in res.get("roles", []):
+                        members = set(r.get("members") or [])
+                        add_role(r, target_hash in members)
+                Clock.schedule_once(apply, 0)
+            threading.Thread(target=work, daemon=True).start()
+
+        def on_create():
+            name = name_in.text.strip()
+            if not name:
+                return
+
+            def work():
+                try:
+                    res = self.guild_api.roles_create(name)
+                except Exception as e:
+                    err = "roles: %r" % e
+                    Clock.schedule_once(
+                        lambda dt: self._show_notice(err), 0)
+                    return
+                if res.get("ok"):
+                    Clock.schedule_once(
+                        lambda dt: setattr(name_in, "text", ""), 0)
+                    Clock.schedule_once(lambda dt: refresh(), 0)
+                else:
+                    Clock.schedule_once(
+                        lambda dt: self._show_notice(
+                            "roles: %s" % res.get("error", "failed")), 0)
+            threading.Thread(target=work, daemon=True).start()
+        create_btn.bind(on_press=lambda inst: on_create())
+        close.bind(on_press=lambda inst: popup.dismiss())
+        refresh()
+        popup.open()
 
     # -- friends + DMs (U7, client-local) -----------------------------------
     def _toggle_friend(self, user_hash, username):
@@ -5692,19 +6745,16 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         grid.bind(minimum_height=grid.setter("height"))
         scroll.add_widget(grid)
         box.add_widget(scroll)
-        row = BoxLayout(size_hint_y=None, height=40, spacing=4)
+        row = BoxLayout(size_hint_y=None, height=36, spacing=4)
         text_in = TextInput(hint_text="message (direct lxmf)",
-                            multiline=False,
-                            background_color=self.theme_colors['input_bg'],
-                            foreground_color=self.theme_colors['text'],
-                            cursor_color=self.theme_colors['text'])
+                            multiline=False)
         row.add_widget(text_in)
         send = Button(text="send", size_hint_x=None, width=70,
-                      size_hint_y=None, height=scaled(40),
+                      size_hint_y=None, height=scaled(36),
                       font_size=sp(14), pos_hint={"center_y": 0.5})
         row.add_widget(send)
         box.add_widget(row)
-        close = Button(text="close", size_hint_y=None, height=scaled(40))
+        close = Button(text="close", size_hint_y=None, height=scaled(28))
         box.add_widget(close)
         popup = Popup(title="dm", content=box, size_hint=(0.7, 0.7))
         self._dm_popup = popup
@@ -5722,8 +6772,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         text_in.bind(on_text_validate=lambda inst: do_send())
         close.bind(on_press=lambda inst: popup.dismiss())
         self._refresh_dm_popup()
-        import ui_fx
-        ui_fx.popup_entrance(popup)
+        popup.open()
 
     def _refresh_dm_popup(self):
         """Re-render the open DM thread from local history."""
@@ -5894,6 +6943,91 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             print("dm delivery error:", repr(e))
 
     # -- admin panel (U8) --------------------------------------------------
+    def _open_admin_panel(self):
+        """Server config screen: tabs for General / Membership / Channels /
+        Roles / Invites, visible per the caller's roles (the server enforces
+        everything regardless -- the client gating is UX, not security)."""
+        if not self.guild_api or not getattr(self, "i_am_admin", False):
+            return
+        try:
+            from ui_server_config import ServerConfigScreen
+            if self.root is not None:
+                screen = self.root.get_screen("server_config")
+                screen.client = self
+                self.root.current = "server_config"
+                self._admin_popup = None
+                return
+            # kv ScreenManager not bound yet (pre-boot, tests, applets):
+            # host the same tabbed screen in a popup so the panel opens
+            # on every invocation path.
+            from kivy.uix.popup import Popup
+            screen = ServerConfigScreen(client=self, name="server_config")
+            screen.build_tabs()
+            popup = Popup(title="server settings", content=screen,
+                          size_hint=(0.9, 0.9))
+            popup.open()
+            self._admin_popup = popup
+        except Exception as e:
+            print("server_config screen failed:", repr(e))
+            return
+
+
+    def _open_join_prompt(self, on_done=None):
+        """Join-code prompt (U6b): shown when the guild's registration
+        policy is 'code' and this client has not joined yet."""
+        box = BoxLayout(orientation="vertical", spacing=4, padding=6)
+        app = App.get_running_app()
+        box.add_widget(Label(
+            text="This guild requires an invite code.",
+            size_hint_y=None, height=24,
+            color=app.theme_colors['text'] if app else (1, 1, 1, 1),
+            font_size=sp(13)))
+        entry = TextInput(hint_text="invite code", multiline=False)
+        box.add_widget(entry)
+        row = BoxLayout(size_hint_y=None, height=34, spacing=4)
+        submit = Button(text="join", size_hint_y=None, height=scaled(34),
+                        pos_hint={"center_y": 0.5})
+        row.add_widget(submit)
+        cancel = Button(text="cancel", size_hint_y=None, height=scaled(34),
+                        pos_hint={"center_y": 0.5})
+        row.add_widget(cancel)
+        box.add_widget(row)
+        status = Label(
+            text="", size_hint_y=None, height=22,
+            color=app.theme_colors['text_muted'] if app else (0.8, 0.82, 0.86, 1),
+            font_size=sp(11))
+        box.add_widget(status)
+        popup = Popup(title="join", content=box, size_hint=(0.7, 0.4))
+        self._join_popup = popup
+
+        def do_submit():
+            code = (entry.text or "").strip().upper()
+            if not code:
+                return
+
+            def work():
+                try:
+                    res = self.guild_api.join(code)
+                except Exception as e:
+                    msg = "join failed: %r" % e
+                    Clock.schedule_once(lambda dt: setattr(status, "text", msg), 0)
+                    return
+                if res.get("ok") and res.get("joined"):
+                    Clock.schedule_once(
+                        lambda dt: setattr(status, "text", "joined"), 0)
+                    Clock.schedule_once(lambda dt: popup.dismiss(), 0.3)
+                    if on_done:
+                        Clock.schedule_once(lambda dt: on_done(True), 0.4)
+                else:
+                    err = res.get("error", "invalid code")
+                    Clock.schedule_once(lambda dt: setattr(status, "text", err),
+                                        0)
+            threading.Thread(target=work, daemon=True).start()
+
+        submit.bind(on_press=lambda inst: do_submit())
+        entry.bind(on_text_validate=lambda inst: do_submit())
+        cancel.bind(on_press=lambda inst: popup.dismiss())
+        popup.open()
 
     def _check_join_gate(self):
         """Ask the guild whether this client may register. Returns True if
@@ -5913,6 +7047,19 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             Clock.schedule_once(lambda dt: self._open_join_prompt(), 0)
         threading.Thread(target=work, daemon=True).start()
 
+    def _update_channel_badges(self):
+        """Push unread counts onto the sidebar buttons (UI thread)."""
+        try:
+            grid = self.root.get_screen("main").ids.channel_grid
+        except Exception:
+            return
+        for child in grid.children:
+            if isinstance(child, ChannelButton):
+                cid = self._channels.get(child.channel_name)
+                unread = 0 if cid in self._muted_channels \
+                    else self._channel_unread.get(cid, 0)
+                child.badge = unread
+
     # -- context menus (U3) ------------------------------------------------
     def open_context_menu(self, actions, window_pos):
         """Show the Window-level context menu overlay."""
@@ -5922,6 +7069,11 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             self._ctx_menu.dismiss_now()
         self._ctx_menu = ContextMenuOverlay(actions, window_pos)
         Window.add_widget(self._ctx_menu)
+
+    def _copy_text(self, text):
+        from kivy.core.clipboard import Clipboard
+        Clipboard.copy(text)
+        self._set_status("copied to clipboard")
 
     def _copy_bootlog(self):
         """paste-able boot-log handoff: no adb, no MediaStore. The
@@ -5971,7 +7123,160 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         except Exception as e:
             print("mention failed:", repr(e))
 
+    def _toggle_mute_channel(self, name, cid):
+        if cid in self._muted_channels:
+            self._muted_channels.discard(cid)
+            self._set_status("#%s unmuted" % name)
+        else:
+            self._muted_channels.add(cid)
+            self._set_status("#%s muted (unread badge hidden)" % name)
+        try:
+            cfg = os.path.join(_app_data_dir(), "muted_channels.json")
+            with open(cfg, "w") as f:
+                json.dump(sorted(self._muted_channels), f)
+        except Exception as e:
+            print("muted-channel persist failed:", repr(e))
+        self._update_channel_badges()
+
+    def _delete_channel(self, name, cid):
+        if not self.guild_api:
+            return
+
+        def work():
+            try:
+                res = self.guild_api.channels_delete(cid)
+            except Exception as e:
+                res = {"ok": 0, "error": repr(e)}
+            if not res.get("ok"):
+                err = res.get("error", "unknown")
+                Clock.schedule_once(
+                    lambda dt: self._set_status("delete failed: %s" % err), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _mod_action(self, method, user_hash, name):
+        """Run a moderation call (mute/ban/...) off the UI thread."""
+        if not self.guild_api:
+            return
+
+        def work():
+            try:
+                res = getattr(self.guild_api, method)(user_hash)
+            except Exception as e:
+                res = {"ok": 0, "error": repr(e)}
+            ok = res.get("ok")
+            err = res.get("error", "unknown")
+            Clock.schedule_once(lambda dt: self._set_status(
+                ("%s: %s" % (method.replace("mod_", ""), name)) if ok
+                else ("%s failed: %s" % (name, err))), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _delete_message(self, msg_id):
+        if not self.guild_api:
+            return
+
+        def work():
+            try:
+                res = self.guild_api.delete(msg_id)
+            except Exception as e:
+                res = {"ok": 0, "error": repr(e)}
+            if not res.get("ok"):
+                err = res.get("error", "unknown")
+                Clock.schedule_once(
+                    lambda dt: self._set_status("delete failed: %s" % err), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _open_edit_popup(self, msg_id, content):
+        try:
+            self.root.get_screen("main")
+        except Exception:
+            return
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
+        ti = TextInput(text=content or "", multiline=True, size_hint_y=None,
+                       height=dp(90))
+        row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40),
+                        spacing=dp(8))
+        popup_holder = {}
+
+        def save(*a):
+            new = (ti.text or "").strip()
+            if not new or not self.guild_api:
+                return
+
+            def work():
+                try:
+                    self.guild_api.edit(msg_id, new)
+                except Exception as e:
+                    print("edit failed:", repr(e))
+            threading.Thread(target=work, daemon=True).start()
+            popup_holder["p"].dismiss()
+        save_btn = Button(text="save", size_hint_y=None, height=scaled(dp(40)),
+                          pos_hint={"center_y": 0.5})
+        save_btn.bind(on_press=save)
+        cancel_btn = Button(text="cancel", size_hint_y=None,
+                            height=scaled(dp(40)), pos_hint={"center_y": 0.5})
+        cancel_btn.bind(on_press=lambda *a: popup_holder["p"].dismiss())
+        row.add_widget(save_btn)
+        row.add_widget(cancel_btn)
+        box.add_widget(ti)
+        box.add_widget(row)
+        popup = Popup(title="edit message", content=box, size_hint=(0.8, 0.45))
+        popup_holder["p"] = popup
+        self._popup = popup
+        popup.open()
+
+    def _copy_invite(self):
+        """shades:// share-link for the current hub (connect-screen format)."""
+        host = getattr(self, "hub_host", None)
+        port = getattr(self, "hub_port", None)
+        node = getattr(self, "node_hash", None)
+        if not (host and port and node):
+            self._set_status("invite unavailable (no hub connection)")
+            return
+        self._copy_text(invite.build_invite(host, port, node))
+
     # -- slash commands (U4) -----------------------------------------------
+    def _handle_slash(self, text, current_channel):
+        """Client-local commands first; everything else goes to the guild's
+        shared dispatcher (/api/v1/command) and shows as an ephemeral notice."""
+        parts = text[1:].split(" ", 1)
+        cmd = (parts[0] or "").lower()
+        rest = (parts[1] if len(parts) > 1 else "").strip()
+        if cmd == "me" and rest:
+            self.send_raw_text("*%s*" % rest)
+            return
+        if cmd == "join" and rest:
+            self._switch_channel(rest.lstrip("#").strip())
+            return
+        if cmd == "search":
+            self.open_search(prefill=rest)
+            return
+        if cmd == "invite":
+            self._copy_invite()
+            return
+        if cmd == "commands":
+            # tay's palette correction: /commands opens the slash-command
+            # palette itself - the discovery surface for the dispatcher
+            # and any future bot/script verbs.
+            self.open_command_palette()
+            return
+        if not self.guild_api:
+            return
+
+        def work():
+            try:
+                res = self.guild_api.command(text)
+            except Exception as e:
+                res = {"ok": 0, "error": repr(e)}
+            if not res.get("ok"):
+                err = res.get("error", "unknown")
+                Clock.schedule_once(
+                    lambda dt: self._set_status("command failed: %s" % err), 0)
+                return
+            out = res.get("output") or "(no output)"
+            if cmd == "help":
+                out = ("client: /me /join /search /invite /commands\n" + out)
+            Clock.schedule_once(lambda dt: self._show_notice(out), 0)
+        threading.Thread(target=work, daemon=True).start()
 
     def send_raw_text(self, text):
         """Post text to the current channel bypassing slash handling."""
@@ -5992,6 +7297,110 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                 Clock.schedule_once(
                     lambda dt: self._set_status("send failed: %s" % err), 0)
         threading.Thread(target=work, daemon=True).start()
+
+    def _show_notice(self, text):
+        """Ephemeral command output rendered as a system row (not persisted,
+        not part of the ledger)."""
+        try:
+            main = self.root.get_screen("main")
+            grid = main.ids.message_grid
+        except Exception:
+            return
+        m = {"msg_id": "notice-%f-%d" % (time.time(), len(text)),
+             "author_hash": "", "username": "console", "content": text[:2000],
+             "ts": time.time(), "reactions": [], "attachments": [],
+             "channel_id": self._stream_cid}
+        self._render_message(grid, m)
+        Clock.schedule_once(lambda dt: self._scroll_to_bottom(), 0.1)
+
+    def _add_channel(self, name):
+        main = self.root.get_screen("main")
+        grid = main.ids.channel_grid
+        btn = ChannelButton(channel_name=name,
+                            selected=name == main._current_channel)
+        btn.bind(on_press=lambda inst: self._switch_channel(name))
+        # task 7: build in server order. channels/list carries position;
+        # Kivy layouts fill rows in reversed-children order, so the child
+        # index of visual row i is (visible_count - i). Insert into the
+        # first visual slot whose row holds a channel with a HIGHER position
+        # (or an unpositioned one), else the end.
+        my_pos = self._channel_pos.get(name)
+        if my_pos is None:
+            grid.add_widget(btn)
+            return
+        existing = [w for w in reversed(grid.children)
+                    if isinstance(w, ChannelButton)]
+        insert_at = None
+        for visual_row, b in enumerate(existing):
+            pos = self._channel_pos.get(b.channel_name)
+            if pos is None or pos > my_pos:
+                insert_at = len(existing) - visual_row
+                break
+        if insert_at is None:
+            grid.add_widget(btn)
+        else:
+            grid.add_widget(btn, index=insert_at)
+
+    def _post_channel_reorder(self):
+        """Send the visual order (top -> bottom) to the server once."""
+        try:
+            main = self.root.get_screen("main")
+            grid = main.ids.channel_grid
+        except Exception:
+            return
+        buttons = [w for w in reversed(grid.children)
+                   if isinstance(w, ChannelButton)]
+        order = []
+        for b in buttons:
+            cid = self._channels.get(b.channel_name)
+            if cid and cid not in order:
+                order.append(cid)
+
+        def work():
+            try:
+                res = self.guild_api.channels_reorder(order)
+            except Exception as e:
+                msg = repr(e)
+                Clock.schedule_once(
+                    lambda dt: self._set_status("reorder failed: %s" % msg),
+                    0)
+                return
+            if res.get("ok"):
+                for i, cid in enumerate(res.get("order") or order, start=1):
+                    self._channel_order[cid] = i
+            else:
+                Clock.schedule_once(
+                    lambda dt: self._set_status("reorder: %s"
+                                                % res.get("error")), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _invite_to_channel(self, cid, name):
+        """Create a channel-targeted invite + copy the shades:// link."""
+        if not self.guild_api:
+            return
+
+        def work():
+            try:
+                res = self.guild_api.invites("create",
+                                             label="#%s" % name, channel=cid)
+            except Exception as e:
+                msg = repr(e)
+                Clock.schedule_once(
+                    lambda dt: self._set_status("invite failed: %s" % msg),
+                    0)
+                return
+            if res.get("ok"):
+                link = "shades://join/%s" % res.get("code", "")
+                Clock.schedule_once(
+                    lambda dt: self._copy_text(link), 0)
+            else:
+                Clock.schedule_once(
+                    lambda dt: self._set_status("invite: %s"
+                                                % res.get("error")), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _refresh_channels_ui(self):
+        self._ensure_general_channel()
 
     def _switch_channel(self, name):
         main = self.root.get_screen("main")
@@ -6016,12 +7425,6 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         self._last_ts = 0.0
         cid = self._channel_cid(name)
         kind = self._channel_kind(cid)
-        # sitenav (d): leaving a site channel hides the nav bar; the
-        # site opener shows it again.
-        if kind != "site":
-            _refresh_nav = getattr(self, "_refresh_site_nav", None)
-            if _refresh_nav is not None:
-                _refresh_nav(visible=False)
         # P8: the composer's truth follows the channel everywhere
         self._sync_composer_props(name, cid)
         # reroute the stream: only the visible channel flows
@@ -6048,12 +7451,6 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             self._fetch_messages(name)
         elif not cached:
             self._set_status("No cached messages for #%s yet." % name)
-            # H7b: offline + empty cache is still an empty channel.
-            # getattr: minimal test stubs bind _switch_channel without
-            # the rest of the app.
-            _refresh_ph = getattr(self, "_refresh_empty_placeholder", None)
-            if _refresh_ph is not None:
-                _refresh_ph(grid)
         self._refresh_members_ui(name)
         # v0.31: re-subscribe NOW. The server binds the channel at
         # subscribe time; setting _stream_cid alone changed nothing on
@@ -6061,6 +7458,223 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         Clock.schedule_once(lambda dt: self._start_streamer(), 0)
 
     # -- site channels (micron pages over RNS; no HTML anywhere) ---------
+    def _open_site_channel(self, name, cid):
+        """Open a site channel: fetch its manifest, then render the index."""
+        self._site_stack = []
+        self._site_current = None
+        self._site_theme = {}
+        try:
+            main = self.root.get_screen("main")
+            grid = main.ids.message_grid
+            grid.clear_widgets()
+            self._msg_widgets.clear()
+            grid.add_widget(self._micron_label("[i]loading site…[/i]"))
+        except Exception as e:
+            print("site open error:", repr(e))
+
+        def work():
+            manifest = {}
+            try:
+                res = self.guild_api.channels_info(cid)
+                if res.get("ok"):
+                    manifest = (res.get("channel") or {}).get("manifest") or {}
+            except Exception as e:
+                print("site manifest error:", repr(e))
+            self._site_theme = manifest.get("theme") or {}
+            index = manifest.get("index") or "/index.mu"
+            Clock.schedule_once(lambda dt: self._site_load_page(cid, index), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _open_term_channel(self, name, cid):
+        """Open (or reuse) a guild console session and show the terminal."""
+        self._term_page = None
+        try:
+            main = self.root.get_screen("main")
+            grid = main.ids.message_grid
+            grid.clear_widgets()
+            self._msg_widgets.clear()
+            page = TermPage()
+            self._term_page = page
+            page.append("(connecting to the guild console…)\n")
+            grid.add_widget(page)
+        except Exception as e:
+            print("term open error:", repr(e))
+        if self._term_sessions.get(cid):
+            return   # session survives channel switches until idle expiry
+
+        def work():
+            try:
+                res = self.guild_api.term_open(cid)
+            except Exception as e:
+                print("term open failed:", repr(e))
+                res = {"ok": 0, "error": repr(e)}
+            if res.get("ok"):
+                self._term_sessions[cid] = res["session"]
+            else:
+                err = res.get("error", "unknown")
+                Clock.schedule_once(lambda dt: self._set_status(
+                    "console: %s" % err), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _send_term_input(self, text):
+        """Send one console line; echo it locally, output rides the stream."""
+        cid = self._stream_cid
+        sid = self._term_sessions.get(cid) if cid else None
+        if not sid:
+            self._set_status("console not connected")
+            return
+        if self._term_page:
+            self._term_page.append("> " + text + "\n")
+
+        def work():
+            try:
+                res = self.guild_api.term_data(sid, text + "\n")
+                if not res.get("ok"):
+                    err = res.get("error", "unknown")
+                    if err == "unknown session":
+                        self._term_sessions.pop(cid, None)
+                    Clock.schedule_once(lambda dt: self._set_status(
+                        "console: %s" % err), 0)
+            except Exception as e:
+                print("term data failed:", repr(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _site_load_page(self, cid, path, push=False):
+        """Fetch + render one micron page. /page/... targets are the guild's
+        own pages (raw request); everything else is a site resource (v1)."""
+        if push and self._site_current:
+            self._site_stack.append(self._site_current)
+        self._site_current = (cid, path)
+        if not self.guild_api:
+            return
+
+        def work():
+            text, err, can_edit = None, "unknown", False
+            try:
+                if path.startswith("/page/"):
+                    raw = self.guild_api.fetch_file(path)
+                    if raw is not None:
+                        text = raw.decode("utf-8", "replace")
+                    else:
+                        err = "no response"
+                else:
+                    res = self.guild_api.site_get(cid, path)
+                    if res.get("ok"):
+                        text = base64.b64decode(
+                            res.get("data_b64") or "").decode("utf-8", "replace")
+                        can_edit = bool(res.get("can_edit"))
+                    else:
+                        err = res.get("error", "not found")
+                        can_edit = bool(res.get("can_edit"))
+            except Exception as e:
+                err = repr(e)
+                print("site page fetch failed:", err)
+            if text is not None:
+                Clock.schedule_once(
+                    lambda dt: self._render_site_page(cid, text,
+                                                      can_edit=can_edit), 0)
+            else:
+                Clock.schedule_once(
+                    lambda dt: self._site_empty_page(cid, err,
+                                                     can_edit=can_edit), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _site_empty_page(self, cid, err, can_edit=False):
+        """The page fetch failed: replace the 'loading site' placeholder
+        with an honest empty page instead of leaving it forever (tay's
+        device receipt, 0.36.10 era). When the server says the viewer
+        may edit, the empty state IS the creation door: a not-found
+        read for a permitted viewer leads with [ Create index page ].
+        channels with a default /index.mu, so this is the exceptional
+        branch: a site created before the seed, or a deleted target."""
+        try:
+            main = self.root.get_screen("main")
+        except Exception:
+            return
+        cur = getattr(main, "_current_channel", None)
+        if cur and self._channel_cid(cur) != cid:
+            return   # user switched away while the fetch was in flight
+        try:
+            grid = main.ids.message_grid
+            grid.clear_widgets()
+            self._msg_widgets.clear()
+            page = SitePage()
+            page.add_widget(self._micron_label(
+                "[b]This site is empty[/b]"))
+            if can_edit and (err or "") == "resource not found":
+                page.add_widget(self._micron_label(
+                    "[ref=shades:site-create][ Create index page ]"
+                    "[/ref]"))
+            page.add_widget(self._micron_label(
+                "The page failed to load: %s" % _escape(err or "unknown")))
+            grid.add_widget(page)
+        except Exception as e:
+            print("site empty-page render failed:", repr(e))
+        self._set_status("page failed: %s" % (err or "unknown"))
+
+    def _render_site_page(self, cid, text, can_edit=False):
+        """Render one micron page into the main grid. Holds the fetched
+        source for the P7c editor and, when the server says the caller
+        carries SITE_EDIT, leads with the [ Edit page ] affordance."""
+        try:
+            main = self.root.get_screen("main")
+        except Exception:
+            return
+        cur = getattr(main, "_current_channel", None)
+        if cur and self._channel_cid(cur) != cid:
+            return   # user switched away while the page was in flight
+        self._site_src_text = text
+        grid = main.ids.message_grid
+        grid.clear_widgets()
+        self._remove_skeleton(getattr(self, "_skeleton_cid", None))
+        self._msg_widgets.clear()
+        blocks = micron_parse(text)
+        page = SitePage()
+        if self._site_stack:
+            page.add_widget(self._micron_label(
+                "[ref=shades:back][b]< Back[/b][/ref]"))
+        if can_edit:
+            page.add_widget(self._micron_label(
+                "[ref=shades:site-edit][b][ Edit page ][/b][/ref]"))
+        self._micron_blocks_into(page, blocks, cid)
+        grid.add_widget(page)
+        try:
+            main.ids.scroll.scroll_y = 1.0
+        except Exception:
+            pass
+
+    def _micron_blocks_into(self, container, blocks, cid, media_ok=True):
+        """The micron block loop shared by the main render and the site
+        editor's preview. media_ok=False (editor preview) renders media
+        runs as text so the preview never reaches for the network."""
+        bg = micron_page_bg(blocks, self._site_theme)
+        if bg and isinstance(container, SitePage):
+            container.bg_color = self._hex6_to_rgba(bg)
+        for b in blocks:
+            t = b["type"]
+            if t == "directive":
+                continue
+            if t == "sep":
+                container.add_widget(MicronSep())
+                continue
+            if t == "heading":
+                container.add_widget(self._micron_label(
+                    runs_to_markup(b["runs"], _escape), heading=True))
+                continue
+            if t == "code":
+                container.add_widget(self._micron_label(
+                    _escape(b["text"]), code=True))
+                continue
+            runs = b.get("runs") or []
+            if len(runs) == 1 and micron_media_target(runs[0].get("link") or ""):
+                if media_ok:
+                    self._add_site_media(container, cid, runs[0])
+                else:
+                    container.add_widget(self._micron_label(
+                        "[i][media: %s][/i]" % _escape(runs[0].get("link") or "")))
+            else:
+                container.add_widget(self._micron_label(
+                    runs_to_markup(runs, _escape), center=b.get("center")))
 
     # -- site editor (P7c): edit the page on screen, then publish -------
     SITE_STARTER_INDEX_MU = (
@@ -6075,6 +7689,87 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         "`!bold!` `*italic*` `_underline_` `F8a8`code`f`\n"
         "[publish with site/put `/index.mu]\n"
     )
+
+    def _open_site_editor(self):
+        """Enter the micron editor for the page currently on screen."""
+        cid, path = self._site_current or (None, None)
+        if not cid or not path:
+            self._set_status("no page on screen to edit")
+            return
+        src = getattr(self, "_site_src_text", None)
+        if src is None:
+            self._set_status("fetching page source…")
+
+            def work():
+                txt, err = None, "fetch failed"
+                try:
+                    res2 = self.guild_api.site_get(cid, path)
+                    if res2.get("ok"):
+                        txt = base64.b64decode(res2.get("data_b64") or "").decode(
+                            "utf-8", "replace")
+                    else:
+                        err = res2.get("error", "fetch failed")
+                except Exception as e2:
+                    err = repr(e2)
+                Clock.schedule_once(
+                    lambda dt: self._enter_site_editor(cid, path, txt,
+                                                       err=err), 0)
+            threading.Thread(target=work, daemon=True).start()
+            return
+        self._enter_site_editor(cid, path, src)
+
+    def _enter_site_editor(self, cid, path, src, err=None):
+        if src is None:
+            self._set_status("page source unavailable: %s" % (err or "unknown"))
+            return
+        self._edit_cid, self._edit_path = cid, path
+        scr = self.root.get_screen("site_editor")
+        scr._src.text = src
+        scr._status.text = "editing %s" % path
+        holder = scr._prev_holder
+        holder.clear_widgets()
+        holder.parent.scroll_y = 1.0
+        self.root.current = "site_editor"
+
+    def _open_new_site_page(self):
+        """Empty-state creation door (tay's device report, 0.36.24): a
+        permitted viewer lands on a not-found read of a site with no
+        stored index; enter the editor with the same starter template
+        the server seeds, keyed to the not-found target (_site_current)."""
+        cid, path = getattr(self, "_site_current", None) or (None, None)
+        if not cid or not path:
+            self._set_status("no page target")
+            return
+        self._edit_cid, self._edit_path = cid, path
+        scr = self.root.get_screen("site_editor")
+        scr._src.text = self.SITE_STARTER_INDEX_MU
+        scr._status.text = "creating %s" % path
+        holder = scr._prev_holder
+        holder.clear_widgets()
+        holder.parent.scroll_y = 1.0
+        self.root.current = "site_editor"
+
+    def _site_editor_back(self):
+        """Return to the rendered page; _site_current is still live."""
+        if self.root is not None:
+            self.root.current = "main"
+
+    def _site_editor_preview(self):
+        """Render the editor's source into the in-screen preview column;
+        media runs stay text so the preview never reaches the network."""
+        try:
+            scr = self.root.get_screen("site_editor")
+        except Exception:
+            return
+        blocks = micron_parse(scr._src.text)
+        holder = scr._prev_holder
+        holder.clear_widgets()
+        page = SitePage()
+        holder.add_widget(page)
+        self._micron_blocks_into(page, blocks,
+                                 getattr(self, "_edit_cid", None),
+                                 media_ok=False)
+        scr._status.text = "preview: %d blocks" % len(blocks)
 
     def _site_editor_publish(self):
         """Store the edited source for the page the editor opened on."""
@@ -6103,6 +7798,140 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             Clock.schedule_once(
                 lambda dt: self._site_editor_publish_done(ok, err), 0)
         threading.Thread(target=work, daemon=True).start()
+
+    def _site_editor_publish_done(self, ok, err):
+        try:
+            scr = self.root.get_screen("site_editor")
+        except Exception:
+            return
+        if ok:
+            scr._status.text = "published"
+            if self.root is not None:
+                self.root.current = "main"
+            self._site_load_page(self._edit_cid, self._edit_path)
+        else:
+            scr._status.text = "publish failed: %s" % err
+
+    def _micron_label(self, markup, heading=False, center=False, code=False):
+        lbl = MicronRefLabel(markup=True, text=markup)
+        lbl.size_hint_y = None
+        lbl.font_size = sp(18) if heading else (sp(13) if code else sp(15))
+        lbl.halign = "center" if center else "left"
+        lbl.color = (0.62, 0.65, 0.7, 1) if code else (0.88, 0.9, 0.93, 1)
+        lbl.bind(width=lambda inst, w: setattr(inst, "text_size", (w, None)))
+        lbl.bind(texture_size=lambda inst, ts: setattr(
+            inst, "height", max(dp(18), ts[1] if ts else 0)))
+        lbl.bind(on_ref_press=lambda inst, ref: self._micron_link_tapped(ref))
+        return lbl
+
+    @staticmethod
+    def _hex6_to_rgba(h):
+        """'#88aa88' -> (r, g, b, 1.0) floats."""
+        h = (h or "#").lstrip("#")
+        if len(h) == 3:
+            h = "".join(c + c for c in h)
+        if len(h) != 6:
+            return (0, 0, 0, 0)
+        return (int(h[0:2], 16) / 255.0, int(h[2:4], 16) / 255.0,
+                int(h[4:6], 16) / 255.0, 1.0)
+
+    def _add_site_media(self, container, cid, run):
+        """A media-only line: images render inline (MessageEmbed, bytes
+        fetched over the link), audio/video as a tappable download row."""
+        target = (run.get("link") or "").split("`")[0].strip()
+        name = target.rsplit("/", 1)[-1] or "media"
+        ext = micron_media_target(target)
+        if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+            container.add_widget(self._micron_label(
+                "[ref=%s]audio: %s[/ref]" % (_escape(target), _escape(name))))
+            return
+        emb = MessageEmbed()
+        emb.source = ""    # placeholder box until the bytes arrive
+        container.add_widget(emb)
+
+        def work():
+            blob = None
+            try:
+                if target.startswith("/file/sites/"):
+                    parts = target.split("/", 4)
+                    if len(parts) == 5:
+                        res = self.guild_api.site_get(parts[3], "/" + parts[4])
+                        if res.get("ok"):
+                            blob = base64.b64decode(res.get("data_b64") or "")
+                else:
+                    raw = self.guild_api.fetch_file(target)
+                    if raw:
+                        blob = raw
+            except Exception as e:
+                print("site media fetch failed:", repr(e))
+            if not blob:
+                return
+            fpath = self._save_attachment_blob(blob, name)
+            Clock.schedule_once(lambda dt: setattr(emb, "source", fpath), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _micron_link_tapped(self, target):
+        """Dispatch a micron link ref press: back stack, media download,
+        intra-site pages, guild /page/... pages, everything else -> status."""
+        target = (target or "").split("`")[0].strip()
+        if target == "shades:back":
+            if self._site_stack:
+                cid, path = self._site_stack.pop()
+                self._site_load_page(cid, path)
+            return
+        if target == "shades:site-edit":
+            self._open_site_editor()
+            return
+        if target == "shades:site-create":
+            self._open_new_site_page()
+            return
+        if micron_media_target(target):
+            self._site_download_media(target)
+            return
+        if target.startswith("/file/sites/") and target.endswith(".mu"):
+            parts = target.split("/", 4)
+            if len(parts) == 5 and re.match(r"^[0-9a-f]{64}$", parts[3]):
+                self._site_load_page(parts[3], "/" + parts[4], push=True)
+                return
+        if target.startswith("/page/"):
+            try:
+                main = self.root.get_screen("main")
+                name = getattr(main, "_current_channel", "general")
+                self._site_load_page(self._channel_cid(name), target, push=True)
+            except Exception:
+                pass
+            return
+        self._set_status("link: %s" % (target or "(empty)"))
+
+    def _site_download_media(self, target):
+        """Download a media target to the local attachments dir."""
+        name = target.rsplit("/", 1)[-1] or "media"
+        self._set_status("downloading %s…" % name)
+
+        def work():
+            blob = None
+            try:
+                if target.startswith("/file/sites/"):
+                    parts = target.split("/", 4)
+                    if len(parts) == 5:
+                        res = self.guild_api.site_get(parts[3], "/" + parts[4])
+                        if res.get("ok"):
+                            blob = base64.b64decode(res.get("data_b64") or "")
+                else:
+                    raw = self.guild_api.fetch_file(target)
+                    if raw:
+                        blob = raw
+            except Exception as e:
+                print("site media download failed:", repr(e))
+            if blob:
+                fpath = self._save_attachment_blob(blob, name)
+                Clock.schedule_once(
+                    lambda dt: self._set_status("saved %s" % fpath), 0)
+            else:
+                Clock.schedule_once(
+                    lambda dt: self._set_status("download failed: %s" % name), 0)
+        threading.Thread(target=work, daemon=True).start()
+
 
     def _member_row(self, user_hash, uname, presence_color):
         """Build a sidebar row with the same avatar resolution as the
@@ -6235,20 +8064,22 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             text = reply_wire(*self._pending_reply, text)
             self.cancel_reply()
         cid = self._channel_cid(cid)
+        # fold-14 P11g: the composer text leaves the field at capture
+        # time and a dead link between here and the server must not
+        # swallow it.
         inp.text = ""
         # Capture ONCE here (main thread): a second send during this
         # worker's flight must not mutate what this one posts.
         att = getattr(self, "_pending_attachment", None)
 
         def _send_failed(reason):
-            """No send failure costs the member their words (P11g):
+            """fold-14 P11g: any send failure gives the compose back.
 
-            a dead link raised out of the old worker with no except while
-            the composer had already cleared - text lost, no status, on
-            every failure leg. Now: the raw pre-reply_wire text returns
-            to the composer, the consumed reply card re-stages, the
-            attachment stays pending, and the status line says so. The
-            field write rides the Clock (worker-thread law)."""
+            The field cleared at capture time; restoring the text (and
+            the reply card, which reply_wire consumed) means a dropped
+            link costs zero retyping. The attachment stays pending --
+            it never moved. Runs from the worker thread, so the field
+            write rides the Clock onto the main thread."""
             def restore(dt=None):
                 try:
                     inp.text = raw_text
@@ -6258,72 +8089,80 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                     self._pending_reply = old_reply
                     self.reply_draft = "Replying to @%s · %s" % (
                         old_reply[0], " ".join(old_reply[1].split())[:80])
-                self._set_status(
-                    "send failed: %s (text restored)" % str(reason)[:80])
             Clock.schedule_once(restore, 0)
+            Clock.schedule_once(
+                lambda dt: self._set_status(
+                    "send failed: %s (text restored)" % str(reason)[:80]),
+                0)
 
         def work():
-            try:
-                _work_inner()
-            except Exception as exc:
-                # the last-ditch net: a raise here is a dead link or an
-                # unexpected error - lose nothing, restore via the Clock
-                self._up_active = False
-                _send_failed(str(exc)[:120])
-
-        def _work_inner():
             atts_req = None
             atts_render = None
-            if att:
-                name, mime, blob = att
-                # v0.30: the blob NEVER rides the message packet. Inline
-                # triples exceed the link packet budget (receipt: tay,
-                # "packet size of 515 exceeds mtu of 500") -- the chunked
-                # blob API moves every byte; the post carries a reference.
-                # v0.32: progress is visible in the status line, so a slow
-                # mobile uplink reads as movement, not silence.
-                Clock.schedule_once(
-                    lambda dt: self._set_status("attach upload starting"),
-                    0)
-
-                def _up_progress(done, total):
+            try:
+                if att:
+                    name, mime, blob = att
+                    # v0.30: the blob NEVER rides the message packet. Inline
+                    # triples exceed the link packet budget (receipt: tay,
+                    # "packet size of 515 exceeds mtu of 500") -- the chunked
+                    # blob API moves every byte; the post carries a reference.
+                    # v0.32: progress is visible in the status line, so a slow
+                    # mobile uplink reads as movement, not silence.
                     Clock.schedule_once(
-                        lambda dt: self._set_status(
-                            "attach upload %d%%"
-                            % int(100 * done / max(total, 1))), 0)
+                        lambda dt: self._set_status("attach upload starting"),
+                        0)
 
-                # Standard path (tay): one retry policy for every upload.
-                up = self.blob_put_healed(name, mime, blob,
-                                          on_progress=_up_progress)
-                if not up.get("ok"):
-                    _send_failed("attach upload (%s): %s"
-                                 % (up.get("phase", "init"),
-                                    up.get("error", "unknown")[:80]))
+                    def _up_progress(done, total):
+                        Clock.schedule_once(
+                            lambda dt: self._set_status(
+                                "attach upload %d%%"
+                                % int(100 * done / max(total, 1))), 0)
+
+                    self._up_active = True
+                    try:
+                        up = self.guild_api.blobs_put(
+                            name, mime, blob, on_progress=_up_progress)
+                    except Exception as exc:
+                        self._up_active = False
+                        _send_failed("attach upload failed: %r" % (exc,))
+                        return
+                    self._up_active = False
+                    if not up.get("ok"):
+                        _send_failed("attach upload failed (%s): %s"
+                                     % (up.get("phase", "init"),
+                                        up.get("error", "unknown")))
+                        return
+                    atts_req = [{"blob_id": up.get("blob_id"),
+                                 "name": name, "mime": mime}]
+                try:
+                    if atts_req:
+                        res = self.guild_api.post_v1(cid, text,
+                                                     attachments=atts_req)
+                        # the server answers with stored metadata (name, mime,
+                        # size, path) and no bytes -- the optimistic render is
+                        # the same shape push delivers to everyone else, so it
+                        # renders lazily through _fetch_attachment like rows
+                        atts_render = res.get("attachments") or None
+                    else:
+                        res = self.guild_api.post(cid, text)
+                except Exception as exc:
+                    _send_failed("%r" % (exc,))
                     return
-                atts_req = [{"blob_id": up.get("blob_id"),
-                             "name": name, "mime": mime}]
-            if atts_req:
-                res = self.guild_api.post_v1(cid, text, attachments=atts_req)
-                # the server answers with stored metadata (name, mime,
-                # size, path) and no bytes -- the optimistic render is the
-                # same shape push delivers to everyone else, so it renders
-                # lazily through _fetch_attachment just like received rows
-                atts_render = res.get("attachments") or None
-            else:
-                res = self.guild_api.post(cid, text)
-            if res.get("ok"):
-                # optimistically show
-                msg_id = res.get("msg_id")
-                m = {"msg_id": msg_id, "author_hash": self.my_hash,
-                     "username": self.username, "content": text,
-                     "ts": now(), "channel_id": cid,
-                     "attachments": atts_render}
-                Clock.schedule_once(lambda dt: self._render_message(
-                    main.ids.message_grid, m, animate=True), 0)
-                self._pending_attachment = None
-            else:
-                err = res.get("error", "unknown")
-                _send_failed(err)
+                if res.get("ok"):
+                    # optimistically show
+                    msg_id = res.get("msg_id")
+                    m = {"msg_id": msg_id, "author_hash": self.my_hash,
+                         "username": self.username, "content": text,
+                         "ts": now(), "channel_id": cid,
+                         "attachments": atts_render}
+                    Clock.schedule_once(lambda dt: self._render_message(
+                        main.ids.message_grid, m), 0)
+                    self._pending_attachment = None
+                else:
+                    _send_failed(res.get("error", "unknown"))
+            except Exception as exc:
+                # last-ditch: the composer still gets restored - a send
+                # failure may never take the member's text.
+                _send_failed("%r" % (exc,))
         threading.Thread(target=work, daemon=True).start()
 
     def _on_key_down(self, window, key, scancode, codepoint, modifier):
@@ -6371,6 +8210,142 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         return None
 
     # -- attachments: server-stored vs ephemeral (P2P) -------------------
+    @staticmethod
+    def _loading_placeholder_text(name):
+        """Match tay's v0.31.10 receipt ('loading image' for mp3's): say
+        what the row is actually loading, judged by extension. Images keep
+        the original wording; everything else gets its own word."""
+        ext = (name.rsplit(".", 1)[-1].lower()
+               if (name or "").count(".") else "")
+        if ext in ("mp3", "wav", "ogg", "flac", "m4a", "opus", "aac", "wma"):
+            return "[loading audio…]"
+        if ext in ("mp4", "mov", "webm", "mkv", "avi"):
+            return "[loading video…]"
+        if ext in ("png", "jpg", "jpeg", "gif", "webp", "bmp"):
+            return "[loading image…]"
+        return "[loading file…]"
+
+    def _add_loading_placeholder(self, row, name=""):
+        """Show a loading placeholder in the row's embed container."""
+        print(
+            f"[TRACE] _add_loading_placeholder: "
+            f"row={row.msg_id[:12] if row.msg_id else '?'}", flush=True)
+        dlog(f"_add_loading_placeholder: row={row.msg_id[:12] if row.msg_id else '?'}")
+        lbl = Label(
+            text=self._loading_placeholder_text(name),
+            size_hint_y=None,
+            height=dp(200),
+            color=(0.7, 0.73, 0.77, 1),
+            font_size=sp(12),
+        )
+        lbl._is_loading_placeholder = True
+        row.ids.embed_container.add_widget(lbl)
+        row._loading_placeholder = lbl
+
+    def _remove_placeholder(self, row):
+        """Remove the loading placeholder from the row's embed container."""
+        lbl = getattr(row, "_loading_placeholder", None)
+        if lbl is not None:
+            print(
+                f"[TRACE] _remove_placeholder: "
+                f"row={row.msg_id[:12] if row.msg_id else '?'}", flush=True)
+            dlog(f"_remove_placeholder: row={row.msg_id[:12] if row.msg_id else '?'}")
+            try:
+                row.ids.embed_container.remove_widget(lbl)
+            except Exception:
+                pass
+            row._loading_placeholder = None
+
+    def open_attach_dialog(self):
+        """Open a window to pick a file and its storage style; OK auto-sends.
+
+        Storage styles:
+          * server-stored  - guild keeps the file; client re-fetches bytes on
+                             restart (loading placeholder until received).
+          * ephemeral (P2P) - bytes sent inline; kept locally so they survive
+                             restart, but no server copy exists.
+        """
+        if self._android_platform():
+            self._open_attach_dialog_android()
+            return
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.label import Label
+        from kivy.uix.button import Button
+        from kivy.uix.popup import Popup
+
+        main = self.root.get_screen("main")
+        text = (main.ids.msg_input.text or "").strip()
+
+        chooser = FileChooserListView(
+            filters=["*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp",
+                     "*.mp4", "*.mp3", ".pdf", ".txt"]
+        )
+        style_box = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        app = App.get_running_app()
+        style_box.add_widget(
+            Label(text="Store:", size_hint_x=None, width=dp(50),
+                  color=app.theme_colors['text'] if app else (1, 1, 1, 1), font_size=sp(12),
+                  halign="left", valign="middle"))
+        btn_server = Button(text="Server-stored", size_hint_x=None,
+                            width=dp(130), size_hint_y=None,
+                            height=scaled(dp(44)), pos_hint={"center_y": 0.5})
+        btn_ephem = Button(text="Ephemeral (P2P)", size_hint_x=None,
+                           width=dp(130), size_hint_y=None,
+                           height=scaled(dp(44)), pos_hint={"center_y": 0.5})
+        selected = {"style": ATT_SERVER}
+
+        def pick(s):
+            selected["style"] = s
+            active_bg = app.theme_colors['primary'] if app else (0.42, 0.48, 1.0, 1)
+            inactive_bg = app.theme_colors['panel_darker'] if app else (0.25, 0.27, 0.31, 1)
+            btn_server.background_color = active_bg if s == ATT_SERVER else inactive_bg
+            btn_ephem.background_color = active_bg if s == ATT_EPHEMERAL else inactive_bg
+
+        btn_server.bind(on_press=lambda *_: pick(ATT_SERVER))
+        btn_ephem.bind(on_press=lambda *_: pick(ATT_EPHEMERAL))
+        pick(ATT_SERVER)
+        style_box.add_widget(btn_server)
+        style_box.add_widget(btn_ephem)
+
+        btn_ok = Button(text="OK — Send", size_hint_y=None,
+                        height=scaled(dp(44)),
+                        background_color=app.theme_colors['primary'] if app else (
+                            0.42, 0.48, 1.0, 1),
+                        color=app.theme_colors['text'] if app else (1, 1, 1, 1))
+        btn_cancel = Button(text="Cancel", size_hint_y=None,
+                            height=scaled(dp(44)),
+                            background_color=app.theme_colors['panel_darker'] if app else (
+                                0.25, 0.27, 0.31, 1),
+                            color=app.theme_colors['text'] if app else (1, 1, 1, 1))
+        btn_box = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        btn_box.add_widget(btn_ok)
+        btn_box.add_widget(btn_cancel)
+
+        content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        content.add_widget(Label(
+            text="Attach a file — choose how it is stored:",
+            size_hint_y=None, height=dp(24),
+            color=app.theme_colors['text'] if app else (1, 1, 1, 1),
+            font_size=sp(12)))
+        content.add_widget(chooser)
+        content.add_widget(style_box)
+        content.add_widget(btn_box)
+
+        popup = Popup(title="Attach file", content=content, size_hint=(0.9, 0.9),
+                      auto_dismiss=False)
+
+        def do_ok(*_):
+            sel = chooser.selection
+            if not sel:
+                self._set_status("No file selected")
+                return
+            path = sel[0]
+            popup.dismiss()
+            self._send_attached_file(text, path, selected["style"])
+
+        btn_ok.bind(on_press=do_ok)
+        btn_cancel.bind(on_press=lambda *_: popup.dismiss())
+        popup.open()
 
     # ---------------- Android SAF file picking ---------------------------
     # kivy's FileChooserListView browses the app sandbox only, which on
@@ -6379,6 +8354,576 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
     # storage permission and returns a content:// uri read through the
     # app's ContentResolver into a local copy, then the normal pipeline
     # takes over (_send_attached_file / _on_file_selected).
+    _SAF_ATTACH = 0x5A17
+    _SAF_GENERIC = 0x5A18
+
+    def _android_platform(self):
+        from kivy.utils import platform
+        return platform == "android"
+
+    def _saf_copy_uri(self, uri):
+        """Copy a content:// uri into the app dir; return the local path.
+        No python-side byte arrays: the transfer runs java-side via
+        java.nio.file.Files.copy (minapi 26), so the only jnius name
+        imported is autoclass -- the one proven to import on-device.
+        (v0.15 raised E4 ImportError importing jbyte/jarray here.)"""
+        try:
+            import mimetypes as _mt
+        except ImportError:
+            _mt = None
+        from jnius import autoclass
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        resolver = PythonActivity.mActivity.getContentResolver()
+        # display name, best effort; the jarray(String) cursor query from
+        # v0.15 needed the same suspect jnius exports as the byte transfer,
+        # so both are gone: last path segment with a mime-based fallback.
+        # v0.30: the real display name comes from the resolver's
+        # _display_name column -- lastPathSegment is a content id on
+        # modern pickers (tay: attachments "still says picked.jpg");
+        # the query needs no new jnius exports and falls back on failure.
+        name = None
+        try:
+            cur = resolver.query(uri, ["_display_name"], None, None, None)
+            if cur is not None:
+                try:
+                    if cur.moveToFirst():
+                        name = cur.getString(0)
+                finally:
+                    cur.close()
+        except Exception:
+            name = None
+        if not name:
+            try:
+                name = uri.getLastPathSegment()
+            except Exception:
+                name = None
+        if name:
+            name = os.path.basename(name.replace("\\", "/"))
+            if not name or "." not in name:
+                name = None
+        if not name:
+            try:
+                mime = resolver.getType(uri)
+            except Exception:
+                mime = None
+            ext = (_mt.guess_extension(mime) if (_mt and mime) else None) or ""
+            name = "picked" + ext
+        name = os.path.basename(name.replace("\\", "/")) or "picked"
+        if name.startswith("."):
+            name = "picked" + name
+        out_dir = os.path.join(_app_data_dir(), "picked")
+        os.makedirs(out_dir, exist_ok=True)
+        candidate = name
+        stem, ext = os.path.splitext(candidate)
+        n = 1
+        while os.path.exists(os.path.join(out_dir, candidate)):
+            candidate = "%s (%d)%s" % (stem, n, ext)
+            n += 1
+        target = os.path.join(out_dir, candidate)
+        if os.path.exists(target):
+            os.remove(target)
+
+        def step(what, fn):
+            """Wrap one copy hop so a failure names the hop exactly."""
+            try:
+                return fn()
+            except Exception as e:
+                dlog("saf %s failed: %r" % (what, e))
+                raise OSError("%s: %s" % (what, type(e).__name__))
+
+        # v0.24 PRIMARY: the file-descriptor path. tay's v0.23 receipt
+        # (224113 bytes, head=00 00 00 00 00 00 00 00) caught the
+        # java-array trap: the JVM fills ITS copy of the reflect byte
+        # array while the python wrapper keeps the original zeros, so
+        # the streamed copy had the right size and no content.
+        # ParcelFileDescriptor.detachFd() hands over the NATIVE fd int;
+        # python os.read owns it end to end and no java byte array
+        # crosses the bridge at all.
+        pfd = None
+        fd = None
+        try:
+            pfd = step("open-pfd", lambda: resolver.openFileDescriptor(uri, "r"))
+        except OSError as e:
+            dlog("saf pfd open failed: %s (falling back to streams)" % e)
+        if pfd is not None:
+            fd = step("detach-fd", lambda: pfd.detachFd())
+            if fd is None:
+                dlog("saf detachFd returned None")
+        if fd is not None:
+            total = 0
+            try:
+                first = os.read(fd, 8)
+                if len(first) == 8 and first == b"\x00" * 8:
+                    raise OSError("provider served zero-filled bytes "
+                                  "(fd head=00 x8)")
+                os.lseek(fd, 0, 0)
+                with open(target, "wb") as out:
+                    while True:
+                        chunk = os.read(fd, 1 << 20)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        total += len(chunk)
+                        if total > 10 * 1024 * 1024:
+                            raise OSError("picked file exceeds the 32 MB "
+                                          "server cap")
+            finally:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+            dlog("saf copy done via fd: %s (%d bytes)"
+                 % (target, total))
+            transfer = "fd"
+        else:
+            # legacy stream path (v0.15-v0.23 machinery), fallback only
+            stream = step("open-stream", lambda: resolver.openInputStream(uri))
+            if stream is None:
+                raise OSError("content provider refused read (stream None)")
+            transfer = None
+            try:
+                # primary: java.nio transfer via exact-signature hops only.
+                # File(String) ctor and File.toPath() have single overloads --
+                # the varargs suspects from v0.16 (getPath/Files.copy) stay
+                # quarantined behind this one call.
+                jfile = step("jfile", lambda: autoclass("java.io.File")(target))
+                jpath = step("jtopath", lambda: jfile.toPath())
+                step("niocopy",
+                     lambda: autoclass("java.nio.file.Files").copy(stream, jpath))
+                transfer = "nio"
+            except OSError as e:
+                dlog("saf nio path failed: %s" % e)
+            if transfer is None:
+                # fallback: re-open fresh (nio may have consumed the stream),
+                # copy python-side through reflect.Array -- no jnius scalar
+                # exports anywhere, no varargs overloads.
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+                stream2 = step("reopen-stream",
+                               lambda: resolver.openInputStream(uri))
+                try:
+                    step("reflect-copy",
+                         lambda: self._reflect_copy(stream2, target))
+                finally:
+                    try:
+                        stream2.close()
+                    except Exception:
+                        pass
+                transfer = "reflect"
+            try:
+                stream.close()
+            except Exception:
+                pass
+        size = os.path.getsize(target)
+        if size > 10 * 1024 * 1024:
+            os.remove(target)
+            raise OSError("picked file exceeds the 32 MB server cap (%d)"
+                          % size)
+        # v0.20 integrity gate: a provider stream can return zero bytes
+        # (or truncated data) and the transfer still "succeeds" -- every
+        # downstream consumer then spins or renders nothing with no
+        # error (tay's v0.19 receipt). tay's v0.20 receipt answered the
+        # zero-byte branch: 203434 real bytes that pillow cannot
+        # decode. v0.21 policy: sniff the magic so the file's TRUE
+        # format names itself. A kivy-decodable magic decodes or not in
+        # the editor (texture check names it); an undecodable family
+        # (HEIC/AVIF) fails here with a message tay can act on.
+        if size == 0:
+            os.remove(target)
+            raise OSError("copy produced a 0-byte file via %s "
+                          "(provider stream empty)" % transfer)
+        if os.path.splitext(target)[1].lower() \
+                in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
+            magic = self._saf_magic(target)
+            if magic is None:
+                os.remove(target)
+                raise OSError("copy produced unreadable data "
+                              "(%d bytes via %s, unknown magic)"
+                              % (size, transfer))
+            if magic in ("heic", "avif", "unknown"):
+                if magic == "unknown" and self._saf_image_ok(target):
+                    # extension lied, bytes decode anyway: keep it
+                    dlog("saf copy done via %s: %s (%d bytes, "
+                         "magic<ext mismatch but PIL verified)"
+                         % (transfer, target, size))
+                    return target
+                # v0.23: HEAD BYTES BEFORE DELETE -- v0.22 removed the
+                # file first, so the hex receipt read nothing
+                # ('(unreadable)' on tay's flash).
+                head_hex = self._saf_head_hex(target)
+                os.remove(target)
+                if magic == "unknown":
+                    raise OSError("picked image is not a decodable format "
+                                  "(%d bytes, head=%s) - please pick a "
+                                  "JPEG or PNG" % (size, head_hex))
+                raise OSError("picked image is %s - kivy cannot render "
+                              "that format here, please pick a JPEG "
+                              "or PNG (%d bytes via %s, head=%s)"
+                              % (magic.upper(), size, transfer, head_hex))
+            # known-decodable magic: PIL verify is advisory here. If
+            # pillow's decode stack is broken on-device, a hard gate
+            # would block good files (v0.20 receipt could be either);
+            # the editor's texture check gives the REAL verdict.
+            if not self._saf_image_ok(target):
+                dlog("saf: PIL could not verify %s magic=%s (%d bytes); "
+                     "letting kivy attempt the render"
+                     % (target, magic, size))
+        dlog("saf copy done via %s: %s (%d bytes, verified)"
+             % (transfer, target, size))
+        return target
+
+    @staticmethod
+    def _saf_head_hex(path, n=8):
+        """First n bytes as space-separated hex -- names unknown content
+        in a status/error line (v0.22, tay's gallery mystery)."""
+        try:
+            with open(path, "rb") as f:
+                head = f.read(n)
+        except Exception:
+            return "(unreadable)"
+        return " ".join("%02X" % b for b in head)
+
+    @staticmethod
+    def _saf_magic(path):
+        """Sniff the file's format from its first bytes: jpeg/png/gif/
+        webp/heic/avif/pdf/unknown/None (None = unreadable)."""
+        try:
+            with open(path, "rb") as f:
+                head = f.read(16)
+        except Exception:
+            return None
+        if head[:3] == b"\xff\xd8\xff":
+            return "jpeg"
+        if head[:8] == b"\x89PNG\r\n\x1a\n":
+            return "png"
+        if head[:4] in (b"GIF8",):
+            return "gif"
+        if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+            return "webp"
+        if head[:4] == b"%PDF":
+            return "pdf"
+        if head[4:8] == b"ftyp":
+            brand = head[8:12].lower()
+            if brand.startswith(b"heic") or brand.startswith(b"mif1"):
+                return "heic"
+            if brand.startswith(b"avif") or brand.startswith(b"avis"):
+                return "avif"
+            return "heic" if brand[:2] in (b"he", b"ms") else "heic"
+        return "unknown"
+
+    def _saf_image_ok(self, path):
+        """True iff the local file decodes as an image (pillow, an
+        in-repo dependency). Any exception -> False; the caller turns
+        it into a named error. Non-image extensions are not checked."""
+        try:
+            from PIL import Image
+            with Image.open(path) as im:
+                im.verify()
+            return True
+        except Exception as e:
+            dlog("saf image verify failed: %s: %s"
+                 % (type(e).__name__, e))
+            return False
+
+    def _reflect_copy(self, stream, target):
+        """Python-side copy with no jbyte/jarray exports: the byte[] is
+        built via java.lang.reflect.Array.newInstance + Byte.TYPE
+        (public, documented surface), read via stream.read(buf). Slow
+        per-element conversion -- correctness fallback only."""
+        from jnius import autoclass
+        make = autoclass("java.lang.reflect.Array")
+        jbyte_cls = autoclass("java.lang.Byte").TYPE
+        buf = make.newInstance(jbyte_cls, 65536)
+        with open(target, "wb") as out:
+            total = 0
+            while True:
+                got = stream.read(buf)
+                if got <= 0:
+                    break
+                out.write(bytes(bytearray(buf[:got])))
+                total += got
+                if total > 10 * 1024 * 1024:
+                    raise OSError("picked file exceeds the 32 MB server cap")
+        return target
+
+    def _saf_pick(self, request_code, on_file, on_fail=None):
+        """Launch the system picker; on_file(local_path) fires on success,
+        on_fail(reason) on any failure. Both run on the kivy thread --
+        the activity callback arrives on the Android UI thread and is
+        marshalled via Clock (kivy widgets must not be touched from
+        foreign threads; property dispatch there is silent-no-op)."""
+        from jnius import autoclass
+        from android import activity as android_activity
+        handlers = getattr(self, "_saf_handlers", None)
+        if handlers is None:
+            handlers = {}
+            self._saf_handlers = handlers
+            android_activity.bind(on_activity_result=self._on_saf_result)
+        if request_code in handlers:
+            self._set_status("file picker already open")
+            return
+        handlers[request_code] = (on_file, on_fail)
+        Intent = autoclass("android.content.Intent")
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        intent.setType("*/*")
+        PythonActivity.mActivity.startActivityForResult(intent, request_code)
+        self._set_status("system picker open — choose a file there")
+
+    def _on_saf_result(self, request_code, result_code, intent):
+        """Called on the ANDROID UI thread by the p4a activity bridge.
+        Never touch kivy state here: snapshot, marshal onto the kivy
+        thread, and process in _finish_saf_result."""
+        handlers = getattr(self, "_saf_handlers", None)
+        if not handlers:
+            return
+        entry = handlers.pop(request_code, None)
+        if entry is None:
+            return
+        from kivy.clock import Clock
+        payload = {
+            "request_code": request_code,
+            "result_code": result_code,
+            "intent": intent,
+            "on_file": entry[0],
+            "on_fail": entry[1],
+        }
+        Clock.schedule_once(
+            lambda dt: self._finish_saf_result(payload), 0)
+
+    def _finish_saf_result(self, payload):
+        """Process a picker result on the kivy thread."""
+        # v0.36.10 (tay's blank-black on selection, ANGLE device): after
+        # any opaque full-screen picker activity the GL surface sometimes
+        # comes back unre-painted. Force a draw now and once the frames
+        # settle -- cheap, and both legs (icon/banner) benefit.
+        try:
+            from kivy.core.window import Window
+            Window.request_draw()
+            Clock.schedule_once(
+                lambda dt: Window.request_draw(), 0.15)
+        except Exception:
+            pass
+        result_code = payload["result_code"]
+        intent = payload["intent"]
+        on_file = payload["on_file"]
+        on_fail = payload["on_fail"]
+
+        def fail(reason):
+            dlog("pick fail: %s" % reason)
+            self._set_status("pick failed: %s" % reason)
+            if on_fail:
+                on_fail(reason)
+
+        from jnius import autoclass
+        ACT = autoclass("android.app.Activity")
+        if result_code != ACT.RESULT_OK:
+            fail("E1: cancelled (code %s)" % result_code)
+            return
+        if intent is None:
+            fail("E2: picker returned no data")
+            return
+        uri = intent.getData()
+        if uri is None:
+            fail("E3: no file uri in result")
+            return
+        tail = "file"
+        try:
+            tail = uri.getLastPathSegment() or "file"
+        except Exception:
+            pass
+        self._set_status("copying %s ..." % os.path.basename(tail))
+
+        def on_file_marshalled(local):
+            # v0.25: handlers run on the kivy thread only (thread-marshal
+            # law); the copy itself now owns a background thread so a big
+            # pick can no longer freeze the UI (tay's v0.24 stall).
+            try:
+                kb = os.path.getsize(local) // 1024
+                self._set_status("picked %s (%d KB)"
+                                 % (os.path.basename(local), kb))
+            except Exception:
+                pass
+            on_file(local)
+
+        def copy_work():
+            try:
+                local = self._saf_copy_uri(uri)
+            except Exception as e:
+                dlog("saf copy failed: %r" % e)
+                reason = "E4: copy failed: %s" % (
+                    str(e) or type(e).__name__)
+                Clock.schedule_once(lambda dt, r=reason: fail(r), 0)
+                return
+            Clock.schedule_once(
+                lambda dt: on_file_marshalled(local), 0)
+
+        threading.Thread(target=copy_work, daemon=True).start()
+
+    def _open_attach_dialog_android(self):
+        """Android attach flow: system picker + storage-style selector."""
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.label import Label
+        from kivy.uix.button import Button
+        from kivy.uix.popup import Popup
+
+        main = self.root.get_screen("main")
+        text = (main.ids.msg_input.text or "").strip()
+        app = App.get_running_app()
+        state = {"style": ATT_SERVER, "path": None}
+
+        style_box = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        style_box.add_widget(
+            Label(text="Store:", size_hint_x=None, width=dp(50),
+                  color=app.theme_colors['text'] if app else (1, 1, 1, 1),
+                  font_size=sp(12), halign="left", valign="middle"))
+        btn_server = Button(text="Server-stored", size_hint_x=None,
+                            width=dp(130), size_hint_y=None,
+                            height=scaled(dp(44)), pos_hint={"center_y": 0.5})
+        btn_ephem = Button(text="Ephemeral (P2P)", size_hint_x=None,
+                           width=dp(130), size_hint_y=None,
+                           height=scaled(dp(44)), pos_hint={"center_y": 0.5})
+
+        def pick(s):
+            state["style"] = s
+            active_bg = (app.theme_colors['primary'] if app
+                         else (0.42, 0.48, 1.0, 1))
+            inactive_bg = (app.theme_colors['panel_darker'] if app
+                           else (0.25, 0.27, 0.31, 1))
+            btn_server.background_color = (active_bg if s == ATT_SERVER
+                                           else inactive_bg)
+            btn_ephem.background_color = (active_bg if s == ATT_EPHEMERAL
+                                          else inactive_bg)
+
+        btn_server.bind(on_press=lambda *_: pick(ATT_SERVER))
+        btn_ephem.bind(on_press=lambda *_: pick(ATT_EPHEMERAL))
+        pick(ATT_SERVER)
+        style_box.add_widget(btn_server)
+        style_box.add_widget(btn_ephem)
+
+        chosen = Label(text="No file picked yet", size_hint_y=None,
+                       height=dp(56),
+                       color=app.theme_colors['text'] if app else (1, 1, 1, 1),
+                       font_size=sp(12), halign="left", valign="middle")
+        chosen.bind(width=lambda inst, w: setattr(inst, "text_size", (w, None)))
+        btn_pick = Button(text="Choose file (system picker)",
+                          size_hint_y=None, height=scaled(dp(44)),
+                          background_color=(app.theme_colors['panel_darker']
+                                            if app
+                                            else (0.25, 0.27, 0.31, 1)),
+                          color=app.theme_colors['text'] if app else (1, 1, 1, 1))
+        btn_ok = Button(text="OK — Send", size_hint_y=None,
+                        height=scaled(dp(44)),
+                        background_color=(app.theme_colors['primary']
+                                          if app else (0.42, 0.48, 1.0, 1)),
+                        color=app.theme_colors['text'] if app else (1, 1, 1, 1))
+        btn_cancel = Button(text="Cancel", size_hint_y=None,
+                            height=scaled(dp(44)),
+                            background_color=(app.theme_colors['panel_darker']
+                                              if app
+                                              else (0.25, 0.27, 0.31, 1)),
+                            color=app.theme_colors['text'] if app
+                            else (1, 1, 1, 1))
+        btn_box = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        btn_box.add_widget(btn_ok)
+        btn_box.add_widget(btn_cancel)
+
+        content = BoxLayout(orientation="vertical", spacing=dp(8),
+                            padding=dp(8))
+        content.add_widget(Label(
+            text="Attach a file — choose how it is stored:",
+            size_hint_y=None, height=dp(24),
+            color=app.theme_colors['text'] if app else (1, 1, 1, 1),
+            font_size=sp(12)))
+        content.add_widget(btn_pick)
+        content.add_widget(chosen)
+        content.add_widget(style_box)
+        content.add_widget(btn_box)
+
+        popup = Popup(title="Attach file", content=content,
+                      size_hint=(0.9, 0.7), auto_dismiss=False)
+
+        def do_pick(*_):
+            def on_fail(reason):
+                chosen.text = reason
+                chosen.color = (1, 0.5, 0.4, 1)
+
+            def on_file(local):
+                state["path"] = local
+                chosen.text = os.path.basename(local)
+                self._set_status("picked %s (%d KB) — choose storage, then OK"
+                                 % (chosen.text,
+                                    os.path.getsize(local) // 1024))
+            self._saf_pick(self._SAF_ATTACH, on_file, on_fail)
+
+        def do_ok(*_):
+            if not state["path"]:
+                self._set_status("No file selected")
+                return
+            popup.dismiss()
+            self._send_attached_file(text, state["path"], state["style"])
+
+        btn_pick.bind(on_press=do_pick)
+        btn_ok.bind(on_press=do_ok)
+        btn_cancel.bind(on_press=lambda *_: popup.dismiss())
+        popup.open()
+
+    def _android_pick_generic(self, avatar):
+        """Android generic picker for open_file_chooser(avatar=...)."""
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.label import Label
+        from kivy.uix.button import Button
+        from kivy.uix.popup import Popup
+        app = App.get_running_app()
+        hint = Label(text="Use the system picker to choose a file.",
+                     size_hint_y=None, height=dp(48),
+                     color=app.theme_colors['text'] if app else (1, 1, 1, 1),
+                     font_size=sp(12), halign="left", valign="middle")
+        hint.bind(width=lambda inst, w: setattr(inst, "text_size", (w, None)))
+        btn = Button(text="Choose file (system picker)",
+                     size_hint_y=None, height=scaled(dp(44)),
+                     background_color=(app.theme_colors['primary'] if app
+                                       else (0.42, 0.48, 1.0, 1)),
+                     color=app.theme_colors['text'] if app else (1, 1, 1, 1))
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        box.add_widget(hint)
+        box.add_widget(btn)
+        popup = Popup(title="Select file", content=box,
+                      size_hint=(0.9, 0.5), auto_dismiss=False)
+
+        def do_pick(*_):
+            def on_fail(reason):
+                hint.text = reason
+                hint.color = (1, 0.5, 0.4, 1)
+
+            def on_file(local):
+                popup.dismiss()
+                self._on_file_selected([local], None)
+            self._saf_pick(self._SAF_GENERIC, on_file, on_fail)
+
+        btn.bind(on_press=do_pick)
+        popup.open()
+
+    def _send_attached_file(self, text, path, style):
+        """Read the chosen file and send it as an attachment of the given style."""
+        try:
+            with open(path, "rb") as f:
+                blob = f.read()
+        except Exception as e:
+            self._set_status("attach failed: %s" % e)
+            return
+        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        name = path.split("/")[-1]
+        # Client-side size check so the user gets a clear message instead of
+        # a silent server rejection. Matches server MAX_ATTACHMENT_SZ (10 MB).
+        if len(blob) > 10 * 1024 * 1024:
+            self._set_status("attach failed: file too large (%d MB, max 10 MB)" %
+                             (len(blob) / 1024 / 1024))
+            return
+        self._send_with_attachment(text, name, mime, blob, style)
 
     def _send_with_attachment(self, text, name, mime, blob, style):
         """Post a message with one attachment and optimistically render it.
@@ -6415,23 +8960,8 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                     Clock.schedule_once(
                         lambda dt, m=msg: self._attach_composer_stage(m), 0)
 
-                # polish (g): the bar setter lives on AttachmentsMixin.
-                # Stub apps that bind _send_with_attachment a la carte
-                # (e.g. the group-2 entrance test's SimpleNamespace)
-                # may not carry it -- degrade to text-only progress
-                # instead of raising mid-send.
-                set_progress = getattr(self, "_set_upload_progress", None)
-
                 def pstage(done, total):
                     pct = int(100 * done / max(total, 1))
-                    # polish (g): the bar is the visual surface for the
-                    # same pct the helper text reports. pstage runs on
-                    # the worker thread, so hop onto the main thread
-                    # like bstage does; the bar jumps to the reported
-                    # pct (state, not motion).
-                    if set_progress is not None:
-                        Clock.schedule_once(
-                            lambda dt, p=pct: set_progress(p), 0)
                     bstage("attachment: uploading %s (%d%%)" % (name, pct))
 
                 # v1 path: upload the blob once, post by reference (no re-transfer
@@ -6455,31 +8985,43 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                 # reaper from stacking a second tear, and hold the retry
                 # alive through the sleep so it lands on the re-established
                 # link (boot_3: the mp3 posted on attempt 2).
-                # Standard path (tay): one retry policy for every upload.
-                # attempt_cb: the polish (g) bar shows from 0% at the
-                # start of every attempt (a retry re-uploads from
-                # scratch, so a stale pct would lie).
-                # 0.31.9 doctrine, restated on the standard path: a
-                # blobs_put timeout/dead is final (no inline re-push);
-                # a deterministic blobs_put raise is the pre-/api/v1
-                # "no v1 here" signal and keeps its legacy fallback.
-                blob_status = (lambda txt: bstage("attachment: %s"
-                                                  % txt.split(": ", 1)[1]))
-
-                def attempt_cb(n):
-                    if set_progress is not None:
-                        Clock.schedule_once(
-                            lambda dt: set_progress(0), 0)
-                    bstage("attachment: uploading %s (%d KB)%s"
-                           % (name, len(blob) // 1024,
-                              "" if n == 1 else " (attempt %d)" % n))
-
-                up = self.blob_put_healed(
-                    name, mime, blob, on_progress=pstage,
-                    status_fn=blob_status, attempt_cb=attempt_cb)
-                if not up.get("ok"):
-                    bstage("attachment: upload failed (%s); retry the "
-                           "attach" % up.get("error", "unknown"))
+                self._up_active = True
+                try:
+                    for attempt in range(4):
+                        bstage("attachment: uploading %s (%d KB)%s"
+                               % (name, len(blob) // 1024,
+                                  "" if attempt == 0 else " (attempt %d)" % (attempt + 1)))
+                        try:
+                            up = self.guild_api.blobs_put(name, mime, blob,
+                                                          on_progress=pstage)
+                        except Exception as e:
+                            dlog("v1 blob path failed: %r" % (e,))
+                            print("[TRACE] v1 blob path failed, falling back:",
+                                  repr(e), flush=True)
+                            break
+                        if up.get("ok"):
+                            break
+                        err = up.get("error", "unknown")
+                        print("[TRACE] blob upload attempt %d failed: %s"
+                              % (attempt + 1, err), flush=True)
+                        link = getattr(getattr(self, "guild_api", None),
+                                       "link", None)
+                        dead = link is None or getattr(
+                            link, "status", None) not in (None, RNS.Link.ACTIVE)
+                        if attempt < 3 and err == "timeout" and not dead:
+                            # Only the receipted socket-gap timeout retries; a
+                            # dead link is the re-establish path's job.
+                            bstage("attachment: waiting for the link (%s, "
+                                   "attempt %d) -- will not give up for "
+                                   "%d s" % (err, attempt + 1,
+                                             (3 - attempt) * 8))
+                            time.sleep(8.0)
+                            continue
+                        bstage("attachment: upload failed (%s); link lost "
+                               "-- retry the attach" % err)
+                        break
+                finally:
+                    self._up_active = False
                 if up is not None and up.get("ok"):
                     bstage("attachment: blob ok, posting %s" % name)
                     try:
@@ -6501,16 +9043,13 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                         return
                 if res is None or not res.get("ok"):
                     # 0.31.9: the legacy inline post is the pre-/api/v1
-                    # fallback only. A blobs_put timeout/dead failure
-                    # after the standard path must never fall through:
+                    # fallback only. ANY blobs_put failure after the retry
+                    # loop (timeout or link dead) must never fall through:
                     # boot_2 receipt at 13:23:22 -- a "link dead" race
                     # between attempts bypassed the timeout-only guard and
                     # the inline post pushed the full blob again.
                     if res is None and up is not None and not up.get("ok"):
-                        if up.get("raise"):
-                            pass  # deterministic no-v1 raise: legacy below
-                        else:
-                            return
+                        return
                     try:
                         stage("attachment: posting inline %s ..." % name)
                         legacy = self.guild_api.post(
@@ -6564,7 +9103,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                  "username": self.username, "content": text, "ts": now(),
                  "channel_id": cid, "attachments": [att]}
             Clock.schedule_once(lambda dt: self._render_message(
-                main.ids.message_grid, m, animate=True), 0)
+                main.ids.message_grid, m), 0)
             Clock.schedule_once(
                 lambda dt: setattr(main.ids.msg_input, "text", ""), 0)
             # 0.31.10: the attach flow is done -- clear the progress channel.
@@ -6573,23 +9112,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             self._queue_cache(m)
             self._save_history()
 
-        def _work_guarded():
-            # polish (g): every exit path of work() must clear the
-            # progress channel -- v1 success, the legacy inline
-            # fallback, and every early `return` on failure (post_v1
-            # raise after blob ok, blobs_put failure, legacy raise,
-            # no response, worker crash). _attach_composer_stage("")
-            # hides the upload bar as well as the helper text, so run
-            # it in a finally here; the success path's own clear
-            # inside work() is the same idempotent call, scheduled
-            # first. work() itself is untouched.
-            try:
-                work()
-            finally:
-                Clock.schedule_once(
-                    lambda dt: self._attach_composer_stage(""), 0)
-
-        threading.Thread(target=_work_guarded, daemon=True).start()
+        threading.Thread(target=work, daemon=True).start()
 
     # -- profile ----------------------------------------------------------
     def open_profile(self, target_hash, username):
@@ -6832,15 +9355,57 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         except Exception:
             self._set_status("Could not switch to profile screen")
 
-    def open_bots(self, *_):
-        """Open the Bots setup/config screen (Group 3, submenu of Profile).
-
-        BotsScreen.on_pre_enter builds the form and refreshes the list.
+    def _show_profile_popup(self, target_hash, username, profile_text,
+                            image_paths=None):
+        """Show a remote user's profile page in a popup.
+        Displays any images referenced in the profile page
+        (![alt](/file/name)) fetched from the remote node.
         """
-        try:
-            self.root.current = "bots"
-        except Exception:
-            self._set_status("Bots screen not available")
+        from kivy.uix.popup import Popup
+        from kivy.uix.label import Label
+        from kivy.uix.scrollview import ScrollView
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.image import Image as KivyImage
+
+        # Remove image references from markdown (images shown separately)
+        import re as _re
+        clean_text = _re.sub(
+            r"!\[([^\]]*)\]\(/file/[^)]+\)", r"\1", profile_text)
+
+        # Convert micron/markdown to Kivy markup
+        markup_text = md_to_kivy(clean_text)
+
+        content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
+
+        # Show fetched images at the top
+        if image_paths:
+            for filename, local_path in image_paths.items():
+                img = KivyImage(
+                    source=local_path,
+                    allow_stretch=False,
+                    keep_ratio=True,
+                    size_hint_y=None,
+                    height=dp(200),
+                )
+                content.add_widget(img)
+
+        scroll = ScrollView()
+        label = Label(text=markup_text, markup=True, size_hint_y=None,
+                      halign="left", valign="top", text_size=(None, None))
+        label.bind(texture_size=lambda *args: label.set_size(label.texture_size))
+        scroll.add_widget(label)
+        content.add_widget(scroll)
+
+        close_btn = Button(text="Close", size_hint_y=None, height=scaled(dp(40)),
+                           background_color=self.theme_colors['sidebar_ctrl'],
+                           color=self.theme_colors['text'])
+        content.add_widget(close_btn)
+
+        popup = Popup(title="Profile: %s" % (username or target_hash[:12]),
+                      content=content, size_hint=(0.8, 0.8),
+                      auto_dismiss=False)
+        close_btn.bind(on_press=popup.dismiss)
+        popup.open()
 
     def page_profile_handler(self, path, data, request_id, link_id,
                              remote_identity, requested_at):
@@ -6909,34 +9474,33 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                       size_hint=(0.9, 0.9))
         chooser.bind(on_submit=lambda inst, selection, *args:
                      self._on_file_selected(selection, popup))
-        import ui_fx
-        ui_fx.popup_entrance(popup)
+        popup.open()
 
     def _route_purpose_file(self, path, purpose):
-        """P10: hand the picked file to the server config screen's
-        icon/banner upload flow (blobs_put -> admin_config). The
-        upload methods live on the SCREEN, not the General tab:
-        calling them on the tab raised AttributeError, which
-        _on_file_selected caught and reported only via _set_status
-        (invisible on the admin screen) — every Android icon/banner
-        pick failed silently."""
-        scr = None
-        panel = None
+        """P10: hand the picked file to the server config SCREEN's
+        icon/banner upload flow (blobs_put -> admin_config).
+
+        0.36.25 (tay, device): this used to fetch tab_content["General"]
+        and call _apply_icon_file on the TAB -- only the SCREEN carries
+        those methods, so every Android pick died with an AttributeError
+        swallowed by _on_file_selected's except: icon/banner stayed
+        white, nothing uploaded. The desktop path was already correct
+        (ui_server_config _icon_file_selected calls screen._apply...).
+        """
+        target = None
         try:
             root = App.get_running_app().root
-            scr = root.get_screen("server_config") if root else None
-            panel = getattr(scr, "tab_content", {}).get("General")
+            target = root.get_screen("server_config") if root else None
         except Exception:
-            scr = None
-            panel = None
-        if scr is None or panel is None:
+            target = None
+        if target is None:
             self._set_status("no server config screen to apply %s"
                              % purpose)
             return
         if purpose == "icon":
-            scr._apply_icon_file(path)
+            target._apply_icon_file(path)
         else:
-            scr._apply_banner_file(path)
+            target._apply_banner_file(path)
 
     def _on_file_selected(self, selection, popup):
         if popup is not None:
@@ -7049,8 +9613,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         save_btn.bind(on_press=do_save)
         cancel_btn.bind(on_press=do_cancel)
         popup.bind(on_dismiss=_trace_dismiss)
-        import ui_fx
-        ui_fx.popup_entrance(popup)
+        popup.open()
 
         def _check_image(dt):
             try:
@@ -7311,6 +9874,19 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             with open(small_path, "rb") as f:
                 IMAGE_CACHE.set_bytes(key, f.read(), "png")
 
+    def attach_file(self, path):
+        """Attach a file to the current message input as an upload."""
+        try:
+            with open(path, "rb") as f:
+                blob = f.read()
+        except Exception as e:
+            self._set_status("attach failed: %s" % e)
+            return
+        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        name = path.split("/")[-1]
+        self._pending_attachment = [name, mime, blob]
+        self._set_status("Attached: %s (%d bytes)" % (name, len(blob)))
+
     def open_confirm_delete_account(self, *_):
         """P1 (tay 2026-11-19): purge this guild account from the server.
 
@@ -7372,8 +9948,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
 
         go.bind(on_press=proceed)
         stay.bind(on_press=lambda *_: sheet.dismiss())
-        import ui_fx
-        ui_fx.popup_entrance(sheet)
+        sheet.open()
 
     def open_confirm_leave_guild(self, *_):
         """Stage 2: the literal the leave endpoint validates."""
@@ -7424,8 +9999,7 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
 
         go.bind(on_press=proceed)
         stay.bind(on_press=lambda *_: sheet.dismiss())
-        import ui_fx
-        ui_fx.popup_entrance(sheet)
+        sheet.open()
 
     def purge_account_worker(self, *_):
         """Both server steps, in order, on the worker thread; every
@@ -7566,27 +10140,6 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
         threading.Thread(target=work, daemon=True).start()
 
     # -- ui helpers ------------------------------------------------------
-    def _clear_fetch_status(self):
-        """Clear a stale 'fetch failed' status after a later success.
-
-        H6: _fetch_messages only ever set the status on failure, so a
-        transient timeout stuck on the line forever. Only a fetch
-        failure is cleared -- any other status is left alone.
-        """
-        try:
-            lbl = self.root.get_screen("connect").ids.status
-            if (lbl.text or "").startswith("fetch failed"):
-                lbl.text = ""
-        except Exception:
-            pass
-        try:
-            lbl = self.root.get_screen("profile").ids.get("profile_status")
-            if lbl is not None and (lbl.text or "").startswith(
-                    "fetch failed"):
-                lbl.text = ""
-        except Exception:
-            pass
-
     def _set_status(self, text):
         try:
             self.root.get_screen("connect").ids.status.text = text
@@ -7601,6 +10154,19 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             lbl = ps.ids.get("profile_status")
             if lbl is not None:
                 lbl.text = str(text)
+        except Exception:
+            pass
+
+    def _attach_composer_stage(self, msg):
+        # 0.31.10 (tay's boot_3 receipt: "no 'uploading' animation"): the
+        # connect-screen status label is invisible from inside a channel,
+        # so the whole attach flow ran silent on his screen. The composer's
+        # helper text is the progress surface he actually sees: mirror
+        # every stage there (upload %, attempts, posting, failure).
+        self._set_status(msg)
+        try:
+            main = self.root.get_screen("main")
+            main.ids.msg_input.helper_text = msg
         except Exception:
             pass
 
@@ -7651,11 +10217,6 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
                 pass
             self.lxmf_router = None
             self.lxmf_delivery = None
-        # desktop teardown carries voice state off with it
-        try:
-            VoicePanelMixin.on_stop(self)
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -7671,9 +10232,6 @@ if __name__ == "__main__":
     _dbg_parser.add_argument("--debug", action="store_true")
     _dbg_args, _ = _dbg_parser.parse_known_args()
     DEBUG = _dbg_args.debug
-    # Phase 2 split: dlog lives in client_util now; keep its flag
-    # in step so mixin dlog() calls honour --debug too.
-    client_util.DEBUG = DEBUG
 
     # Graceful GL backend fallback: Wayland without a GPU, headless runners,
     # and VMs often fail with "No matching FB config found" from SDL2/OpenGL.

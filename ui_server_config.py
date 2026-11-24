@@ -40,10 +40,7 @@ from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.screenmanager import Screen
 from kivy.uix.scrollview import ScrollView
-# Blircle kit: tay 2026-11-23 -- text inputs are blircles; the
-# local name TextInput keeps every call site untouched.
-from client_widgets import BlircleTextInput as TextInput
-import ui_fx
+from kivy.uix.textinput import TextInput
 
 # mirrors the server PERMS dict (sHades: view..admin)
 PERM_BITS = (
@@ -69,7 +66,7 @@ def _row_label(text, w=0.5, h=26, fs=None):
     return lbl
 
 
-def _btn(text, width=70, h=40, fs=None):
+def _btn(text, width=70, h=30, fs=None):
     fs = fs or sp(11)
     return Button(text=text, size_hint_x=None, width=_scaled(width),
                   size_hint_y=None, height=_scaled(h), font_size=fs,
@@ -103,11 +100,7 @@ class _Tab:
 
     # -- widget scaffolding --------------------------------------------------
     def make_content(self):
-        # Polish2 item 4: tab-content rows are 40px (the 40px touch
-        # target), so the scaffold spacing is 4px -- at 640x480 the
-        # General tab's eight 40px control rows + audit scroll only
-        # just fit, and 8px gaps would eat the scroll strip.
-        self.box = BoxLayout(orientation="vertical", spacing=dp(4))
+        self.box = BoxLayout(orientation="vertical", spacing=dp(8))
         self._build_controls()
         scroll = ScrollView(size_hint=(1, 1))
         grid = GridLayout(cols=1, size_hint_y=None, spacing=dp(3),
@@ -176,59 +169,121 @@ class _Tab:
 class GeneralTab(_Tab):
     title = "General"
 
-    CONFIG_FIELDS = ("guild_name", "motd", "slowmode", "registration")
+    CONFIG_FIELDS = ("guild_name", "motd", "slowmode", "registration",
+                     "update_channel", "update_channel_peer",
+                     "update_channel_shapin", "update_trusted_hub")
 
     def _build_controls(self):
         self.entries = {}
 
-        m_row = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
+        m_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
         self.motd_entry = TextInput(hint_text="motd", multiline=False,
                                     size_hint_x=0.6)
         self.entries["motd"] = self.motd_entry
-        m_save = _btn("save", 70, 40)
+        m_save = _btn("save", 70, 30)
         m_save.bind(on_press=lambda _i: self.do_save_key("motd"))
         m_row.add_widget(self.motd_entry)
         m_row.add_widget(m_save)
         self.box.add_widget(m_row)
 
-        n_row = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
+        n_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
         n_entry = TextInput(hint_text="guild name", multiline=False,
                             size_hint_x=0.6)
         self.entries["guild_name"] = n_entry
-        n_save = _btn("save", 70, 40)
+        n_save = _btn("save", 70, 30)
         n_save.bind(on_press=lambda _i: self.do_save_key("guild_name"))
         n_row.add_widget(n_entry)
         n_row.add_widget(n_save)
         self.box.add_widget(n_row)
 
-        s_row = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
+        s_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
         s_entry = TextInput(hint_text="slowmode (s, 0=off)", multiline=False,
                             size_hint_x=0.6)
         self.entries["slowmode"] = s_entry
-        s_save = _btn("save", 70, 40)
+        s_save = _btn("save", 70, 30)
         s_save.bind(on_press=lambda _i: self.do_save_key("slowmode"))
         s_row.add_widget(s_entry)
         s_row.add_widget(s_save)
         self.box.add_widget(s_row)
 
-        r_row = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
+        r_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
         r_entry = TextInput(hint_text="registration: open|code",
                             multiline=False, size_hint_x=0.6)
         self.entries["registration"] = r_entry
-        r_save = _btn("save", 70, 40)
+        r_save = _btn("save", 70, 30)
         r_save.bind(on_press=lambda _i: self.do_save_key("registration"))
         r_row.add_widget(r_entry)
         r_row.add_widget(r_save)
         self.box.add_widget(r_row)
 
+        # P11 chain 5 tail (0.36.25, tay): the software channel rides
+        # the phone too. Both keys save through do_save_key, so the
+        # verdicts mirror like every other config key. The peer pin is
+        # the 64-hex node destination hash of the trusted serving peer
+        # (P11d's gate compares the link identity's hash against it).
+        c_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
+        c_entry = TextInput(hint_text="update channel: off|github|rns",
+                            multiline=False, size_hint_x=0.6)
+        self.entries["update_channel"] = c_entry
+        c_save = _btn("save", 70, 30)
+        c_save.bind(on_press=lambda _i: self.do_save_key("update_channel"))
+        c_row.add_widget(c_entry)
+        c_row.add_widget(c_save)
+        self.box.add_widget(c_row)
+
+        p_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
+        p_entry = TextInput(hint_text="peer pin (64-hex node hash)",
+                            multiline=False, size_hint_x=0.6)
+        self.entries["update_channel_peer"] = p_entry
+        p_save = _btn("save", 70, 30)
+        p_save.bind(
+            on_press=lambda _i: self.do_save_key("update_channel_peer"))
+        p_row.add_widget(p_entry)
+        p_row.add_widget(p_save)
+        self.box.add_widget(p_row)
+
+        # the artifact pin (P11e): the sha256 the pull verifies against.
+        # Source it out-of-band - the release body, another admin. With
+        # it set the serving peer is a courier, not an authority.
+        h_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
+        h_entry = TextInput(hint_text="artifact sha pin (64-hex)",
+                            multiline=False, size_hint_x=0.6)
+        self.entries["update_channel_shapin"] = h_entry
+        h_save = _btn("save", 70, 30)
+        h_save.bind(
+            on_press=lambda _i: self.do_save_key("update_channel_shapin"))
+        h_row.add_widget(h_entry)
+        h_row.add_widget(h_save)
+        self.box.add_widget(h_row)
+
+        # the trusted hub (P11f): the DISTRIBUTED hub's node dest hash -
+        # the sole trusted initiating update source. Tay seeds it when
+        # the hub identity is provisioned; members never invent peers.
+        t_row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
+        t_entry = TextInput(hint_text="trusted hub (64-hex node hash)",
+                            multiline=False, size_hint_x=0.6)
+        self.entries["update_trusted_hub"] = t_entry
+        t_save = _btn("save", 70, 30)
+        t_save.bind(
+            on_press=lambda _i: self.do_save_key("update_trusted_hub"))
+        t_row.add_widget(t_entry)
+        t_row.add_widget(t_save)
+        self.box.add_widget(t_row)
+
+        # the updater's own status line (the status-mirror rule): the
+        # verdict + channel + interval are this tab's business, not the
+        # composer's
+        self.upd_state = _row_label("updater: ...", w=0.9)
+        self.box.add_widget(self.upd_state)
+
         # attachments persistence (P3): the live mode, one tap to flip.
         # Ephemeral means bytes ride the server RAM registry (TTL +
         # cap) instead of disk: new uploads only, flip-back is safe.
-        a_row = BoxLayout(size_hint_y=None, height=_scaled(40),
+        a_row = BoxLayout(size_hint_y=None, height=_scaled(32),
                           spacing=dp(4))
-        self.att_state = _row_label("attachments: saved", w=0.35, h=40)
-        self.att_saved_btn = _btn("saved", 80, 40)
-        self.att_eph_btn = _btn("ephemeral", 110, 40)
+        self.att_state = _row_label("attachments: saved", w=0.35)
+        self.att_saved_btn = _btn("saved", 80, 30)
+        self.att_eph_btn = _btn("ephemeral", 110, 30)
         self.att_saved_btn.bind(
             on_press=lambda _i: self._save_attachments("saved"))
         self.att_eph_btn.bind(
@@ -242,8 +297,8 @@ class GeneralTab(_Tab):
                              spacing=dp(8))
         self.icon_widget = Image(size_hint_x=None, width=_scaled(56),
                                  allow_stretch=True, keep_ratio=True)
-        pick = _btn("set icon...", 110, 40)
-        clear = _btn("clear", 60, 40)
+        pick = _btn("set icon...", 110, 30)
+        clear = _btn("clear", 60, 30)
         pick.bind(on_press=lambda _i: self._open_icon_chooser())
         clear.bind(on_press=lambda _i: self._clear_icon())
         icon_row.add_widget(self.icon_widget)
@@ -259,8 +314,8 @@ class GeneralTab(_Tab):
         self.box.add_widget(self.banner_widget)
         banner_row = BoxLayout(size_hint_y=None, height=_scaled(40),
                                spacing=dp(8))
-        bpick = _btn("set banner...", 110, 40)
-        bclear = _btn("clear", 60, 40)
+        bpick = _btn("set banner...", 110, 30)
+        bclear = _btn("clear", 60, 30)
         bpick.bind(on_press=lambda _i: self._open_banner_chooser())
         bclear.bind(on_press=lambda _i: self._clear_banner())
         banner_row.add_widget(bpick)
@@ -321,6 +376,29 @@ class GeneralTab(_Tab):
         else:
             self.banner_widget.texture = None
         self._load_audit()
+        self._load_update_status()
+
+    def _load_update_status(self):
+        def work():
+            return self.client.guild_api.update_status()
+
+        def on_ok(res):
+            if not res.get("ok"):
+                self.upd_state.text = "updater: n/a"
+                return
+            peer = (res.get("peer") or "").strip()
+            shapin = (res.get("shapin") or "").strip()
+            self.upd_state.text = ("updater: %s ch=%s every %sm peer=%s "
+                                   "pin=%s") % (
+                res.get("verdict") or "never",
+                res.get("channel") or "off",
+                res.get("interval") or "?",
+                (peer[:12] + "...") if peer else "-",
+                "artifact" if shapin else "peer-only")
+
+        # _fetch swallows work exceptions into the status mirror; the
+        # not-ok verdict lands in on_ok below
+        self._fetch(work, on_ok)
 
     def _load_audit(self):
         def work():
@@ -349,9 +427,9 @@ class GeneralTab(_Tab):
         chooser = FileChooserListView(
             path=os.path.expanduser("~"),
             filters=["*.png", "*.jpg", "*.jpeg", "*.webp", "*.gif"])
-        cancel = _btn("cancel", 90, 40)
-        pick = _btn("use this file", 130, 40)
-        buttons = BoxLayout(size_hint_y=None, height=_scaled(40),
+        cancel = _btn("cancel", 90, 30)
+        pick = _btn("use this file", 130, 30)
+        buttons = BoxLayout(size_hint_y=None, height=_scaled(34),
                             spacing=dp(4))
         buttons.add_widget(cancel)
         buttons.add_widget(pick)
@@ -363,7 +441,7 @@ class GeneralTab(_Tab):
         cancel.bind(on_press=lambda _i: popup.dismiss())
         pick.bind(on_press=lambda _i: self._icon_file_selected(chooser,
                                                                popup))
-        ui_fx.popup_entrance(popup)
+        popup.open()
 
     def _icon_file_selected(self, chooser, popup):
         selection = chooser.selection
@@ -387,9 +465,9 @@ class GeneralTab(_Tab):
         chooser = FileChooserListView(
             path=os.path.expanduser("~"),
             filters=["*.png", "*.jpg", "*.jpeg", "*.webp", "*.gif"])
-        cancel = _btn("cancel", 90, 40)
-        pick = _btn("use this file", 130, 40)
-        buttons = BoxLayout(size_hint_y=None, height=_scaled(40),
+        cancel = _btn("cancel", 90, 30)
+        pick = _btn("use this file", 130, 30)
+        buttons = BoxLayout(size_hint_y=None, height=_scaled(34),
                             spacing=dp(4))
         buttons.add_widget(cancel)
         buttons.add_widget(pick)
@@ -401,7 +479,7 @@ class GeneralTab(_Tab):
         cancel.bind(on_press=lambda _i: popup.dismiss())
         pick.bind(on_press=lambda _i: self._banner_file_selected(chooser,
                                                                  popup))
-        ui_fx.popup_entrance(popup)
+        popup.open()
 
     def _banner_file_selected(self, chooser, popup):
         selection = chooser.selection
@@ -420,11 +498,11 @@ class MembershipTab(_Tab):
     title = "Membership"
 
     def _build_controls(self):
-        row = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
+        row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
         self.hash_entry = TextInput(hint_text="user hash (32 hex)",
                                     multiline=False, size_hint_x=0.6)
-        addm = _btn("add mod", 80, 40)
-        adda = _btn("add admin", 90, 40)
+        addm = _btn("add mod", 80, 30)
+        adda = _btn("add admin", 90, 30)
         addm.bind(on_press=lambda _i: self._do_op("add"))
         adda.bind(on_press=lambda _i: self._do_op("admin_add"))
         row.add_widget(self.hash_entry)
@@ -446,10 +524,9 @@ class MembershipTab(_Tab):
         self.grid.clear_widgets()
         for h in sorted(set(mods) | set(admins)):
             kind = "admin" if h in admins else "mod"
-            r = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
-            r.add_widget(_row_label("%s  %s..." % (kind, h[:12]), w=0.7,
-                                    h=40))
-            rm = _btn("remove", 70, 40)
+            r = BoxLayout(size_hint_y=None, height=_scaled(26), spacing=dp(4))
+            r.add_widget(_row_label("%s  %s..." % (kind, h[:12]), w=0.7))
+            rm = _btn("remove", 70, 26, sp(10))
             rm.bind(on_press=lambda _i, hh=h, kk=kind: self._do_op(
                 "admin_remove" if kk == "admin" else "remove", hh))
             r.add_widget(rm)
@@ -485,22 +562,22 @@ class ChannelsTab(_Tab):
 
     def _channel_row(self, ch):
         cid = ch["id"]
-        row = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(2))
+        row = BoxLayout(size_hint_y=None, height=_scaled(30), spacing=dp(2))
         row.add_widget(_row_label("#%s  %s" % (ch["name"],
                                                ch.get("kind", "chat")),
-                                  w=0.35, h=40))
+                                  w=0.35))
         topic = TextInput(text=ch.get("topic") or "", multiline=False,
                           size_hint_x=0.35)
-        save_topic = _btn("topic", 60, 40)
+        save_topic = _btn("topic", 60, 26, sp(10))
         save_topic.bind(on_press=lambda _i, c=cid, t=topic:
                         self._save_topic(c, t.text))
-        ed = _btn("perms...", 70, 40)
+        ed = _btn("perms...", 70, 26, sp(10))
         ed.bind(on_press=lambda _i: self._open_perm_editor(ch))
         row.add_widget(topic)
         row.add_widget(save_topic)
         row.add_widget(ed)
         if getattr(self.client, "i_am_admin", False):
-            dele = _btn("delete", 60, 40)
+            dele = _btn("delete", 60, 26, sp(10))
             dele.bind(on_press=lambda _i, c=cid, n=ch["name"]:
                       self._delete(c, n))
             row.add_widget(dele)
@@ -568,12 +645,12 @@ class ChannelsTab(_Tab):
             self._post(job, on_ok=self.reload, label="overwrites")
             popup.dismiss()
 
-        apply_btn = _btn("apply", 90, 40)
+        apply_btn = _btn("apply", 90, 30)
         apply_btn.bind(on_press=lambda _i: do_apply())
         box.add_widget(apply_btn)
         popup = Popup(title="permissions: #%s" % ch["name"], content=box,
                       size_hint=(0.85, 0.8))
-        ui_fx.popup_entrance(popup)
+        popup.open()
         self._fetch(lambda: self.client.guild_api.roles_list(), fill)
 
     def _delete(self, cid, name):
@@ -588,7 +665,7 @@ class RolesTab(_Tab):
 
     def _build_controls(self):
         self._perm_checks = {}
-        row = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
+        row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
         self.new_role_name = TextInput(hint_text="new role name",
                                        multiline=False, size_hint_x=0.25)
         row.add_widget(self.new_role_name)
@@ -598,21 +675,21 @@ class RolesTab(_Tab):
                           pos_hint={"center_y": 0.5})
             self._perm_checks[label] = cb
             row.add_widget(cb)
-        create = _btn("create", 70, 40)
+        create = _btn("create", 70, 30)
         create.bind(on_press=lambda _i: self.do_create_role())
         row.add_widget(create)
         self.box.add_widget(row)
 
-        assign_row = BoxLayout(size_hint_y=None, height=_scaled(40),
+        assign_row = BoxLayout(size_hint_y=None, height=_scaled(32),
                                spacing=dp(4))
         self.assign_user = TextInput(hint_text="user hash", multiline=False,
                                      size_hint_x=0.55)
         self.assign_role = TextInput(hint_text="role id", multiline=False,
                                      size_hint_x=0.25)
-        go = _btn("assign", 70, 40)
+        go = _btn("assign", 70, 30)
         go.bind(on_press=lambda _i: self.do_assign(
             _role_id_from(self.assign_role.text), self.assign_user.text))
-        go2 = _btn("unassign", 80, 40)
+        go2 = _btn("unassign", 80, 30)
         go2.bind(on_press=lambda _i: self.do_unassign(
             _role_id_from(self.assign_role.text), self.assign_user.text))
         assign_row.add_widget(self.assign_user)
@@ -671,13 +748,12 @@ class RolesTab(_Tab):
         for role in res.get("roles") or []:
             bits = ", ".join(lbl for lbl, bit in PERM_BITS
                              if role["perms"] & bit) or "no perms"
-            row = BoxLayout(size_hint_y=None, height=_scaled(40),
+            row = BoxLayout(size_hint_y=None, height=_scaled(26),
                             spacing=dp(2))
             row.add_widget(_row_label(
                 "%s  [%s]  members=%s" % (role["name"], bits,
-                                          role.get("members", "?")), w=0.85,
-                h=40))
-            dele = _btn("delete", 60, 40)
+                                          role.get("members", "?")), w=0.85))
+            dele = _btn("delete", 60, 26, sp(10))
             dele.bind(on_press=lambda _i, rid=role["role_id"]:
                       self._delete(rid))
             row.add_widget(dele)
@@ -694,7 +770,7 @@ class InvitesTab(_Tab):
     title = "Invites"
 
     def _build_controls(self):
-        row = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
+        row = BoxLayout(size_hint_y=None, height=_scaled(32), spacing=dp(4))
         self.label_in = TextInput(hint_text="label (optional)",
                                   multiline=False, size_hint_x=0.35)
         self.uses_in = TextInput(hint_text="max uses", multiline=False,
@@ -703,7 +779,7 @@ class InvitesTab(_Tab):
                                 size_hint_x=0.15)
         self.channel_in = TextInput(hint_text="channel cid (optional)",
                                     multiline=False, size_hint_x=0.25)
-        create = _btn("create", 70, 40)
+        create = _btn("create", 70, 30)
         create.bind(on_press=lambda _i: self.do_create())
         row.add_widget(self.label_in)
         row.add_widget(self.uses_in)
@@ -732,13 +808,13 @@ class InvitesTab(_Tab):
                    % (inv.get("code", ""), inv.get("label") or "-",
                       inv.get("uses", 0), inv.get("max_uses") or "*",
                       exp_txt, suffix))
-            row = BoxLayout(size_hint_y=None, height=_scaled(40),
+            row = BoxLayout(size_hint_y=None, height=_scaled(26),
                             spacing=dp(2))
-            row.add_widget(_row_label(txt, w=0.8, h=40, fs=sp(10)))
-            cp = _btn("copy", 55, 40)
+            row.add_widget(_row_label(txt, w=0.8, fs=sp(10)))
+            cp = _btn("copy", 55, 26, sp(10))
             cp.bind(on_press=lambda _i, code=inv.get("code", ""):
                     self._copy_link(code))
-            rv = _btn("revoke", 65, 40)
+            rv = _btn("revoke", 65, 26, sp(10))
             rv.bind(on_press=lambda _i, code=inv.get("code"):
                     self._revoke(code))
             row.add_widget(cp)
@@ -827,12 +903,8 @@ class ServerConfigScreen(Screen):
         self._tab_contents = {}
 
         root = BoxLayout(orientation="vertical", padding=dp(6))
-        # G6 (UIX P2-1): the tab bar is 40px and its buttons are 40px
-        # tall. Polish2 item 4: the tab-content rows are 40px too now
-        # (the _btn default is 40px), so no tab-content button is
-        # below the 40px touch target.
-        bar = BoxLayout(size_hint_y=None, height=_scaled(40), spacing=dp(4))
-        back = _btn("< back", 90, 40, sp(12))
+        bar = BoxLayout(size_hint_y=None, height=_scaled(34), spacing=dp(4))
+        back = _btn("< back", 90, 30, sp(12))
         back.bind(on_press=lambda _i: self._back())
         bar.add_widget(back)
         self._bar = bar
@@ -840,22 +912,6 @@ class ServerConfigScreen(Screen):
         self._content_slot = BoxLayout()
         root.add_widget(bar)
         root.add_widget(self._content_slot)
-        # Status line for the admin screen. The screen is built in
-        # Python (no kv rule), so self.ids was always empty and the
-        # v0.36.10 status mirror (ids["config_status"]) never found
-        # its label: every icon/banner status — "icon set" and every
-        # failure — was invisible while standing on this screen.
-        # Registering the label in ids makes the existing lookups in
-        # _Tab._status and _apply_status_ui find it.
-        from kivy.uix.label import Label
-        accent = (app.theme_colors.get("accent", (0.345, 0.839, 0.765, 1))
-                  if app else (0.345, 0.839, 0.765, 1))
-        status = Label(text="", size_hint_y=None, height=_scaled(26),
-                       color=accent, halign="left", valign="middle")
-        status.bind(width=lambda inst, w: setattr(
-            inst, "text_size", (w, None)))
-        root.add_widget(status)
-        self.ids["config_status"] = status
         self.add_widget(root)
 
         for tab_cls in TAB_CLASSES:
@@ -865,7 +921,7 @@ class ServerConfigScreen(Screen):
             content = tab.make_content()  # starts the worker fetches
             self.tab_content[tab_cls.title] = tab
             self._tab_contents[tab_cls.title] = content
-            btn = _btn(tab_cls.title, 70, 40, sp(12))
+            btn = _btn(tab_cls.title, 70, 30, sp(12))
             btn.size_hint_x = 1.0  # the tab strip splits evenly
             btn.background_color = self._inactive
             btn.bind(on_press=lambda _i, t=tab_cls.title: self._show_tab(t))
@@ -899,34 +955,21 @@ class ServerConfigScreen(Screen):
             return
 
         def work():
-            raw = None
             try:
                 import io
-                api = self.client.guild_api
-                if hasattr(api, "blobs_get_full"):
-                    raw = api.blobs_get_full(blob_id)
-                else:
-                    import base64
-                    res = api.blobs_get(blob_id)
-                    if res.get("ok"):
-                        raw = base64.b64decode(res.get("data_b64") or "")
+                import base64
+                res = self.client.guild_api.blobs_get(blob_id)
+                if not res.get("ok"):
+                    return
+                raw = base64.b64decode(res.get("data_b64") or "")
                 if not raw:
                     return
                 from kivy.core.image import Image as CoreImage
-                ext = "png"
-                if raw[:2] == bytes([0xff, 0xd8]):
-                    ext = "jpg"
-                try:
-                    ci = CoreImage(io.BytesIO(raw), ext=ext)
-                except Exception as e:
-                    self._apply_status(
-                        "banner image load failed (%d bytes ext=%s): %s"
-                        % (len(raw), ext, e))
-                    return
+                ci = CoreImage(io.BytesIO(raw), ext="png")
                 Clock.schedule_once(
                     lambda _dt: self._set_texture(widget, ci), 0)
-            except Exception as e:
-                print("[blob] render fetch failed (%s): %r" % (blob_id[:12], e))
+            except Exception:
+                pass
         threading.Thread(target=work, daemon=True).start()
 
     def _set_texture(self, widget, core_image):
@@ -964,28 +1007,24 @@ class ServerConfigScreen(Screen):
             mime = "image/webp"
         elif name.lower().endswith(".gif"):
             mime = "image/gif"
-        print("[icon] apply start path=%r" % path, flush=True)
         try:
             with open(path, "rb") as f:
                 data = f.read()
         except OSError as e:
-            print("[icon] read failed: %r" % e, flush=True)
             self._apply_status("icon read failed: %r" % e)
             return
-        print("[icon] read ok: %d bytes, uploading" % len(data), flush=True)
 
         def work():
             # v0.36.10: every path reports; a raise can no longer kill the
             # worker silently (tay's "returns without setting").
             try:
-                res = self.client.blob_put_healed(
-                    name, mime, data, label="icon",
-                    status_fn=self._apply_status)
+                res = self.client.guild_api.blobs_put(name, mime, data)
             except Exception as e:
                 self._apply_status("icon upload: %r" % e)
                 return
             if not res.get("ok"):
-                return  # the standard path already set the status line
+                self._apply_status("icon upload: %s" % res.get("error"))
+                return
             blob_id = res.get("blob_id")
             try:
                 res2 = self.client.guild_api.admin_config("guild_icon",
@@ -1012,28 +1051,24 @@ class ServerConfigScreen(Screen):
             mime = "image/webp"
         elif name.lower().endswith(".gif"):
             mime = "image/gif"
-        print("[banner] apply start path=%r" % path, flush=True)
         try:
             with open(path, "rb") as f:
                 data = f.read()
         except OSError as e:
-            print("[banner] read failed: %r" % e, flush=True)
             self._apply_status("banner read failed: %r" % e)
             return
-        print("[banner] read ok: %d bytes, uploading" % len(data), flush=True)
 
         def work():
             # v0.36.10: every path reports; a raise can no longer kill the
             # worker silently (tay's "returns without setting").
             try:
-                res = self.client.blob_put_healed(
-                    name, mime, data, label="banner",
-                    status_fn=self._apply_status)
+                res = self.client.guild_api.blobs_put(name, mime, data)
             except Exception as e:
                 self._apply_status("banner upload: %r" % e)
                 return
             if not res.get("ok"):
-                return  # the standard path already set the status line
+                self._apply_status("banner upload: %s" % res.get("error"))
+                return
             blob_id = res.get("blob_id")
             try:
                 res2 = self.client.guild_api.admin_config("banner", blob_id)

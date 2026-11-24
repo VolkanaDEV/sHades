@@ -18,7 +18,6 @@ Covers:
     boot succeeds (proved by the stubs' append-only runlog).
 """
 import hashlib
-import shutil
 import io
 import json
 import os
@@ -298,15 +297,9 @@ with open(os.path.join(tree, "update_staging", "pending_version"), "w",
           encoding="ascii"):
     pass
 
-# The launcher resolves its tree from its own location (the audited
-# 2026-11-22 fix: under systemd, CWD is not the tree and the rollback
-# never engaged). Mirror production: run the launcher copy that lives
-# INSIDE the supervised tree.
-shutil.copy2(os.path.join(ROOT, "update_run.py"),
-             os.path.join(tree, "update_run.py"))
-proc = subprocess.run([sys.executable, os.path.join(tree, "update_run.py"),
+proc = subprocess.run([sys.executable, os.path.join(ROOT, "update_run.py"),
                        "--bootflag"],
-                      cwd=tempfile.gettempdir(), capture_output=True, text=True, timeout=60)
+                      cwd=tree, capture_output=True, text=True, timeout=60)
 check("launcher: exit 0 after rollback", proc.returncode == 0,
       (proc.returncode, proc.stderr[-300:]))
 check("launcher: marker cleared",
