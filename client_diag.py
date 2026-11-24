@@ -29,6 +29,19 @@ _DIAG = {"scheduled": None}
 TARGET_IDS = ("chat_screen", "left_sidebar", "right_sidebar")
 _SEP = {}
 
+try:
+    from kivy.graphics.stencil_instructions import (StencilPush, StencilUse,
+                                                    StencilUnUse, StencilPop)
+except ImportError:  # stub/test path
+    class StencilPush(object):
+        pass
+    class StencilUse(object):
+        pass
+    class StencilUnUse(object):
+        pass
+    class StencilPop(object):
+        pass
+
 
 def _walk_widgets(widget, out, cap=1200):
     if len(out) >= cap:
@@ -124,6 +137,57 @@ def install_batch_separators(app):
             print("DIAG batch-separator %s error %s" % (k, e), flush=True)
 
 
+def strip_mask_stencils(app):
+    """STENCIL FALSIFIER: remove every round-mask StencilPush/Use/UnUse/
+    Pop family from widget canvases, one complete family per widget so
+    the global stencil stream stays balanced.
+
+    Receipt basis (the order audit b7b283b, audit_order_receipts_1124.md):
+    tar1 added three stencil mask families - the message-embed image
+    corner mask (kv_md.kv ~212-240), the FullScreenImageOverlay mask,
+    and the avatar disc mask (the PfpImage canvas.before at the
+    kivy_client 1094-1105 split move). Stencil ops interleave
+    rasterizer state along the frame instruction stream on exactly the
+    two surfaces where the device order symptoms live (the crossing
+    embed and the People drawer's avatar rows). Every side-loaded log
+    to date ran with the masks active. If the crossing dies with the
+    ops stripped, tar1's stencil masks are the named root; the shapes
+    render square/round as the geometry itself dictates, only the
+    texture corner mask is lost - a visual sacrifice we buy for one
+    verdict. New embeds spawning later are caught at the next DIAG
+    moment (each embed-applied fires report -> this strip).
+    """
+    widgets = []
+    _walk_widgets(app.root, widgets)
+    stripped = 0
+    seen = set()
+    for w in widgets:
+        key = id(w)
+        if key in seen:
+            continue
+        seen.add(key)
+        for bucket_name in ("before", "after"):
+            canvas = getattr(w.canvas, bucket_name, None) \
+                if w.canvas is not None else None
+            if canvas is None:
+                continue
+            try:
+                kids = list(canvas.children)
+                ops = [i for i in kids
+                       if isinstance(i, (StencilPush, StencilUse,
+                                         StencilUnUse, StencilPop))]
+                if not ops:
+                    continue
+                for op in ops:
+                    canvas.remove(op)
+                stripped += len(ops)
+            except Exception:
+                pass
+    if stripped:
+        print("DIAG stencil-strip removed=%d widgets=%d"
+              % (stripped, len(widgets)), flush=True)
+
+
 def report(app, tag):
     """One receipt line: panel paint chains + non-empty blank census."""
     try:
@@ -133,6 +197,7 @@ def report(app, tag):
             return
         chains = _panel_chains(root)
         install_batch_separators(app)
+        strip_mask_stencils(app)
         try:
             import fbo_drawers
             fbo_drawers.install(app)
