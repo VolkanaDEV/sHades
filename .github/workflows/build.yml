@@ -276,8 +276,8 @@ jobs:
             echo "buildozer exited 0"
           else
             BUILD_EXIT=$?
-            echo "::error::buildozer exited $BUILD_EXIT; last 100 lines follow"
-            tail -100 buildlog.txt
+            echo "::error::buildozer exited $BUILD_EXIT; last 300 lines follow"
+            tail -300 buildlog.txt
             exit $BUILD_EXIT
           fi
           # BZ2 gate, fail closed: this build's own log must carry a
@@ -300,6 +300,14 @@ jobs:
         with:
           name: sHades-client-android
           path: bin/*.apk
+          retention-days: 7
+          if-no-files-found: error
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # actions/upload-artifact@v4
+        with:
+          name: sHades-buildlog-android
+          path: buildlog.txt
           retention-days: 7
 
   server-bundle:
