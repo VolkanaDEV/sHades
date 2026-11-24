@@ -83,7 +83,16 @@ def agreement(img_a, img_b):
 
 
 def main():
-    # ---- 1. context reuse across drains on one thread ----
+    # Every receipt in this suite drives a real OpenGL ES context
+    # (backend cache, program cache, raw blit, forced-fallback
+    # recovery). On hosts with no EGL (headless CI) select_backend
+    # falls back to CPU and the leg results would be the wrong tier:
+    # skip cleanly and let tay's GL box carry the receipts.
+    be, be_reason = gd.select_backend()
+    if not isinstance(be, gd.GLESBackend):
+        print("SKIP  GL perf suite  | no EGL here (%s)" % (be_reason,))
+        print("PASS GL perf: 0 checks, 0 failed")
+        return 0
     gd.release_thread_backend()
     r1 = gd.drain_gpu_commands(MANDEL_Q)
     b1 = gd._thread_backends.backend
