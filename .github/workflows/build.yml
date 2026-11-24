@@ -17,7 +17,10 @@ env:
 jobs:
   lint-and-test:
     name: lint + import test (Linux)
-    runs-on: ubuntu-22.04
+    # 24.04, pinned: sanguis/bch (the script interpreter binary this
+    # job's real-runner tests exec) is a glibc 2.38 build; 22.04
+    # ships 2.35 and the loader refuses it ("GLIBC_2.38' not found").
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # actions/checkout@v4
       - name: Set up Python
@@ -36,8 +39,8 @@ jobs:
           pip install -r requirements.txt
       - name: Lint
         run: |
-          python -m py_compile main.py kivy_client.py setup_sHades.py sHades.py ui_scale.py applet_bridge.py app_attachments.py app_channels.py app_menus.py app_settings.py app_site.py app_stream.py client_util.py client_widgets.py store.py guild_api.py ui_fx.py ui_geom.py ui_theme.py updater.py update_run.py offline_store.py profile_card.py dms.py micron.py invite.py recovery.py qr_tools.py mesh_ui.py
-          python -m flake8 main.py kivy_client.py setup_sHades.py sHades.py ui_scale.py applet_bridge.py app_attachments.py app_channels.py app_menus.py app_settings.py app_site.py app_stream.py client_util.py client_widgets.py store.py guild_api.py ui_fx.py ui_geom.py ui_theme.py updater.py update_run.py offline_store.py profile_card.py dms.py micron.py invite.py recovery.py qr_tools.py mesh_ui.py
+          python -m py_compile main.py kivy_client.py setup_sHades.py sHades.py ui_scale.py applet_bridge.py app_attachments.py app_channels.py app_menus.py app_settings.py app_site.py app_stream.py client_util.py client_widgets.py store.py guild_api.py ui_fx.py ui_geom.py ui_theme.py updater.py update_run.py offline_store.py profile_card.py dms.py micron.py invite.py recovery.py qr_tools.py mesh_ui.py sanguis_script.py gpu_drain.py audio_drain.py
+          python -m flake8 main.py kivy_client.py setup_sHades.py sHades.py ui_scale.py applet_bridge.py app_attachments.py app_channels.py app_menus.py app_settings.py app_site.py app_stream.py client_util.py client_widgets.py store.py guild_api.py ui_fx.py ui_geom.py ui_theme.py updater.py update_run.py offline_store.py profile_card.py dms.py micron.py invite.py recovery.py qr_tools.py mesh_ui.py sanguis_script.py gpu_drain.py audio_drain.py
       - name: Import smoke test (headless)
         run: xvfb-run -a python -c "import kivy_client; app = kivy_client.sHadesClientApp(); app.build(); print('client builds OK')"
       - name: Test suite
@@ -85,6 +88,8 @@ jobs:
             --collect-all=kivymd \
             --add-data "kv_md.kv:." \
             --add-data "fonts:fonts" \
+            --add-data "sanguis/interp.bc:sanguis" \
+            --add-data "sanguis/bch:sanguis" \
             --distpath dist/linux
       - name: Publish artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # actions/upload-artifact@v4
@@ -119,7 +124,7 @@ jobs:
         # never bundles; local mirror of this exact command produced an exe
         # with ZERO wasmtime entries in Analysis/EXE TOCs. Without it the
         # frozen client silently drops the micron applet bridge.
-        run: pyinstaller --onefile --name sHades-client.exe kivy_client.py --hidden-import=RNS --hidden-import=LXMF --hidden-import=RNS.vendor --hidden-import=RNS.vendor.umsgpack --hidden-import=ui_scale --hidden-import=kivymd.icon_definitions --hidden-import=ui_fx --collect-all=RNS --collect-all=LXMF --collect-all=wasmtime --collect-all=kivymd --add-data "kv_md.kv;." --add-data "fonts;fonts" --distpath dist/windows
+        run: pyinstaller --onefile --name sHades-client.exe kivy_client.py --hidden-import=RNS --hidden-import=LXMF --hidden-import=RNS.vendor --hidden-import=RNS.vendor.umsgpack --hidden-import=ui_scale --hidden-import=kivymd.icon_definitions --hidden-import=ui_fx --collect-all=RNS --collect-all=LXMF --collect-all=wasmtime --collect-all=kivymd --add-data "kv_md.kv;." --add-data "fonts;fonts" --add-data "sanguis/interp.bc;sanguis" --add-data "sanguis/bch.exe;sanguis" --distpath dist/windows
       - name: Publish artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # actions/upload-artifact@v4
         with:
@@ -251,6 +256,27 @@ jobs:
             echo "::error::materialyoucolor recipe version not updated"; exit 1
           fi
           echo "materialyoucolor recipe pinned to 3.0.4: $MYC_RECIPE"
+      - name: Stage Android bch for the APK
+        # sanguis/bch in the tree is the LINUX binary (shipped by
+        # PyInstaller); the APK must carry the NDK arm64 build instead.
+        # sanguis/bch-android is that build (ANDROID-BCH-REPORT.md:
+        # NDK r27c, API 26, arm64-v8a, static, reproducible via
+        # android-ndk/build-bch-android.sh). Copy it onto sanguis/bch
+        # in this ephemeral checkout so buildozer's existing
+        # source.include_patterns = sanguis/bch ships it unchanged and
+        # the exec-bit shim (sanguis_script.executable_bch_path)
+        # resolves it as `bch` on-device. The copy is verified as a
+        # static AArch64 ELF here; the step after the build confirms
+        # the APK actually carries it. Linux/Windows jobs never run
+        # this step, so their bch/bch.exe are unaffected.
+        run: |
+          test -f sanguis/bch-android || { echo "::error::sanguis/bch-android missing from checkout"; exit 1; }
+          cp sanguis/bch-android sanguis/bch
+          chmod 755 sanguis/bch
+          file sanguis/bch
+          readelf -h sanguis/bch | grep -q "Machine:.*AArch64" || { echo "::error::staged bch is not AArch64"; exit 1; }
+          if readelf -l sanguis/bch | grep -q "INTERP"; then echo "::error::staged bch must be static (no INTERP)"; exit 1; fi
+          echo "staged Android bch: $(sha256sum sanguis/bch)"
       - name: Build debug APK
         # p4a version selection: Recipe.version reads VERSION_<name> env
         # (pythonforandroid/recipe.py). Kivy 2.3.1 supports python 3.8-3.13
@@ -262,7 +288,19 @@ jobs:
           VERSION_hostpython3: 3.11.5
         run: |
           set -o pipefail
-          buildozer android debug 2>&1 | tee buildlog.txt > /dev/null
+          # tee with /dev/null keeps the step log silent for the whole
+          # 13-minute build; a failure would leave nothing in the job's
+          # log (receipt: voice job 138391370476 - 13 min, then exit 1,
+          # zero output). Capture the exit and print the build's own
+          # tail, then let the gates still run as before.
+          if buildozer android debug 2>&1 | tee buildlog.txt > /dev/null; then
+            echo "buildozer exited 0"
+          else
+            BUILD_EXIT=$?
+            echo "::error::buildozer exited $BUILD_EXIT; last 300 lines follow"
+            tail -300 buildlog.txt
+            exit $BUILD_EXIT
+          fi
           # BZ2 gate, fail closed: this build's own log must carry a
           # target-python _bz2 probe answered yes (live or cached), and
           # no missing verdict may appear anywhere. A build that ships
@@ -278,11 +316,40 @@ jobs:
             tail -60 buildlog.txt; exit 1
           fi
           echo "bz2 gate: _bz2 probe yes count = $PROBES"
+      - name: Verify APK carries the Sanguis files
+        # buildozer's include_patterns is the only thing putting the
+        # extensionless sanguis/bch into the APK; if it ever misses,
+        # the app would silently fall back to "scripting unavailable".
+        # Fail the job instead, and list what did ship for diagnosis.
+        # RECEIPT: app data does NOT sit as loose APK entries - p4a
+        # packs the whole app dir into one asset, assets/private.tar
+        # (the green voice APK shades-0.36.25-arm64-v8a-debug.apk lists
+        # 48 entries, zero loose .py files, one assets/private.tar;
+        # sanguis live inside it). unzip -l | grep sanguis therefore
+        # always false-negatives; open the tar instead (run 45389210300
+        # job 138430726400 died here although the buildlog shows
+        # sanguis/bch, sanguis/bch-android and sanguis/interp.bc copied
+        # into the app dir).
+        run: |
+          APK=$(ls bin/*.apk | head -1)
+          unzip -p "$APK" assets/private.tar > private.tar
+          tar -tf private.tar | grep sanguis
+          tar -tf private.tar | grep -q "sanguis/bch" || { echo "::error::APK is missing sanguis/bch (inside assets/private.tar)"; exit 1; }
+          tar -tf private.tar | grep -q "sanguis/interp.bc" || { echo "::error::APK is missing sanguis/interp.bc (inside assets/private.tar)"; exit 1; }
+          echo "APK carries sanguis/bch + sanguis/interp.bc via assets/private.tar"
       - name: Publish APK
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # actions/upload-artifact@v4
         with:
           name: sHades-client-android
           path: bin/*.apk
+          retention-days: 7
+          if-no-files-found: error
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # actions/upload-artifact@v4
+        with:
+          name: sHades-buildlog-android
+          path: buildlog.txt
           retention-days: 7
 
   server-bundle:

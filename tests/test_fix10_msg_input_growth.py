@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
-"""fixes.md #10: msg_input grows with multi-line text (up to dp(160))
-and the composer bar grows with it, instead of capping at one line.
+"""Composer single-line recipe: msg_input one line dp(40), bar dp(56).
+
+fixes.md #10 (G1) grew the field with multiline text and the bar with
+the field (dp(160) cap). That recipe came in with the phase-2 tarball
+and breaks the phone: tay 2026-11-24 shots show the field's fill
+painting as a partial band beside the send pill under the
+minimum_height rebind. The pre-tarball recipe is restored instead:
+multiline stays, the height rebinding is gone. This suite now pins
+the restored recipe: five lines must NOT grow the field past dp(40),
+the bar must NOT move, and clearing stays clean. Re-introducing the
+growth on a device-verified path flips this suite deliberately with
+it.
 
 Boots the real app to the main screen, sets 1-line then 5-line text,
 and asserts the field height, the bar height and containment after the
@@ -60,23 +70,20 @@ class Fix10Probe(sHadesClientApp):
 
     def check_5line(self, dt):
         field, bar, scroll = self._field_and_bar()
-        self.check(field.height > dp(40),
-                   "5-line input grows past dp(40) (got %.1f)"
+        self.check(abs(field.height - dp(40)) <= 1,
+                   "5-line input still one line dp(40) (got %.1f)"
                    % field.height)
-        self.check(field.height <= dp(160) + 1,
-                   "5-line input stays within the dp(160) cap (got %.1f)"
-                   % field.height)
-        self.check(bar.height > dp(56),
-                   "composer bar grows with the field (got %.1f)"
+        self.check(abs(bar.height - dp(56)) <= 1,
+                   "composer bar stays dp(56) with 5 lines (got %.1f)"
                    % bar.height)
         self.check(field.y >= bar.y - 1 and field.top <= bar.top + 1,
                    "5-line field stays inside the composer bar")
         inside = all(
             c.y >= bar.y - 1 and c.top <= bar.top + 1
             for c in bar.children)
-        self.check(inside, "every composer child stays inside the grown bar")
-        self.check(scroll.height < self.scroll_h_1line,
-                   "message list shrinks as the bar grows (%.1f -> %.1f)"
+        self.check(inside, "every composer child stays inside the bar")
+        self.check(abs(scroll.height - self.scroll_h_1line) <= 1,
+                   "message list unchanged with 5 lines (%.1f -> %.1f)"
                    % (self.scroll_h_1line, scroll.height))
         field.text = ""
         Clock.schedule_once(self.finish, 0.5)
