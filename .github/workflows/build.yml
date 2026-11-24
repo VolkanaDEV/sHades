@@ -32,7 +32,7 @@ jobs:
           # libopus0: VoiceCodec's discovery reads the system libopus
           # via find_library on Linux; the headless runner has none by
           # default, and the voice suites construct a real codec.
-          sudo apt-get install -y -qq libcairo2-dev pkg-config libmtdev1 xvfb libopus0
+          sudo apt-get install -y -qq libcairo2-dev pkg-config libmtdev1 xvfb libopus0 portaudio19-dev
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -66,7 +66,10 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y -qq libcairo2-dev pkg-config libmtdev1 xvfb
+          # portaudio19-dev: pyaudio (desktop MicSource/SpeakerSink in
+          # requirements.txt) has no prebuilt wheel for this Python on
+          # Linux; pip builds it and needs the portaudio headers.
+          sudo apt-get install -y -qq libcairo2-dev pkg-config libmtdev1 xvfb portaudio19-dev
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
