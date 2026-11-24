@@ -13,6 +13,7 @@ import re
 import threading
 import webbrowser
 from client_util import _escape
+from client_widgets import MicronRefLabel
 
 # Kivy (guarded so the module can be imported for linting without Kivy present)
 try:
@@ -511,7 +512,7 @@ class SiteMixin:
             scr._status.text = "publish failed: %s" % err
 
     def _micron_label(self, markup, heading=False, center=False, code=False):
-        lbl = Label(markup=True, text=markup)
+        lbl = MicronRefLabel(markup=True, text=markup)
         lbl.size_hint_y = None
         lbl.font_size = sp(18) if heading else (sp(13) if code else sp(15))
         lbl.halign = "center" if center else "left"

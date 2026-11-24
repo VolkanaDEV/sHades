@@ -144,10 +144,22 @@ class LayoutProbe(sHadesClientApp):
                    "android builds resize above the keyboard")
         main.left_open = False
         drawer = main.ids.left_sidebar
-        overlay_width = drawer.width
+        self._drawer_overlay_width = drawer.width
         main.left_open = True
         self.check(abs(chat.width - main.width) <= 1,
                    "chat stays full width under the open drawer")
+        # settle-read: the inline read sampled the open-state drawer
+        # geometry mid-anim on starved software-GL runners (CI: green at
+        # 21:33Z, red at 21:37/21:52Z twice, client code identical in all
+        # three; desktop GL passes the inline read). Read after the open
+        # animation lands instead.
+        Clock.schedule_once(self.check_drawer_settled, 0.4)
+
+    def check_drawer_settled(self, dt):
+        main = self.root.get_screen("main")
+        drawer = main.ids.left_sidebar
+        pfp = main.ids.composer_pfp
+        overlay_width = self._drawer_overlay_width
         self.check(drawer.width >= overlay_width
                    and drawer.x >= 0 and drawer.right >= pfp.x,
                    "open drawer covers the composer rail")

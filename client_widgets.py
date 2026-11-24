@@ -990,6 +990,64 @@ class SkeletonRow(Widget):
                              size=(width * 0.16, dp(10)), radius=[dp(5)] * 4)
 
 
+class MicronRefLabel(Label):
+    """Markup label whose ref taps survive nesting inside a ScrollView.
+
+    Kivy 2.3.1 walks site pages 2+ levels under the messages ScrollView
+    (scroll > GridLayout > page container > label), and the touch reaches
+    those widgets in the SCROLL's content frame (scrollview.py to_local
+    folds a single g_translate over the whole subtree; the walk applies no
+    per-hop pos transforms). Label.on_touch_down's ref check assumes its
+    own parent space, so the zones miss by the accumulated offsets and the
+    tap dies (0.36.x device receipt: [ Edit page ] did nothing; the client
+    split dropped the pre-split MicronRefLabel when it moved the rows to
+    plain kv labels - fold-18 restored this class verbatim from the
+    pre-split base).
+
+    Convert the delivered frame by subtracting this label's own offset
+    chain up to the wrapping ScrollView, then run kivy's ref-zone check
+    with the same top-down texture y that label.py uses. The scroll's own
+    translation stays in the delivered frame, so stopping the walk there
+    is both correct and the only cheap anchor kivy gives us.
+    """
+
+    def _content_anchor(self):
+        ox, oy = self.x, self.y  # offsets up to (and incl.) this label
+        node = self.parent
+        while node is not None and type(node).__name__ != "ScrollView":
+            ox += node.x
+            oy += node.y
+            node = node.parent
+        return ox, oy
+
+    def on_touch_down(self, touch):
+        _dbg = os.environ.get("TAPWALK")
+        if _dbg:
+            print("REFLBL delivered=%r anchor=%r tex=%r size=%r" % (
+                tuple(round(v, 1) for v in touch.pos),
+                tuple(round(v, 1) for v in self._content_anchor()),
+                tuple(self.texture_size), tuple(self.size)), flush=True)
+        if super().on_touch_down(touch):
+            return True
+        if not len(self.refs):
+            return False
+        ox, oy = self._content_anchor()
+        lx = touch.x - ox
+        ly = touch.y - oy
+        tex_h = self.texture_size[1] or 18.0
+        ty = tex_h - ly  # label zones are top-down like label.py's math
+        if _dbg:
+            print("REFLBL local=(%.1f, %.1f) ty=%.1f zones=%r" % (
+                lx, ly, ty, self.refs), flush=True)
+        for uid, zones in self.refs.items():
+            for zone in zones:
+                x, y, w, h = zone
+                if x <= lx <= w and y <= ty <= h:
+                    self.dispatch('on_ref_press', uid)
+                    return True
+        return False
+
+
 class ClickableLabel(ContextMenuMixin, ButtonBehavior, Label):
     """Username label: tap opens a profile, right-click/long-press offers
     mention + profile."""
