@@ -148,6 +148,8 @@ def _sync(st, cid, bake=False):
             return
         size = (max(int(clip.width), 1), max(int(clip.height), 1))
         if tuple(fbo.size) != size:
+            print("DIAG fbo-drawer %s resize fbo=%s quad=%s"
+                  % (cid, size, tuple(clip.size)), flush=True)
             fbo.size = size
             quad.texture = fbo.texture
             bake = True
