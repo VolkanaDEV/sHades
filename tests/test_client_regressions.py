@@ -677,6 +677,7 @@ def test_resume_heal_rebuilds_lxmf_and_dead_links():
         _heal_after_resume = kc.sHadesClientApp._heal_after_resume
         _init_lxmf_router = kc.sHadesClientApp._init_lxmf_router
         _dm_announce_loop = kc.sHadesClientApp._dm_announce_loop
+        _DMA_INTERVAL = kc.sHadesClientApp._DMA_INTERVAL
         _on_dm_delivery = kc.sHadesClientApp._on_dm_delivery
         _do_reestablish = kc.sHadesClientApp._do_reestablish
         client_identity = object()
@@ -764,6 +765,7 @@ def test_channel_management_gates_and_kinds():
     check("admin flag: gate open", app._can_create_channels() is True)
 
 
+
 def test_send_failure_restores_compose():
     """fold-14 P11g: a dead link at send must not swallow the compose.
 
@@ -828,7 +830,7 @@ def test_send_failure_restores_compose():
         def _set_status(self, msg):
             self.statuses.append(msg)
 
-        def _render_message(self, grid, m):
+        def _render_message(self, grid, m, animate=False):
             self.rendered.append(m)
 
     real_clock = kc.Clock
@@ -924,7 +926,6 @@ def test_send_failure_restores_compose():
         kc.Clock = real_clock
         kc.threading = real_kc_threading
 
-
 def test_restore_without_server_row_dials_default():
     """P11h: tay's import-stall receipt (0.36.24). A restored kit with no
     dialable server row parked the member on connect (hub blank, Connect
@@ -983,7 +984,6 @@ def test_restore_without_server_row_dials_default():
     started3 = app3._enter_restored_account()
     check("an invalid kit port parks with prefill instead of dialing",
           started3 is False and app3.deliveries == [], app3.deliveries)
-
 
 def main():
     for fn in (test_display_name_preserved,

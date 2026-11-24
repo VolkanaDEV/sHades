@@ -304,38 +304,38 @@ module-level flag.
 
 ## Remediation status
 
-All 15 findings are remediated. Each fix was re-verified with the same
+14 of the 15 findings are remediated; P2-6 was a documentation error (own-author colour is `primary` per DESIGN.md rule 1, not `text_muted` — no code change was needed). Each fix was re-verified with the same
 method as the audit (absolute geometry from the layout engine on a real
 `app.run()`), not by re-reading the source.
 
 | # | Item | Verified fix |
 |---|---|---|
 | 1 | P1-1 `members \u25bc` literal text | ASCII arrows, matching the channels button |
-| 2 | P1-2 invisible own-message bubble | `msg_own` → `#1E1E1E`, distinct from `panel` |
+| 2 | P1-2 invisible own-message bubble | `msg_own` → `#1B2C3A`, distinct from `panel` |
 | 3 | P1-3 profile "Delivery:" shows username | `target_delivery` property renders the lxmf.delivery hash |
-| 4 | P0-1 connect screen overflow + clipped banner | content 820px → 344px; ScrollView; banner 200→120px; clipped = 0 at 1280×720, 1024×600, 800×600, 1920×1080, 640×480 |
+| 4 | P0-1 connect screen overflow + clipped banner | content 482px (disclosure closed) / 580px (open); ScrollView; banner 96px; clipped = 0 at 1280×720, 1024×600, 800×600, 1920×1080, 640×480 |
 | 5 | P0-2 hub-address field overlaps heading | form sized from content; zero collisions at all five window sizes |
-| 6 | P2-3 `text-dim` contrast failure | `#B08C46` (5.96:1 / 5.54:1) |
-| 7 | P2-4 add border tokens | `border #646464`, `border_subtle #3A3A3A` |
-| 8 | P2-1 remove the 2/3 button scale | 0 buttons under 40h/48w on main + connect screens |
-| 9 | P2-2 input bar 24px → 48px | bar 48px, field 40px capped, 0 children overflow |
+| 6 | P2-3 `text-dim` contrast failure | `#91A3B4` (6.81:1 on panel, 7.07:1 on sidebar, 7.36:1 on bg_main) |
+| 7 | P2-4 add border tokens | `border #637A87`, `border_subtle #2A3B49` |
+| 8 | P2-1 remove the 2/3 button scale | 2/3 scale set to 1.0 (`BUTTON_V_SCALE`), not removed; 0 buttons under 40h/48w on main + connect screens |
+| 9 | P2-2 input bar 24px → 56px | bar 56px (holds the 42px pfp), field 40px growing to a 160px cap with the bar, 0 children overflow |
 | 10 | P2-5 top bar divider | 1px `border_subtle` hairline on the top bar's bottom edge |
-| 11 | P2-6 swap own/other author colour | own → `text_muted`, others → `text` |
+| 11 | P2-6 swap own/other author colour | not a code fix: own-author colour is `primary`, others are `text` (DESIGN.md rule 1); the finding's swap was a documentation error |
 | 12 | P3-1 delete dead hex constants | 11 constants removed; `DEFAULT_THEME_COLORS` is the single copy |
-| 13 | P3-2 generate config rows from `THEME_KEYS` | rows generated in `ConfigScreen._ensure_color_rows`; also closes the gap the audit measured indirectly — the 14 KV rows covered only 14 of 17 keys (`btn_text`, `border`, `border_subtle` were silently uneditable because `save_config` skipped missing `c_<key>` ids). All 17 keys now render, save, validate and reset; Python-added widgets are tracked in `ConfigScreen._color_fields` instead of KV ids (KV ids only register KV-declared widgets) |
+| 13 | P3-2 generate config rows from `THEME_KEYS` | rows generated in `ConfigScreen._ensure_color_rows`; also closes the gap the audit measured indirectly — the 14 KV rows covered only 14 of 17 keys (`btn_text`, `border`, `border_subtle` were silently uneditable because `save_config` skipped missing `c_<key>` ids). All 20 keys now render, save, validate and reset; Python-added widgets are tracked in `ConfigScreen._color_fields` instead of KV ids (KV ids only register KV-declared widgets) |
 | 14 | P3-3 constrain connect form width | all fields 420px, centred |
-| 15 | P3-4 guard the KV load in tests | harnesses let `app.run()` own the build |
+| 15 | P3-4 guard the KV load in tests | fixed in code by the module-level `_KV_LOADED` guard in `kivy_client.py` `build()` — repeated `build()` calls load `kv_md.kv` once, warning-free |
 
 ### Verification runs
 
-- **Connect screen** (fixed 3.0s probe after first layout): content 344px,
-  viewport ≥450px at every tested size, Connect button fully on-screen,
-  banner clipped 0px, 0 collisions, 0 undersized buttons, disclosure
-  toggles 0 → 98 → 0. Sizes: 1280×720, 1024×600, 800×600, 1920×1080,
-  640×480.
-- **Main screen**: input bar 48px, children within the bar, 0 buttons
+- **Connect screen** (fixed 3.0s probe after first layout): content 482px
+  (disclosure closed) / 580px (open), viewport ≥450px at every tested size,
+  Connect button fully on-screen, banner clipped 0px, 0 collisions,
+  0 undersized buttons, disclosure toggles 0 → 98 → 0. Sizes: 1280×720,
+  1024×600, 800×600, 1920×1080, 640×480.
+- **Main screen**: input bar 56px, children within the bar, 0 buttons
   under target, content overflow 0.
-- **Config screen** (16 checks): 17 rows = 17 `THEME_KEYS` entries, labels
+- **Config screen** (16 checks): 20 rows = 20 `THEME_KEYS` entries, labels
   match `THEME_LABELS`, prefill matches the live theme, save applies +
   persists (`ui_config.json`), invalid hex rejected without partial
   apply, reset restores defaults *and* refreshes the fields, generated
