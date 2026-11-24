@@ -155,3 +155,97 @@ def bind(engine, mic=None, speaker=None):
     if speaker is not None:
         engine.attach_sink(speaker)
     return mic, speaker
+
+
+class RNSLinkShell:
+    """The VoiceEngine's link-like view of a live RNS.Link. alive reads
+    the link status so pre-establish sends are skipped; send pushes the
+    engine's raw packet down the link."""
+
+    def __init__(self, link):
+        self._link = link
+        self.remote_dest = None
+
+    @property
+    def alive(self):
+        import RNS
+        try:
+            return getattr(self._link, "status", None) == RNS.Link.ACTIVE
+        except Exception:
+            return False
+
+    def send(self, body):
+        self._link.send(body)
+
+    def teardown(self):
+        try:
+            self._link.teardown()
+        except Exception:
+            pass
+
+
+class VoiceLane:
+    """One client's RNS voice lane: an announced listening destination
+    plus a dial factory, both feeding one VoiceEngine."""
+
+    APP_NAME = "shades"
+    ASPECT = "voice"
+
+    def __init__(self, identity):
+        self.identity = identity
+        self._listener = None
+        self._dest = None
+        self.engine = None
+
+    def open_listener(self, engine, announce=True):
+        """IN destination on the client identity; raw voice packets from
+        any peer's link feed engine.accept_inbound."""
+        import RNS
+        self.engine = engine
+        self._dest = RNS.Destination(
+            self.identity, RNS.Destination.IN, RNS.Destination.SINGLE,
+            self.APP_NAME, self.ASPECT)
+
+        def on_link(link):
+            shell = RNSLinkShell(link)
+            try:
+                ri = link.get_remote_identity()
+                if ri is not None:
+                    shell.remote_dest = RNS.Destination.hash(ri).hex()
+                    engine.accept_inbound(shell.remote_dest, shell)
+            except Exception:
+                pass
+
+        self._dest.set_link_established_callback(on_link)
+        if announce:
+            self._dest.announce(app_data=self._dest.hash)
+        return self._dest.hash.hex() if hasattr(self._dest.hash, "hex") \
+            else self._dest.hash
+
+    def close_listener(self):
+        try:
+            self._dest.teardown()
+        except Exception:
+            pass
+        self._dest = None
+        self._listener = None
+
+    def dial_factory(self, engine):
+        def make(dest_hex):
+            import RNS
+            if not dest_hex:
+                return None
+            dest_bytes = bytes.fromhex(dest_hex)
+            ri = RNS.Identity.recall(dest_bytes)
+            if ri is None:
+                # path not heard yet: the roster's dest hashes rely on
+                # peers' voice announces; skip this tick, retry on the
+                # next roster push
+                return None
+            out = RNS.Destination(ri, RNS.Destination.OUT,
+                                  RNS.Destination.SINGLE,
+                                  self.APP_NAME, self.ASPECT)
+            link = RNS.Link(out)
+            shell = RNSLinkShell(link)
+            return shell
+        return make

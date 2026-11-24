@@ -167,7 +167,22 @@ class StreamMixin:
         thread: threadsafe updates + Clock marshalling only."""
         try:
             frame = msgpack.unpackb(plaintext, raw=False)
-            if not isinstance(frame, dict) or frame.get("k") != "stream":
+            if not isinstance(frame, dict):
+                return
+            if frame.get("k") == "voice":
+                # relay fallback (item 4 lane): a speaker's raw packet,
+                # hub-fanned to this room subscriber's link
+                engine = getattr(self, "_voice_engine", None)
+                if engine is not None:
+                    eng = engine
+                    d = frame.get("dest") or ""
+                    b = frame.get("body") or b""
+
+                    def _relay(dt, e=eng, dest=d, body=b):
+                        e.packet_relayed(dest, body)
+                    Clock.schedule_once(_relay, 0)
+                return
+            if frame.get("k") != "stream":
                 return
             self._handle_stream_frame(frame)
         except Exception as e:

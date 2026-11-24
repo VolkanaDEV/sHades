@@ -295,6 +295,18 @@ class GuildAPI:
         """Roster counts per voice channel, for the rail."""
         return self._request_json("/api/v1/voice/rooms", {})
 
+    def voice_publish(self, channel, body):
+        """One speaker tick destined for the relay fallback. body is the
+        engine's raw packet (seq + codec packet); it rides the request
+        body b64 and the hub fans it to the room's other subscriber
+        links as a k:"voice" raw push frame."""
+        import base64
+        raw = body if isinstance(body, (bytes, bytearray)) else bytes(body)
+        return self._request_json(
+            "/api/v1/voice/publish",
+            {"channel": channel,
+             "body": base64.b64encode(bytes(raw)).decode("ascii")})
+
     def typing(self, channel, active=True):
         return self._request_json("/api/v1/typing",
                                   {"channel": channel, "active": bool(active)})
