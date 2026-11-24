@@ -10,3 +10,4 @@ wasmtime==50.0.1
 flake8
 pygments
 qrcode==8.2
+pytest
