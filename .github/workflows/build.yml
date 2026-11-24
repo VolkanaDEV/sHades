@@ -321,10 +321,22 @@ jobs:
         # extensionless sanguis/bch into the APK; if it ever misses,
         # the app would silently fall back to "scripting unavailable".
         # Fail the job instead, and list what did ship for diagnosis.
+        # RECEIPT: app data does NOT sit as loose APK entries - p4a
+        # packs the whole app dir into one asset, assets/private.tar
+        # (the green voice APK shades-0.36.25-arm64-v8a-debug.apk lists
+        # 48 entries, zero loose .py files, one assets/private.tar;
+        # sanguis live inside it). unzip -l | grep sanguis therefore
+        # always false-negatives; open the tar instead (run 45389210300
+        # job 138430726400 died here although the buildlog shows
+        # sanguis/bch, sanguis/bch-android and sanguis/interp.bc copied
+        # into the app dir).
         run: |
-          unzip -l bin/*.apk | grep sanguis
-          unzip -l bin/*.apk | grep -q "sanguis/bch" || { echo "::error::APK is missing sanguis/bch"; exit 1; }
-          unzip -l bin/*.apk | grep -q "sanguis/interp.bc" || { echo "::error::APK is missing sanguis/interp.bc"; exit 1; }
+          APK=$(ls bin/*.apk | head -1)
+          unzip -p "$APK" assets/private.tar > private.tar
+          tar -tf private.tar | grep sanguis
+          tar -tf private.tar | grep -q "sanguis/bch" || { echo "::error::APK is missing sanguis/bch (inside assets/private.tar)"; exit 1; }
+          tar -tf private.tar | grep -q "sanguis/interp.bc" || { echo "::error::APK is missing sanguis/interp.bc (inside assets/private.tar)"; exit 1; }
+          echo "APK carries sanguis/bch + sanguis/interp.bc via assets/private.tar"
       - name: Publish APK
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # actions/upload-artifact@v4
         with:
