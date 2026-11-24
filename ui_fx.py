@@ -30,6 +30,17 @@ EASE_SPRING = "out_back"     # small, playful settles
 _TEX = {}
 REDUCED_MOTION = False
 
+# tay 2026-11-24: the popup opacity fade hides sheet button labels on
+# the Android GLES path (recovery/restore sheets render clean on the
+# desktop GL stack - probe shots z5/z6 - and the fade is the only
+# phone-specific paint path in them). The fade stays off on Android
+# entirely; desktop keeps it.
+try:
+    from kivy.utils import platform as _kivy_platform
+    POPUP_FADE_SKIP = (_kivy_platform == "android")
+except ImportError:
+    POPUP_FADE_SKIP = False
+
 # Screen fades use the same language as reveal(): short, out_quint ease.
 SCREEN_TRANSITION_DURATION = 0.18
 
@@ -155,8 +166,13 @@ def popup_entrance(popup, duration=POPUP_FADE_DURATION):
     frame flashes, then fades to 1. REDUCED_MOTION opens at opacity 1
     at once. A failed open() restores opacity 1 and re-raises, so a
     broken popup still fails loudly instead of failing silently.
+
+    POPUP_FADE_SKIP (Android) opens at opacity 1 with no animation:
+    on the phone GLES path the fade hides sheet button labels
+    (tay 2026-11-24); the desktop probes z5/z6 show the same sheets
+    render clean without any phone-specific path left but the fade.
     """
-    if REDUCED_MOTION:
+    if REDUCED_MOTION or POPUP_FADE_SKIP:
         popup.opacity = 1
         popup.open()
         return
