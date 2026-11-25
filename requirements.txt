@@ -15,3 +15,10 @@ qrcode==8.2
 # lanes (bare msgpack imports) must stay importable here too.
 pytest
 msgpack
+# Voice (client_voice.py): opuslib binds the system libopus (the
+# loader searches HADES_OPUS_LIB, then find_library, then the SDL2
+# runtime dir); pyaudio drives MicSource + SpeakerSink on desktop.
+# Android drives the codec through jnius, and opus comes from the APK
+# (buildozer spec, libopus.so) - PyAudio is desktop-only.
+opuslib==3.0.1
+pyaudio

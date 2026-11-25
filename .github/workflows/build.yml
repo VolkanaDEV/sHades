@@ -29,7 +29,10 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y -qq libcairo2-dev pkg-config libmtdev1 xvfb
+          # libopus0: VoiceCodec's discovery reads the system libopus
+          # via find_library on Linux; the headless runner has none by
+          # default, and the voice suites construct a real codec.
+          sudo apt-get install -y -qq libcairo2-dev pkg-config libmtdev1 xvfb libopus0 portaudio19-dev
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -63,7 +66,10 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y -qq libcairo2-dev pkg-config libmtdev1 xvfb
+          # portaudio19-dev: pyaudio (desktop MicSource/SpeakerSink in
+          # requirements.txt) has no prebuilt wheel for this Python on
+          # Linux; pip builds it and needs the portaudio headers.
+          sudo apt-get install -y -qq libcairo2-dev pkg-config libmtdev1 xvfb portaudio19-dev
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -251,6 +257,21 @@ jobs:
             echo "::error::materialyoucolor recipe version not updated"; exit 1
           fi
           echo "materialyoucolor recipe pinned to 3.0.4: $MYC_RECIPE"
+          # opus recipe injection: the pinned p4a revision has NO opus
+          # recipe of any name (receipt: recipe tree probed at the pin;
+          # the miss first fell into p4a's pip group and pip died on
+          # "No matching distribution found for opus" -- run 45381551657,
+          # job 138404504953). This repo carries the recipe at
+          # android-ndk/p4a-recipes/opus (opus 1.5.2 from xiph, sha256
+          # 65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1,
+          # built_libraries copy = the APK's lib/arm64-v8a/libopus.so,
+          # the exact name voice_codec probes in nativeLibraryDir).
+          OPUS_DST="$P4A_DIR/python-for-android/pythonforandroid/recipes/opus"
+          cp -r "$GITHUB_WORKSPACE/android-ndk/p4a-recipes/opus" "$OPUS_DST"
+          if ! grep -q 'version = "1.5.2"' "$OPUS_DST/__init__.py"; then
+            echo "::error::opus recipe injection failed"; exit 1
+          fi
+          echo "opus recipe injected: $OPUS_DST (1.5.2)"
       - name: Build debug APK
         # p4a version selection: Recipe.version reads VERSION_<name> env
         # (pythonforandroid/recipe.py). Kivy 2.3.1 supports python 3.8-3.13
@@ -278,6 +299,16 @@ jobs:
             tail -60 buildlog.txt; exit 1
           fi
           echo "bz2 gate: _bz2 probe yes count = $PROBES"
+      - name: Verify APK carries libopus.so
+        # The injected opus recipe builds and installs libopus.so during
+        # the p4a build; without this gate a silent recipe drop-out would
+        # ship an APK where voice_codec raises VoiceCodecUnavailable
+        # ("voice stays off, everything else runs") and nothing would
+        # notice. Fail closed instead: the APK must carry the exact
+        # nativeLibraryDir name the probe appends.
+        run: |
+          unzip -l bin/*.apk | grep -q "lib/arm64-v8a/libopus.so" || { echo "::error::APK is missing lib/arm64-v8a/libopus.so"; exit 1; }
+          echo "APK carries libopus.so (nativeLibraryDir name voice_codec probes)"
       - name: Publish APK
         uses: actions/upload-artifact@v4
         with:
