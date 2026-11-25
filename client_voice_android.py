@@ -160,9 +160,11 @@ class AndroidMic:
         read = self._rec.read
         buf = self._buf
         while not self._stop.is_set():
-            # jnius: read(byte[], int) fills in place and returns the
-            # byte count; a bare read(int) has no Java overload
-            n = read(buf, FRAME_BYTES)
+            # jnius: AudioRecord.read's byte[] overload is the 3-arg
+            # read(byte[] buf, int offsetInBytes, int sizeInBytes);
+            # the 2-arg call matches no Java surface (device log 12:
+            # jnius.JavaException - available: ([BII)I for bytes)
+            n = read(buf, 0, FRAME_BYTES)
             if not isinstance(n, int) or n != FRAME_BYTES:
                 continue
             with self._lock:

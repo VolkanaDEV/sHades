@@ -51,9 +51,14 @@ class _FakeAudioRecord:
     def startRecording(self):
         self.state = 3
 
-    def read(self, buf, size):
+    def read(self, buf, offset_in_bytes, size):
+        # Android's byte[] overload is read(byte[], int, int) - the
+        # 2-arg call matches no Java surface (device log 12, jnius):
+        # the real device needs offset 0 explicitly.
         if size != FRAME_BYTES:
             return -1                       # wrong overload use: loud
+        if offset_in_bytes != 0:
+            return -2
         # 960 s16 mono frame; a quiet sine stands in for capture
         import math
         self._phase += voice_codec.FRAME_SAMPLES
