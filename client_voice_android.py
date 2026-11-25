@@ -93,11 +93,12 @@ def _audio_classes(test_overrides=None):
 
 def _mic_permission_missing():
     """True when the RECORD_AUDIO runtime grant is absent; fires the
-    grant dialog when it is. p4a's android.permissions helper exists
-    only inside the app bundle, so desktop/tests answer False with no
-    permission layer at all. The grant result lands asynchronously:
-    this join stays listen-only with a named reason, and the next one
-    reaps the grant."""
+    grant dialog when it is, then re-checks: p4a's helper resolves the
+    dialog from the calling thread without a re-join (device log 13 -
+    join -> dialog -> grant landed, but the join still owed a second
+    tap; now a grant inside the dialog goes live immediately). A denial
+    or a permanent block keeps this join listen-only with the named
+    reason; the next one reaps any later grant."""
     try:
         from android.permissions import check_permission, Permission
     except Exception:
@@ -110,6 +111,11 @@ def _mic_permission_missing():
     try:
         from android.permissions import request_permissions
         request_permissions([Permission.RECORD_AUDIO])
+    except Exception:
+        pass
+    try:
+        if check_permission(Permission.RECORD_AUDIO):
+            return False
     except Exception:
         pass
     return True
