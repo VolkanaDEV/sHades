@@ -36,6 +36,11 @@ class VoicePanelMixin:
         self._voice_muted = False
         self._voice_rows = {}           # cid -> VoiceRow
         self._voice_lock = threading.RLock()
+        try:
+            from kivy.clock import Clock
+            Clock.schedule_interval(self._voice_speak_tick, 0.25)
+        except Exception:
+            pass
 
     # ---- push path ------------------------------------------------------
 
@@ -70,10 +75,36 @@ class VoicePanelMixin:
             self.root.get_screen("main")
         except Exception:
             return
-        for cid, w in list(rows.items()):
-            w.render(self._voice_rooms.get(cid),
-                     joined=cid == self._voice_room_cid,
-                     muted=self._voice_muted)
+        engine = getattr(self, "_voice_engine", None)
+        room_cid = getattr(self, "_voice_room_cid", None)
+        speaking = []
+        mine = False
+        mode = None
+        if engine is not None and room_cid is not None:
+            # bench fakes may predate the tx-shaping getters
+            fn_speak = getattr(engine, "speaking_peers", None)
+            speaking = fn_speak() if fn_speak else []
+            fn_self = getattr(engine, "self_speaking", None)
+            mine = fn_self() if fn_self else False
+            mode = getattr(engine, "voice_mode", None)
+        my_viewer = getattr(self, "my_user_hash", "") or ""
+        for cid_, w in list(rows.items()):
+            w.render(self._voice_rooms.get(cid_),
+                     joined=cid_ == self._voice_room_cid,
+                     muted=self._voice_muted,
+                     speaking=speaking if cid_ == room_cid else None,
+                     tx_mode=mode if cid_ == room_cid else None,
+                     self_speaking=mine,
+                     my_viewer=my_viewer)
+
+    def _voice_speak_tick(self, dt):
+        """Live speaking refresh while joined (greens move at 4 Hz)."""
+        if getattr(self, "_voice_room_cid", None) is None:
+            return
+        try:
+            self._voice_rail_refresh()
+        except Exception:
+            pass
 
     def _voice_row_for(self, name, cid):
         """The sidebar's voice row widget for a channel; built lazily."""
@@ -82,10 +113,30 @@ class VoicePanelMixin:
         from client_widgets import VoiceRow
         row = VoiceRow(channel_name=name)
         row.bind_action(self._voice_tap_join, self._voice_tap_leave,
-                        self._voice_tap_toggle_mute)
+                        self._voice_tap_toggle_mute,
+                        on_mode=self._voice_tap_mode,
+                        on_ptt=self._voice_tap_ptt)
         self._voice_rows[cid] = row
         self._voice_rail_refresh(cid)
         return row
+
+    def _voice_tap_mode(self, name, mode):
+        engine = getattr(self, "_voice_engine", None)
+        fn = getattr(engine, "set_voice_mode", None) if engine else None
+        if fn is None:
+            return
+        got = fn(mode)
+        self._set_status("voice tx: %s" %
+                         ("push-to-talk" if got == "ptt" else
+                          "voice-activated" if got == "vad" else "open mic"))
+        self._voice_rail_refresh()
+
+    def _voice_tap_ptt(self, name, down):
+        engine = getattr(self, "_voice_engine", None)
+        fn = getattr(engine, "set_ptt", None) if engine else None
+        if fn is None:
+            return
+        fn(down)
 
     # ---- actions --------------------------------------------------------
 
