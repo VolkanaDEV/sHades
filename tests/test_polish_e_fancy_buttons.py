@@ -284,7 +284,8 @@ def run_checks(app):
     check("unknown variant falls back to filled style",
           odd.style == "filled", repr(odd.style))
 
-    # --- KV wiring: 25 converted, 5 deliberate plain ------------------
+    # --- KV wiring: 25 converted (split-base counts; the tarball's
+    # split client builds the rest in modules, not kv) ---
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "..", "kv_md.kv")) as f:
         kv = f.read()
