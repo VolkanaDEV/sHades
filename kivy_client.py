@@ -266,6 +266,28 @@ from app_site import SiteMixin  # noqa: E402
 from app_stream import StreamMixin  # noqa: E402
 from app_menus import MenusMixin  # noqa: E402
 from app_attachments import AttachmentsMixin  # noqa: E402
+
+
+def _blob_sniff(raw):
+    """Sniff raw asset bytes for an SDL-image-loadable format.
+
+    Returns (ext, renderable). Unknown formats keep the bytes off
+    every Image widget (the strip renders the letter tile instead):
+    naming them .png just trades a missing banner for a broken one.
+    """
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png", True
+    if raw[:3] == b"\xff\xd8\xff":
+        return "jpg", True
+    if raw[:4] == b"GIF8":
+        return "gif", True
+    if raw[:2] == b"BM":
+        return "bmp", True
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "webp", True
+    return "bin", False
+
+
 if KIVY:
     from app_site import MessageEmbed  # noqa: E402, F401
 
@@ -3438,13 +3460,63 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
         self._fetch_server_blob(blob_id, srv, "banners", "banner_blob",
                                 "banner_path")
 
+    def _repair_recorded_assets(self, srv):
+        """Self-heal recorded blob assets after an upgrade: the pre-
+        assembly ingest wrote the FIRST SLICE as the whole file, so any
+        asset over the slice cap landed truncated (and possibly mis-
+        named) while the record still looked valid - the unchanged check
+        then kept binding the junk forever (the device banner defect).
+        Re-ingest when the stored bytes disagree with the blob's total
+        size or the sniffed format."""
+        if not srv or not self.guild_api:
+            return
+        for blob_key, path_key, subdir, ingest in (
+                ("icon_blob", "icon_path", "icons",
+                 self._ingest_guild_icon),
+                ("banner_blob", "banner_path", "banners",
+                 self._ingest_banner)):
+            blob_id = srv.get(blob_key)
+            path = srv.get(path_key)
+            if not blob_id or not path:
+                continue
+            if not os.path.isfile(path):
+                print("asset repair (%s): record lost its file, reingesting"
+                      % subdir)
+                srv.pop(blob_key, None)
+                srv.pop(path_key, None)
+                self._fetch_server_blob(blob_id, srv, subdir, blob_key,
+                                        path_key)
+                continue
+            try:
+                res = self.guild_api.blobs_get(blob_id, offset=0)
+                raw = base64.b64decode(res.get("data_b64") or b"")
+            except Exception as e:
+                print("asset repair (%s): probe failed" % subdir, repr(e))
+                continue
+            if not res.get("ok") or not raw:
+                continue
+            ext, _renderable = _blob_sniff(raw)
+            stored_ext = os.path.splitext(path)[1].lstrip(".").lower()
+            stored = os.path.getsize(path)
+            if stored < (res.get("total") or 0) or (
+                    ext != "bin" and stored_ext != ext):
+                print("asset repair (%s): stored %d of %s bytes, ext %s "
+                      "(blob says %s) -> reingesting" % (
+                          subdir, stored, res.get("total"), stored_ext,
+                          ext))
+                srv.pop(blob_key, None)
+                srv.pop(path_key, None)
+                self._fetch_server_blob(blob_id, srv, subdir, blob_key,
+                                        path_key)
+
     def _fetch_server_blob(self, blob_id, srv, subdir, blob_key, path_key):
         """Shared ingest engine for server-owned blob assets: fetch a
-        blob by id, store it under _app_data_dir()/subdir as
-        <host>_<blob head>.<ext>, record blob_key/path_key on the servers
-        entry, then refresh the sidebar. Disk writes happen on the
-        caller worker thread; only the widget refresh hops to the main
-        thread."""
+        blob by id (assembled across the chunked transport, not a single
+        1 MiB slice), store it under _app_data_dir()/subdir as
+        <host>_<blob head>.<ext> only when the format decodes, record
+        blob_key/path_key on the servers entry, then refresh the
+        sidebar. Disk writes happen on the caller worker thread; only
+        the widget refresh hops to the main thread."""
         if not blob_id or not srv or not self.guild_api:
             return
         if srv.get(blob_key) == blob_id and srv.get(path_key):
@@ -3453,28 +3525,33 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
 
         def work():
             try:
-                res = api.blobs_get(blob_id)
+                res = api.blobs_get_all(blob_id)
             except Exception as e:
                 print("asset fetch failed (%s):" % subdir, repr(e))
                 return
             if not res.get("ok"):
+                print("asset fetch refused (%s):" % subdir,
+                      repr(res.get("error")))
                 return
             import base64 as _b64
             raw = _b64.b64decode(res.get("data_b64") or b"")
             if not raw:
                 return
-            ext = "png"
-            head = raw[:8]
-            if head == b"\x89PNG\r\n\x1a\n":
-                ext = "png"
-            elif raw[:2] == b"\xff\xd8":
-                ext = "jpg"
-            elif raw[:4] in (b"RIFF",):
-                ext = "webp"
+            ext, renderable = _blob_sniff(raw)
+            print("asset ingest (%s): %d bytes, format %s%s" % (
+                subdir, len(raw), ext,
+                "" if renderable
+                else "; format not renderable, letter tile stays"))
             try:
                 dest_dir = os.path.join(_app_data_dir(), subdir)
                 os.makedirs(dest_dir, exist_ok=True)
                 host = (srv.get("host") or "server").replace(":", "_")
+                if not renderable:
+                    srv[blob_key] = blob_id
+                    self._save_servers()
+                    Clock.schedule_once(
+                        lambda dt: self._refresh_server_sidebar(), 0)
+                    return
                 path = os.path.join(
                     dest_dir,
                     "%s_%s.%s" % (host, blob_id[:12], ext))
@@ -4791,24 +4868,24 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin, StreamMixin, Menu
                           res.get("user_hash", "")), flush=True)
                 # task 6: the guild icon rides whoami; ingest it per server
                 guild = res.get("guild") or {}
+                idx = self._active_server_idx
+                srv = None
+                if 0 <= idx < len(self._servers):
+                    srv = self._servers[idx]
                 icon_blob = (guild.get("icon") or "").strip()
-                if icon_blob:
-                    idx = self._active_server_idx
-                    if 0 <= idx < len(self._servers):
-                        srv = self._servers[idx]
-                        if srv.get("icon_blob") != icon_blob:
-                            Clock.schedule_once(
-                                lambda dt: self._ingest_guild_icon(
-                                    icon_blob, srv), 0)
+                if icon_blob and srv is not None:
+                    if srv.get("icon_blob") != icon_blob:
+                        Clock.schedule_once(
+                            lambda dt: self._ingest_guild_icon(
+                                icon_blob, srv), 0)
+                if srv is not None:
+                    self._repair_recorded_assets(srv)
                 banner_blob = (guild.get("banner") or "").strip()
-                if banner_blob:
-                    idx = self._active_server_idx
-                    if 0 <= idx < len(self._servers):
-                        srv = self._servers[idx]
-                        if srv.get("banner_blob") != banner_blob:
-                            Clock.schedule_once(
-                                lambda dt: self._ingest_banner(
-                                    banner_blob, srv), 0)
+                if banner_blob and srv is not None:
+                    if srv.get("banner_blob") != banner_blob:
+                        Clock.schedule_once(
+                            lambda dt: self._ingest_banner(
+                                banner_blob, srv), 0)
                 # P6: the message-of-the-day strip under the banner
                 Clock.schedule_once(
                     lambda dt: self._apply_motd(

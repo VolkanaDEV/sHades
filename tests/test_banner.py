@@ -175,6 +175,7 @@ def main():
           and "self.banner_letter = (" in py)
 
     import kivy_client as kc
+    import guild_api as _ga
 
     class FakeBannerApi:
         def __init__(self, data):
@@ -183,6 +184,13 @@ def main():
         def blobs_get(self, blob_id):
             return {"ok": 1,
                     "data_b64": base64.b64encode(self.data).decode()}
+
+        def blobs_get_all(self, blob_id):
+            """The one-shot slice cap fix: the ingest engines assemble
+            through this entry now; hand back the whole asset."""
+            return {"ok": 1,
+                    "data_b64": base64.b64encode(self.data).decode(),
+                    "total": len(self.data), "eof": True}
 
     app = kc.sHadesClientApp()
     app.guild_api = FakeBannerApi(png)
@@ -205,6 +213,83 @@ def main():
           os.path.basename(srv.get("banner_path", "")) ==
           "bannerhost_123_%s.png" % blob_id[:12],
           srv.get("banner_path"))
+
+    # the chunked-transport regression lane: the engine must loop the
+    # REAL assembly through more than one slice, not treat one read as
+    # the whole asset (the 1 MiB one-shot defect)
+    class FakeSlicedBannerApi:
+        def __init__(self, data):
+            self.data = data
+            self.calls = 0
+
+        def blobs_get(self, blob_id, offset=0, length=None):
+            chunk = 65536
+            raw = self.data[offset:offset + chunk]
+            self.calls += 1
+            return {"ok": 1,
+                    "data_b64": base64.b64encode(raw).decode(),
+                    "total": len(self.data), "offset": offset,
+                    "eof": offset + len(raw) >= len(self.data)}
+
+        def blobs_get_all(self, blob_id):
+            return _ga.GuildAPI.blobs_get_all(self, blob_id)
+
+    big_png = b"\x89PNG\r\n\x1a\n" + os.urandom(5 * 65536)
+    sliced = FakeSlicedBannerApi(big_png)
+    app.guild_api = sliced
+    srv2 = app._servers[0]
+    srv2.pop("banner_path", None)
+    srv2.pop("banner_blob", None)
+    app._ingest_banner("f00d" * 8, srv2)
+    deadline = time.time() + 5.0
+    while time.time() < deadline and "banner_path" not in srv2:
+        time.sleep(0.05)
+    got = open(srv2["banner_path"], "rb").read() if srv2.get(
+        "banner_path") else b""
+    check("assembled ingest spans multiple slices",
+          sliced.calls > 1, sliced.calls)
+    check("assembled ingest matches the source byte for byte",
+          got == big_png, len(got))
+    check("assembled ingest names the file with the sniffed ext",
+          os.path.basename(srv2.get("banner_path", "")) ==
+          "bannerhost_123_%s.png" % ("f00d" * 8)[:12],
+          srv2.get("banner_path"))
+
+
+    # the upgrade repair pass: the pre-assembly build left a truncated
+    # stored file under a still-valid record; the repair must reingest
+    truncated = big_png[:65000]
+    srv3 = app._servers[0]
+    stale = os.path.join(kc._app_data_dir(), "banners", "repair_trunc.png")
+    with open(stale, "wb") as f:
+        f.write(truncated)
+    srv3["banner_path"] = stale
+    srv3["banner_blob"] = "beef" * 8
+    calls_before = sliced.calls
+    app._repair_recorded_assets(srv3)
+    expect_name = "bannerhost_123_%s.png" % ("beef" * 8)[:12]
+    deadline = time.time() + 5.0
+    while time.time() < deadline and not (
+            srv3.get("banner_path") == expect_name
+            and os.path.isfile(srv3["banner_path"])
+            and os.path.getsize(srv3["banner_path"]) == len(big_png)):
+        time.sleep(0.05)
+    repaired = open(srv3["banner_path"], "rb").read() if srv3.get(
+        "banner_path") else b""
+    check("repair reingests a stale truncated asset",
+          repaired == big_png, (len(repaired), len(big_png)))
+    check("repair probe consumed the head slice only",
+          sliced.calls >= calls_before + 1, sliced.calls)
+    healthy = os.path.join(kc._app_data_dir(), "banners", "repair_full.png")
+    with open(healthy, "wb") as f:
+        f.write(big_png)
+    srv3["banner_path"] = healthy
+    srv3["banner_blob"] = "beef" * 8
+    calls_before = sliced.calls
+    app._repair_recorded_assets(srv3)
+    time.sleep(0.2)
+    check("repair of a healthy asset consumes the probe only",
+          sliced.calls == calls_before + 1, sliced.calls)
 
     print("RESULT: %d PASS, %d FAIL" % (len(PASS), len(FAIL)))
     sys.exit(1 if FAIL else 0)

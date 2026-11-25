@@ -20,6 +20,10 @@ import time
 import RNS
 from RNS.vendor import umsgpack as msgpack
 
+# Client-side cap for assembling a chunked read into one blob; mirrors
+# MAX_ATTACHMENT_SZ (the 10 MB payload law) on the server.
+BLOB_ASSEMBLE_MAX = 10 * 1024 * 1024
+
 
 class GuildAPI:
     """Thin wrapper around an RNS Link to the sHades guild node."""
@@ -367,6 +371,43 @@ class GuildAPI:
         if length is not None:
             data["len"] = length
         return self._request_json("/api/v1/blobs/get", data)
+
+    def blobs_get_all(self, blob_id):
+        """Assemble one whole blob across the chunked transport.
+
+        blobs_get returns a single <=1 MiB slice with total/eof markers;
+        the ingest engines that treated the first slice as the whole file
+        produced truncated assets (the 1 MiB banner-strip defect, seen on
+        device as a strip that never renders). Reads every slice until
+        eof and returns the assembly in the same shape as a single-shot
+        reply ({ok, data_b64, total, eof}), capped at BLOB_ASSEMBLE_MAX.
+        """
+        parts = []
+        got = 0
+        offset = 0
+        while True:
+            res = self.blobs_get(blob_id, offset=offset)
+            if not res.get("ok"):
+                return res
+            part = base64.b64decode(res.get("data_b64") or b"")
+            if part:
+                parts.append(part)
+                got += len(part)
+            elif not res.get("eof"):
+                # empty slice and no eof marker: nothing more coming
+                break
+            if res.get("eof"):
+                break
+            offset += len(part)
+            if got >= (res.get("total") or got):
+                break
+            if got > BLOB_ASSEMBLE_MAX:
+                return {"ok": 0,
+                        "error": "blob exceeds client assembly cap (%d bytes)"
+                                 % BLOB_ASSEMBLE_MAX}
+        return {"ok": 1,
+                "data_b64": base64.b64encode(b"".join(parts)).decode("ascii"),
+                "total": got, "eof": True}
 
     def att_get(self, path, offset=0, length=None):
         """Chunked attachment read (v0.31). Returns {data_b64, total,

@@ -15,6 +15,7 @@ Pins down:
   - Roles tab: create posts the checked bitmask; assign posts role+user;
   - Invites tab: create posts label/max_uses/expires_in/channel.
 """
+import base64
 import os, sys, time, json
 
 os.environ.setdefault("KIVY_GL_BACKEND", "mock")
@@ -100,6 +101,16 @@ class FakeApi:
     def blobs_get(self, blob_id):
         return self._rec(("blobs_get", blob_id),
                          {"ok": 0, "error": "no blob in the fake"})
+
+    def blobs_get_all(self, blob_id):
+        """The one-shot slice cap fix: the ingest engines assemble through
+        this entry now; hand back a canned png so the preview lane keeps
+        its shape."""
+        return self._rec(("blobs_get_all", blob_id),
+                         {"ok": 1,
+                          "data_b64": base64.b64encode(
+                              b"\x89PNG\r\n\x1a\n" + b"FAKEPNGDATA*").decode("ascii"),
+                          "total": 21, "eof": True})
 
 class FakeClient:
     def __init__(self):
@@ -416,7 +427,8 @@ def main():
     gen._render({"ok": 1, "config": client.guild_api.config["config"]})
     pump(1.0)
     check("banner render fetches the banner blob",
-          ("blobs_get", "b" * 32) in client.guild_api.calls,
+          (("blobs_get", "b" * 32) in client.guild_api.calls
+           or ("blobs_get_all", "b" * 32) in client.guild_api.calls),
           client.guild_api.calls[-4:])
 
     for t in scr.tab_buttons:
@@ -450,6 +462,36 @@ def main():
     check("failures also mirror to the client status",
           any("icon upload:" in s for s in client.status)
           and any("banner upload:" in s for s in client.status))
+
+    # --- chunked blob assembly (the 1 MiB ingest defect) -----------
+    import base64 as _b64
+    import guild_api as _ga
+    big = bytes(range(256)) * 5000 + b"!SHADES"  # 1.28 MB > 1 MiB slice cap
+
+    def _sliced_get(route, data):
+        chunk = 65536
+        offset = data.get("offset", 0)
+        raw = big[offset:offset + chunk]
+        return {"ok": 1,
+                "data_b64": _b64.b64encode(raw).decode("ascii"),
+                "total": len(big), "offset": offset,
+                "eof": offset + len(raw) >= len(big)}
+
+    api = object.__new__(_ga.GuildAPI)
+    api._request_json = _sliced_get
+    res = api.blobs_get_all("deadbeef" * 8)
+    check("chunked assembly returns the whole blob",
+          res.get("ok") == 1 and _b64.b64decode(res["data_b64"]) == big)
+    one = _sliced_get("/api/v1/blobs/get", {"offset": 0})
+    check("one-shot slice alone is truncated (the 1 MiB defect)",
+          len(_b64.b64decode(one["data_b64"])) < len(big))
+    from kivy_client import _blob_sniff as _sniff
+    check("sniff names a real png head",
+          _sniff(b"\x89PNG\r\n\x1a\n" + b"0" * 12) == ("png", True))
+    check("sniff names a real jpg head",
+          _sniff(b"\xff\xd8\xff\xe0" + b"0" * 12) == ("jpg", True))
+    check("sniff keeps unknown bytes off the strip",
+          _sniff(b"<?xml" + b"0" * 12) == ("bin", False))
 
     print("RESULT: %d PASS, %d FAIL" % (len(PASS), len(FAIL)))
     return 1 if FAIL else 0
