@@ -54,6 +54,14 @@ def main():
                     "offset": 0, "eof": True,
                     "data_b64": base64.b64encode(PNG).decode()}
 
+        def blobs_get_all(self, blob_id):
+            """Chunk 5 rides the assembled entry: record the fetch and
+            hand back the whole asset in the single-shot shape."""
+            self.blob_calls.append(blob_id)
+            return {"ok": 1, "blob_id": blob_id, "total": len(PNG),
+                    "offset": 0, "eof": True,
+                    "data_b64": base64.b64encode(PNG).decode()}
+
         def blobs_put(self, name, mime, data):
             return {"ok": 1, "blob_id": "d" * 32, "size": len(data)}
 

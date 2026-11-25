@@ -932,8 +932,9 @@ class ServerConfigScreen(Screen):
             try:
                 import io
                 import base64
-                res = self.client.guild_api.blobs_get(blob_id)
+                res = self.client.guild_api.blobs_get_all(blob_id)
                 if not res.get("ok"):
+                    self._apply_status("preview: %s" % res.get("error"))
                     return
                 raw = base64.b64decode(res.get("data_b64") or "")
                 if not raw:
