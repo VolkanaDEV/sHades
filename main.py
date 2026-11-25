@@ -96,13 +96,23 @@ def _export_bootlog_for_user():
             DL = autoclass("android.provider.MediaStore$Downloads")
             coll = DL.getContentUri("external_primary")
             uri = None
-            # find an existing row first so re-boots overwrite instead
-            # of stacking sHades_boot (1).log, (2).log, ...
+            # tay 2026-11-25 (log_13): the orphan world. Own-package
+            # MediaStore rows die at uninstall, but the Download FILE
+            # from a previous install persists on disk. The bare-name
+            # insert then collides with that orphan and this provider
+            # refuses to uniquify -- IllegalStateException "Failed to
+            # build unique file", 3 export misses out of 3 attempts on
+            # the chunk-5 boot. So the row search covers the whole
+            # export family (bare name and stamped names), newest
+            # first, and when no row exists the insert name is
+            # timestamped, which cannot collide with the orphan bare
+            # name. Once one row exists it is overwritten in place
+            # forever -- still no sHades_boot (1).log stacking.
             try:
-                cur = resolver.query(coll, ["_id"],
-                                     "_display_name = "
-                                     "'sHades_boot.log'",
-                                     None, None)
+                cur = resolver.query(
+                    coll, ["_id"],
+                    "_display_name LIKE 'sHades_boot%.log'",
+                    None, "_date_modified DESC")
                 try:
                     if cur is not None and cur.moveToFirst():
                         uri = autoclass(
@@ -117,7 +127,11 @@ def _export_bootlog_for_user():
                 uri = None
             if uri is None:
                 cv = autoclass("android.content.ContentValues")()
-                cv.put("_display_name", "sHades_boot.log")
+                # a unique name at insert time: the stamp cannot
+                # collide with the foreign orphan that made "Failed to
+                # build unique file" permanent on tay's device
+                cv.put("_display_name", "sHades_boot_%s.log" % time.strftime(
+                    "%Y%m%d_%H%M%S", time.gmtime()))
                 cv.put("mime_type", "text/plain")
                 uri = resolver.insert(coll, cv)
                 if uri is None:

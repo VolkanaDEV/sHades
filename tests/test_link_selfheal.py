@@ -564,8 +564,11 @@ def test_bootlog_export_contract():
     assert "_EXPORT_MIN_INTERVAL" in main_src and \
         "_LAST_EXPORT_TS" in main_src, "30 s attempt-throttle knob"
     assert "DIRECTORY_DOWNLOADS" in main_src, "API 26-28 fallback route"
-    assert "_display_name = " in main_src and "'sHades_boot.log'" \
-        in main_src, "existing-row overwrite (no (1).log stacking)"
+    assert "_display_name LIKE 'sHades_boot%.log'" in main_src, \
+        "export-family row search: bare + stamped names, newest first"
+    assert "sHades_boot_%s.log" in main_src and "%Y%m%d_%H%M%S" \
+        in main_src and "time.gmtime" in main_src, \
+        "timestamped insert name cannot collide with a foreign orphan"
     # v0.36.4: nio copy -- Files.copy(Path, OutputStream) is the legal
     # overload; FileInputStream/InputStream targets never resolved
     assert "java.nio.file.Paths" in main_src and \
@@ -796,6 +799,16 @@ def test_bootlog_bridge_contract():
             "clean boot export lands on-device"
         kinds = [c[0] for c in calls]
         assert "insert" in kinds, "no existing row -> insert"
+        # tay 2026-11-25 (log_13): orphan world -- with no row anywhere,
+        # the insert name is timestamped, so it cannot collide with the
+        # bare-name orphan file that made "Failed to build unique file"
+        # permanent (3 misses out of 3 export attempts on that boot)
+        import re as _re
+        ins_names = [c[1]["_display_name"] for c in calls
+                     if c[0] == "insert"]
+        assert ins_names and _re.fullmatch(
+            r"sHades_boot_\d{8}_\d{6}\.log", ins_names[0]), \
+            "no-row insert name is stamped, collision-free: %s" % ins_names
         assert ("copy", "path,out") in calls, \
             "copy ran on the legal Path,OutputStream overload"
         ac_names = [c[1] for c in calls if c[0] == "ac"]
@@ -807,7 +820,7 @@ def test_bootlog_bridge_contract():
         with open(main_mod._log_path(), "a", encoding="utf-8") as f:
             f.write("second boot\n")
         assert main_mod._export_bootlog_for_user() is True
-        assert ("query", "_display_name = 'sHades_boot.log'") in calls, \
+        assert ("query", "_display_name LIKE 'sHades_boot%.log'") in calls, \
             "overwrite query before any insert"
         assert [c[0] for c in calls].count("insert") == 0, \
             "no (1).log stacking: query found the row, insert skipped"
