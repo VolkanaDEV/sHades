@@ -7,7 +7,8 @@ as before). The app class inherits this mixin, so every method stays
 reachable as ``app.<name>`` and ``kc.sHadesClientApp.<name>``.
 """
 
-from client_widgets import (ChannelButton, _app_data_dir)
+from client_widgets import (ChannelButton, VoiceRow,
+                            _app_data_dir)
 import RNS
 import json
 import os
@@ -130,6 +131,47 @@ class ChannelsMixin:
             grid.add_widget(btn)
         else:
             grid.add_widget(btn, index=insert_at)
+        self._voice_attach_row(name)
+
+    def _voice_attach_row(self, name):
+        """item 6: a voice-kind channel's roster row rides under its
+        button. Called after the button exists; a late kind update
+        (channels/list arrives after a seed) attaches here too."""
+        cid = self._channels.get(name)
+        if getattr(self, "_channel_kinds", {}).get(cid) != "voice":
+            return
+        if not hasattr(self, "_voice_row_for"):
+            return
+        if getattr(self, "_voice_rows", {}).get(cid) is not None:
+            return     # already attached; roster pushes refresh it
+        row = self._voice_row_for(name, cid)
+        grid = self.root.get_screen("main").ids.channel_grid
+        btn_idx = None
+        for i, w in enumerate(grid.children):
+            if isinstance(w, ChannelButton) and w.channel_name == name:
+                btn_idx = i
+                break
+        if btn_idx is None:
+            grid.add_widget(row)
+            return
+        # children render in reversed order under this grid's layout:
+        # insert directly BEFORE the button's child index so the row
+        # draws under it (same math family as _add_channel's insert)
+        grid.add_widget(row, index=btn_idx)
+
+    def _voice_row_slot(self, name):
+        """Child index that visually lands the voice row directly under
+        its channel button, derived from _add_channel's insert math."""
+        grid = self.root.get_screen("main").ids.channel_grid
+        existing = [w for w in reversed(grid.children)
+                    if isinstance(w, (ChannelButton, VoiceRow))]
+        my_pos = self._channel_pos.get(name)
+        for visual_row, b in enumerate(existing):
+            pos = self._channel_pos.get(getattr(b, "channel_name", ""))
+            if pos is None or (my_pos is not None
+                               and pos is not None and pos > my_pos):
+                return len(existing) - visual_row
+        return len(existing)
 
     def _has_channel_button(self, name):
         """True when the sidebar already holds a button for `name`."""

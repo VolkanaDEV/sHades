@@ -29,6 +29,10 @@ except Exception as _e:  # pragma: no cover - Kivy missing at import time
 class StreamMixin:
     """Live stream/polling/term: streamer, keepalive, frames, presence, update cycle."""
 
+    def on_voice_state(self, cid, members):
+        """Overridden by the app class: direct-link wiring + UI land here."""
+        return
+
     def _start_poll(self):
         # v0.28: no polling loops anywhere in the client. This one-shot
         # keeps what the first poll tick did (seed the UI once); every
@@ -163,7 +167,22 @@ class StreamMixin:
         thread: threadsafe updates + Clock marshalling only."""
         try:
             frame = msgpack.unpackb(plaintext, raw=False)
-            if not isinstance(frame, dict) or frame.get("k") != "stream":
+            if not isinstance(frame, dict):
+                return
+            if frame.get("k") == "voice":
+                # relay fallback (item 4 lane): a speaker's raw packet,
+                # hub-fanned to this room subscriber's link
+                engine = getattr(self, "_voice_engine", None)
+                if engine is not None:
+                    eng = engine
+                    d = frame.get("dest") or ""
+                    b = frame.get("body") or b""
+
+                    def _relay(dt, e=eng, dest=d, body=b):
+                        e.packet_relayed(dest, body)
+                    Clock.schedule_once(_relay, 0)
+                return
+            if frame.get("k") != "stream":
                 return
             self._handle_stream_frame(frame)
         except Exception as e:
@@ -284,6 +303,20 @@ class StreamMixin:
                 # 3s state poller that used to notice them is deleted.
                 Clock.schedule_once(
                     lambda dt: self._refresh_channels_from_guild(), 0)
+            elif kind == "voice_state":
+                # tay 2026-11-23: a voice roster (who is in, each member's
+                # peer voice destination, mute flags). The room listens on
+                # the channel stream, so members get the roster on push.
+                room_cid = data.get("channel") or cid
+                rooms = dict(getattr(self, "_voice_rooms", {}) or {})
+                rooms[room_cid] = [
+                    m for m in (data.get("members") or [])
+                    if isinstance(m, dict)]
+                self._voice_rooms = rooms
+                members = list(rooms[room_cid])
+                Clock.schedule_once(
+                    lambda dt, c=room_cid, m=members:
+                    self.on_voice_state(c, m), 0)
             # "typing" events are consumed by a later phase
         if touched:
             # full refresh of the visible channel; _render_message dedupes
