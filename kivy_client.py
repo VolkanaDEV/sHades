@@ -891,6 +891,8 @@ class CtxHeaderLabel(ContextMenuMixin, Label):
         if app and getattr(app, "i_am_admin", False):
             actions.append(("server settings", True,
                             lambda: app and app._open_admin_panel()))
+        actions.append(("profile config", True,
+                        lambda: app and app.open_config()))
         actions.append(("copy boot log", True,
                         lambda: app and app._copy_bootlog()))
         return actions
@@ -977,6 +979,8 @@ if KIVY:
             if app and getattr(app, "i_am_admin", False):
                 actions.append(("server settings", True,
                                 lambda: app and app._open_admin_panel()))
+            actions.append(("profile config", True,
+                            lambda: app and app.open_config()))
             actions.append(("copy boot log", True,
                             lambda: app and app._copy_bootlog()))
             actions.append(("remove server", True,

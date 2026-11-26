@@ -131,6 +131,23 @@ def main():
               screen.ids["config_host"].children
               and screen.ids["config_pages"]
               in screen.ids["config_host"].children)
+        # tab row visibility receipt (tay 2026-11-26: the tabs rendered in
+        # kv but no route opened the screen; pin both the row geometry and
+        # the initial variant split so a future kv edit cannot silently
+        # drop the tabs from the visible surface)
+        from kivy.metrics import dp
+        tb = screen.ids["tab_general"]
+        tv = screen.ids["tab_voice"]
+        pump()
+        check("tab row carries both tabs with the row geometry",
+              tb.parent is tv.parent
+              and tb.parent.height == dp(56)
+              and tb.height == dp(44) and tv.height == dp(44)
+              and tb.height > 0 and tv.height > 0,
+              dict(row=tb.parent.height, g=tb.height, v=tv.height))
+        check("initial tab variants mark appearance active",
+              tb.variant == "primary" and tv.variant == "outlined",
+              repr((tb.variant, tv.variant)))
         screen.switch_tab("voice")
         pump()
         check("voice tab hosts the page",
