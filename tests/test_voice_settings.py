@@ -81,14 +81,14 @@ def main():
     check("letter names itself", vp.key_name(97, 38, "a") == "key 'a'")
     check("arrows map to names", vp.key_name(276) == "left")
 
-    # ---- settings screen (kivy) ----------------------------------------
+    # ---- settings page (kivy) ------------------------------------------
     if ui_lane_enabled():
         from kivy.clock import Clock
         from kivy.uix.screenmanager import ScreenManager
         import kivy.app as _kapp
         import app_voice as av
         import kivy_client as kc
-        from ui_user_settings import UserSettingsScreen
+        from ui_user_settings import VoiceSettingsPage
 
         def pump():
             Clock.tick()
@@ -103,57 +103,86 @@ def main():
                 return getattr(self._a, name)
 
         _kapp.App._running_app = _RA(app)
+        from kivy.lang import Builder
+        try:
+            Builder.load_file("kv_md.kv")  # kv ids for config screen
+        except Exception:
+            pass  # already loaded by an earlier battery in the session
         sm = ScreenManager()
         sm.add_widget(kc.MainScreen(name="main"))
+        sm.add_widget(kc.ConfigScreen(name="config"))
         app.root = sm
 
         engine = av.VoiceEngine()
         app.my_user_hash = "cef43e" + "0" * 58
         app._voice_prefs = dict(vp.DEFAULTS)
         app._voice_engine = engine
-        screen = UserSettingsScreen(client=app, name="user_settings")
-        screen.build_tabs()
+
+        # standalone page behavior (mode/vad/capture on the real prefs)
+        page = VoiceSettingsPage(client=app)
         pump()
-        check("screen builds with voice tab default",
-              screen._tab_buttons and screen._status is not None
-              and screen._mode_row is not None)
+        check("page builds rows", page._rows_ok())
+        screen = sm.get_screen("config")
+
+        # tab switch hosts the page, then hands back to appearance
+        screen.on_pre_enter()
+        pump()
+        check("entry lands on appearance",
+              screen.ids["config_host"].children
+              and screen.ids["config_pages"]
+              in screen.ids["config_host"].children)
+        screen.switch_tab("voice")
+        pump()
+        check("voice tab hosts the page",
+              screen._voice_page is page.parent
+              or screen._voice_page in
+              screen.ids["voice_host"].children,
+              type(screen._voice_page).__name__)
+        check("footer hidden on voice tab",
+              screen.ids.get("config_footer").height == 0
+              or screen.ids.get("config_footer").opacity == 0)
 
         # mode tap reaches the engine + persists
-        screen._pick_mode("vad")
+        screen._voice_page._pick_mode("vad")
         p = vp.load_voice_prefs(path=vp.prefs_path(app))
         check("mode tap applies + persists",
               engine.voice_mode == "vad" and p["mode"] == "vad")
-        check("mode row repaints", screen._mode_row is not None)
 
         # vad slider persists + applies
-        screen._pick_vad(1234)
+        screen._voice_page._pick_vad(1234)
         check("vad applies + persists",
               engine.vad_rms == 1234
               and vp.load_voice_prefs(
                   path=vp.prefs_path(app))["vad_rms"] == 1234)
 
         # capture binds the next key; esc cancels
-        screen._start_capture(screen._cap_btn, screen._ptt_cur)
-        screen._capture_key_down(None, 27, 0, None, [])
+        pg = screen._voice_page
+        pg._start_capture(pg._cap_btn, pg._ptt_cur)
+        pg._capture_key_down(None, 27, 0, None, [])
         check("esc cancels capture",
-              not screen._capturing
+              not pg._capturing
               and vp.load_voice_prefs(
                   path=vp.prefs_path(app))["ptt_key"] is None)
-        screen._start_capture(screen._cap_btn, screen._ptt_cur)
-        # a space presses with codepoint " ": it strips empty, so the
-        # name comes from the key-code map ("space"), not the quote form
-        screen._capture_key_down(None, 32, 44, " ", [])
+        pg._start_capture(pg._cap_btn, pg._ptt_cur)
+        # a space presses with codepoint " ": strips empty, so the name
+        # comes from the key-code map ("space"), not the quote form
+        pg._capture_key_down(None, 32, 44, " ", [])
         p = vp.load_voice_prefs(path=vp.prefs_path(app))
         check("key capture binds + persists",
               p["ptt_key"] and p["ptt_key"]["key"] == 32
               and p["ptt_key"]["name"] == "space", p["ptt_key"])
-        screen._clear_ptt_key(screen._ptt_cur)
+        pg._clear_ptt_key(pg._ptt_cur)
         p = vp.load_voice_prefs(path=vp.prefs_path(app))
         check("clear removes the binding", p["ptt_key"] is None)
 
-        # account tab rebuilds without error
-        screen._switch("account")
-        check("account tab renders", len(screen._inner.children) >= 3)
+        # back to appearance: page unplugged, footer restored
+        screen.switch_tab("general")
+        pump()
+        check("appearance tab resumes",
+              screen.ids["config_pages"]
+              in screen.ids["config_host"].children
+              and screen.ids.get("config_footer").height > 0
+              and screen.ids.get("config_footer").opacity == 1)
     else:
         print(" (kivy unavailable: ui lanes skipped)")
 
