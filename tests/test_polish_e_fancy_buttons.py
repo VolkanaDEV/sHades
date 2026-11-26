@@ -284,7 +284,7 @@ def run_checks(app):
     check("unknown variant falls back to filled style",
           odd.style == "filled", repr(odd.style))
 
-    # --- KV wiring: 25 converted (split-base counts; the tarball's
+    # --- KV wiring: 26 converted (split-base counts; the tarball's
     # split client builds the rest in modules, not kv) ---
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "..", "kv_md.kv")) as f:
@@ -293,8 +293,8 @@ def run_checks(app):
              if ln.strip() == "MDButton:"]
     fancy = [ln for ln in kv.splitlines()
              if ln.strip() == "FancyMDButton:"]
-    check("kv converts 27 buttons to FancyMDButton",
-          len(fancy) == 27, "got %d" % len(fancy))
+    check("kv converts 28 buttons to FancyMDButton",
+          len(fancy) == 28, "got %d" % len(fancy))
     check("kv leaves exactly 5 plain MDButtons", len(plain) == 5,
           "got %d" % len(plain))
     check("kv keeps 4 text-style plain buttons",
@@ -306,8 +306,8 @@ def run_checks(app):
     check("kv primary variants number 9",
           kv.count("variant: 'primary'") == 9,
           "got %d" % kv.count("variant: 'primary'"))
-    check("kv outlined variants number 17",
-          kv.count("variant: 'outlined'") == 17,
+    check("kv outlined variants number 18",
+          kv.count("variant: 'outlined'") == 18,
           "got %d" % kv.count("variant: 'outlined'"))
     check("kv danger variant is the delete button only",
           kv.count("variant: 'danger'") == 1,

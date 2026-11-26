@@ -458,6 +458,15 @@
                 size_hint_x: None
                 width: dp(230)
                 pos_hint: {'center_x': 0.5}
+                on_press: app.open_config()
+                MDButtonText:
+                    text: 'Profile config'
+                    text_color: app.theme_colors['text']
+            FancyMDButton:
+                variant: 'outlined'
+                size_hint_x: None
+                width: dp(230)
+                pos_hint: {'center_x': 0.5}
                 on_press: app.open_command_palette()
                 MDButtonText:
                     text: 'Slash commands'

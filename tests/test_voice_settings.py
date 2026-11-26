@@ -148,6 +148,20 @@ def main():
         check("initial tab variants mark appearance active",
               tb.variant == "primary" and tv.variant == "outlined",
               repr((tb.variant, tv.variant)))
+        # the owner must reach this screen from their profile page (tay
+        # 2026-11-26, log_16): the own-profile card carries a button wired
+        # to the same route open_config serves to the context menus
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "kv_md.kv"), "rb") as f:
+            kv_txt = f.read().decode("utf-8")
+        pos_cfg = kv_txt.find("text: 'Profile config'")
+        blk_start = kv_txt.rfind("FancyMDButton", 0, pos_cfg)
+        blk = kv_txt[blk_start:pos_cfg]
+        check("own-profile page routes Profile config to open_config",
+              pos_cfg > -1
+              and "variant: 'outlined'" in blk
+              and "app.open_config()" in blk,
+              repr(blk[-140:]))
         screen.switch_tab("voice")
         pump()
         check("voice tab hosts the page",
