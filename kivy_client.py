@@ -1494,15 +1494,18 @@ if KIVY:
 
         def _ensure_voice_page(self):
             """Build the user settings page (voice rows) once; it saves
-            instantly, so no footer applies to it."""
+            instantly, so no footer applies to it. The page hosts
+            directly in the scroll host: the parked voice_host container
+            sat inside config_pages (height 0, opacity 0), which
+            switch_tab had just removed -- adding there rendered an
+            empty tab on every platform (tay 2026-11-26 photo)."""
             if self._voice_page is not None:
                 return
             try:
                 from ui_user_settings import VoiceSettingsPage
-                host = self.ids["voice_host"]
+                host = self.ids["config_host"]
                 page = VoiceSettingsPage(
                     client=App.get_running_app())
-                host.bind(minimum_height=host.setter("height"))
                 host.add_widget(page)
                 self._voice_page = page
             except Exception as e:

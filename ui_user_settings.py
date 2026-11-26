@@ -6,7 +6,7 @@ The user settings submenu is a TAB of the profile config screen
 v1 shipped as a separate registered screen and, unopened, rendered
 nothing (device log 14: the entry could not open anything). This
 module is now one page widget: VoiceSettingsPage is added to the
-config screen's voice_host by switch_tab and removed when the
+config screen's scroll host by switch_tab and removed when the
 appearance tab resumes.
 
 Rows:

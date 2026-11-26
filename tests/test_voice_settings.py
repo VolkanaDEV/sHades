@@ -149,26 +149,45 @@ def main():
               tb.variant == "primary" and tv.variant == "outlined",
               repr((tb.variant, tv.variant)))
         # the owner must reach this screen from their profile page (tay
-        # 2026-11-26, log_16): the own-profile card carries a button wired
-        # to the same route open_config serves to the context menus
+        # 2026-11-26, log_17): a Settings button sits directly under
+        # Copy card payload (above the fold on device) wired to the same
+        # route open_config serves to the context menus
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "..", "kv_md.kv"), "rb") as f:
             kv_txt = f.read().decode("utf-8")
-        pos_cfg = kv_txt.find("text: 'Profile config'")
-        blk_start = kv_txt.rfind("FancyMDButton", 0, pos_cfg)
-        blk = kv_txt[blk_start:pos_cfg]
-        check("own-profile page routes Profile config to open_config",
-              pos_cfg > -1
+        pos_copy = kv_txt.find("text: 'Copy card payload'")
+        pos_set = kv_txt.find("text: 'Settings'", pos_copy)
+        pos_imp = kv_txt.find("text: 'Import card from clipboard'", pos_set)
+        blk_start = kv_txt.rfind("FancyMDButton", 0, pos_set)
+        blk = kv_txt[blk_start:pos_set]
+        check("own-profile page routes Settings to open_config",
+              pos_copy > -1 and pos_set > -1 and pos_imp > -1
               and "variant: 'outlined'" in blk
               and "app.open_config()" in blk,
               repr(blk[-140:]))
         screen.switch_tab("voice")
         pump()
-        check("voice tab hosts the page",
-              screen._voice_page is page.parent
-              or screen._voice_page in
-              screen.ids["voice_host"].children,
+        # visibility contract (tay 2026-11-26 photo: the tab rendered
+        # empty because switch_tab parked the page into voice_host --
+        # height 0, opacity 0, nested INSIDE the config_pages subtree
+        # switch_tab had just removed). Host the page in the scroll
+        # host itself and pin the visible tree.
+        ch = screen.ids["config_host"]
+        # weakproxy ids: compare with == (delegates to the underlying
+        # widget), never with `is` (raw parent ref vs proxy)
+        check("voice tab hosts the page in the scroll host",
+              screen._voice_page is not None
+              and screen._voice_page in ch.children
+              and screen._voice_page.parent == ch,
               type(screen._voice_page).__name__)
+        check("voice tab swaps out the appearance page",
+              screen.ids["config_pages"] not in ch.children,
+              repr([type(w).__name__ for w in ch.children]))
+        check("voice page carries visible height",
+              screen._voice_page.height > 0,
+              "h=%s" % screen._voice_page.height)
+        check("parked voice_host container is gone from kv",
+              "voice_host" not in kv_txt)
         check("footer hidden on voice tab",
               screen.ids.get("config_footer").height == 0
               or screen.ids.get("config_footer").opacity == 0)

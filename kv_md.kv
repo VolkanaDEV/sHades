@@ -440,6 +440,15 @@
                 size_hint_x: None
                 width: dp(230)
                 pos_hint: {'center_x': 0.5}
+                on_press: app.open_config()
+                MDButtonText:
+                    text: 'Settings'
+                    text_color: app.theme_colors['text']
+            FancyMDButton:
+                variant: 'outlined'
+                size_hint_x: None
+                width: dp(230)
+                pos_hint: {'center_x': 0.5}
                 on_press: app.import_contact_card()
                 MDButtonText:
                     text: 'Import card from clipboard'
@@ -452,15 +461,6 @@
                 on_press: app.open_recovery_sheet()
                 MDButtonText:
                     text: 'Save recovery kit'
-                    text_color: app.theme_colors['text']
-            FancyMDButton:
-                variant: 'outlined'
-                size_hint_x: None
-                width: dp(230)
-                pos_hint: {'center_x': 0.5}
-                on_press: app.open_config()
-                MDButtonText:
-                    text: 'Profile config'
                     text_color: app.theme_colors['text']
             FancyMDButton:
                 variant: 'outlined'
@@ -1541,12 +1541,6 @@
                         size_hint_y: None
                         height: self.minimum_height
                         spacing: dp(8)
-                BoxLayout:
-                    id: voice_host
-                    orientation: 'vertical'
-                    size_hint_y: None
-                    height: 0
-                    opacity: 0
         Label:
             id: config_status
             text: ''
