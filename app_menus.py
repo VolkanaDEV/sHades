@@ -471,6 +471,28 @@ class MenusMixin:
         cancel.bind(on_press=lambda inst: popup.dismiss())
         ui_fx.popup_entrance(popup)
 
+    def _open_user_settings(self):
+        """User settings screen: tabbed voice/account pages (tay
+        2026-11-25); tx prefs persist client-side in voice.json."""
+        try:
+            from ui_user_settings import UserSettingsScreen
+            if self.root is not None:
+                screen = self.root.get_screen("user_settings")
+                screen.client = self
+                self.root.current = "user_settings"
+                return
+            # kv ScreenManager not bound yet (pre-boot, tests, applets):
+            # host the same tabbed screen in a popup.
+            from kivy.uix.popup import Popup
+            screen = UserSettingsScreen(client=self, name="user_settings")
+            screen.build_tabs()
+            popup = Popup(title="user settings", content=screen,
+                          size_hint=(0.9, 0.9))
+            ui_fx.popup_entrance(popup)
+            self._settings_popup = popup
+        except Exception as e:
+            print("user settings failed:", repr(e))
+
     def _open_admin_panel(self):
         """Server config screen: tabs for General / Membership / Channels /
         Roles / Invites, visible per the caller's roles (the server enforces

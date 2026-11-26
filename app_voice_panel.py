@@ -36,9 +36,52 @@ class VoicePanelMixin:
         self._voice_muted = False
         self._voice_rows = {}           # cid -> VoiceRow
         self._voice_lock = threading.RLock()
+        # tay 2026-11-25 (user settings): persisted tx prefs + the ptt
+        # key dispatch; the settings screen writes through the same
+        # client_voice_prefs store (voice.json beside the other prefs)
+        self._voice_prefs = {}
+        try:
+            import client_voice_prefs as vpref
+            self._voice_prefs = vpref.load_voice_prefs(app=self)
+        except Exception:
+            pass
         try:
             from kivy.clock import Clock
             Clock.schedule_interval(self._voice_speak_tick, 0.25)
+        except Exception:
+            pass
+        try:
+            from kivy.core.window import Window
+            Window.bind(on_key_down=self._voice_key_down,
+                        on_key_up=self._voice_key_up)
+        except Exception:
+            pass
+
+    def _voice_key_down(self, window, key, scancode, codepoint, modifier):
+        # bound ptt key: down edge raises the hold (no consume; other
+        # listeners may share the event)
+        try:
+            import client_voice_prefs as vpref
+            prefs = getattr(self, "_voice_prefs", None) or {}
+            if not vpref.ptt_key_matches(prefs, key, scancode):
+                return
+            engine = getattr(self, "_voice_engine", None)
+            fn = getattr(engine, "set_ptt", None) if engine else None
+            if fn is not None:
+                fn(True)
+        except Exception:
+            pass
+
+    def _voice_key_up(self, window, key, scancode):
+        try:
+            import client_voice_prefs as vpref
+            prefs = getattr(self, "_voice_prefs", None) or {}
+            if not vpref.ptt_key_matches(prefs, key, scancode):
+                return
+            engine = getattr(self, "_voice_engine", None)
+            fn = getattr(engine, "set_ptt", None) if engine else None
+            if fn is not None:
+                fn(False)
         except Exception:
             pass
 
@@ -194,6 +237,18 @@ class VoicePanelMixin:
                     return self.api.voice_publish(cid, body)
 
             engine = VoiceEngine(viewer=user_hash, hub=HubGate(self.guild_api))
+            # persisted tx prefs (user settings page) apply to the fresh
+            # engine so a saved mode/threshold survives restarts
+            prefs = getattr(self, "_voice_prefs", None) or {}
+            mode_fn = getattr(engine, "set_voice_mode", None)
+            if mode_fn is not None and prefs.get("mode") in (
+                    "always", "ptt", "vad"):
+                mode_fn(prefs["mode"])
+            if prefs.get("vad_rms"):
+                try:
+                    engine.vad_rms = int(prefs["vad_rms"])
+                except (TypeError, ValueError):
+                    pass
             my_ident = RNS.Identity.from_file(self._identity_file())
             lane = core.VoiceLane(my_ident)
             my_dest = lane.open_listener(engine)

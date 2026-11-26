@@ -891,6 +891,8 @@ class CtxHeaderLabel(ContextMenuMixin, Label):
         if app and getattr(app, "i_am_admin", False):
             actions.append(("server settings", True,
                             lambda: app and app._open_admin_panel()))
+        actions.append(("user settings", True,
+                        lambda: app and app._open_user_settings()))
         actions.append(("copy boot log", True,
                         lambda: app and app._copy_bootlog()))
         return actions
@@ -977,6 +979,8 @@ if KIVY:
             if app and getattr(app, "i_am_admin", False):
                 actions.append(("server settings", True,
                                 lambda: app and app._open_admin_panel()))
+            actions.append(("user settings", True,
+                            lambda: app and app._open_user_settings()))
             actions.append(("copy boot log", True,
                             lambda: app and app._copy_bootlog()))
             actions.append(("remove server", True,
@@ -1879,6 +1883,12 @@ class sHadesClientApp(SettingsMixin, ChannelsMixin, SiteMixin,
             sm.add_widget(ServerConfigScreen(name="server_config"))
         except Exception as e:
             print("server_config screen unavailable:", repr(e))
+        # tay 2026-11-25: tabbed user settings (voice / account)
+        try:
+            from ui_user_settings import UserSettingsScreen
+            sm.add_widget(UserSettingsScreen(name="user_settings"))
+        except Exception as e:
+            print("user_settings screen unavailable:", repr(e))
         # Plain Enter sends the message; Shift+Enter inserts a newline
         # (multiline input). Handled via _on_key_down below.
         Window.bind(on_key_down=self._on_key_down)
