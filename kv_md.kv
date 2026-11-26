@@ -1442,11 +1442,13 @@
             height: dp(44)
         BoxLayout:
             size_hint_y: None
-            height: dp(40)
+            height: dp(56)
             spacing: dp(8)
-            padding: dp(12)
+            padding: dp(6)
             FancyMDButton:
                 id: tab_general
+                size_hint_y: None
+                height: dp(44)
                 variant: 'primary'
                 on_press: root.switch_tab('general')
                 MDButtonText:
@@ -1454,6 +1456,8 @@
                     text_color: app.theme_colors['btn_text']
             FancyMDButton:
                 id: tab_voice
+                size_hint_y: None
+                height: dp(44)
                 variant: 'outlined'
                 on_press: root.switch_tab('voice')
                 MDButtonText:
