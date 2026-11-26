@@ -14,7 +14,11 @@ Rows:
     persisted via client_voice_prefs into voice.json;
   - voc RMS threshold slider (200-4000) with a live readout;
   - PTT key setup: capture binds the next Window key down (esc
-    cancels), the row shows the bound key's name, clear unbinds.
+    cancels), the row shows the bound key's name, clear unbinds;
+  - on-screen hold-to-talk button: press raises the engine's tx gate,
+    release drops it (tay 2026-11-26: the tab carries the tx controls
+    rather than only showing state; mirrors the rail's hold control
+    for when the channel rail is not open).
 
 Android note: only the key events the platform actually delivers reach
 Window.on_key_down; desktop keys and delivered media/hardware buttons
@@ -74,6 +78,9 @@ class VoiceSettingsPage(BoxLayout):
 
     def _row_mode(self):
         prefs = self._prefs()
+        # rebuilds replace the old row instead of stacking a duplicate
+        if self._mode_row is not None and self._mode_row.parent is self:
+            self.remove_widget(self._mode_row)
         row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(6))
         row.add_widget(_row_label("transmit mode"))
         active = prefs.get("mode", "always")
@@ -102,6 +109,10 @@ class VoiceSettingsPage(BoxLayout):
 
     def _row_ptt_key(self):
         prefs = self._prefs()
+        # rebuilds replace the old row instead of stacking a duplicate
+        if getattr(self, "_ptt_row", None) is not None \
+                and self._ptt_row.parent is self:
+            self.remove_widget(self._ptt_row)
         pk = prefs.get("ptt_key")
         row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(6))
         row.add_widget(_row_label("ptt key"))
@@ -111,11 +122,41 @@ class VoiceSettingsPage(BoxLayout):
         clear = _btn("clear", width=70)
         clear.bind(on_press=lambda inst: self._clear_ptt_key(cur))
         self._ptt_cur = cur
+        self._ptt_row = row
         self._cap_btn = cap
         row.add_widget(cur)
         row.add_widget(cap)
         row.add_widget(clear)
         self.add_widget(row)
+
+    def _row_hold(self):
+        """On-screen hold-to-talk: press raises the engine tx gate,
+        release drops it. Mirrors the rail's hold (ptt) control so the
+        tab is usable with the channel rail closed."""
+        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        row.add_widget(_row_label("ptt button (hold)"))
+        hold = _btn("hold (ptt)", width=120, h=38)
+        hold.bind(on_press=lambda inst: self._hold_down())
+        hold.bind(on_release=lambda inst: self._hold_up())
+        self._hold_btn = hold
+        row.add_widget(hold)
+        self.add_widget(row)
+
+    def _hold_down(self):
+        engine = self._live_engine()
+        fn = getattr(engine, "set_ptt", None) if engine else None
+        if fn is None:
+            self._say("ptt: no live voice engine")
+            return
+        fn(True)
+        self._say("ptt gate: up")
+
+    def _hold_up(self):
+        engine = self._live_engine()
+        fn = getattr(engine, "set_ptt", None) if engine else None
+        if fn is not None:
+            fn(False)
+        self._say("ptt gate: dropped")
 
     def _build_voice(self):
         note = Label(
@@ -129,6 +170,7 @@ class VoiceSettingsPage(BoxLayout):
         self._row_mode()
         self._row_vad()
         self._row_ptt_key()
+        self._row_hold()
         self._status = _value_label("", w=1)
         self._status.size_hint_x = 1
         self.add_widget(self._status)

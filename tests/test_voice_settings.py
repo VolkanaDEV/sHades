@@ -206,6 +206,42 @@ def main():
         p = vp.load_voice_prefs(path=vp.prefs_path(app))
         check("clear removes the binding", p["ptt_key"] is None)
 
+        # hold-to-talk: the on-screen ptt gate lives on the tab too
+        # (tay 2026-11-26: the tab carries the tx controls, not only
+        # state)
+        from ui_user_settings import VoiceSettingsPage
+        import types as _types
+        from kivy.uix.boxlayout import BoxLayout as _BL
+        hold_calls = []
+        engine.set_ptt = lambda down: hold_calls.append(bool(down))
+        pg._hold_down()
+        pg._hold_up()
+        check("hold button drives the tx gate both ways",
+              hold_calls == [True, False], repr(hold_calls))
+        check("hold button reports the dropped gate",
+              pg._status.text == "ptt gate: dropped", pg._status.text)
+        pg2 = VoiceSettingsPage(client=_types.SimpleNamespace(
+            _voice_engine=None))
+        pg2._hold_down()
+        check("hold button degrades to a status note with no engine",
+              pg2._status.text == "ptt: no live voice engine",
+              pg2._status.text)
+
+        # mode re-picks rebuild their row in place; the old rowsite
+        # must not stack duplicates every tap
+        def _mode_rows(pginst):
+            return [ch for ch in pginst.children
+                    if isinstance(ch, _BL) and len(ch.children) == 4
+                    and any(getattr(b, "text", "") in ("always", "ptt",
+                                                       "voc")
+                            for b in ch.children)]
+        n0 = len(_mode_rows(pg))
+        pg._pick_mode("ptt")
+        pg._pick_mode("ptt")
+        check("mode re-picks replace their row, not stack duplicates",
+              len(_mode_rows(pg)) == n0 and n0 == 1, repr((n0,
+                                                          len(_mode_rows(pg)))))
+
         # back to appearance: page unplugged, footer restored
         screen.switch_tab("general")
         pump()
