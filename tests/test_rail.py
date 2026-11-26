@@ -166,8 +166,9 @@ def main():
     app.i_am_admin = False
     actions = rail2[0].build_context_menu()
     labels = [a[0] for a in actions]
-    check("non-admin loses the settings item",
-          not any("settings" in l for l in labels), labels)
+    check("non-admin keeps user settings, loses server settings",
+          any("user settings" in l for l in labels)
+          and not any("server settings" in l for l in labels), labels)
     check("non-admin keeps remove server",
           any("remove" in l for l in labels), labels)
     app.i_am_admin = True
